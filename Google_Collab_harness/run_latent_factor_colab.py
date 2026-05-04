@@ -84,13 +84,23 @@ from latent_factor_pytorch import (
 def _setup_logging(verbose: bool = True, run_label: str = "") -> None:
     """Reset root logging with the (possibly run-tagged) format.
 
-    Called from both the parent process and each subprocess worker.
+    Called from both the parent process and each subprocess worker. We
+    deliberately route to ``sys.stdout`` (not the default stderr) so that
+    when this script is launched by a Jupyter / Colab cell that captures
+    output via Popen.stdout, the log lines actually reach the cell.
     """
     level = logging.INFO if verbose else logging.WARNING
     fmt = "%(asctime)s " + (f"[{run_label}] " if run_label else "") + "%(message)s"
     for h in list(logging.root.handlers):
         logging.root.removeHandler(h)
-    logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S", force=True)
+    logging.basicConfig(
+        level=level, format=fmt, datefmt="%H:%M:%S",
+        force=True, stream=sys.stdout,
+    )
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
 
 
 def _seed_everything(seed: int) -> None:
