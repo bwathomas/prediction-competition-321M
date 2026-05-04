@@ -1,0 +1,957 @@
+name,organization,parameters,release_date,family,macro-family
+0-hero/Matter-0.1-7B-boost-DPO-preview,0-hero,7,unknown,Matter 7B,Matter
+0-hero/Matter-0.1-7B-DPO-preview,0-hero,7,unknown,Matter 7B,Matter
+20231010_rag_claude2,unknown,unknown,935,Claude 2,Claude 2
+20231010_rag_gpt35,unknown,unknown,935,GPT-3.5,GPT-3.5
+20231010_rag_swellama13b,Princeton,13,935,SWELLama 13B,SWELLama
+20231010_rag_swellama7b,Princeton,7,935,SWELLama 7B,SWELLama
+20240402_rag_claude3opus,unknown,unknown,761,Claude 3 Opus,Opus
+20240402_rag_gpt4,unknown,unknown,761,GPT-4,GPT-4
+20240402_sweagent_claude3opus,Princeton,unknown,761,Claude 3 Opus,Opus
+20240402_sweagent_gpt4,Princeton,unknown,761,GPT-4,GPT-4
+20240509_amazon-q-developer-agent-20240430-dev,Amazon,unknown,724,Amazon Q Developer,Amazon Q
+20240612_MASAI_gpt4o,IIT Delhi,unknown,690,GPT-4o,GPT-4o
+20240615_appmap-navie_gpt4o,AppMap,unknown,687,GPT-4o,GPT-4o
+20240617_factory_code_droid,Factory,unknown,685,unknown,unknown
+20240620_sweagent_claude3.5sonnet,Princeton,unknown,682,Claude 3.5 Sonnet,Sonnet
+20240628_autocoderover-v20240620,AutoCodeRover,unknown,674,unknown,unknown
+20240721_amazon-q-developer-agent-20240719-dev,Amazon,unknown,651,Amazon Q Developer,Amazon Q
+20240728_sweagent_gpt4o,Princeton,unknown,644,GPT-4o,GPT-4o
+20240820_epam-ai-run-gpt-4o,EPAM,unknown,621,GPT-4o,GPT-4o
+20240820_honeycomb,Honeycomb,unknown,621,unknown,unknown
+20240824_gru,Gru,unknown,617,unknown,unknown
+20240918_lingma-agent_lingma-swe-gpt-72b,Alibaba,72,592,Lingma SWE-GPT 72B,Lingma
+20240918_lingma-agent_lingma-swe-gpt-7b,Alibaba,7,592,Lingma SWE-GPT 7B,Lingma
+20240920_solver,Solver,unknown,590,unknown,unknown
+20240924_solver,Solver,unknown,586,unknown,unknown
+20241001_nfactorial,nFactorial,unknown,579,unknown,unknown
+20241002_lingma-agent_lingma-swe-gpt-72b,Alibaba,72,578,Lingma SWE-GPT 72B,Lingma
+20241002_lingma-agent_lingma-swe-gpt-7b,Alibaba,7,578,Lingma SWE-GPT 7B,Lingma
+20241007_nfactorial,nFactorial,unknown,573,unknown,unknown
+20241016_composio_swekit,Composio,unknown,564,unknown,unknown
+20241016_epam-ai-run-gpt-4o,EPAM,unknown,564,GPT-4o,GPT-4o
+20241022_tools_claude-3-5-haiku,unknown,unknown,558,Claude 3.5 Haiku,Haiku
+20241022_tools_claude-3-5-sonnet-updated,unknown,unknown,558,Claude 3.5 Sonnet,Sonnet
+20241023_emergent,Emergent,unknown,557,unknown,unknown
+20241025_composio_swekit,Composio,unknown,555,unknown,unknown
+20241028_agentless-1.5_gpt4o,Agentless (UIUC),unknown,552,GPT-4o,GPT-4o
+20241028_solver,Solver,unknown,552,unknown,unknown
+20241029_epam-ai-run-claude-3-5-sonnet,EPAM,unknown,551,Claude 3.5 Sonnet,Sonnet
+20241029_OpenHands-CodeAct-2.1-sonnet-20241022,OpenHands,unknown,551,Claude 3.5 Sonnet,Sonnet
+20241030_nfactorial,nFactorial,unknown,550,unknown,unknown
+20241105_nfactorial,nFactorial,unknown,544,unknown,unknown
+20241106_navie-2-gpt4o-sonnet,AppMap,unknown,543,GPT-4o,GPT-4o
+20241108_autocoderover-v2.0-claude-3-5-sonnet-20241022,AutoCodeRover,unknown,541,Claude 3.5 Sonnet,Sonnet
+20241108_devlo,Devlo,unknown,541,unknown,unknown
+20241113_nebius-search-open-weight-models-11-24,Nebius,unknown,536,unknown,unknown
+20241120_artemis_agent,Artemis,unknown,529,unknown,unknown
+20241125_enginelabs,EngineLabs,unknown,524,unknown,unknown
+20241125_marscode-agent-dev,ByteDance,unknown,524,unknown,unknown
+20241128_SWE-Fixer_Qwen2.5-7b-retriever_Qwen2.5-72b-editor_20241128,SWE-Fixer,72,521,Qwen2.5,Qwen2.5
+20241202_agentless-1.5_claude-3.5-sonnet-20241022,Agentless (UIUC),unknown,517,Claude 3.5 Sonnet,Sonnet
+20241202_amazon-q-developer-agent-20241202-dev,Amazon,unknown,517,Amazon Q Developer,Amazon Q
+20241208_gru,Gru,unknown,511,unknown,unknown
+20241212_epam-ai-run-claude-3-5-sonnet,EPAM,unknown,507,Claude 3.5 Sonnet,Sonnet
+20241212_google_jules_gemini_2.0_flash_experimental,Google,unknown,507,Gemini 2.0 Flash,Gemini 2.0
+20241213_devlo,Devlo,unknown,506,unknown,unknown
+20241221_codestory_midwit_claude-3-5-sonnet_swe-search,CodeStory,unknown,498,Claude 3.5 Sonnet,Sonnet
+20241223_emergent,Emergent,unknown,496,unknown,unknown
+20250110_blackboxai_agent_v1.1,BlackboxAI,unknown,478,unknown,unknown
+20250110_learn_by_interact_claude3.5,Learn by Interact,unknown,478,Claude 3.5 Sonnet,Sonnet
+20250112_ugaiforge,UGAIForge,unknown,476,unknown,unknown
+20250117_wandb_programmer_o1_crosscheck5,Weights & Biases,unknown,471,o1,o1
+20250118_codeshellagent_gemini_2.0_flash_experimental,CodeShellAgent,unknown,470,Gemini 2.0 Flash,Gemini 2.0
+20250120_Bracket,Bracket,unknown,468,unknown,unknown
+20250122_autocoderover-v2.1-claude-3-5-sonnet-20241022,AutoCodeRover,unknown,466,Claude 3.5 Sonnet,Sonnet
+20250203_openhands_4x_scaled,OpenHands,unknown,454,unknown,unknown
+20250206_agentscope,AgentScope,unknown,451,unknown,unknown
+20250214_agentless_lite_o3_mini,Agentless (UIUC),unknown,443,o3 mini,o3
+20250224_tools_claude-3-7-sonnet,unknown,unknown,433,Claude 3.7 Sonnet,Sonnet
+20250225_sweagent_claude-3-7-sonnet,Princeton,unknown,432,Claude 3.7 Sonnet,Sonnet
+20250226_swerl_llama3_70b,SweRL,70,431,Llama 3 70B,Llama 3
+20250228_epam-ai-run-claude-3-5-sonnet,EPAM,unknown,429,Claude 3.5 Sonnet,Sonnet
+20250306_SWE-Fixer_Qwen2.5-7b-retriever_Qwen2.5-72b-editor,SWE-Fixer,72,422,Qwen2.5,Qwen2.5
+20250316_augment_agent_v0,Augment,unknown,412,unknown,unknown
+20250405_amazon-q-developer-agent-20250405-dev,Amazon,unknown,393,Amazon Q Developer,Amazon Q
+20250405_swe-rizzo_claude37,SWE-Rizzo,unknown,393,Claude 3.7 Sonnet,Sonnet
+20250410_cortexa,Cortexa,unknown,388,unknown,unknown
+20250415_openhands,OpenHands,unknown,383,unknown,unknown
+20250430_zencoder_ai,ZenCoder,unknown,368,unknown,unknown
+20250503_patchpilot-v1.1-o4-mini,PatchPilot,unknown,365,o4 mini,o4
+20250511_sweagent_lm_32b,Princeton,32,357,unknown,unknown
+20250514_aime_coder,AIME Coder,unknown,354,unknown,unknown
+20250515_Refact_Agent,Refact AI,unknown,353,unknown,unknown
+20250516_cortexa_o3,Cortexa,unknown,352,o3,o3
+20250519_devlo,Devlo,unknown,349,unknown,unknown
+20250519_trae,ByteDance,unknown,349,unknown,unknown
+20250520_openhands_devstral_small,OpenHands,unknown,348,Devstral Small,Devstral
+20250522_sweagent_claude-4-sonnet-20250514,Princeton,unknown,346,Claude Sonnet 4,Sonnet
+20250522_tools_claude-4-opus,unknown,unknown,346,Claude Opus 4,Opus
+20250522_tools_claude-4-sonnet,unknown,unknown,346,Claude Sonnet 4,Sonnet
+20250524_openhands_claude_4_sonnet,OpenHands,unknown,344,Claude Sonnet 4,Sonnet
+20250527_amazon.nova-premier-v1.0,Amazon,unknown,341,Amazon Nova Premier,Amazon Nova
+20250528_patchpilot_Co-PatcheR,PatchPilot,unknown,340,unknown,unknown
+20250603_Refact_Agent_claude-4-sonnet,Refact AI,unknown,334,Claude Sonnet 4,Sonnet
+20250610_augment_agent_v1,Augment,unknown,327,unknown,unknown
+20250611_moatless_claude-4-sonnet-20250514,Moatless Tools,unknown,326,Claude Sonnet 4,Sonnet
+20250612_trae,ByteDance,unknown,325,unknown,unknown
+20250616_Skywork-SWE-32B,Skywork,32,321,Skywork-SWE 32B,Skywork-SWE
+20250616_Skywork-SWE-32B+TTS_Bo8,Skywork,32,321,Skywork-SWE 32B,Skywork-SWE
+20250623_warp,Warp,unknown,314,unknown,unknown
+20250627_agentless_MCTS-Refine-7B,Agentless (UIUC),7,310,unknown,unknown
+20250629_deepswerl_r2eagent,DeepSweRL,unknown,308,unknown,unknown
+20250629_deepswerl_r2eagent_tts,DeepSweRL,unknown,308,unknown,unknown
+20250710_bloop,Bloop,unknown,297,unknown,unknown
+20250715_qodo_command,Qodo,unknown,292,unknown,unknown
+20250716_openhands_kimi_k2,OpenHands,1000,291,Kimi K2,Kimi K2
+20250720_Lingxi-v1.5_claude-4-sonnet-20250514,Lingxi,unknown,287,Claude Sonnet 4,Sonnet
+20250725_sweagent_devstral_small_2507,Princeton,unknown,282,Devstral Small,Devstral
+20250728_zai_glm4-5,Z.AI,355,279,GLM-4.5,GLM-4.5
+20250731_harness_ai,Harness AI,unknown,276,unknown,unknown
+20250804_codesweep_sweagent_kimi_k2_instruct,CodeSweep,1000,272,Kimi K2,Kimi K2
+20250804_epam-ai-run-claude-4-sonnet,EPAM,unknown,272,Claude Sonnet 4,Sonnet
+20250805_openhands-Qwen3-Coder-30B-A3B-Instruct,OpenHands,30,271,Qwen3 Coder 30B,Qwen3
+20250805_openhands-Qwen3-Coder-480B-A35B-Instruct,OpenHands,480,271,Qwen3 Coder 480B,Qwen3
+20250806_SWE-Exp_DeepSeek-V3,SWE-Exp,671,270,DeepSeek V3,DeepSeek V3
+20250807_openhands_gpt5,OpenHands,unknown,269,GPT-5,GPT-5
+20250819_ACoder,ACoder,unknown,257,unknown,unknown
+20250901_entroPO_R2E_QwenCoder30BA3B,EntroPO,30,244,Qwen3 Coder 30B,Qwen3
+20250901_entroPO_R2E_QwenCoder30BA3B_tts,EntroPO,30,244,Qwen3 Coder 30B,Qwen3
+20250901_warp,Warp,unknown,244,unknown,unknown
+20250902_atlassian-rovo-dev,Atlassian,unknown,243,unknown,unknown
+20250915_JoyCode,JoyCode,unknown,230,unknown,unknown
+20250924_artemis_agent_v2,Artemis,unknown,221,unknown,unknown
+20250928_trae_doubao_seed_code,ByteDance,unknown,217,Doubao Seed Code,Doubao Seed
+20250929_Prometheus_v1.2_gpt5,Prometheus,unknown,216,GPT-5,GPT-5
+20250930_zai_glm4-6,Z.AI,unknown,215,GLM-4.6,GLM-4.6
+20251014_Lingxi_kimi_k2,Lingxi,1000,201,Kimi K2,Kimi K2
+20251015_Prometheus_v1.2.1_gpt5,Prometheus,unknown,200,GPT-5,GPT-5
+20251021_SalesforceAIResearch_SAGE_bash_only,Salesforce AI Research,unknown,194,unknown,unknown
+20251103_SalesforceAIResearch_SAGE_OpenHands,Salesforce AI Research,unknown,181,unknown,unknown
+20251103_sonar-foundation-agent_claude-sonnet-4-5,Sonar Foundation,unknown,181,Claude Sonnet 4.5,Sonnet
+20251110_frogboss-32b,unknown,32,174,unknown,unknown
+20251110_frogmini-14b,unknown,14,174,unknown,unknown
+20251120_livesweagent_gemini-3-pro-preview,LiveSWEAgent,unknown,164,Gemini 3 Pro,Gemini 3
+20251127_openhands_claude-opus-4-5,OpenHands,unknown,157,Claude Opus 4.5,Opus
+20251205_sonar-foundation-agent_claude-opus-4-5,Sonar Foundation,unknown,149,Claude Opus 4.5,Opus
+20251215_livesweagent_claude-opus-4-5,LiveSWEAgent,unknown,139,Claude Opus 4.5,Opus
+360VL-70B,Qihoo 360,70,unknown,360VL 70B,360VL
+abab6.5s,MiniMax,unknown,unknown,ABAB 6.5,ABAB
+abab7-preview,MiniMax,unknown,unknown,ABAB 7,ABAB
+Ahjeong/MMPO_Gemma_7b,Ahjeong,7,unknown,MMPO Gemma 7B,Gemma
+Ahjeong/MMPO_Gemma_7b_gamma1.1_epoch3,Ahjeong,7,unknown,MMPO Gemma 7B,Gemma
+AKI,unknown,unknown,unknown,unknown,unknown
+allenai/llama-3-tulu-2-70b-uf-mean-rm,Allen AI,70,unknown,Tulu 2 70B,Tulu 2
+allenai/llama-3-tulu-2-8b-uf-mean-rm,Allen AI,8,unknown,Tulu 2 8B,Tulu 2
+allenai/llama-3-tulu-2-dpo-70b,Allen AI,70,unknown,Tulu 2 70B,Tulu 2
+allenai/llama-3-tulu-2-dpo-8b,Allen AI,8,unknown,Tulu 2 8B,Tulu 2
+allenai/OLMo-7B-Instruct,Allen AI,7,808,OLMo 7B,OLMo
+allenai/tulu-2-dpo-13b,Allen AI,13,908,Tulu 2 13B,Tulu 2
+allenai/tulu-2-dpo-70b,Allen AI,70,908,Tulu 2 70B,Tulu 2
+allenai/tulu-2-dpo-7b,Allen AI,7,908,Tulu 2 7B,Tulu 2
+allenai/tulu-v2.5-13b-preference-mix-rm,Allen AI,13,unknown,Tulu v2.5 13B,Tulu 2
+allenai/tulu-v2.5-13b-uf-rm,Allen AI,13,unknown,Tulu v2.5 13B,Tulu 2
+allenai/tulu-v2.5-70b-preference-mix-rm,Allen AI,70,unknown,Tulu v2.5 70B,Tulu 2
+allenai/tulu-v2.5-70b-uf-rm,Allen AI,70,unknown,Tulu v2.5 70B,Tulu 2
+alpaca-13b,Stanford,13,1147,Alpaca 13B,Alpaca
+alpaca-7b,Stanford,7,1147,Alpaca 7B,Alpaca
+Aquila-VL-2B,BAAI,2,unknown,Aquila-VL 2B,Aquila-VL
+Aria,Rhymes AI,unknown,unknown,Aria,Aria
+arx_0314,unknown,unknown,unknown,unknown,unknown
+arx_3,unknown,unknown,unknown,unknown,unknown
+AutoDevice,unknown,unknown,unknown,unknown,unknown
+AzeroGPT-64b,Azero AI,64,unknown,AzeroGPT 64B,AzeroGPT
+bailingMM,Alibaba,unknown,unknown,BailingMM,BailingMM
+bailingMM-Lite,Alibaba,unknown,unknown,BailingMM Lite,BailingMM
+BailingMM-Pro-0120,Alibaba,unknown,unknown,BailingMM Pro,BailingMM
+baize-v2-13b,UCSD,13,1073,Baize v2 13B,Baize
+bard,Google,unknown,1139,Bard,Bard
+berkeley-nest/Starling-RM-34B,Berkeley,34,unknown,Starling RM 34B,Starling
+berkeley-nest/Starling-RM-7B-alpha,Berkeley,7,unknown,Starling RM 7B,Starling
+BioMistral-7B,Community,7,unknown,BioMistral 7B,BioMistral
+BitAgent_GoGoAgent,unknown,unknown,unknown,unknown,unknown
+BlueLM_V,VIVO,unknown,unknown,BlueLM-V,BlueLM
+Bunny-llama3-8B,Community,8,unknown,Bunny 8B,Bunny
+c4ai-command-r-v01,Cohere,35,792,Command-R,Command-R
+cambrian_13b,NYU,13,unknown,Cambrian 13B,Cambrian
+cambrian_34b,NYU,34,unknown,Cambrian 34B,Cambrian
+cambrian_8b,NYU,8,unknown,Cambrian 8B,Cambrian
+chameleon_30b,Meta,30,720,Chameleon 30B,Chameleon
+chameleon_7b,Meta,7,720,Chameleon 7B,Chameleon
+chatglm-6b,Zhipu AI,6,unknown,ChatGLM 6B,ChatGLM
+ChatGPT4o,OpenAI,unknown,720,GPT-4o,GPT-4o
+CIR-AMS/BTRM_Qwen2_7b_0613,CIR-AMS,7,690,BTRM Qwen2 7B,Qwen2
+Claude 3 Opus,Anthropic,unknown,790,Claude 3 Opus,Opus
+Claude 3.5 Sonnet,Anthropic,unknown,682,Claude 3.5 Sonnet,Sonnet
+claude-3-5-haiku-20241022,Anthropic,unknown,558,Claude 3.5 Haiku,Haiku
+claude-3-5-haiku-20241022-FC,Anthropic,unknown,558,Claude 3.5 Haiku,Haiku
+claude-3-5-sonnet-20240620,Anthropic,unknown,682,Claude 3.5 Sonnet,Sonnet
+claude-3-5-sonnet-20241022,Anthropic,unknown,558,Claude 3.5 Sonnet,Sonnet
+claude-3-5-sonnet-20241022-FC,Anthropic,unknown,558,Claude 3.5 Sonnet,Sonnet
+claude-3-7-sonnet-20250219,Anthropic,unknown,438,Claude 3.7 Sonnet,Sonnet
+Claude-3-Haiku,Anthropic,unknown,787,Claude 3 Haiku,Haiku
+claude-3-haiku-20240307,Anthropic,unknown,787,Claude 3 Haiku,Haiku
+claude-3-opus-20240229,Anthropic,unknown,794,Claude 3 Opus,Opus
+claude-3-opus-20240229-FC,Anthropic,unknown,794,Claude 3 Opus,Opus
+claude-3-sonnet-20240229,Anthropic,unknown,794,Claude 3 Sonnet,Sonnet
+claude-3-sonnet-20240229 (repeat_user_prompt),Anthropic,unknown,794,Claude 3 Sonnet,Sonnet
+claude-3.5-sonnet,Anthropic,unknown,682,Claude 3.5 Sonnet,Sonnet
+Claude-3.5-Sonnet,Anthropic,unknown,682,Claude 3.5 Sonnet,Sonnet
+Claude-3.5-Sonnet-20240620,Anthropic,unknown,682,Claude 3.5 Sonnet,Sonnet
+Claude-3.5-Sonnet-20241022,Anthropic,unknown,558,Claude 3.5 Sonnet,Sonnet
+Claude-3.7-Sonnet,Anthropic,unknown,433,Claude 3.7 Sonnet,Sonnet
+claude-3.7-sonnet,Anthropic,unknown,433,Claude 3.7 Sonnet,Sonnet
+Claude-3.7-Sonnet (Think),Anthropic,unknown,433,Claude 3.7 Sonnet,Sonnet
+claude-instant-v1,Anthropic,unknown,1146,Claude Instant v1,Instant
+Claude-Opus-4,Anthropic,unknown,346,Claude Opus 4,Opus
+Claude-Opus-4 (Thinking),Anthropic,unknown,346,Claude Opus 4,Opus
+Claude-Opus-4.0 (Think),Anthropic,unknown,346,Claude Opus 4,Opus
+Claude-Opus-4.5,Anthropic,unknown,160,Claude Opus 4.5,Opus
+Claude-Opus-4.6 (High),Anthropic,unknown,87,Claude Opus 4.6,Opus
+Claude-Sonnet-4,Anthropic,unknown,346,Claude Sonnet 4,Sonnet
+claude-sonnet-4,Anthropic,unknown,346,Claude Sonnet 4,Sonnet
+Claude-Sonnet-4 (Thinking),Anthropic,unknown,346,Claude Sonnet 4,Sonnet
+Claude-Sonnet-4.5,Anthropic,unknown,215,Claude Sonnet 4.5,Sonnet
+claude-sonnet-4.5,Anthropic,unknown,215,Claude Sonnet 4.5,Sonnet
+Claude-Sonnet-4.5 (Think),Anthropic,unknown,215,Claude Sonnet 4.5,Sonnet
+claude-v1,Anthropic,unknown,1146,Claude 1,Claude 1
+Claude3-5V_Sonnet,Anthropic,unknown,682,Claude 3.5 Sonnet,Sonnet
+Claude3-5V_Sonnet_20241022,Anthropic,unknown,558,Claude 3.5 Sonnet,Sonnet
+Claude3-7V_Sonnet,Anthropic,unknown,433,Claude 3.7 Sonnet,Sonnet
+Claude3V_Haiku,Anthropic,unknown,787,Claude 3 Haiku,Haiku
+Claude3V_Opus,Anthropic,unknown,790,Claude 3 Opus,Opus
+Claude3V_Sonnet,Anthropic,unknown,790,Claude 3 Sonnet,Sonnet
+CloudWalk,CloudWalk Technology,unknown,unknown,CloudWalk,CloudWalk
+Codestral-Latest,Mistral AI,unknown,704,Codestral,Codestral
+cogvlm-chat,Zhipu AI,17,949,CogVLM,CogVLM
+cogvlm2-llama3-chat-19B,Zhipu AI,19,690,CogVLM2,CogVLM2
+command-r,Cohere,35,792,Command-R,Command-R
+command-r-plus,Cohere,104,759,Command-R+,Command-R
+command-r-plus-FC,Cohere,104,759,Command-R+,Command-R
+command-r7b-12-2024-FC,Cohere,7,517,Command-R 7B,Command-R
+ContextualAI/archangel_sft-dpo_llama13b,ContextualAI,13,unknown,Archangel LLaMA 13B,Archangel
+ContextualAI/archangel_sft-dpo_llama30b,ContextualAI,30,unknown,Archangel LLaMA 30B,Archangel
+ContextualAI/archangel_sft-dpo_llama7b,ContextualAI,7,unknown,Archangel LLaMA 7B,Archangel
+ContextualAI/archangel_sft-dpo_pythia1-4b,ContextualAI,1.4,unknown,Archangel Pythia 1.4B,Archangel
+ContextualAI/archangel_sft-dpo_pythia12-0b,ContextualAI,12,unknown,Archangel Pythia 12B,Archangel
+ContextualAI/archangel_sft-dpo_pythia2-8b,ContextualAI,2.8,unknown,Archangel Pythia 2.8B,Archangel
+ContextualAI/archangel_sft-dpo_pythia6-9b,ContextualAI,6.9,unknown,Archangel Pythia 6.9B,Archangel
+ContextualAI/archangel_sft-kto_llama13b,ContextualAI,13,unknown,Archangel LLaMA 13B,Archangel
+ContextualAI/archangel_sft-kto_llama30b,ContextualAI,30,unknown,Archangel LLaMA 30B,Archangel
+ContextualAI/archangel_sft-kto_llama7b,ContextualAI,7,unknown,Archangel LLaMA 7B,Archangel
+ContextualAI/archangel_sft-kto_pythia1-4b,ContextualAI,1.4,unknown,Archangel Pythia 1.4B,Archangel
+ContextualAI/archangel_sft-kto_pythia12-0b,ContextualAI,12,unknown,Archangel Pythia 12B,Archangel
+ContextualAI/archangel_sft-kto_pythia2-8b,ContextualAI,2.8,unknown,Archangel Pythia 2.8B,Archangel
+ContextualAI/archangel_sft-kto_pythia6-9b,ContextualAI,6.9,unknown,Archangel Pythia 6.9B,Archangel
+databricks-dbrx-instruct,Databricks,132,767,DBRX Instruct,DBRX
+DeepCoder-14B-Preview,Agentica,14,unknown,DeepCoder 14B,DeepCoder
+deepseek,DeepSeek,unknown,unknown,DeepSeek,DeepSeek
+deepseek-ai_DeepSeek-Coder-V2-Instruct-0724,DeepSeek,236,648,DeepSeek Coder V2,DeepSeek Coder
+deepseek-ai_DeepSeek-Coder-V2-Lite-Instruct,DeepSeek,16,725,DeepSeek Coder V2 Lite,DeepSeek Coder
+deepseek-chat-v2_5,DeepSeek,236,591,DeepSeek V2.5,DeepSeek V2
+DeepSeek-Coder-V2,DeepSeek,236,725,DeepSeek Coder V2,DeepSeek Coder
+deepseek-coder-v2,DeepSeek,236,725,DeepSeek Coder V2,DeepSeek Coder
+DeepSeek-R1,DeepSeek,671,468,DeepSeek R1,DeepSeek R1
+deepseek-r1,DeepSeek,671,468,DeepSeek R1,DeepSeek R1
+DeepSeek-R1-0528,DeepSeek,671,340,DeepSeek R1 0528,DeepSeek R1
+deepseek-r1-0528,DeepSeek,671,340,DeepSeek R1 0528,DeepSeek R1
+DeepSeek-R1-Distill-1.5B,DeepSeek,1.5,468,DeepSeek R1 Distill,DeepSeek R1 Distill
+DeepSeek-R1-Distill-14B,DeepSeek,14,468,DeepSeek R1 Distill,DeepSeek R1 Distill
+DeepSeek-R1-Distill-32B,DeepSeek,32,468,DeepSeek R1 Distill,DeepSeek R1 Distill
+DeepSeek-R1-Distill-70B,DeepSeek,70,468,DeepSeek R1 Distill,DeepSeek R1 Distill
+DeepSeek-R1-Lite-Preview,DeepSeek,unknown,529,DeepSeek R1 Preview,DeepSeek R1
+DeepSeek-R1-Preview,DeepSeek,unknown,529,DeepSeek R1 Preview,DeepSeek R1
+DeepSeek-V3,DeepSeek,671,493,DeepSeek V3,DeepSeek V3
+deepseek-v3,DeepSeek,671,493,DeepSeek V3,DeepSeek V3
+DeepSeek-V3-03-24,DeepSeek,671,404,DeepSeek V3 03-24,DeepSeek V3
+DeepSeek-v3.1 (Think),DeepSeek,671,255,DeepSeek V3.1,DeepSeek V3
+DeepSeek-v3.2 (Think),DeepSeek,671,153,DeepSeek V3.2,DeepSeek V3
+DeepSeek-v3.2-Exp (Think),DeepSeek,671,216,DeepSeek V3.2 Exp,DeepSeek V3
+DeepSeek-V3.2-Exp-Thinking,DeepSeek,671,216,DeepSeek V3.2 Exp,DeepSeek V3
+DeepSeek-v3.2-Speciale,DeepSeek,671,153,DeepSeek V3.2 Speciale,DeepSeek V3
+DeepSeek-v3.2-Speciale Agent,DeepSeek,671,153,DeepSeek V3.2 Speciale,DeepSeek V3
+DeepSeek-V3.2-Thinking,DeepSeek,671,153,DeepSeek V3.2,DeepSeek V3
+deepseek_vl2,DeepSeek,4.5,529,DeepSeek VL2,DeepSeek VL2
+deepseek_vl2_small,DeepSeek,2.4,529,DeepSeek VL2 Small,DeepSeek VL2
+deepseek_vl2_tiny,DeepSeek,1.0,529,DeepSeek VL2 Tiny,DeepSeek VL2
+deepseek_vl_1.3b,DeepSeek,1.3,790,DeepSeek VL 1.3B,DeepSeek VL
+deepseek_vl_7b,DeepSeek,7,790,DeepSeek VL 7B,DeepSeek VL
+dolly-v2-12b,Databricks,12,1116,Dolly v2 12B,Dolly
+DoubaoVL,ByteDance,unknown,unknown,DoubaoVL,Doubao
+DroidRun,unknown,unknown,unknown,unknown,unknown
+DSCoder-1.3b-Ins,DeepSeek,1.3,unknown,DeepSeek Coder 1.3B,DeepSeek Coder
+DSCoder-33b-Ins,DeepSeek,33,unknown,DeepSeek Coder 33B,DeepSeek Coder
+DSCoder-6.7b-Ins,DeepSeek,6.7,unknown,DeepSeek Coder 6.7B,DeepSeek Coder
+Eagle-X5-13B,unknown,13,unknown,Eagle X5 13B,Eagle X5
+Eagle-X5-34B-Chat,unknown,34,unknown,Eagle X5 34B,Eagle X5
+Eagle-X5-7B,unknown,7,unknown,Eagle X5 7B,Eagle X5
+emu2_chat,BAAI,37,808,Emu2,Emu
+emu3_chat,BAAI,8,720,Emu3,Emu
+EXAONE-4.0-32B,LG AI Research,32,unknown,EXAONE 4.0 32B,EXAONE
+falcon-40b-instruct,TII,40,1073,Falcon 40B,Falcon
+Falcon2-VLM-11B,TII,11,unknown,Falcon 2 VLM 11B,Falcon 2
+fastchat-t5-3b,LMSYS,3,1073,FastChat T5 3B,FastChat
+FinalRun,unknown,unknown,unknown,unknown,unknown
+firefunction-v1-FC,Fireworks AI,unknown,unknown,Firefunction v1,Firefunction
+firefunction-v2-FC,Fireworks AI,unknown,unknown,Firefunction v2,Firefunction
+flamingov2,DeepMind,unknown,949,Flamingo v2,Flamingo
+flash,Google,unknown,unknown,Gemini Flash,Gemini Flash
+Gemini 1.5 Pro,Google,unknown,808,Gemini 1.5 Pro,Gemini 1.5
+Gemini 2.5 Flash (Thinking),Google,unknown,381,Gemini 2.5 Flash,Gemini 2.5
+Gemini 2.5 Pro,Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+Gemini 2.5 Pro (05-06),Google,unknown,362,Gemini 2.5 Pro,Gemini 2.5
+Gemini 2.5 Pro (agent),Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+Gemini 2.5 Pro (best-of-32),Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+Gemini 3 Flash,Google,unknown,137,Gemini 3 Flash,Gemini 3
+Gemini 3 Pro (preview),Google,unknown,166,Gemini 3 Pro,Gemini 3
+Gemini 3.1 Pro Preview,Google,unknown,73,Gemini 3.1 Pro,Gemini 3
+Gemini 3.1 Pro Preview (low),Google,unknown,73,Gemini 3.1 Pro,Gemini 3
+Gemini 3.1 Pro Preview (medium),Google,unknown,73,Gemini 3.1 Pro,Gemini 3
+Gemini Deep Think 3 (12/25),Google,unknown,137,Gemini 3,Gemini 3
+Gemini IMO Deep Think,Google,unknown,296,Gemini IMO,Gemini 3
+gemini-1.0-pro-002,Google,unknown,872,Gemini 1.0 Pro,Gemini 1.0
+gemini-1.0-pro-002-FC,Google,unknown,872,Gemini 1.0 Pro,Gemini 1.0
+gemini-1.5-flash-001,Google,unknown,719,Gemini 1.5 Flash,Gemini 1.5
+gemini-1.5-flash-001-FC,Google,unknown,719,Gemini 1.5 Flash,Gemini 1.5
+gemini-1.5-flash-002,Google,unknown,586,Gemini 1.5 Flash,Gemini 1.5
+gemini-1.5-flash-002-FC,Google,unknown,586,Gemini 1.5 Flash,Gemini 1.5
+gemini-1.5-pro-001,Google,unknown,719,Gemini 1.5 Pro,Gemini 1.5
+gemini-1.5-pro-001-FC,Google,unknown,719,Gemini 1.5 Pro,Gemini 1.5
+gemini-1.5-pro-002,Google,unknown,586,Gemini 1.5 Pro,Gemini 1.5
+gemini-1.5-pro-002-FC,Google,unknown,586,Gemini 1.5 Pro,Gemini 1.5
+gemini-2.0-flash,Google,unknown,452,Gemini 2.0 Flash,Gemini 2.0
+gemini-2.0-flash-001,Google,unknown,452,Gemini 2.0 Flash,Gemini 2.0
+gemini-2.0-flash-exp,Google,unknown,507,Gemini 2.0 Flash Exp,Gemini 2.0
+gemini-2.0-flash-exp-FC,Google,unknown,507,Gemini 2.0 Flash Exp,Gemini 2.0
+gemini-2.0-flash-thinking,Google,unknown,467,Gemini 2.0 Flash Thinking,Gemini 2.0
+gemini-2.0-pro,Google,unknown,452,Gemini 2.0 Pro,Gemini 2.0
+Gemini-2.5-Flash,Google,unknown,381,Gemini 2.5 Flash,Gemini 2.5
+gemini-2.5-flash,Google,unknown,381,Gemini 2.5 Flash,Gemini 2.5
+gemini-2.5-flash (think),Google,unknown,381,Gemini 2.5 Flash,Gemini 2.5
+Gemini-2.5-Flash-04-17,Google,unknown,381,Gemini 2.5 Flash,Gemini 2.5
+Gemini-2.5-Flash-05-20,Google,unknown,348,Gemini 2.5 Flash,Gemini 2.5
+Gemini-2.5-Pro,Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+gemini-2.5-pro,Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+gemini-2.5-pro*,Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+Gemini-2.5-Pro-03-25,Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+Gemini-2.5-Pro-05-06,Google,unknown,362,Gemini 2.5 Pro,Gemini 2.5
+Gemini-2.5-Pro-06-05,Google,unknown,333,Gemini 2.5 Pro,Gemini 2.5
+Gemini-3-Pro-Preview,Google,unknown,166,Gemini 3 Pro,Gemini 3
+gemini-3-pro-preview,Google,unknown,166,Gemini 3 Pro,Gemini 3
+gemini-3.1-pro,Google,unknown,73,Gemini 3.1 Pro,Gemini 3
+Gemini-Exp-1206,Google,unknown,513,Gemini Exp 1206,Gemini 2.0
+gemini-exp-1206,Google,unknown,513,Gemini Exp 1206,Gemini 2.0
+gemini-exp-1206-FC,Google,unknown,513,Gemini Exp 1206,Gemini 2.0
+Gemini-Flash-1.5-002,Google,unknown,586,Gemini 1.5 Flash,Gemini 1.5
+Gemini-Flash-2.0-Exp,Google,unknown,507,Gemini 2.0 Flash,Gemini 2.0
+Gemini-Flash-2.0-Exp (N=10),Google,unknown,507,Gemini 2.0 Flash,Gemini 2.0
+Gemini-Flash-2.0-Thinking,Google,unknown,467,Gemini 2.0 Flash Thinking,Gemini 2.0
+Gemini-Flash-2.0-Thinking-01-21,Google,unknown,467,Gemini 2.0 Flash Thinking,Gemini 2.0
+Gemini-Flash-2.0-Thinking-12-19,Google,unknown,500,Gemini 2.0 Flash Thinking,Gemini 2.0
+Gemini-Pro-1.5-002,Google,unknown,586,Gemini 1.5 Pro,Gemini 1.5
+gemini_pro,Google,unknown,872,Gemini 1.0 Pro,Gemini 1.0
+gemini_ultra,Google,unknown,808,Gemini 1.0 Ultra,Gemini 1.0
+GeminiFlash1-5,Google,unknown,719,Gemini 1.5 Flash,Gemini 1.5
+GeminiFlash1-5-002,Google,unknown,586,Gemini 1.5 Flash,Gemini 1.5
+GeminiFlash2-0,Google,unknown,452,Gemini 2.0 Flash,Gemini 2.0
+GeminiPro1-0,Google,unknown,872,Gemini 1.0 Pro,Gemini 1.0
+GeminiPro1-5,Google,unknown,719,Gemini 1.5 Pro,Gemini 1.5
+GeminiPro1-5-002,Google,unknown,586,Gemini 1.5 Pro,Gemini 1.5
+GeminiPro2-0,Google,unknown,452,Gemini 2.0 Pro,Gemini 2.0
+GeminiPro2-5,Google,unknown,404,Gemini 2.5 Pro,Gemini 2.5
+GeminiProVision,Google,unknown,872,Gemini 1.0 Pro Vision,Gemini 1.0
+gemma-7b,Google,7,802,Gemma 7B,Gemma
+Gemma3-12B,Google,12,417,Gemma 3 12B,Gemma 3
+Gemma3-27B,Google,27,417,Gemma 3 27B,Gemma 3
+Gemma3-4B,Google,4,417,Gemma 3 4B,Gemma 3
+GLM 4.5,Z.AI,355,279,GLM-4.5,GLM-4.5
+GLM 4.5 Air,Z.AI,106,279,GLM-4.5 Air,GLM-4.5
+GLM 4.5V,Z.AI,unknown,unknown,GLM-4.5V,GLM-4.5
+GLM 4.6,Z.AI,unknown,215,GLM-4.6,GLM-4.6
+GLM 4.7,Z.AI,unknown,132,GLM-4.7,GLM-4.7
+GLM 5,Z.AI,unknown,unknown,GLM-5,GLM-5
+glm-4.6,Z.AI,unknown,215,GLM-4.6,GLM-4.6
+GLM-4.6,Z.AI,unknown,215,GLM-4.6,GLM-4.6
+glm-4v-9b,Zhipu AI,9,697,GLM-4V 9B,GLM-4V
+GLM4V,Zhipu AI,unknown,829,GLM-4V,GLM-4V
+GLM4V_PLUS,Zhipu AI,unknown,unknown,GLM-4V Plus,GLM-4V
+GLM4V_PLUS_20250111,Zhipu AI,unknown,477,GLM-4V Plus,GLM-4V
+google/gemini-1.5-flash-001,Google,unknown,719,Gemini 1.5 Flash,Gemini 1.5
+google/gemini-1.5-pro-exp-0801,Google,unknown,640,Gemini 1.5 Pro,Gemini 1.5
+google/gemma-2-27b-it,Google,27,675,Gemma 2 27B,Gemma 2
+google_gemma-2-27b-it,Google,27,675,Gemma 2 27B,Gemma 2
+google_gemma-2-2b-it,Google,2,675,Gemma 2 2B,Gemma 2
+google_gemma-2-9b-it,Google,9,675,Gemma 2 9B,Gemma 2
+GPT OSS 120B (high),OpenAI,120,unknown,GPT OSS 120B,GPT OSS
+GPT OSS 20B (high),OpenAI,20,unknown,GPT OSS 20B,GPT OSS
+gpt-3.5-turbo,OpenAI,unknown,1146,GPT-3.5 Turbo,GPT-3.5
+gpt-3.5-turbo-0125,OpenAI,unknown,829,GPT-3.5 Turbo,GPT-3.5
+gpt-3.5-turbo-0125-FC,OpenAI,unknown,829,GPT-3.5 Turbo,GPT-3.5
+gpt-3.5-turbo-1106,OpenAI,unknown,908,GPT-3.5 Turbo,GPT-3.5
+gpt-4,OpenAI,unknown,1146,GPT-4,GPT-4
+GPT-4,OpenAI,unknown,1146,GPT-4,GPT-4
+gpt-4-0125-preview,OpenAI,unknown,829,GPT-4 Turbo,GPT-4
+gpt-4-0613,OpenAI,unknown,1055,GPT-4,GPT-4
+GPT-4-0613,OpenAI,unknown,1055,GPT-4,GPT-4
+gpt-4-turbo,OpenAI,unknown,908,GPT-4 Turbo,GPT-4
+GPT-4-Turbo-1106,OpenAI,unknown,908,GPT-4 Turbo,GPT-4
+GPT-4-Turbo-2024-04-09,OpenAI,unknown,754,GPT-4 Turbo,GPT-4
+gpt-4-turbo-2024-04-09,OpenAI,unknown,754,GPT-4 Turbo,GPT-4
+gpt-4-turbo-2024-04-09-FC,OpenAI,unknown,754,GPT-4 Turbo,GPT-4
+gpt-4o,OpenAI,unknown,720,GPT-4o,GPT-4o
+GPT-4o,OpenAI,unknown,720,GPT-4o,GPT-4o
+GPT-4O-2024-05-13,OpenAI,unknown,720,GPT-4o,GPT-4o
+gpt-4o-2024-05-13,OpenAI,unknown,720,GPT-4o,GPT-4o
+gpt-4o-2024-05-13 (repeat_user_prompt),OpenAI,unknown,720,GPT-4o,GPT-4o
+gpt-4o-2024-05-13 (spotlighting_with_delimiting),OpenAI,unknown,720,GPT-4o,GPT-4o
+gpt-4o-2024-05-13 (tool_filter),OpenAI,unknown,720,GPT-4o,GPT-4o
+gpt-4o-2024-05-13 (transformers_pi_detector),OpenAI,unknown,720,GPT-4o,GPT-4o
+GPT-4O-2024-08-06,OpenAI,unknown,635,GPT-4o,GPT-4o
+gpt-4o-2024-08-06,OpenAI,unknown,635,GPT-4o,GPT-4o
+gpt-4o-2024-11-20,OpenAI,unknown,529,GPT-4o,GPT-4o
+gpt-4o-2024-11-20-FC,OpenAI,unknown,529,GPT-4o,GPT-4o
+gpt-4o-mini,OpenAI,unknown,655,GPT-4o mini,GPT-4o
+GPT-4O-mini-2024-07-18,OpenAI,unknown,655,GPT-4o mini,GPT-4o
+gpt-4o-mini-2024-07-18,OpenAI,unknown,655,GPT-4o mini,GPT-4o
+gpt-4o-mini-2024-07-18-FC,OpenAI,unknown,655,GPT-4o mini,GPT-4o
+GPT-5 (high),OpenAI,unknown,269,GPT-5,GPT-5
+GPT-5 (High) Agent,OpenAI,unknown,269,GPT-5,GPT-5
+GPT-5-mini (high),OpenAI,unknown,269,GPT-5 mini,GPT-5
+GPT-5-nano (high),OpenAI,unknown,269,GPT-5 nano,GPT-5
+GPT-5-nano (low),OpenAI,unknown,269,GPT-5 nano,GPT-5
+GPT-5-Pro,OpenAI,unknown,269,GPT-5 Pro,GPT-5
+GPT-5.1,OpenAI,unknown,172,GPT-5.1,GPT-5
+GPT-5.1 (high),OpenAI,unknown,172,GPT-5.1,GPT-5
+GPT-5.2 (high),OpenAI,unknown,143,GPT-5.2,GPT-5
+GPT-5.2 (low),OpenAI,unknown,143,GPT-5.2,GPT-5
+GPT-5.2 (xhigh),OpenAI,unknown,143,GPT-5.2,GPT-5
+GPT-5.4 (xhigh),OpenAI,unknown,59,GPT-5.4,GPT-5
+GPT-5.4-Pro (xhigh),OpenAI,unknown,59,GPT-5.4 Pro,GPT-5
+GPT4.5,OpenAI,unknown,430,GPT-4.5,GPT-4
+gpt4all-13b-snoozy,Nomic AI,13,1095,GPT4All 13B,GPT4All
+GPT4o,OpenAI,unknown,720,GPT-4o,GPT-4o
+gpt4o(2024-05-13),OpenAI,unknown,720,GPT-4o,GPT-4o
+GPT4o_20240806,OpenAI,unknown,635,GPT-4o,GPT-4o
+GPT4o_20241120,OpenAI,unknown,529,GPT-4o,GPT-4o
+GPT4o_HIGH,OpenAI,unknown,720,GPT-4o,GPT-4o
+GPT4o_MINI,OpenAI,unknown,655,GPT-4o mini,GPT-4o
+GPT4V,OpenAI,unknown,908,GPT-4V,GPT-4
+GPT4V_20240409,OpenAI,unknown,754,GPT-4V,GPT-4
+GPT4V_20240409_HIGH,OpenAI,unknown,754,GPT-4V,GPT-4
+GPT4V_HIGH,OpenAI,unknown,908,GPT-4V,GPT-4
+Grok 3 (Think),xAI,unknown,438,Grok 3,Grok 3
+Grok 3 Mini (high),xAI,unknown,438,Grok 3 Mini,Grok 3
+Grok 3 Mini (low),xAI,unknown,438,Grok 3 Mini,Grok 3
+Grok 4,xAI,unknown,298,Grok 4,Grok 4
+Grok 4 (Specific Prompt),xAI,unknown,298,Grok 4,Grok 4
+Grok 4 Fast (Reasoning) (Selfcheck Agent),xAI,unknown,226,Grok 4 Fast,Grok 4
+Grok 4 Fast R,xAI,unknown,226,Grok 4 Fast,Grok 4
+Grok 4.1 Fast (Reasoning),xAI,unknown,167,Grok 4.1,Grok 4
+grok-2-vision-1212,xAI,unknown,507,Grok 2 Vision,Grok 2
+Grok-3-Mini (High),xAI,unknown,438,Grok 3 Mini,Grok 3
+Grok-4,xAI,unknown,298,Grok 4,Grok 4
+guanaco-33b,Community,33,1073,Guanaco 33B,Guanaco
+guanaco-65b,Community,65,1073,Guanaco 65B,Guanaco
+h2ogpt-oasst-open-llama-13b,H2O.ai,13,949,H2OGPT 13B,H2OGPT
+h2ovl-mississippi-1b,H2O.ai,1,unknown,H2OVL Mississippi 1B,H2OVL
+h2ovl-mississippi-2b,H2O.ai,2,unknown,H2OVL Mississippi 2B,H2OVL
+hendrydong/Mistral-RM-for-RAFT-GSHF-v0,Community,7,unknown,Mistral RM 7B,Mistral RM
+HuggingFaceH4/starchat2-15b-v0.1,HuggingFace,15,unknown,StarChat2 15B,StarChat
+HuggingFaceH4/zephyr-7b-alpha,HuggingFace,7,949,Zephyr 7B Alpha,Zephyr
+HuggingFaceH4/zephyr-7b-beta,HuggingFace,7,908,Zephyr 7B Beta,Zephyr
+HuggingFaceH4/zephyr-7b-gemma-v0.1,HuggingFace,7,unknown,Zephyr 7B Gemma,Zephyr
+HunYuan-Standard-Vision,Tencent,unknown,unknown,Hunyuan Vision Standard,Hunyuan
+HunYuan-Vision,Tencent,unknown,unknown,Hunyuan Vision,Hunyuan
+iask_pro,iAsk.AI,unknown,unknown,iAsk Pro,iAsk
+ibm-granite_granite-20b-functioncalling,IBM,20,unknown,Granite 20B,Granite
+IDEA-CCNL/Ziya-LLaMA-7B-Reward,IDEA Research,7,unknown,Ziya LLaMA 7B,Ziya
+idefics2_8b,HuggingFace,8,808,IDEFICS2 8B,IDEFICS
+Idefics3-8B-Llama3,HuggingFace,8,655,IDEFICS3 8B,IDEFICS
+idefics_80b_instruct,HuggingFace,80,949,IDEFICS 80B,IDEFICS
+idefics_9b_instruct,HuggingFace,9,949,IDEFICS 9B,IDEFICS
+infly/INF-ORM-Llama3.1-70B,Infly AI,70,unknown,INF-ORM 70B,Llama 3.1
+instructblip_13b,Salesforce,13,1095,InstructBLIP 13B,InstructBLIP
+instructblip_7b,Salesforce,7,1095,InstructBLIP 7B,InstructBLIP
+internlm/internlm2-1_8b-reward,Shanghai AI Lab,1.8,unknown,InternLM2 1.8B,InternLM2
+internlm/internlm2-20b-reward,Shanghai AI Lab,20,unknown,InternLM2 20B,InternLM2
+internlm/internlm2-7b-reward,Shanghai AI Lab,7,unknown,InternLM2 7B,InternLM2
+InternVL-Chat-V1-1,Shanghai AI Lab,unknown,829,InternVL v1.1,InternVL
+InternVL-Chat-V1-2,Shanghai AI Lab,unknown,808,InternVL v1.2,InternVL
+InternVL-Chat-V1-2-Plus,Shanghai AI Lab,unknown,790,InternVL v1.2 Plus,InternVL
+InternVL-Chat-V1-5,Shanghai AI Lab,unknown,745,InternVL v1.5,InternVL
+InternVL2-1B,Shanghai AI Lab,1,670,InternVL2 1B,InternVL2
+InternVL2-26B,Shanghai AI Lab,26,670,InternVL2 26B,InternVL2
+InternVL2-2B,Shanghai AI Lab,2,670,InternVL2 2B,InternVL2
+InternVL2-40B,Shanghai AI Lab,40,670,InternVL2 40B,InternVL2
+InternVL2-4B,Shanghai AI Lab,4,670,InternVL2 4B,InternVL2
+InternVL2-76B,Shanghai AI Lab,76,670,InternVL2 76B,InternVL2
+InternVL2-8B,Shanghai AI Lab,8,670,InternVL2 8B,InternVL2
+InternVL2-8B-MPO,Shanghai AI Lab,8,670,InternVL2 8B,InternVL2
+InternVL2-8B-MPO-CoT,Shanghai AI Lab,8,670,InternVL2 8B,InternVL2
+InternVL2_5-1B,Shanghai AI Lab,1,514,InternVL2.5 1B,InternVL2.5
+InternVL2_5-1B-MPO,Shanghai AI Lab,1,514,InternVL2.5 1B,InternVL2.5
+InternVL2_5-26B,Shanghai AI Lab,26,514,InternVL2.5 26B,InternVL2.5
+InternVL2_5-26B-COT,Shanghai AI Lab,26,514,InternVL2.5 26B,InternVL2.5
+InternVL2_5-26B-MPO,Shanghai AI Lab,26,514,InternVL2.5 26B,InternVL2.5
+InternVL2_5-2B,Shanghai AI Lab,2,514,InternVL2.5 2B,InternVL2.5
+InternVL2_5-2B-MPO,Shanghai AI Lab,2,514,InternVL2.5 2B,InternVL2.5
+InternVL2_5-38B,Shanghai AI Lab,38,514,InternVL2.5 38B,InternVL2.5
+InternVL2_5-38B-MPO,Shanghai AI Lab,38,514,InternVL2.5 38B,InternVL2.5
+InternVL2_5-4B,Shanghai AI Lab,4,514,InternVL2.5 4B,InternVL2.5
+InternVL2_5-4B-MPO,Shanghai AI Lab,4,514,InternVL2.5 4B,InternVL2.5
+InternVL2_5-78B,Shanghai AI Lab,78,514,InternVL2.5 78B,InternVL2.5
+InternVL2_5-78B-COT,Shanghai AI Lab,78,514,InternVL2.5 78B,InternVL2.5
+InternVL2_5-78B-MPO,Shanghai AI Lab,78,514,InternVL2.5 78B,InternVL2.5
+InternVL2_5-8B,Shanghai AI Lab,8,514,InternVL2.5 8B,InternVL2.5
+InternVL2_5-8B-BoN-8,Shanghai AI Lab,8,514,InternVL2.5 8B,InternVL2.5
+InternVL2_5-8B-MPO,Shanghai AI Lab,8,514,InternVL2.5 8B,InternVL2.5
+jamba-1.5-large,AI21 Labs,94,601,Jamba 1.5 Large,Jamba
+Janus-1.3B,DeepSeek,1.3,514,Janus 1.3B,Janus
+Janus-Pro-7B,DeepSeek,7,468,Janus Pro 7B,Janus
+jondurbin/bagel-dpo-34b-v0.5,Community,34,unknown,Bagel DPO 34B,Bagel
+JSL-MedLlama-3-8B-v2.0,John Snow Labs,8,unknown,MedLlama 3 8B,MedLlama
+JTVL,unknown,unknown,unknown,unknown,unknown
+K2-Think,Moonshot AI,1000,296,Kimi K2,Kimi K2
+Kimi K2 Thinking,Moonshot AI,1000,296,Kimi K2,Kimi K2
+Kimi K2.5 (Think),Moonshot AI,unknown,unknown,Kimi K2.5,Kimi K2
+Kimi-k1.6-IOI,Moonshot AI,unknown,unknown,Kimi k1.6,Kimi k1
+Kimi-k1.6-IOI-high,Moonshot AI,unknown,unknown,Kimi k1.6,Kimi k1
+Kimi-K2-Thinking-Turbo,Moonshot AI,1000,296,Kimi K2,Kimi K2
+koala-13b,Berkeley,13,1095,Koala 13B,Koala
+Kosmos2,Microsoft,unknown,1027,Kosmos-2,Kosmos
+LIMO,Shanghai AI Lab,32,468,LIMO 32B,Qwen2.5
+Llama 3 70b Chat,Meta,70,745,Llama 3 70B,Llama 3
+Llama 3.1 405B Instruct,Meta,405,649,Llama 3.1 405B,Llama 3.1
+llama-13b,Meta,13,1164,Llama 1 13B,Llama 1
+Llama-2-13b-chat,Meta,13,1020,Llama 2 13B,Llama 2
+llama-2-13b-chat,Meta,13,1020,Llama 2 13B,Llama 2
+Llama-2-13b-hf,Meta,13,1020,Llama 2 13B,Llama 2
+llama-2-70b-chat,Meta,70,1020,Llama 2 70B,Llama 2
+Llama-2-70b-chat,Meta,70,1020,Llama 2 70B,Llama 2
+Llama-2-70b-hf,Meta,70,1020,Llama 2 70B,Llama 2
+Llama-2-7b-chat,Meta,7,1020,Llama 2 7B,Llama 2
+llama-2-7b-chat,Meta,7,1020,Llama 2 7B,Llama 2
+Llama-2-7b-hf,Meta,7,1020,Llama 2 7B,Llama 2
+Llama-3-MixSenseV1_1,Community,unknown,unknown,Llama 3 MixSense,Llama 3
+Llama-3-VILA1.5-8b,NVIDIA,8,719,VILA1.5 8B,VILA
+Llama-3.2-11B-Vision-Instruct,Meta,11,585,Llama 3.2 11B,Llama 3.2
+Llama-3.2-90B-Vision-Instruct,Meta,90,585,Llama 3.2 90B,Llama 3.2
+Llama-3_1-Nemotron-Nano-8B-v1,NVIDIA,8,unknown,Nemotron Nano 8B,Nemotron
+Llama-3_1-Nemotron-Ultra-253B-v1,NVIDIA,253,unknown,Nemotron Ultra 253B,Nemotron
+Llama-4-Maverick,Meta,400,393,Llama 4 Maverick,Llama 4
+llama-4-maverick,Meta,400,393,Llama 4 Maverick,Llama 4
+llama3-405b-instruct-maas,Meta,405,649,Llama 3.1 405B,Llama 3.1
+Llama3-OpenBioLLM-70B,Saama AI Research,70,745,OpenBioLLM 70B,Llama 3
+LLama3.3-70b-Ins,Meta,70,515,Llama 3.3 70B,Llama 3.3
+LLaVA-CoT,Community,unknown,514,LLaVA-CoT,LLaVA
+llava-internlm-7b,Community,7,unknown,LLaVA-InternLM 7B,LLaVA
+llava-internlm2-20b,Community,20,unknown,LLaVA-InternLM2 20B,LLaVA
+llava-internlm2-7b,Community,7,unknown,LLaVA-InternLM2 7B,LLaVA
+llava-llama-3-8b,Community,8,745,LLaVA LLaMA-3 8B,LLaVA
+llava-v1.5-13b-xtuner,Community,13,949,LLaVA v1.5 13B,LLaVA
+llava-v1.5-7b-xtuner,Community,7,949,LLaVA v1.5 7B,LLaVA
+llava_next_interleave_7b,Community,7,719,LLaVA-NeXT Interleave 7B,LLaVA-NeXT
+llava_next_interleave_7b_dpo,Community,7,719,LLaVA-NeXT Interleave 7B,LLaVA-NeXT
+llava_next_llama3,Community,8,745,LLaVA-NeXT LLaMA3,LLaVA-NeXT
+llava_next_mistral_7b,Community,7,874,LLaVA-NeXT Mistral 7B,LLaVA-NeXT
+llava_next_qwen_32b,Community,32,719,LLaVA-NeXT Qwen 32B,LLaVA-NeXT
+llava_next_vicuna_13b,Community,13,874,LLaVA-NeXT Vicuna 13B,LLaVA-NeXT
+llava_next_vicuna_7b,Community,7,874,LLaVA-NeXT Vicuna 7B,LLaVA-NeXT
+llava_next_yi_34b,Community,34,719,LLaVA-NeXT Yi 34B,LLaVA-NeXT
+llava_onevision_qwen2_0.5b_ov,Community,0.5,649,LLaVA-OneVision 0.5B,LLaVA-OneVision
+llava_onevision_qwen2_0.5b_si,Community,0.5,649,LLaVA-OneVision 0.5B,LLaVA-OneVision
+llava_onevision_qwen2_72b_ov,Community,72,649,LLaVA-OneVision 72B,LLaVA-OneVision
+llava_onevision_qwen2_72b_si,Community,72,649,LLaVA-OneVision 72B,LLaVA-OneVision
+llava_onevision_qwen2_7b_ov,Community,7,649,LLaVA-OneVision 7B,LLaVA-OneVision
+llava_onevision_qwen2_7b_si,Community,7,649,LLaVA-OneVision 7B,LLaVA-OneVision
+llava_v1.5_13b,Community,13,949,LLaVA v1.5 13B,LLaVA
+llava_v1.5_7b,Community,7,949,LLaVA v1.5 7B,LLaVA
+llava_v1_7b,Community,7,1027,LLaVA v1 7B,LLaVA
+LxzGordon/URM-LLaMa-3-8B,Community,8,unknown,URM LLaMa 3 8B,Llama 3
+LxzGordon/URM-LLaMa-3.1-8B,Community,8,unknown,URM LLaMa 3.1 8B,Llama 3.1
+MadeAgents_Hammer2.1-0.5b,MadeAgents,0.5,unknown,Hammer 2.1 0.5B,Hammer
+MadeAgents_Hammer2.1-1.5b,MadeAgents,1.5,unknown,Hammer 2.1 1.5B,Hammer
+MadeAgents_Hammer2.1-3b,MadeAgents,3,unknown,Hammer 2.1 3B,Hammer
+MadeAgents_Hammer2.1-7b,MadeAgents,7,unknown,Hammer 2.1 7B,Hammer
+Mantis-8B-clip-llama3,TIGER Lab,8,745,Mantis 8B,Mantis
+Mantis-8B-Fuyu,TIGER Lab,8,745,Mantis 8B,Mantis
+Mantis-8B-Idefics2,TIGER Lab,8,745,Mantis 8B,Mantis
+Mantis-8B-siglip-llama3,TIGER Lab,8,745,Mantis 8B,Mantis
+mathstral-7B,Mistral AI,7,649,Mathstral 7B,Mathstral
+mattshumer/Reflection-70B,Community,70,591,Reflection 70B,Llama 3.1
+Meditron-7B,EPFL,7,908,Meditron 7B,Meditron
+medlm,Google,unknown,unknown,MedLM,MedLM
+medpalm2,Google,unknown,808,MedPaLM 2,MedPaLM
+meetkai_functionary-medium-v3.1-FC,MeetKai,unknown,unknown,Functionary Medium v3.1,Functionary
+meetkai_functionary-small-v3.1-FC,MeetKai,unknown,unknown,Functionary Small v3.1,Functionary
+Meta-Llama-3-70B,Meta,70,745,Llama 3 70B,Llama 3
+Meta-Llama-3-70B-Instruct,Meta,70,745,Llama 3 70B,Llama 3
+meta-llama-3-70b-instruct,Meta,70,745,Llama 3 70B,Llama 3
+Meta-Llama-3-8B,Meta,8,745,Llama 3 8B,Llama 3
+Meta-Llama-3-8B-Instruct,Meta,8,745,Llama 3 8B,Llama 3
+meta-llama-3-8b-instruct,Meta,8,745,Llama 3 8B,Llama 3
+Meta-Llama-3.1-8B-Instruct,Meta,8,649,Llama 3.1 8B,Llama 3.1
+Meta-Llama-3_1-70B,Meta,70,649,Llama 3.1 70B,Llama 3.1
+Meta-Llama-3_1-70B-Instruct,Meta,70,649,Llama 3.1 70B,Llama 3.1
+Meta-Llama-3_1-8B,Meta,8,649,Llama 3.1 8B,Llama 3.1
+Meta-Llama-3_1-8B-Instruct,Meta,8,649,Llama 3.1 8B,Llama 3.1
+meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo,Meta,405,649,Llama 3.1 405B,Llama 3.1
+meta-llama/Meta-Llama-3.1-70B-Instruct,Meta,70,649,Llama 3.1 70B,Llama 3.1
+meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo,Meta,70,649,Llama 3.1 70B,Llama 3.1
+meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo,Meta,8,649,Llama 3.1 8B,Llama 3.1
+meta-llama_Llama-3-70b-chat-hf,Meta,70,745,Llama 3 70B,Llama 3
+meta-llama_Llama-3.1-70B-Instruct,Meta,70,649,Llama 3.1 70B,Llama 3.1
+meta-llama_Llama-3.1-70B-Instruct-FC,Meta,70,649,Llama 3.1 70B,Llama 3.1
+meta-llama_Llama-3.1-8B-Instruct,Meta,8,649,Llama 3.1 8B,Llama 3.1
+meta-llama_Llama-3.1-8B-Instruct-FC,Meta,8,649,Llama 3.1 8B,Llama 3.1
+meta-llama_Llama-3.2-1B-Instruct,Meta,1,585,Llama 3.2 1B,Llama 3.2
+meta-llama_Llama-3.2-3B-Instruct,Meta,3,585,Llama 3.2 3B,Llama 3.2
+meta-llama_Llama-3.3-70B-Instruct,Meta,70,515,Llama 3.3 70B,Llama 3.3
+meta-llama_Llama-3.3-70B-Instruct (repeat_user_prompt),Meta,70,515,Llama 3.3 70B,Llama 3.3
+meta-llama_Meta-Llama-3-70B-Instruct,Meta,70,745,Llama 3 70B,Llama 3
+meta-llama_Meta-Llama-3-8B-Instruct,Meta,8,745,Llama 3 8B,Llama 3
+Meta-SecAlign-70B,Meta,70,unknown,SecAlign 70B,Llama 3
+Meta-SecAlign-70B (repeat_user_prompt),Meta,70,unknown,SecAlign 70B,Llama 3
+MetaStone-L1-7B,unknown,7,unknown,MetaStone L1 7B,MetaStone
+Mini-InternVL-Chat-2B-V1-5,Shanghai AI Lab,2,745,Mini-InternVL v1.5 2B,InternVL
+Mini-InternVL-Chat-4B-V1-5,Shanghai AI Lab,4,745,Mini-InternVL v1.5 4B,InternVL
+MiniCPM-Llama3-V-2_5,OpenBMB,8,719,MiniCPM-V 2.5,MiniCPM
+MiniCPM-o-2_6,OpenBMB,8,514,MiniCPM-o 2.6,MiniCPM
+MiniCPM-V,OpenBMB,unknown,1027,MiniCPM-V,MiniCPM
+MiniCPM-V-2,OpenBMB,unknown,949,MiniCPM-V 2,MiniCPM
+MiniCPM-V-2_6,OpenBMB,8,591,MiniCPM-V 2.6,MiniCPM
+MiniGPT-4-v1-13B,KAUST,13,1027,MiniGPT-4 v1 13B,MiniGPT-4
+MiniGPT-4-v1-7B,KAUST,7,1027,MiniGPT-4 v1 7B,MiniGPT-4
+MiniGPT-4-v2,KAUST,unknown,949,MiniGPT-4 v2,MiniGPT-4
+MiniMax-M2,MiniMax,unknown,unknown,MiniMax-M2,MiniMax
+minimonkey,unknown,unknown,unknown,minimonkey,minimonkey
+mistral-7b-instruct-v0.1,Mistral AI,7,949,Mistral 7B v0.1,Mistral 7B
+Mistral-7B-Instruct-v0.1,Mistral AI,7,949,Mistral 7B v0.1,Mistral 7B
+mistral-7b-instruct-v0.2,Mistral AI,7,874,Mistral 7B v0.2,Mistral 7B
+Mistral-7B-Instruct-v0.2,Mistral AI,7,874,Mistral 7B v0.2,Mistral 7B
+Mistral-7B-Instruct-v0.3,Mistral AI,7,711,Mistral 7B v0.3,Mistral 7B
+Mistral-7B-v0.1,Mistral AI,7,949,Mistral 7B v0.1,Mistral 7B
+Mistral-7B-v0.2-hf,Mistral AI,7,874,Mistral 7B v0.2,Mistral 7B
+mistral-large,Mistral AI,123,830,Mistral Large,Mistral Large
+Mistral-Large,Mistral AI,123,830,Mistral Large,Mistral Large
+mistral-large-2407,Mistral AI,123,648,Mistral Large 2407,Mistral Large
+mistral-large-2407-FC,Mistral AI,123,648,Mistral Large 2407,Mistral Large
+Mistral-Magistral-Medium,Mistral AI,unknown,unknown,Mistral Magistral Medium,Mistral Magistral
+mistral-medium-2312,Mistral AI,unknown,874,Mistral Medium,Mistral Medium
+mistral-small-2402,Mistral AI,22,808,Mistral Small 2402,Mistral Small
+mistral-small-2402-FC,Mistral AI,22,808,Mistral Small 2402,Mistral Small
+mistralai/Mixtral-8x7B-Instruct-v0.1,Mistral AI,47,874,Mixtral 8x7B,Mixtral
+mistralai_Ministral-8B-Instruct-2410,Mistral AI,8,558,Ministral 8B,Ministral
+Mixtral 8x22b Instruct,Mistral AI,141,746,Mixtral 8x22B,Mixtral
+Mixtral-8x7B-Instruct-v0.1,Mistral AI,47,874,Mixtral 8x7B,Mixtral
+mixtral-8x7b-instruct-v0.1,Mistral AI,47,874,Mixtral 8x7B,Mixtral
+Mixtral-8x7B-v0.1,Mistral AI,47,874,Mixtral 8x7B,Mixtral
+MMAlaya,DeepCtrl AI,unknown,unknown,MMAlaya,MMAlaya
+MMAlaya2,DeepCtrl AI,unknown,unknown,MMAlaya2,MMAlaya
+molmo-72B-0924,Allen AI,72,591,Molmo 72B,Molmo
+molmo-7B-D-0924,Allen AI,7,591,Molmo 7B-D,Molmo
+molmo-7B-O-0924,Allen AI,7,591,Molmo 7B-O,Molmo
+molmoE-1B-0924,Allen AI,1,591,MolmoE 1B,MolmoE
+monkey,Tsinghua,unknown,949,Monkey,Monkey
+monkey-chat,Tsinghua,unknown,949,Monkey Chat,Monkey
+Moondream1,Moondream,unknown,808,Moondream 1,Moondream
+Moondream2,Moondream,unknown,745,Moondream 2,Moondream
+moonshot-v1-8k,Moonshot AI,unknown,808,Moonshot V1,Moonshot
+mPLUG-Owl2,Alibaba DAMO,unknown,949,mPLUG-Owl2,mPLUG
+mPLUG-Owl3,Alibaba DAMO,unknown,591,mPLUG-Owl3,mPLUG
+mpt-30b-chat,MosaicML,30,1073,MPT-30B,MPT
+mpt-30b-instruct,MosaicML,30,1073,MPT-30B,MPT
+mpt-7b-chat,MosaicML,7,1073,MPT-7B,MPT
+MUG-U-7B,unknown,7,unknown,MUG-U 7B,MUG
+my_model/,unknown,unknown,unknown,unknown,unknown
+NCSOFT/Llama-3-OffsetBias-8B,NCSOFT,8,unknown,OffsetBias 8B,Llama 3
+NCSOFT/Llama-3-OffsetBias-RM-8B,NCSOFT,8,unknown,OffsetBias RM 8B,Llama 3
+Nexusflow-Raven-v2,Nexusflow,unknown,808,Nexus Raven v2,Nexus Raven
+nicolinho/QRM-Gemma-2-27B,Community,27,unknown,QRM Gemma 2 27B,Gemma 2
+nicolinho/QRM-Llama3.1-8B-v2,Community,8,unknown,QRM Llama 3.1 8B,Llama 3.1
+nous-hermes-13b,NousResearch,13,949,Nous Hermes 13B,Nous Hermes
+NousResearch/Hermes-3-Llama-3.1-70B,NousResearch,70,591,Hermes 3 70B,Hermes 3
+NousResearch/Nous-Hermes-2-Mistral-7B-DPO,NousResearch,7,808,Nous Hermes 2 7B,Nous Hermes 2
+NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO,NousResearch,47,808,Nous Hermes 2 Mixtral,Nous Hermes 2
+NousResearch_Hermes-2-Pro-Llama-3-8B,NousResearch,8,745,Hermes 2 Pro 8B,Hermes 2
+NousResearch_Hermes-2-Pro-Mistral-7B,NousResearch,7,808,Hermes 2 Pro 7B,Hermes 2
+NVIDIA-Nemotron-3-Super,NVIDIA,unknown,unknown,Nemotron 3 Super,Nemotron
+NVLM,NVIDIA,72,591,NVLM,NVLM
+o1 (medium),OpenAI,unknown,502,o1,o1
+o1-2024-12-17,OpenAI,unknown,502,o1,o1
+O1-2024-12-17 (High),OpenAI,unknown,502,o1,o1
+O1-2024-12-17 (Low),OpenAI,unknown,502,o1,o1
+O1-2024-12-17 (Med),OpenAI,unknown,502,o1,o1
+o1-2024-12-17-FC,OpenAI,unknown,502,o1,o1
+o1-mini-2024-09-12,OpenAI,unknown,598,o1 mini,o1
+O1-Mini-2024-09-12,OpenAI,unknown,598,o1 mini,o1
+o1-preview-2024-09-12,OpenAI,unknown,598,o1 Preview,o1
+O1-Preview-2024-09-12,OpenAI,unknown,598,o1 Preview,o1
+o1-pro (high),OpenAI,unknown,514,o1 Pro,o1
+O3 (High),OpenAI,unknown,382,o3,o3
+o3 (high),OpenAI,unknown,382,o3,o3
+o3-mini (high),OpenAI,unknown,457,o3 mini,o3
+o3-mini (low),OpenAI,unknown,457,o3 mini,o3
+o3-mini (medium),OpenAI,unknown,457,o3 mini,o3
+O3-Mini-2025-01-31 (High),OpenAI,unknown,457,o3 mini,o3
+O3-Mini-2025-01-31 (Low),OpenAI,unknown,457,o3 mini,o3
+O3-Mini-2025-01-31 (Med),OpenAI,unknown,457,o3 mini,o3
+O4-Mini (High),OpenAI,unknown,382,o4 mini,o4
+o4-mini (high),OpenAI,unknown,382,o4 mini,o4
+O4-Mini (Low),OpenAI,unknown,382,o4 mini,o4
+o4-mini (low),OpenAI,unknown,382,o4 mini,o4
+O4-Mini (Medium),OpenAI,unknown,382,o4 mini,o4
+o4-mini (medium),OpenAI,unknown,382,o4 mini,o4
+oasst-sft-4-pythia-12b,OpenAssistant,12,1027,OASST Pythia 12B,OASST
+oasst-sft-7-llama-30b,OpenAssistant,30,1027,OASST LLaMA 30B,OASST
+ola,unknown,unknown,unknown,unknown,unknown
+OmChat,unknown,unknown,unknown,unknown,unknown
+OmniLMM_12B,OpenBMB,12,808,OmniLMM 12B,OmniLMM
+open-mistral-nemo-2407,Mistral AI,12,655,Mistral Nemo,Mistral Nemo
+open-mistral-nemo-2407-FC,Mistral AI,12,655,Mistral Nemo,Mistral Nemo
+open-mixtral-8x22b,Mistral AI,141,746,Mixtral 8x22B,Mixtral
+open-mixtral-8x22b-FC,Mistral AI,141,746,Mixtral 8x22B,Mixtral
+open-mixtral-8x7b,Mistral AI,47,874,Mixtral 8x7B,Mixtral
+OpenAI o1-preview,OpenAI,unknown,598,o1 Preview,o1
+openai/gpt-4o-2024-05-13,OpenAI,unknown,720,GPT-4o,GPT-4o
+openai/gpt-4o-2024-08-06,OpenAI,unknown,635,GPT-4o,GPT-4o
+openai/gpt-4o-mini-2024-07-18,OpenAI,unknown,655,GPT-4o mini,GPT-4o
+OpenAssistant/oasst-rm-2-pythia-6.9b-epoch-1,OpenAssistant,6.9,unknown,OASST RM Pythia 6.9B,OASST
+OpenAssistant/oasst-rm-2.1-pythia-1.4b-epoch-2.5,OpenAssistant,1.4,unknown,OASST RM Pythia 1.4B,OASST
+OpenAssistant/reward-model-deberta-v3-large-v2,OpenAssistant,unknown,unknown,OASST DeBERTa RM,OASST
+openbmb/Eurus-7b-kto,OpenBMB,7,unknown,Eurus 7B,Eurus
+openbmb/Eurus-RM-7b,OpenBMB,7,unknown,Eurus RM 7B,Eurus
+openbmb/MiniCPM-2B-dpo-fp32,OpenBMB,2,unknown,MiniCPM 2B,MiniCPM
+openbmb/UltraRM-13b,OpenBMB,13,unknown,UltraRM 13B,UltraRM
+openbmb_MiniCPM3-4B,OpenBMB,4,591,MiniCPM3 4B,MiniCPM3
+openbmb_MiniCPM3-4B-FC,OpenBMB,4,591,MiniCPM3 4B,MiniCPM3
+OpenCodeReasoning-Nemotron-1.1-32B,NVIDIA,32,unknown,OpenCodeReasoning Nemotron 32B,Nemotron
+opencompass/CompassJudger-1-1.5B-Instruct,OpenCompass,1.5,unknown,CompassJudger 1.5B,CompassJudger
+opencompass/CompassJudger-1-14B-Instruct,OpenCompass,14,unknown,CompassJudger 14B,CompassJudger
+opencompass/CompassJudger-1-7B-Instruct,OpenCompass,7,unknown,CompassJudger 7B,CompassJudger
+OpenReasoning-Nemotron-32B,NVIDIA,32,unknown,OpenReasoning Nemotron 32B,Nemotron
+OpenThinker-32B,Community,32,433,OpenThinker 32B,OpenThinker
+opus,Anthropic,unknown,790,Claude 3 Opus,Opus
+Ovis1.5-Gemma2-9B,Alibaba,9,591,Ovis 1.5 9B,Ovis
+Ovis1.5-Llama3-8B,Alibaba,8,591,Ovis 1.5 8B,Ovis
+Ovis1.6-Gemma2-27B,Alibaba,27,515,Ovis 1.6 27B,Ovis
+Ovis1.6-Gemma2-9B,Alibaba,9,515,Ovis 1.6 9B,Ovis
+Ovis1.6-Llama3.2-3B,Alibaba,3,515,Ovis 1.6 3B,Ovis
+Ovis2-16B,Alibaba,16,468,Ovis2 16B,Ovis2
+Ovis2-1B,Alibaba,1,468,Ovis2 1B,Ovis2
+Ovis2-2B,Alibaba,2,468,Ovis2 2B,Ovis2
+Ovis2-34B,Alibaba,34,468,Ovis2 34B,Ovis2
+Ovis2-4B,Alibaba,4,468,Ovis2 4B,Ovis2
+Ovis2-8B,Alibaba,8,468,Ovis2 8B,Ovis2
+paligemma-3b-mix-448,Google,3,719,PaliGemma 3B,PaliGemma
+palm-2-chat-bison-001,Google,unknown,949,PaLM 2 Chat,PaLM 2
+PandaGPT_13B,CUHK,13,1027,PandaGPT 13B,PandaGPT
+Parrot,unknown,unknown,unknown,unknown,unknown
+Phi-3-medium-128k-instruct,Microsoft,14,719,Phi-3 Medium,Phi-3
+Phi-3-mini-128k-instruct,Microsoft,3.8,740,Phi-3 Mini,Phi-3
+phi-3-mini-128k-instruct,Microsoft,3.8,740,Phi-3 Mini,Phi-3
+Phi-3-mini-4k-instruct,Microsoft,3.8,740,Phi-3 Mini,Phi-3
+phi-3-mini-4k-instruct,Microsoft,3.8,740,Phi-3 Mini,Phi-3
+Phi-3-Vision,Microsoft,4.2,712,Phi-3 Vision,Phi-3
+Phi-3.5-Vision,Microsoft,4.2,621,Phi-3.5 Vision,Phi-3.5
+Phi-4-reasoning-plus,Microsoft,14,368,Phi-4 Reasoning,Phi-4
+Phi-4-Vision,Microsoft,14,507,Phi-4 Vision,Phi-4
+Pixtral-12B,Mistral AI,12,593,Pixtral 12B,Pixtral
+PKU-Alignment/beaver-7b-v1.0-cost,PKU,7,unknown,Beaver 7B,Beaver
+PKU-Alignment/beaver-7b-v1.0-reward,PKU,7,unknown,Beaver 7B,Beaver
+PKU-Alignment/beaver-7b-v2.0-cost,PKU,7,unknown,Beaver 7B,Beaver
+PKU-Alignment/beaver-7b-v2.0-reward,PKU,7,unknown,Beaver 7B,Beaver
+PMC-LLaMA-7B,Stanford,7,unknown,PMC-LLaMA 7B,Llama
+POINTS-Qwen-2.5-7B-Chat,Community,7,unknown,POINTS Qwen2.5 7B,Qwen2.5
+POINTS-Yi-1.5-9B-Chat,Community,9,unknown,POINTS Yi-1.5 9B,Yi-1.5
+POINTSV15-Qwen-2.5-7B-Chat,Community,7,unknown,POINTS v1.5 Qwen2.5 7B,Qwen2.5
+prometheus-eval/prometheus-8x7b-v2.0,KAIST,47,unknown,Prometheus 8x7B v2,Prometheus
+pythia-12b,EleutherAI,12,1095,Pythia 12B,Pythia
+QED-Nano,unknown,unknown,unknown,unknown,unknown
+QVQ-72B-Preview,Alibaba,72,494,QVQ 72B Preview,QVQ
+Qwen-VL-Max-0809,Alibaba,unknown,632,Qwen-VL Max,Qwen-VL
+Qwen-VL-Plus-0809,Alibaba,unknown,632,Qwen-VL Plus,Qwen-VL
+Qwen/Qwen1.5-0.5B-Chat,Alibaba,0.5,817,Qwen1.5 0.5B,Qwen1.5
+Qwen/Qwen1.5-1.8B-Chat,Alibaba,1.8,817,Qwen1.5 1.8B,Qwen1.5
+Qwen/Qwen1.5-14B-Chat,Alibaba,14,817,Qwen1.5 14B,Qwen1.5
+Qwen/Qwen1.5-4B-Chat,Alibaba,4,817,Qwen1.5 4B,Qwen1.5
+Qwen/Qwen1.5-72B-Chat,Alibaba,72,817,Qwen1.5 72B,Qwen1.5
+Qwen/Qwen1.5-7B-Chat,Alibaba,7,817,Qwen1.5 7B,Qwen1.5
+Qwen/Qwen1.5-MoE-A2.7B-Chat,Alibaba,14.3,817,Qwen1.5 MoE,Qwen1.5
+Qwen1.5-110B,Alibaba,110,817,Qwen1.5 110B,Qwen1.5
+Qwen1.5-14B-Chat,Alibaba,14,817,Qwen1.5 14B,Qwen1.5
+Qwen1.5-72B-Chat,Alibaba,72,817,Qwen1.5 72B,Qwen1.5
+qwen1.5-72b-chat,Alibaba,72,817,Qwen1.5 72B,Qwen1.5
+qwen1.5-7b-chat,Alibaba,7,817,Qwen1.5 7B,Qwen1.5
+Qwen1.5-7B-Chat,Alibaba,7,817,Qwen1.5 7B,Qwen1.5
+Qwen2-Ins-72B,Alibaba,72,695,Qwen2 72B,Qwen2
+Qwen2-VL-2B-Instruct,Alibaba,2,558,Qwen2-VL 2B,Qwen2-VL
+Qwen2-VL-72B-Instruct,Alibaba,72,558,Qwen2-VL 72B,Qwen2-VL
+Qwen2-VL-7B-Instruct,Alibaba,7,558,Qwen2-VL 7B,Qwen2-VL
+Qwen2.5-Coder-Ins-32B,Alibaba,32,591,Qwen2.5 Coder 32B,Qwen2.5 Coder
+Qwen2.5-Coder-Ins-7B,Alibaba,7,591,Qwen2.5 Coder 7B,Qwen2.5 Coder
+Qwen2.5-Ins-32B,Alibaba,32,591,Qwen2.5 32B,Qwen2.5
+Qwen2.5-Ins-72B,Alibaba,72,591,Qwen2.5 72B,Qwen2.5
+Qwen2.5-Ins-7B,Alibaba,7,591,Qwen2.5 7B,Qwen2.5
+Qwen2.5-VL-3B,Alibaba,3,462,Qwen2.5-VL 3B,Qwen2.5-VL
+Qwen2.5-VL-3B-Instruct,Alibaba,3,462,Qwen2.5-VL 3B,Qwen2.5-VL
+Qwen2.5-VL-72B,Alibaba,72,462,Qwen2.5-VL 72B,Qwen2.5-VL
+Qwen2.5-VL-72B-Instruct,Alibaba,72,462,Qwen2.5-VL 72B,Qwen2.5-VL
+Qwen2.5-VL-7B,Alibaba,7,462,Qwen2.5-VL 7B,Qwen2.5-VL
+Qwen2.5-VL-7B-Instruct,Alibaba,7,462,Qwen2.5-VL 7B,Qwen2.5-VL
+Qwen3-235B-2507-Think,Alibaba,235,282,Qwen3 235B,Qwen3
+Qwen3-235B-A22B,Alibaba,235,365,Qwen3 235B,Qwen3
+qwen3-30b-a3b,Alibaba,30,365,Qwen3 30B-A3B,Qwen3
+Qwen3-30B-A3B,Alibaba,30,365,Qwen3 30B-A3B,Qwen3
+Qwen3-30B-A3B-2507-Think,Alibaba,30,282,Qwen3 30B-A3B,Qwen3
+Qwen3-4B-2507-Think,Alibaba,4,282,Qwen3 4B,Qwen3
+Qwen3-Max,Alibaba,235,365,Qwen3 Max,Qwen3
+Qwen3-Next-80B-A3B-Thinking,Alibaba,80,unknown,Qwen3 Next 80B,Qwen3 Next
+Qwen3-VL-235B Instruct,Alibaba,235,unknown,Qwen3-VL 235B,Qwen3-VL
+Qwen3-VL-Thinking,Alibaba,unknown,unknown,Qwen3-VL,Qwen3-VL
+Qwen3.5-27B,Alibaba,27,60,Qwen3.5 27B,Qwen3.5
+Qwen3.5-35B-A3B,Alibaba,35,60,Qwen3.5 35B-A3B,Qwen3.5
+Qwen3.5-397b-a17b,Alibaba,397,60,Qwen3.5 397B-A17B,Qwen3.5
+Qwen3.5-4B,Alibaba,4,unknown,Qwen3.5 4B,Qwen3.5
+Qwen3.5-9B,Alibaba,9,unknown,Qwen3.5 9B,Qwen3.5
+qwen_base,Alibaba,unknown,unknown,Qwen,Qwen
+qwen_chat,Alibaba,unknown,unknown,Qwen,Qwen
+Qwen_Qwen2-1.5B-Instruct,Alibaba,1.5,695,Qwen2 1.5B,Qwen2
+Qwen_Qwen2-7B-Instruct,Alibaba,7,695,Qwen2 7B,Qwen2
+Qwen_Qwen2.5-0.5B-Instruct,Alibaba,0.5,591,Qwen2.5 0.5B,Qwen2.5
+Qwen_Qwen2.5-1.5B-Instruct,Alibaba,1.5,591,Qwen2.5 1.5B,Qwen2.5
+Qwen_Qwen2.5-14B-Instruct,Alibaba,14,591,Qwen2.5 14B,Qwen2.5
+Qwen_Qwen2.5-32B-Instruct,Alibaba,32,591,Qwen2.5 32B,Qwen2.5
+Qwen_Qwen2.5-3B-Instruct,Alibaba,3,591,Qwen2.5 3B,Qwen2.5
+Qwen_Qwen2.5-72B-Instruct,Alibaba,72,591,Qwen2.5 72B,Qwen2.5
+Qwen_Qwen2.5-7B-Instruct,Alibaba,7,591,Qwen2.5 7B,Qwen2.5
+QwenVLMax,Alibaba,unknown,unknown,Qwen-VL Max,Qwen-VL
+QwenVLPlus,Alibaba,unknown,unknown,Qwen-VL Plus,Qwen-VL
+QwQ-32B,Alibaba,32,424,QwQ 32B,QwQ
+qwq-32b,Alibaba,32,424,QwQ 32B,QwQ
+qwq-32b-preview,Alibaba,32,522,QwQ 32B Preview,QwQ
+QwQ-32B-Preview,Alibaba,32,522,QwQ 32B Preview,QwQ
+QwQ-32B_temp,Alibaba,32,522,QwQ 32B,QwQ
+QwQ-Max-Preview,Alibaba,unknown,unknown,QwQ Max,QwQ
+Ray2333/Gemma-2B-rewardmodel-baseline,Community,2,unknown,Gemma 2B RM,Gemma
+Ray2333/Gemma-2B-rewardmodel-ft,Community,2,unknown,Gemma 2B RM,Gemma
+Ray2333/GRM-Gemma-2B-rewardmodel-ft,Community,2,unknown,GRM Gemma 2B,GRM
+Ray2333/GRM-Gemma-2B-sftreg,Community,2,unknown,GRM Gemma 2B,GRM
+Ray2333/GRM-gemma2-2B-rewardmodel-ft,Community,2,unknown,GRM Gemma2 2B,GRM
+Ray2333/GRM-llama3-8B-distill,Community,8,unknown,GRM LLaMA3 8B,GRM
+Ray2333/GRM-Llama3-8B-rewardmodel-ft,Community,8,unknown,GRM LLaMA3 8B,GRM
+Ray2333/GRM-llama3-8B-sftreg,Community,8,unknown,GRM LLaMA3 8B,GRM
+Ray2333/GRM-llama3.2-3B-rewardmodel-ft,Community,3,unknown,GRM LLaMA3.2 3B,GRM
+Ray2333/reward-model-Mistral-7B-instruct-Unified-Feedback,Community,7,unknown,Mistral 7B RM,Mistral RM
+RBDash_72b,unknown,72,unknown,RBDash 72B,RBDash
+RekaEdge,Reka AI,unknown,745,Reka Edge,Reka
+RekaFlash,Reka AI,unknown,745,Reka Flash,Reka
+Ristretto-3B,unknown,3,unknown,Ristretto 3B,Ristretto
+RLHFlow/LLaMA3-iterative-DPO-final,RLHFlow,unknown,unknown,LLaMA3 Iterative DPO,Llama 3
+RLHFlow/RewardModel-Mistral-7B-for-DPA-v1,RLHFlow,7,unknown,RLHFlow Mistral RM,Mistral RM
+ross-qwen2-7b,Community,7,unknown,Qwen2 7B (fine-tune),Qwen2
+rwkv-4-raven-14b,RWKV Team,14,1027,RWKV-4 Raven 14B,RWKV
+s1.1-32B,Stanford,32,438,s1.1 32B,s1
+SAIL-VL-2B,Alibaba,2,unknown,SAIL-VL 2B,SAIL-VL
+Salesforce_xLAM-1b-fc-r,Salesforce,1,unknown,xLAM 1B,xLAM
+Salesforce_xLAM-7b-fc-r,Salesforce,7,unknown,xLAM 7B,xLAM
+Salesforce_xLAM-7b-r,Salesforce,7,unknown,xLAM 7B,xLAM
+Salesforce_xLAM-8x22b-r,Salesforce,141,unknown,xLAM 8x22B,xLAM
+Salesforce_xLAM-8x7b-r,Salesforce,47,unknown,xLAM 8x7B,xLAM
+SenseChat-Vision,SenseTime,unknown,unknown,SenseChat Vision,SenseChat
+sfairXC/FsfairX-LLaMA3-RM-v0.1,FsfairX,8,unknown,FsfairX LLaMA3 RM,Llama 3
+sharecaptioner,Community,unknown,unknown,ShareCaptioner,ShareCaptioner
+sharegpt4v_13b,Community,13,949,ShareGPT4V 13B,ShareGPT4V
+sharegpt4v_7b,Community,7,949,ShareGPT4V 7B,ShareGPT4V
+Skywork/Skywork-Critic-Llama-3.1-8B,Skywork,8,unknown,Skywork Critic 8B,Skywork
+Skywork/Skywork-Reward-Gemma-2-27B,Skywork,27,unknown,Skywork Reward 27B,Skywork
+Skywork/Skywork-Reward-Gemma-2-27B-v0.2,Skywork,27,unknown,Skywork Reward 27B,Skywork
+Skywork/Skywork-Reward-Llama-3.1-8B,Skywork,8,unknown,Skywork Reward 8B,Skywork
+Skywork/Skywork-Reward-Llama-3.1-8B-v0.2,Skywork,8,unknown,Skywork Reward 8B,Skywork
+Slime-13B,unknown,13,unknown,Slime 13B,Slime
+Slime-7B,unknown,7,unknown,Slime 7B,Slime
+Slime-8B,unknown,8,unknown,Slime 8B,Slime
+SmolVLM,HuggingFace,unknown,522,SmolVLM,SmolVLM
+SmolVLM-256M,HuggingFace,0.256,522,SmolVLM 256M,SmolVLM
+SmolVLM-500M,HuggingFace,0.5,522,SmolVLM 500M,SmolVLM
+SmolVLM-DPO,HuggingFace,unknown,522,SmolVLM DPO,SmolVLM
+SmolVLM-Synthetic,HuggingFace,unknown,522,SmolVLM Synthetic,SmolVLM
+SmolVLM2,HuggingFace,unknown,382,SmolVLM2,SmolVLM2
+SmolVLM2-256M,HuggingFace,0.256,382,SmolVLM2 256M,SmolVLM2
+SmolVLM2-500M,HuggingFace,0.5,382,SmolVLM2 500M,SmolVLM2
+sonnet,Anthropic,unknown,790,Claude 3 Sonnet,Sonnet
+sonnet-3.5,Anthropic,unknown,682,Claude 3.5 Sonnet,Sonnet
+stabilityai/stable-code-instruct-3b,Stability AI,3,unknown,Stable Code 3B,Stable Code
+stabilityai/stablelm-2-12b-chat,Stability AI,12,808,StableLM 2 12B,StableLM 2
+stabilityai/stablelm-2-zephyr-1_6b,Stability AI,1.6,808,StableLM 2 Zephyr 1.6B,StableLM 2
+stabilityai/stablelm-zephyr-3b,Stability AI,3,874,StableLM Zephyr 3B,StableLM
+stablelm-tuned-alpha-7b,Stability AI,7,1073,StableLM Alpha 7B,StableLM
+starchat,HuggingFace,16,1073,StarChat,StarChat
+Step 3.5 Flash,Stepfun,196,87,Step 3.5 Flash,Step 3
+Step1.5V-mini,Stepfun,unknown,unknown,Step 1.5V Mini,Step 1
+Step1o,Stepfun,unknown,unknown,Step1o,Step 1
+Step1V,Stepfun,unknown,unknown,Step1V,Step 1
+SultanR/SmolTulu-1.7b-RM,Community,1.7,unknown,SmolTulu 1.7B RM,SmolTulu
+Sup-AI-Ensemble,unknown,unknown,unknown,unknown,unknown
+Taichu-VLR-3B,Taichu AI,3,unknown,Taichu VLR 3B,Taichu VLR
+Taichu-VLR-7B,Taichu AI,7,unknown,Taichu VLR 7B,Taichu VLR
+Taiyi,unknown,unknown,unknown,Taiyi,Taiyi
+Team-ACE_ToolACE-8B,Team ACE,8,unknown,ToolACE 8B,ToolACE
+TeleMM,unknown,unknown,unknown,unknown,unknown
+THUDM_glm-4-9b-chat,Zhipu AI,9,697,GLM-4 9B,GLM-4
+TransCore_M,unknown,unknown,unknown,unknown,unknown
+tulu-30b,Allen AI,30,949,Tulu 30B,Tulu
+ultralm-13b,Allen AI,13,1027,UltraLM 13B,UltraLM
+ultralm-65b,Allen AI,65,1027,UltraLM 65B,UltraLM
+upstage/SOLAR-10.7B-Instruct-v1.0,Upstage,10.7,874,SOLAR 10.7B,SOLAR
+URSA-8B,URSA Team,8,unknown,URSA 8B,URSA
+valley_eagle,unknown,unknown,unknown,unknown,unknown
+varco-vision-hf,NCSOFT,unknown,unknown,Varco Vision,Varco
+vicuna-13b-v1.3,LMSYS,13,1027,Vicuna 13B,Vicuna
+vicuna-33b,LMSYS,33,1027,Vicuna 33B,Vicuna
+vicuna-33b-v1.3,LMSYS,33,1027,Vicuna 33B,Vicuna
+vicuna-7b-v1.3,LMSYS,7,1027,Vicuna 7B,Vicuna
+VILA1.5-13b,NVIDIA,13,719,VILA1.5 13B,VILA
+VILA1.5-3b,NVIDIA,3,719,VILA1.5 3B,VILA
+VILA1.5-40b,NVIDIA,40,719,VILA1.5 40B,VILA
+Vintern-1B-v2,VinBrain,1,unknown,Vintern 1B,Vintern
+Vintern-3B-beta,VinBrain,3,unknown,Vintern 3B,Vintern
+VisualGLM_6b,Zhipu AI,6,1027,VisualGLM 6B,VisualGLM
+vita,Tencent,unknown,591,VITA,VITA
+vita_qwen2,Tencent,unknown,591,VITA Qwen2,VITA
+VLAA-Thinker-Qwen2.5VL-3B,Community,3,unknown,VLAA Thinker 3B,Qwen2.5-VL
+VLAA-Thinker-Qwen2.5VL-7B,Community,7,unknown,VLAA Thinker 7B,Qwen2.5-VL
+VLM-R1,Community,unknown,393,VLM-R1,VLM-R1
+VXVERSE,unknown,unknown,unknown,unknown,unknown
+watt-ai_watt-tool-70B,Watt AI,70,unknown,Watt Tool 70B,Watt Tool
+watt-ai_watt-tool-8B,Watt AI,8,unknown,Watt Tool 8B,Watt Tool
+WeMM,unknown,unknown,unknown,unknown,unknown
+wenbopan/Faro-Yi-9B-DPO,Community,9,unknown,Faro Yi 9B,Yi
+weqweasdas/hh_rlhf_rm_open_llama_3b,Community,3,unknown,HH-RLHF RM 3B,Llama
+weqweasdas/RM-Gemma-2B,Community,2,unknown,RM Gemma 2B,Gemma
+weqweasdas/RM-Gemma-7B,Community,7,unknown,RM Gemma 7B,Gemma
+weqweasdas/RM-Gemma-7B-4096,Community,7,unknown,RM Gemma 7B,Gemma
+weqweasdas/RM-Mistral-7B,Community,7,unknown,RM Mistral 7B,Mistral RM
+wizardlm-13b,WizardLM,13,1027,WizardLM 13B,WizardLM
+wizardlm-30b,WizardLM,30,949,WizardLM 30B,WizardLM
+wizardlm-70b,WizardLM,70,808,WizardLM 70B,WizardLM
+wizardlm-7b,WizardLM,7,1027,WizardLM 7B,WizardLM
+XBai-o4-medium,unknown,unknown,unknown,unknown,unknown
+XComposer,Shanghai AI Lab,unknown,949,XComposer,XComposer
+XComposer2,Shanghai AI Lab,7,808,XComposer2,XComposer2
+XComposer2_1.8b,Shanghai AI Lab,1.8,808,XComposer2 1.8B,XComposer2
+XComposer2_4KHD,Shanghai AI Lab,7,808,XComposer2 4KHD,XComposer2
+XComposer2d5,Shanghai AI Lab,7,719,XComposer2.5,XComposer2
+xgen-mm-phi3-dpo-r-v1.5,Salesforce,3.8,719,XGen-MM Phi3 DPO,XGen-MM
+xgen-mm-phi3-interleave-r-v1.5,Salesforce,3.8,719,XGen-MM Phi3,XGen-MM
+XinYuan-VL-2B-Instruct,Community,2,unknown,XinYuan-VL 2B,XinYuan-VL
+Yi-34B,01.AI,34,909,Yi 34B,Yi
+yi-34b,01.AI,34,909,Yi 34B,Yi
+Yi-6B,01.AI,6,909,Yi 6B,Yi
+yi-6b,01.AI,6,909,Yi 6B,Yi
+yi-6b-chat,01.AI,6,909,Yi 6B Chat,Yi
+Yi-6B-Chat,01.AI,6,909,Yi 6B Chat,Yi
+Yi-6b-Chat,01.AI,6,909,Yi 6B Chat,Yi
+Yi-Vision,01.AI,unknown,909,Yi Vision,Yi Vision
+Yi_VL_34B,01.AI,34,909,Yi-VL 34B,Yi-VL
+Yi_VL_6B,01.AI,6,909,Yi-VL 6B,Yi-VL

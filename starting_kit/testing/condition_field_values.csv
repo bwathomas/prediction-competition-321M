@@ -1,0 +1,204 @@
+field,value,n_condition_strings_with_value,n_response_rows_with_value
+source,afrimedqa-v2,1,70380
+source,afrimedqa-v1,1,12000
+source,unknown,1,28550
+source,submissions,1,324595
+source,leaderboard;aggregate=pass@1,1,1935
+prompt,base,2,98930
+prompt,instruct,1,12000
+metric,utility,16,36678
+metric,security,15,33118
+attack,direct,2,8850
+attack,ignore_previous,2,8850
+attack,important_instructions,2,38760
+attack,captcha_dos,2,194
+attack,dos,2,194
+attack,felony_dos,2,194
+attack,important_instructions_no_model_name,2,1258
+attack,important_instructions_no_names,2,1258
+attack,important_instructions_no_user_name,2,1258
+attack,important_instructions_wrong_model_name,2,1258
+attack,important_instructions_wrong_user_name,2,1258
+attack,injecagent,2,1258
+attack,offensive_email_dos,2,194
+attack,swearwords_dos,2,194
+attack,tool_knowledge,2,1258
+attack,none,1,3560
+mode,unguided,1,320
+mode,subtask_guided,1,320
+mode,subtask_fractional,1,320
+judge,1;criterion=Applying the Cauchy Inequality,1,3
+judge,1;criterion=Deriving a useful function,1,3
+judge,1;criterion=Finishing of the lower bound,1,3
+judge,1;criterion=Recovering the polynomial for $f$,1,3
+judge,1;criterion=Closed under addition,1,3
+judge,1;criterion=Contains odd integers,1,3
+judge,1;criterion=GCD $d$,1,3
+judge,1;criterion=First recurrence,1,3
+judge,1;criterion=Second recurrence,1,6
+judge,1;criterion=Lower bound and exact value,1,3
+judge,1;criterion=Simplifying to solution to the Pell equation,1,3
+judge,1;criterion=Argument about the solution size,1,3
+judge,1;criterion=Discounting large $d$,1,3
+judge,1;criterion=Behaviour for single-solution $d$,1,3
+judge,1;criterion=Binding the contribution of multi-solution $d$,1,3
+judge,1;criterion=Functional Equation,1,3
+judge,1;criterion=Uneven degree,1,3
+judge,1;criterion=Finishing part (a),1,3
+judge,1;criterion=Even degree,1,3
+judge,1;criterion=Finishing part (b),1,3
+judge,1;criterion=Defining the rotation,1,3
+judge,1;criterion=Properties of rotation,1,3
+judge,1;criterion=Expressing the eigenvalues in 2 distinct ways,1,3
+judge,1;criterion=Proving $\lambda^2$ is real,1,3
+judge,1;criterion=Simplifying the LHS for $b=1$,1,3
+judge,1;criterion=Creating a tight condition between $a$ and $x$,1,3
+judge,1;criterion=Finding the necessary condition for x,1,3
+judge,1;criterion=Sufficiency for $a\geqslant 4$,1,3
+judge,1;criterion=Sufficiency for $a=2$,1,3
+judge,1;criterion=Form of matrices in $\mathcal{S}$,1,3
+judge,1;criterion=Size of $\mathcal{S}$,1,3
+judge,1;criterion=Commutation condition,1,3
+judge,1;criterion=Wrap up,1,3
+judge,1;criterion=First step,1,3
+judge,1;criterion=Second step,1,3
+judge,1;criterion=Third step,1,3
+judge,1;criterion=Finishes,1,3
+judge,1;criterion=Defining an auxiliary function,1,3
+judge,1;criterion=Properties of the auxiliary function,1,3
+judge,1;criterion=Continuity arguments,1,3
+judge,1;criterion=Finishing,1,191
+judge,1;criterion=Splitting the order,1,3
+judge,1;criterion=Finish simple case,1,3
+judge,1;criterion=Prime does not divide cycle length,1,3
+judge,1;criterion=$N \leqslant f(n)/2$,1,3
+judge,1;criterion=Finishes the proof,1,3
+judge,1;criterion=Redefining point of tangency,1,56
+judge,1;criterion=$P$ is excenter,1,28
+judge,1;criterion=$EXFB$ is circumscribed,1,28
+judge,1;criterion=$H$ is incenter,1,28
+judge,1;criterion=Finalizing,1,56
+judge,2;criterion=Redefining point of tangency,1,40
+judge,2;criterion=$P$ is excenter,1,20
+judge,2;criterion=$EXFB$ is circumscribed,1,20
+judge,2;criterion=$H$ is incenter,1,20
+judge,2;criterion=Finalizing,1,40
+judge,"1;criterion=Reaching the answer $k=0,1,3$ for all $n$",1,28
+judge,"1;criterion=Describing a construction for $k=0,1,3$ for $n=3$",1,28
+judge,1;criterion=Reducing the problem from $n$ to $n-1$ given a boundary line,1,28
+judge,1;criterion=Making an argument about the boundary points' covering,1,28
+judge,1;criterion=Origin in the $n$ boundary lines case,1,28
+judge,1;criterion=Hypotenuse points in the $n-1$ boundary lines case,1,28
+judge,"2;criterion=Reaching the answer $k=0,1,3$ for all $n$",1,24
+judge,"2;criterion=Describing a construction for $k=0,1,3$ for $n=3$",1,24
+judge,2;criterion=Reducing the problem from $n$ to $n-1$ given a boundary line,1,24
+judge,2;criterion=Making an argument about the boundary points' covering,1,24
+judge,2;criterion=Origin in the $n$ boundary lines case,1,24
+judge,2;criterion=Hypotenuse points in the $n-1$ boundary lines case,1,24
+judge,2;criterion=Finishing,1,184
+judge,1;criterion=Final answer,1,28
+judge,1;criterion=Divisibility by 2 and 3,1,28
+judge,1;criterion=Reduction from 12k to k,1,28
+judge,1;criterion=Divisibility by 5,1,28
+judge,2;criterion=Final answer,1,20
+judge,2;criterion=Divisibility by 2 and 3,1,20
+judge,2;criterion=Reduction from 12k to k,1,20
+judge,2;criterion=Divisibility by 5,1,20
+judge,1;criterion=$f(p)\neq 1$ is true for finitely many $p$,1,28
+judge,1;criterion=$f(2k+1) = 1$,1,28
+judge,1;criterion=f(2k)=2^m,1,28
+judge,1;criterion=$\nu_2(f(a)) \leq \nu_2(a) + 2,1,28
+judge,1;criterion=Construction for $c=4$,1,28
+judge,2;criterion=$f(p)\neq 1$ is true for finitely many $p$,1,24
+judge,2;criterion=$f(2k+1) = 1$,1,24
+judge,2;criterion=f(2k)=2^m,1,24
+judge,2;criterion=$\nu_2(f(a)) \leq \nu_2(a) + 2,1,24
+judge,2;criterion=Construction for $c=4$,1,24
+judge,1;criterion=Construction,1,28
+judge,1;criterion=Lower bounds on diagonal sequences,1,28
+judge,1;criterion=Lower bound on number of rectangles,1,28
+judge,2;criterion=Construction,1,20
+judge,2;criterion=Lower bounds on diagonal sequences,1,20
+judge,2;criterion=Lower bound on number of rectangles,1,20
+judge,1;criterion=Strategy for $\lambda < \frac{\sqrt{2}}{2}$,1,28
+judge,1;criterion=Proving the strategy for $\lambda < \frac{\sqrt{2}}{2}$,1,28
+judge,1;criterion=Strategy for $\lambda > \frac{\sqrt{2}}{2}$,1,28
+judge,1;criterion=Proving the strategy for $\lambda > \frac{\sqrt{2}}{2}$,1,28
+judge,1;criterion=Showing a tie occurs for $\lambda = \frac{\sqrt{2}}{2}$,1,28
+judge,2;criterion=Strategy for $\lambda < \frac{\sqrt{2}}{2}$,1,24
+judge,2;criterion=Proving the strategy for $\lambda < \frac{\sqrt{2}}{2}$,1,24
+judge,2;criterion=Strategy for $\lambda > \frac{\sqrt{2}}{2}$,1,24
+judge,2;criterion=Proving the strategy for $\lambda > \frac{\sqrt{2}}{2}$,1,24
+judge,2;criterion=Showing a tie occurs for $\lambda = \frac{\sqrt{2}}{2}$,1,24
+judge,1;criterion=Correctness,1,85
+judge,1;criterion=Pigeonhole principle,1,40
+judge,1;criterion=Adjacent zero coefficients,1,40
+judge,1;criterion=Root distinctness contradiction,1,40
+judge,2;criterion=Pigeonhole principle,1,40
+judge,2;criterion=Adjacent zero coefficients,1,40
+judge,2;criterion=Root distinctness contradiction,1,40
+judge,1;criterion=Initial closed form expression for each digit,1,40
+judge,1;criterion=Interchanging the floor and mod,1,40
+judge,1;criterion=Bounding the expression,1,40
+judge,2;criterion=Initial closed form expression for each digit,1,40
+judge,2;criterion=Interchanging the floor and mod,1,40
+judge,2;criterion=Bounding the expression,1,40
+judge,1;criterion=Additional construction,1,40
+judge,1;criterion=Properties of the construction,1,40
+judge,2;criterion=Additional construction,1,40
+judge,2;criterion=Properties of the construction,1,40
+judge,1;criterion=Connectivity of construction,1,40
+judge,1;criterion=Finiteness of shortest paths,1,40
+judge,1;criterion=Showing the graph is planar,1,40
+judge,2;criterion=Connectivity of construction,1,40
+judge,2;criterion=Finiteness of shortest paths,1,40
+judge,2;criterion=Showing the graph is planar,1,40
+judge,1;criterion=Defining a graph,1,40
+judge,1;criterion=Hall's theorem,1,40
+judge,1;criterion=Reducing the problem,1,40
+judge,2;criterion=Defining a graph,1,40
+judge,2;criterion=Hall's theorem,1,40
+judge,2;criterion=Reducing the problem,1,40
+judge,1;criterion=Reduction to powers of prime divisors of n+1,1,40
+judge,1;criterion=Remainder of (n-j / j) when p_l does not divide j,1,36
+judge,1;criterion=Remainder of (n-j / j) when p_l divides j,1,36
+judge,2;criterion=Reduction to powers of prime divisors of n+1,1,40
+judge,2;criterion=Remainder of (n-j / j) when p_l does not divide j,1,36
+judge,2;criterion=Remainder of (n-j / j) when p_l divides j,1,36
+judge,1;criterion=Remainder of $\frac{n-j}{j} when p_l does not divide j,1,4
+judge,1;criterion=Remainder of $\frac{n-j}{j} when $p_l$ divides $j$,1,4
+judge,2;criterion=Remainder of $\frac{n-j}{j} when p_l does not divide j,1,4
+judge,2;criterion=Remainder of $\frac{n-j}{j} when $p_l$ divides $j$,1,4
+skill,attribute_reasoning,1,146266
+skill,logic_reasoning,1,112039
+skill,finegrained_perception (instance-level),1,270516
+skill,finegrained_perception (cross-instance),1,163280
+skill,coarse_perception,1,334339
+skill,relation_reasoning,1,154177
+subset,alpacaeval-easy,1,15100
+subset,alpacaeval-hard,1,14345
+subset,alpacaeval-length,1,14345
+subset,mt-bench-easy,1,4228
+subset,mt-bench-med,1,6040
+subset,mt-bench-hard,1,5587
+subset,llmbar-natural,1,15100
+subset,llmbar-adver-neighbor,1,20234
+subset,llmbar-adver-GPTInst,1,13892
+subset,llmbar-adver-GPTOut,1,7097
+subset,llmbar-adver-manual,1,6946
+subset,refusals-dangerous,1,15100
+subset,refusals-offensive,1,15100
+subset,xstest-should-respond,1,37750
+subset,xstest-should-refuse,1,23254
+subset,donotanswer,1,20536
+subset,hep-python,1,24764
+subset,hep-go,1,24764
+subset,hep-cpp,1,24764
+subset,hep-js,1,24764
+subset,hep-rust,1,24764
+subset,hep-java,1,24764
+subset,math-prm,1,67497
+aspect,helpfulness,1,255864
+aspect,honesty,1,242143
+aspect,instruction_following,1,255859
+aspect,truthfulness,1,255864

@@ -1,0 +1,17 @@
+benchmark,topic,age,has_conditions,conditions
+afrimedqa,Medicine,548,1,"{""prompt"": ""bool"", ""source"": ""bool""}"
+agentdojo,Safety,701,1,"{""attack"": ""bool"", ""metric"": ""bool""}"
+ai2d_test,Vision,3715,0,{}
+androidworld,GUI Agents,732,0,{}
+bfcl,Tool Use,609,0,{}
+cybench,Cybersecurity,640,1,"{""mode"": ""bool""}"
+hle,Reasoning,487,0,{}
+livecodebench,Coding,793,1,"{""aggregate"": ""bool"", ""source"": ""bool""}"
+matharena,Mathematics,367,1,"{""criterion"": ""bool"", ""judge"": ""scalar""}"
+mathvista_mini,Mathematics,945,0,{}
+mmbench_v11,Vision,1037,1,"{""skill"": ""bool""}"
+mmlupro,Reasoning,701,0,{}
+mtbench,Preference,1067,0,{}
+rewardbench,Preference,793,1,"{""subset"": ""bool""}"
+swebench,Coding,945,0,{}
+ultrafeedback,Preference,945,1,"{""aspect"": ""bool""}"

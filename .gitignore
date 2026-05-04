@@ -1,0 +1,11 @@
+﻿starting_kit/Data/
+Google_Collab_harness/outputs/
+validation_harness/splits/
+
+**/__pycache__/
+*.py[cod]
+
+*.pt
+*.pkl
+*.joblib
+*.parquet

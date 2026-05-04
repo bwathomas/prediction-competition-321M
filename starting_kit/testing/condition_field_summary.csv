@@ -1,0 +1,10 @@
+field,n_unique_values,n_condition_strings_using_field,n_response_rows_using_field
+skill,6,6,1180617
+aspect,4,4,1009730
+subset,23,23,450735
+source,5,5,437460
+prompt,2,3,110930
+metric,2,31,69796
+attack,16,31,69796
+judge,142,142,3462
+mode,3,3,960

@@ -1,0 +1,15 @@
+{
+  "n_train_rows": 4819400,
+  "n_features_pre_encoding": 28,
+  "n_features_post_encoding": 966,
+  "n_pos": 3429354,
+  "n_neg": 1390046,
+  "train_mean_log_likelihood": -0.5194669880115306,
+  "train_auc_roc": 0.8129451650670878,
+  "val_mean_log_likelihood": -0.5246320762165237,
+  "val_auc_roc": 0.809370420098757,
+  "binarize_threshold": 0.5,
+  "solver": "lbfgs",
+  "n_jobs": 11,
+  "wall_clock_seconds": 170.28
+}
