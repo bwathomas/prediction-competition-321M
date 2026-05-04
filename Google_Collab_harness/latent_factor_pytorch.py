@@ -753,8 +753,19 @@ def train_model(
     val_dataset: MetadataDataset | None,
     config: LFConfig,
     device: torch.device,
+    *,
+    run_label: str = "",
+    print_every_epoch: bool = True,
 ) -> dict[str, Any]:
-    """Training loop with progress, ETA, AMP, gradient clipping, early stop."""
+    """Training loop with progress, ETA, AMP, gradient clipping, early stop.
+
+    `run_label` is prepended to every log line so that interleaved logs
+    from a parallel sweep stay attributable to their run. When called from
+    a sweep, the worker also bumps the root logging format with its run
+    index, so this is just an extra tag for downstream parsing.
+    """
+    tag = f"{run_label} " if run_label else ""
+
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
@@ -775,8 +786,10 @@ def train_model(
 
     started = time.perf_counter()
     LOGGER.info(
-        "Train start: rows=%d  steps/epoch=%d  bs=%d  amp=%s  device=%s",
-        n, steps_per_epoch, bs, use_amp, device,
+        "%sTrain start: rows=%d  steps/epoch=%d  bs=%d  amp=%s  device=%s  "
+        "epochs=%d  patience=%d  lr=%.1e  wd=%.1e  id_l2=%.1e",
+        tag, n, steps_per_epoch, bs, use_amp, device,
+        config.epochs, config.patience, config.lr, config.weight_decay, config.id_emb_l2,
     )
 
     for epoch in range(1, config.epochs + 1):
@@ -819,12 +832,18 @@ def train_model(
         elapsed = time.perf_counter() - started
         avg_per_epoch = elapsed / epoch
         eta_s = avg_per_epoch * (config.epochs - epoch)
-        LOGGER.info(
-            "epoch %3d/%d  train_loss=%.4f  val_ll=%.4f  val_brier=%.4f  val_auc=%.4f  "
-            "epoch=%.1fs  elapsed=%.1fs  eta~%.1fs",
-            epoch, config.epochs, train_loss, val_ll, val_brier, val_auc,
-            epoch_dt, elapsed, eta_s,
-        )
+        improved = (val_dataset is not None) and (val_ll > best_ll + 1e-5)
+        marker = " *" if improved else ""
+        if print_every_epoch:
+            LOGGER.info(
+                "%sepoch %3d/%d  train_loss=%.4f  val_ll=%+.4f  val_brier=%.4f  "
+                "val_auc=%.4f  epoch=%.2fs  elapsed=%.1fs  eta~%.1fs  best=%+.4f@%d%s",
+                tag, epoch, config.epochs, train_loss, val_ll, val_brier, val_auc,
+                epoch_dt, elapsed, eta_s,
+                best_ll if best_ll != -float("inf") else val_ll,
+                best_epoch if best_epoch > 0 else epoch,
+                marker,
+            )
 
         history.append(
             {
@@ -842,7 +861,7 @@ def train_model(
             best_epoch = epoch
             continue
 
-        if val_ll > best_ll + 1e-5:
+        if improved:
             best_ll = val_ll
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best_epoch = epoch
@@ -851,8 +870,8 @@ def train_model(
             epochs_no_improve += 1
             if epochs_no_improve >= config.patience:
                 LOGGER.info(
-                    "Early stopping at epoch %d (best epoch %d, best val_ll=%.4f)",
-                    epoch, best_epoch, best_ll,
+                    "%sEarly stopping at epoch %d (best epoch %d, best val_ll=%+.4f)",
+                    tag, epoch, best_epoch, best_ll,
                 )
                 break
 
@@ -877,16 +896,31 @@ def save_artifacts(
     preprocessor: MetadataPreprocessor,
     config: LFConfig,
     metrics: Mapping[str, Any] | None = None,
+    *,
+    save_raw_weights: bool = True,
 ) -> None:
+    """Persist the full reproducible bundle for one trained model.
+
+    Files written
+    -------------
+    best_model.pt       full bundle: state_dict + config (load via load_artifacts)
+    weights.pt          raw state_dict only (smaller, loadable into a fresh
+                        LatentFactorModel built from the same preprocessor)
+    preprocessor.pkl    fitted preprocessor (vocabularies, scalers, lookups)
+    metrics.json        per-run scalar metrics
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     torch.save(
         {
-            "state_dict": model.state_dict(),
+            "state_dict": state,
             "config": asdict(config),
         },
         out_dir / "best_model.pt",
     )
+    if save_raw_weights:
+        torch.save(state, out_dir / "weights.pt")
     with open(out_dir / "preprocessor.pkl", "wb") as f:
         pickle.dump(
             {

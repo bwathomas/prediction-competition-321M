@@ -69,8 +69,81 @@ python run_latent_factor_colab.py `
   --latent-dim 16 --epochs 30 --batch-size 65536
 ```
 
-For the optional grid (~24 runs over `latent_dim x weight_decay x dropout`)
-add `--sweep`.
+### Hyperparameter sweep (parallelized on the GPU)
+
+Sweep dimensions:
+
+| dim | values |
+| --- | --- |
+| `latent_dim`   | 4, 8, 16, 32 |
+| `hidden_dim`   | 128, 256 |
+| `dropout`      | 0.05, 0.1, 0.2 |
+| `weight_decay` | 1e-4, 1e-3 |
+| `lr`           | 1e-3, 3e-3 |
+| `id_emb_l2`    | 1e-4, 1e-3 |
+| `patience`     | 5, 10 |
+
+Full grid = 384 configs; default mode is `random` with `--sweep-budget 24`.
+Use `--sweep-mode full` to walk the entire grid.
+
+Add `--sweep --parallel-runs 8` to run 8 configs concurrently on one GPU
+via `ProcessPoolExecutor` with the `spawn` start method. The preprocessor
++ all training/validation tensors are precomputed once and pickled to
+`outputs/latent_factor/cache/` so each worker reloads in ~1 s instead of
+re-fitting (~10 s) and re-aggregating (~5 s). Each completed run prints
+a sweep-level progress line with elapsed wall, ETA, and best-so-far
+val log-likelihood. Per-run logs are tagged `[run NNN/TTT]` for grep-friendly
+attribution when output interleaves.
+
+Each run also writes its own checkpoint + preprocessor copy to
+`outputs/latent_factor/runs/run_NNN/`, and the best run by full-val
+log-likelihood is copied up to the canonical `outputs/latent_factor/`
+location and used to build the submission folder.
+
+### Reproducibility / saved weights
+
+Every run writes:
+
+- `best_model.pt`     — full bundle (`{state_dict, config_dict}`) loadable via `latent_factor_pytorch.load_artifacts`
+- `weights.pt`        — raw `state_dict` only (smaller, drop-in for `LatentFactorModel.load_state_dict`)
+- `preprocessor.pkl`  — fitted preprocessor with vocabularies, scalers, and metadata lookups
+- `metrics.json`      — final scalar metrics for that run
+
+After the sweep, the best run's files are copied to the top-level
+`outputs/latent_factor/`. Two extra reproducibility artifacts are written
+there:
+
+- `reproduce.json`  — exhaustive manifest including:
+  - the full launch `argv` and the parsed `args`
+  - the best `config` (post-sweep)
+  - all seeds (`model_seed`, `split_seed`, `official_seeds`)
+  - md5 hashes of `train.parquet`, `val.parquet`, `model_info.csv`,
+    `benchmark_info.csv` so a re-run can prove it had the same data
+  - git commit, branch, and dirty flag of the local repo
+  - package versions (`torch`, `numpy`, `pandas`, `pyarrow`, `sklearn`),
+    Python version, platform, and GPU name
+  - sweep wall + per-run completion summary
+- `reproduce.sh` (Linux/Colab) and `reproduce.bat` (Windows) — one-line
+  CLIs that re-run JUST the best config (no sweep) into
+  `outputs/latent_factor/reproduced/`.
+
+To re-validate a saved checkpoint without retraining, point a fresh run at
+the previous output directory:
+
+```bash
+python Google_Collab_harness/run_latent_factor_colab.py \
+  --resume-from outputs/latent_factor \
+  --splits-dir validation_harness/splits/v1 \
+  --model-info-csv starting_kit/Model_Info/model_info.csv \
+  --benchmark-info-csv starting_kit/benchmark_info/benchmark_info.csv \
+  --validation-harness-dir validation_harness \
+  --output-dir outputs/latent_factor_revalidated
+```
+
+This skips fitting the preprocessor and training entirely, copies
+`best_model.pt`/`weights.pt`/`preprocessor.pkl`/the two metadata CSVs to
+the new output dir, builds the submission folder, and runs the
+official-like 3-seed validation.
 
 ## Important notes on the runtime contract
 
