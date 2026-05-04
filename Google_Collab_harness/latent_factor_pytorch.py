@@ -51,9 +51,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    from tqdm.auto import tqdm  # type: ignore
+    _HAS_TQDM = True
+except ImportError:  # tqdm is in requirements.txt but degrade gracefully
+    tqdm = None  # type: ignore
+    _HAS_TQDM = False
+
 EPS_PROB = 1e-6
 LOGGER = logging.getLogger("latent_factor")
 NAME_RE = re.compile(r"(?im)^\s*Name:\s*(.*?)\s*$")
+
+
+def _tqdm_aware_print(msg: str) -> None:
+    """Emit a line that doesn't clobber an active tqdm bar."""
+    if _HAS_TQDM:
+        try:
+            tqdm.write(msg)
+            return
+        except Exception:
+            pass
+    print(msg, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +141,10 @@ class LFConfig:
     min_token_count: int = 1
 
     seed: int = 0
+
+    # Reporting
+    log_every_steps: int = 10        # 0 disables per-step loss prints
+    show_progress_bar: bool = True   # tqdm bar over total training steps
 
     model_categorical: tuple = ("organization", "family", "macro_family")
     benchmark_categorical: tuple = ("topic",)
@@ -757,12 +779,18 @@ def train_model(
     run_label: str = "",
     print_every_epoch: bool = True,
 ) -> dict[str, Any]:
-    """Training loop with progress, ETA, AMP, gradient clipping, early stop.
+    """Training loop with per-step + per-epoch progress, AMP, grad clip, early stop.
 
-    `run_label` is prepended to every log line so that interleaved logs
-    from a parallel sweep stay attributable to their run. When called from
-    a sweep, the worker also bumps the root logging format with its run
-    index, so this is just an extra tag for downstream parsing.
+    Reporting
+    ---------
+    - tqdm-style bar over the planned total steps (epochs * steps_per_epoch),
+      live-updating with the current epoch, batch loss, and best val LL.
+    - Per-step LOGGER line every `config.log_every_steps` steps with current
+      batch loss, % done, elapsed, and ETA.
+    - Per-epoch LOGGER summary with weighted train loss, val LL/Brier/AUC.
+
+    `run_label` is prepended to every log line so that logs from a parallel
+    sweep stay attributable to their run.
     """
     tag = f"{run_label} " if run_label else ""
 
@@ -776,6 +804,9 @@ def train_model(
     n = len(train_dataset)
     bs = max(1, int(config.batch_size))
     steps_per_epoch = (n + bs - 1) // bs
+    total_steps = steps_per_epoch * int(config.epochs)
+    log_every = max(0, int(getattr(config, "log_every_steps", 10) or 0))
+    use_bar = bool(getattr(config, "show_progress_bar", True)) and _HAS_TQDM
 
     history: list[dict[str, float]] = []
     best_ll = -float("inf")
@@ -786,94 +817,169 @@ def train_model(
 
     started = time.perf_counter()
     LOGGER.info(
-        "%sTrain start: rows=%d  steps/epoch=%d  bs=%d  amp=%s  device=%s  "
-        "epochs=%d  patience=%d  lr=%.1e  wd=%.1e  id_l2=%.1e",
-        tag, n, steps_per_epoch, bs, use_amp, device,
+        "%sTrain start: rows=%d  steps/epoch=%d  total_steps=%d  bs=%d  amp=%s  device=%s  "
+        "epochs=%d  patience=%d  lr=%.1e  wd=%.1e  id_l2=%.1e  log_every=%d",
+        tag, n, steps_per_epoch, total_steps, bs, use_amp, device,
         config.epochs, config.patience, config.lr, config.weight_decay, config.id_emb_l2,
+        log_every,
     )
 
-    for epoch in range(1, config.epochs + 1):
-        epoch_t0 = time.perf_counter()
-        model.train()
-        perm = torch.randperm(n)
-        total_loss, total_w = 0.0, 0.0
-
-        for step, start in enumerate(range(0, n, bs), start=1):
-            idx = perm[start:start + bs].tolist()
-            batch = train_collate(idx)
-            batch = _move_to(batch, device)
-
-            with torch.amp.autocast(**autocast_kwargs):
-                loss = _compute_loss(model, batch)
-
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-            scaler.step(opt)
-            scaler.update()
-
-            wsum = float(batch["weight"].sum().item())
-            total_loss += float(loss.detach().item()) * wsum
-            total_w += wsum
-
-        train_loss = total_loss / max(1.0, total_w)
-        epoch_dt = time.perf_counter() - epoch_t0
-
-        val_ll = float("nan")
-        val_brier = float("nan")
-        val_auc = float("nan")
-        if val_dataset is not None:
-            val_metrics = evaluate(model, val_dataset, device, batch_size=bs)
-            val_ll = val_metrics["log_likelihood"]
-            val_brier = val_metrics["brier"]
-            val_auc = val_metrics.get("auc_roc", float("nan"))
-
-        elapsed = time.perf_counter() - started
-        avg_per_epoch = elapsed / epoch
-        eta_s = avg_per_epoch * (config.epochs - epoch)
-        improved = (val_dataset is not None) and (val_ll > best_ll + 1e-5)
-        marker = " *" if improved else ""
-        if print_every_epoch:
-            LOGGER.info(
-                "%sepoch %3d/%d  train_loss=%.4f  val_ll=%+.4f  val_brier=%.4f  "
-                "val_auc=%.4f  epoch=%.2fs  elapsed=%.1fs  eta~%.1fs  best=%+.4f@%d%s",
-                tag, epoch, config.epochs, train_loss, val_ll, val_brier, val_auc,
-                epoch_dt, elapsed, eta_s,
-                best_ll if best_ll != -float("inf") else val_ll,
-                best_epoch if best_epoch > 0 else epoch,
-                marker,
-            )
-
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_log_likelihood": val_ll,
-                "val_brier": val_brier,
-                "val_auc": val_auc,
-                "epoch_seconds": epoch_dt,
-            }
+    bar = None
+    if use_bar:
+        bar = tqdm(
+            total=total_steps,
+            desc=(run_label or "train").strip(),
+            unit="step",
+            dynamic_ncols=True,
+            mininterval=0.3,
+            leave=True,
+            smoothing=0.1,
         )
 
-        if val_dataset is None:
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best_epoch = epoch
-            continue
+    global_step = 0
+    stopped_early = False
 
-        if improved:
-            best_ll = val_ll
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best_epoch = epoch
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= config.patience:
-                LOGGER.info(
-                    "%sEarly stopping at epoch %d (best epoch %d, best val_ll=%+.4f)",
-                    tag, epoch, best_epoch, best_ll,
+    try:
+        for epoch in range(1, config.epochs + 1):
+            epoch_t0 = time.perf_counter()
+            model.train()
+            perm = torch.randperm(n)
+            total_loss, total_w = 0.0, 0.0
+            last_step_loss = float("nan")
+
+            for step, start in enumerate(range(0, n, bs), start=1):
+                idx = perm[start:start + bs].tolist()
+                batch = train_collate(idx)
+                batch = _move_to(batch, device)
+
+                with torch.amp.autocast(**autocast_kwargs):
+                    loss = _compute_loss(model, batch)
+
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                scaler.step(opt)
+                scaler.update()
+
+                cur_loss = float(loss.detach().item())
+                wsum = float(batch["weight"].sum().item())
+                total_loss += cur_loss * wsum
+                total_w += wsum
+                last_step_loss = cur_loss
+
+                global_step += 1
+                if bar is not None:
+                    bar.update(1)
+                    bar.set_postfix(
+                        epoch=f"{epoch}/{config.epochs}",
+                        loss=f"{cur_loss:.4f}",
+                        best_val=(f"{best_ll:+.4f}" if best_ll != -float("inf") else "n/a"),
+                        refresh=False,
+                    )
+
+                if log_every > 0 and (
+                    global_step % log_every == 0 or global_step == total_steps
+                ):
+                    elapsed_now = time.perf_counter() - started
+                    eta_now = elapsed_now * (total_steps - global_step) / max(1, global_step)
+                    pct = 100.0 * global_step / max(1, total_steps)
+                    msg = (
+                        f"{tag}step {global_step:5d}/{total_steps:5d} "
+                        f"({pct:5.1f}% done with training, time estimated is {eta_now:6.1f}s)  "
+                        f"epoch={epoch}/{config.epochs}  step_in_epoch={step}/{steps_per_epoch}  "
+                        f"loss={cur_loss:.4f}  elapsed={elapsed_now:6.1f}s"
+                    )
+                    if bar is not None:
+                        try:
+                            tqdm.write(msg)
+                        except Exception:
+                            print(msg, flush=True)
+                    else:
+                        print(msg, flush=True)
+
+            train_loss = total_loss / max(1.0, total_w)
+            epoch_dt = time.perf_counter() - epoch_t0
+
+            val_ll = float("nan")
+            val_brier = float("nan")
+            val_auc = float("nan")
+            if val_dataset is not None:
+                val_metrics = evaluate(model, val_dataset, device, batch_size=bs)
+                val_ll = val_metrics["log_likelihood"]
+                val_brier = val_metrics["brier"]
+                val_auc = val_metrics.get("auc_roc", float("nan"))
+
+            elapsed = time.perf_counter() - started
+            avg_per_epoch = elapsed / epoch
+            eta_s = avg_per_epoch * (config.epochs - epoch)
+            improved = (val_dataset is not None) and (val_ll > best_ll + 1e-5)
+            marker = " *" if improved else ""
+            if print_every_epoch:
+                epoch_msg = (
+                    f"{tag}epoch {epoch:3d}/{config.epochs}  "
+                    f"train_loss={train_loss:.4f}  val_ll={val_ll:+.4f}  "
+                    f"val_brier={val_brier:.4f}  val_auc={val_auc:.4f}  "
+                    f"epoch={epoch_dt:.2f}s  elapsed={elapsed:.1f}s  eta~{eta_s:.1f}s  "
+                    f"best={best_ll if best_ll != -float('inf') else val_ll:+.4f}@"
+                    f"{best_epoch if best_epoch > 0 else epoch}{marker}"
                 )
-                break
+                if bar is not None:
+                    try:
+                        tqdm.write(epoch_msg)
+                    except Exception:
+                        LOGGER.info("%s", epoch_msg)
+                else:
+                    LOGGER.info("%s", epoch_msg)
+
+            history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_log_likelihood": val_ll,
+                    "val_brier": val_brier,
+                    "val_auc": val_auc,
+                    "epoch_seconds": epoch_dt,
+                }
+            )
+
+            if val_dataset is None:
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+                continue
+
+            if improved:
+                best_ll = val_ll
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= config.patience:
+                    early_msg = (
+                        f"{tag}Early stopping at epoch {epoch} "
+                        f"(best epoch {best_epoch}, best val_ll={best_ll:+.4f})"
+                    )
+                    if bar is not None:
+                        try:
+                            tqdm.write(early_msg)
+                        except Exception:
+                            LOGGER.info("%s", early_msg)
+                    else:
+                        LOGGER.info("%s", early_msg)
+                    stopped_early = True
+                    break
+    finally:
+        if bar is not None:
+            try:
+                # When early stopping triggered, jump the bar to 100% so the
+                # final printed bar reflects "training is done" rather than
+                # "stuck at 60%".
+                if stopped_early and bar.n < bar.total:
+                    bar.update(bar.total - bar.n)
+                bar.close()
+            except Exception:
+                pass
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -882,6 +988,8 @@ def train_model(
         "best_val_log_likelihood": best_ll,
         "best_epoch": best_epoch,
         "wall_seconds": time.perf_counter() - started,
+        "global_steps_run": global_step,
+        "stopped_early": stopped_early,
     }
 
 

@@ -658,6 +658,20 @@ def main() -> None:
     ap.add_argument("--aggregate", action="store_true", default=True)
     ap.add_argument("--no-aggregate", dest="aggregate", action="store_false")
 
+    ap.add_argument(
+        "--log-every-steps", type=int, default=10,
+        help="Print a one-line training-step summary every N optimizer steps. "
+             "Set to 0 to disable per-step prints (per-epoch summary still emitted).",
+    )
+    ap.add_argument(
+        "--progress-bar", dest="progress_bar", action="store_true", default=True,
+        help="Show a tqdm bar over total training steps with live ETA. (default on)",
+    )
+    ap.add_argument(
+        "--no-progress-bar", dest="progress_bar", action="store_false",
+        help="Disable the tqdm progress bar (e.g. for non-interactive logs).",
+    )
+
     ap.add_argument("--official-seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--official-n", type=int, default=5000)
     ap.add_argument("--official-k", type=int, default=5)
@@ -765,6 +779,8 @@ def main() -> None:
         use_amp=args.amp,
         id_emb_l2=args.id_emb_l2,
         seed=args.seed,
+        log_every_steps=int(args.log_every_steps),
+        show_progress_bar=bool(args.progress_bar),
     )
 
     print(f"Precomputing preprocessor + tensors -> {cache_dir} ...")
@@ -784,8 +800,24 @@ def main() -> None:
 
     parallel = args.parallel_runs if args.parallel_runs > 0 else _default_parallel_runs()
     parallel = max(1, min(parallel, len(sweeps)))
-    print(f"Sweep: {len(sweeps)} runs ({args.sweep_mode if args.sweep else 'single'}), "
-          f"parallel_runs={parallel}, device={device}")
+
+    # When more than one worker runs concurrently, multiple tqdm bars from
+    # different processes interleave very badly in stdout. Disable the bar
+    # for parallel sweeps; per-step + per-epoch text logs still go through.
+    if parallel > 1:
+        from dataclasses import replace
+        sweeps = [replace(c, show_progress_bar=False) for c in sweeps]
+        print(
+            f"Sweep: {len(sweeps)} runs ({args.sweep_mode if args.sweep else 'single'}), "
+            f"parallel_runs={parallel}, device={device}  "
+            f"(progress bar disabled in parallel mode; use --parallel-runs 1 for the bar)"
+        )
+    else:
+        print(
+            f"Sweep: {len(sweeps)} runs ({args.sweep_mode if args.sweep else 'single'}), "
+            f"parallel_runs={parallel}, device={device}  "
+            f"(sequential -> per-run tqdm bar is shown)"
+        )
 
     runs_records: list[dict] = []
     sweep_t0 = time.perf_counter()

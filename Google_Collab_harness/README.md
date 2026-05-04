@@ -69,7 +69,26 @@ python run_latent_factor_colab.py `
   --latent-dim 16 --epochs 30 --batch-size 65536
 ```
 
-### Hyperparameter sweep (parallelized on the GPU)
+### Live training progress
+
+Both single-config training (notebook section 6) and sweep runs (section 7)
+emit three coordinated streams of progress:
+
+- A **tqdm bar** over the planned `epochs * steps_per_epoch` steps with
+  live `% done`, `ETA`, and a postfix showing the current `epoch`,
+  current batch `loss`, and best validation log-likelihood seen so far.
+- A **per-step log line** every `--log-every-steps N` (default 10) shaped
+  like:
+  `step 120/3600 (3.3% done with training, time estimated is 41.8s)  epoch=2/30  step_in_epoch=20/120  loss=0.5012  elapsed=1.4s`
+- A **per-epoch summary** with `train_loss`, `val_ll`, `val_brier`,
+  `val_auc`, `epoch_seconds`, `eta`, and the running best (with `*` if
+  this epoch improved).
+
+Set `--log-every-steps 0` to suppress the per-step prints (the tqdm bar
+and per-epoch summary still emit). Set `--no-progress-bar` to suppress
+the tqdm bar (per-step + per-epoch text logs still emit).
+
+### Hyperparameter sweep
 
 Sweep dimensions:
 
@@ -86,14 +105,22 @@ Sweep dimensions:
 Full grid = 384 configs; default mode is `random` with `--sweep-budget 24`.
 Use `--sweep-mode full` to walk the entire grid.
 
-Add `--sweep --parallel-runs 8` to run 8 configs concurrently on one GPU
-via `ProcessPoolExecutor` with the `spawn` start method. The preprocessor
-+ all training/validation tensors are precomputed once and pickled to
+The notebook's section 7 runs the sweep **sequentially** (`--parallel-runs 1`),
+so each run prints its own clean tqdm bar + per-step loss + per-epoch summary,
+then we "pick up" the next run when it finishes. This is the easiest mode for
+monitoring "what's going on right now".
+
+Pass `--sweep --parallel-runs 8` (or `--parallel-runs 0` for auto) to instead
+run multiple configs concurrently on one GPU via `ProcessPoolExecutor` with
+the `spawn` start method. In that mode the script auto-disables the per-run
+tqdm bar (multiple bars from different processes interleave very badly) but
+still emits the per-step + per-epoch text logs, all tagged `[run NNN/TTT]`
+for grep-friendly attribution when output interleaves. The preprocessor +
+all training/validation tensors are precomputed once and pickled to
 `outputs/latent_factor/cache/` so each worker reloads in ~1 s instead of
-re-fitting (~10 s) and re-aggregating (~5 s). Each completed run prints
-a sweep-level progress line with elapsed wall, ETA, and best-so-far
-val log-likelihood. Per-run logs are tagged `[run NNN/TTT]` for grep-friendly
-attribution when output interleaves.
+re-fitting (~10 s) and re-aggregating (~5 s). Each completed run prints a
+sweep-level progress line with elapsed wall, ETA, and best-so-far val
+log-likelihood.
 
 Each run also writes its own checkpoint + preprocessor copy to
 `outputs/latent_factor/runs/run_NNN/`, and the best run by full-val
