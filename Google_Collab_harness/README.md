@@ -28,14 +28,57 @@ with two MLP towers + residual ID embeddings:
 It uses cross-effects only via the bilinear `(u_m . v_bc)` term — no
 hand-crafted feature crosses.
 
+### Optional: gated MLP residual
+
+When invoked with `--use-gated-residual`, the model layers a SwiGLU-style
+scalar correction on top of the base logit:
+
+```
+logit(m,b,c) = base_logit(m,b,c) + residual_scale * GatedResidual(h_mbc)
+
+h_mbc = concat(u_m, v_bc, u_m * v_bc, |u_m - v_bc|, model_meta_hidden, bench_meta_hidden)
+
+GatedResidual(h) = down_proj( SiLU(gate_proj(LN(h))) * up_proj(LN(h)) )
+```
+
+Design choices:
+
+- The base logit is computed identically to the baseline; the residual is
+  strictly additive. With the default `--residual-scale-init 0.0` the
+  gated block contributes exactly nothing at $t=0$ and the optimizer has
+  to actively grow `residual_scale` (a single learnable scalar) for the
+  new MLP to have any effect. This guarantees the strong baseline cannot
+  be wiped out by an unlucky residual init.
+- The metadata-hidden vectors come from each tower's *last hidden
+  activation* (the input to the tower's final Linear). The towers are
+  refactored to optionally return that activation alongside their
+  scalar/vector output, with NO change to their `state_dict` layout — so
+  baseline checkpoints (`use_gated_residual=False`) saved before this
+  feature still load cleanly under the new code.
+- AdamW weight decay regularizes the gated block's parameters. The
+  custom `id_emb_l2` penalty is **not** applied to the gated residual
+  (it remains for ID lookup tables only).
+- Item content is still ignored: this is still a metadata-only model.
+
+Relevant CLI flags (all off / default-y when omitted):
+
+```
+--use-gated-residual            # turn the residual on
+--gated-hidden-dim 64           # SwiGLU hidden dim
+--gated-dropout    0.05         # dropout after SiLU(gate)*up
+--residual-scale-init 0.0       # initial scalar (start small / zero)
+--no-learn-residual-scale       # freeze the scalar (default: trainable)
+```
+
 ## Files
 
 | file | purpose |
 | --- | --- |
-| `latent_factor_pytorch.py`         | preprocessor (vocab + scaler), `LatentFactorModel`, training loop, `LatentFactorInference` |
-| `run_latent_factor_colab.py`       | end-to-end CLI: build split → train → official-like validation → write metrics |
-| `submission_template/model.py`     | runtime `model.py` copied into the validation-harness submission folder |
-| `latent_factor_colab.ipynb`        | the Colab notebook (clones repo, downloads parquets, runs everything) |
+| `latent_factor_pytorch.py`           | preprocessor (vocab + scaler), `LatentFactorModel`, optional `GatedResidual`, training loop, `LatentFactorInference` |
+| `run_latent_factor_colab.py`         | end-to-end CLI: build split → train (baseline OR gated) → official-like validation → write metrics |
+| `submission_template/model.py`       | runtime `model.py` copied into the validation-harness submission folder; same code handles both model variants |
+| `latent_factor_colab.ipynb`          | Colab notebook for the **baseline** latent-factor model |
+| `latent_factor_gated_colab.ipynb`    | Colab notebook for the **gated MLP residual** variant (same 10-section structure, just `--use-gated-residual` plus an ablation cell that compares to the baseline outputs) |
 
 ## Running on Colab
 

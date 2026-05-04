@@ -153,6 +153,18 @@ class LFConfig:
     use_release: bool = True
     use_benchmark_age: bool = True
 
+    # ---- Gated MLP residual (off by default; preserves prior baseline) ----
+    # When False, LatentFactorModel.forward and state_dict are byte-identical
+    # to the previous baseline. When True, an extra SwiGLU-style residual
+    # block is layered on top of the latent-factor base logit, gated by a
+    # small scalar (residual_scale_raw) so the new MLP cannot dominate at
+    # initialization.
+    use_gated_residual: bool = False
+    gated_hidden_dim: int = 64
+    gated_dropout: float = 0.05
+    residual_scale_init: float = 0.0
+    learn_residual_scale: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Vocab + scaler
@@ -549,6 +561,14 @@ def make_collate(pp: PreprocessOutput, targets: torch.Tensor, weights: torch.Ten
 
 
 class MLPTower(nn.Module):
+    """num_layers blocks of (Linear -> GELU -> Dropout) followed by a final
+    Linear out head. We keep ``self.net`` as one ``nn.Sequential`` so that
+    state_dicts saved by the previous baseline (keyed under ``net.0...``)
+    continue to load. The optional ``return_hidden=True`` path simply replays
+    every layer except the last and returns the activation just before the
+    final Linear -- that activation is what the gated residual consumes.
+    """
+
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, num_layers: int, dropout: float):
         super().__init__()
         layers: list[nn.Module] = []
@@ -558,13 +578,54 @@ class MLPTower(nn.Module):
             d = hidden_dim
         layers += [nn.Linear(d, out_dim)]
         self.net = nn.Sequential(*layers)
+        # Dim of the hidden activation BEFORE the final Linear (which is
+        # ``self.net[-1]``). For num_layers==0 this is the input dim itself.
+        self.last_hidden_dim = d if num_layers > 0 else in_dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x: torch.Tensor, return_hidden: bool = False):
+        if not return_hidden:
+            return self.net(x)
+        h = x
+        for layer in self.net[:-1]:
+            h = layer(h)
+        out = self.net[-1](h)
+        return out, h
+
+
+class GatedResidual(nn.Module):
+    """SwiGLU-style scalar residual block:
+
+        h_norm  = LayerNorm(h)
+        gated   = SiLU(gate_proj(h_norm)) * up_proj(h_norm)
+        out     = down_proj(dropout(gated))                   # shape (..., 1)
+
+    Applied as a *correction* on top of the latent-factor base logit. By
+    default ``residual_scale_init=0.0`` is multiplied in by the parent
+    model, so at initialization this block contributes exactly zero to
+    the prediction even if its weights are non-trivial -- the optimizer
+    has to actively grow the scale (and/or the down-proj) to make use of
+    it. That preserves the strong baseline when the flag is enabled.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, dropout: float = 0.05) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
+        self.gate_proj = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        h_n = self.norm(h)
+        gate = F.silu(self.gate_proj(h_n))
+        up = self.up_proj(h_n)
+        hidden = self.dropout(gate * up)
+        return self.down_proj(hidden).squeeze(-1)
 
 
 class LatentFactorModel(nn.Module):
-    """eta = mu + a_m + b_bc + (u_m . v_bc) / sqrt(k)."""
+    """eta = mu + a_m + b_bc + (u_m . v_bc) / sqrt(k)
+              + (optional) residual_scale * GatedResidual([u, v, u*v, |u-v|, m_h, b_h])."""
 
     def __init__(self, pp: MetadataPreprocessor, config: LFConfig) -> None:
         super().__init__()
@@ -640,6 +701,34 @@ class LatentFactorModel(nn.Module):
         self._model_in = model_in
         self._bench_in = bench_in
 
+        # ---- Optional SwiGLU-style residual on top of the base logit -----
+        # NOTE: when use_gated_residual=False, NEITHER ``gated_residual``
+        # NOR ``residual_scale_raw`` exist on this module. That guarantees
+        # the state_dict layout is byte-identical to the previous baseline
+        # for backward compatibility with checkpoints trained before this
+        # feature existed.
+        self.use_gated_residual = bool(config.use_gated_residual)
+        if self.use_gated_residual:
+            residual_in_dim = (
+                4 * self.k                          # u, v, u*v, |u-v|
+                + self.model_tower.last_hidden_dim  # m metadata hidden
+                + self.bench_tower.last_hidden_dim  # b metadata hidden
+            )
+            self.gated_residual = GatedResidual(
+                in_dim=residual_in_dim,
+                hidden_dim=int(config.gated_hidden_dim),
+                dropout=float(config.gated_dropout),
+            )
+            init_val = float(config.residual_scale_init)
+            if bool(config.learn_residual_scale):
+                self.residual_scale_raw = nn.Parameter(torch.tensor(init_val))
+            else:
+                # Frozen scalar; persisted in state_dict as a buffer.
+                self.register_buffer("residual_scale_raw", torch.tensor(init_val))
+            self._residual_in_dim = residual_in_dim
+        else:
+            self._residual_in_dim = 0
+
     def _model_features(self, batch: dict) -> torch.Tensor:
         parts: list[torch.Tensor] = []
         for col, emb in self.model_cat_embs.items():
@@ -668,8 +757,16 @@ class LatentFactorModel(nn.Module):
         m_feats = self._model_features(batch)
         b_feats = self._bench_features(batch)
 
-        m_out = self.model_tower(m_feats)
-        b_out = self.bench_tower(b_feats)
+        # Tower forward: in baseline mode we only need (a, u). When the
+        # gated residual is on we also need each tower's last hidden
+        # activation as a compact metadata representation for ``h_mbc``.
+        if self.use_gated_residual:
+            m_out, m_hidden = self.model_tower(m_feats, return_hidden=True)
+            b_out, b_hidden = self.bench_tower(b_feats, return_hidden=True)
+        else:
+            m_out = self.model_tower(m_feats)
+            b_out = self.bench_tower(b_feats)
+            m_hidden = b_hidden = None
         assert m_out.shape == (n, 1 + self.k), m_out.shape
         assert b_out.shape == (n, 1 + self.k), b_out.shape
 
@@ -685,10 +782,41 @@ class LatentFactorModel(nn.Module):
         v_bc = v_bc_prior + self.bench_cond_skill(batch["benchmark_condition_id"])
 
         bilinear = (u_m * v_bc).sum(dim=-1) / math.sqrt(self.k)
-
         eta = self.global_bias + a_m + b_bc + bilinear
+
+        if self.use_gated_residual:
+            # Concat the FINAL latent vectors actually used in the dot
+            # product (post ID-residual) with both metadata hidden states.
+            h = torch.cat(
+                [u_m, v_bc, u_m * v_bc, (u_m - v_bc).abs(), m_hidden, b_hidden],
+                dim=-1,
+            )
+            assert h.shape == (n, self._residual_in_dim), h.shape
+            residual = self.gated_residual(h)
+            assert residual.shape == (n,), residual.shape
+            eta = eta + self.residual_scale_raw * residual
+
         assert eta.shape == (n,), eta.shape
         return eta
+
+    # -- introspection ----------------------------------------------------
+
+    def count_residual_params(self) -> int:
+        """Return the number of params owned by the gated residual block
+        (including the residual_scale parameter when learnable). Used for
+        logging only -- everything is normally counted by the optimizer.
+        """
+        if not self.use_gated_residual:
+            return 0
+        n = sum(p.numel() for p in self.gated_residual.parameters())
+        if isinstance(self.residual_scale_raw, nn.Parameter):
+            n += int(self.residual_scale_raw.numel())
+        return int(n)
+
+    def current_residual_scale(self) -> float:
+        if not self.use_gated_residual:
+            return 0.0
+        return float(self.residual_scale_raw.detach().item())
 
     def regularization(self) -> torch.Tensor:
         """L2 over the residual ID embeddings only (rest is via AdamW)."""
@@ -823,6 +951,24 @@ def train_model(
         config.epochs, config.patience, config.lr, config.weight_decay, config.id_emb_l2,
         log_every,
     )
+    if getattr(config, "use_gated_residual", False):
+        n_total = sum(p.numel() for p in model.parameters())
+        n_resid = model.count_residual_params() if hasattr(model, "count_residual_params") else 0
+        scale_now = (
+            model.current_residual_scale() if hasattr(model, "current_residual_scale") else 0.0
+        )
+        LOGGER.info(
+            "%sGated residual ON: hidden_dim=%d  dropout=%.3f  scale_init=%.3f  "
+            "learn_scale=%s  residual_in_dim=%d  residual_params=%d/%d (%.2f%%)",
+            tag, int(config.gated_hidden_dim), float(config.gated_dropout),
+            float(config.residual_scale_init), bool(config.learn_residual_scale),
+            int(getattr(model, "_residual_in_dim", 0)),
+            int(n_resid), int(n_total),
+            (100.0 * n_resid / max(1, n_total)),
+        )
+        LOGGER.info("%sresidual_scale (current value, t=0): %+.4f", tag, scale_now)
+    else:
+        LOGGER.info("%sGated residual OFF (baseline latent-factor model)", tag)
 
     bar = None
     if use_bar:
@@ -916,13 +1062,16 @@ def train_model(
             improved = (val_dataset is not None) and (val_ll > best_ll + 1e-5)
             marker = " *" if improved else ""
             if print_every_epoch:
+                resid_suffix = ""
+                if getattr(config, "use_gated_residual", False) and hasattr(model, "current_residual_scale"):
+                    resid_suffix = f"  scale={model.current_residual_scale():+.4f}"
                 epoch_msg = (
                     f"{tag}epoch {epoch:3d}/{config.epochs}  "
                     f"train_loss={train_loss:.4f}  val_ll={val_ll:+.4f}  "
                     f"val_brier={val_brier:.4f}  val_auc={val_auc:.4f}  "
                     f"epoch={epoch_dt:.2f}s  elapsed={elapsed:.1f}s  eta~{eta_s:.1f}s  "
                     f"best={best_ll if best_ll != -float('inf') else val_ll:+.4f}@"
-                    f"{best_epoch if best_epoch > 0 else epoch}{marker}"
+                    f"{best_epoch if best_epoch > 0 else epoch}{marker}{resid_suffix}"
                 )
                 if bar is not None:
                     try:

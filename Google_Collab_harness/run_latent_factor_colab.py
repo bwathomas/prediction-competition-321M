@@ -208,6 +208,9 @@ def _save_reproduce_files(
             "lr", "weight_decay", "id_emb_l2", "patience",
             "batch_size", "epochs", "aggregate", "use_amp", "seed",
             "max_embedding_dim", "min_token_count", "grad_clip",
+            # gated MLP residual fields (only meaningful when use_gated_residual=True)
+            "use_gated_residual", "gated_hidden_dim", "gated_dropout",
+            "residual_scale_init", "learn_residual_scale",
         ) if k in best_run},
         "base_config": asdict(base_config),
         "seeds": {
@@ -279,6 +282,20 @@ def _save_reproduce_files(
         best_args.append("--aggregate")
     else:
         best_args.append("--no-aggregate")
+
+    # Gated MLP residual flags: emit them ONLY if the best run actually used
+    # the gated residual, otherwise the reproduce script stays a baseline run.
+    if repro["best_config"].get("use_gated_residual"):
+        best_args += [
+            "--use-gated-residual",
+            "--gated-hidden-dim",     str(repro["best_config"].get("gated_hidden_dim", base_config.gated_hidden_dim)),
+            "--gated-dropout",        str(repro["best_config"].get("gated_dropout", base_config.gated_dropout)),
+            "--residual-scale-init",  str(repro["best_config"].get("residual_scale_init", base_config.residual_scale_init)),
+        ]
+        if repro["best_config"].get("learn_residual_scale", True):
+            best_args.append("--learn-residual-scale")
+        else:
+            best_args.append("--no-learn-residual-scale")
 
     py = sys.executable
     script = sys.argv[0]
@@ -445,11 +462,18 @@ def _worker_train(args_dict: dict) -> dict:
 
     model = LatentFactorModel(pp, config)
     n_params = sum(p.numel() for p in model.parameters())
+    n_resid = model.count_residual_params() if hasattr(model, "count_residual_params") else 0
     log.info(
         "config: latent_dim=%d hidden=%d layers=%d dropout=%.2f wd=%.1e lr=%.1e "
-        "id_l2=%.1e patience=%d  params=%d",
+        "id_l2=%.1e patience=%d  params=%d  gated=%s%s",
         config.latent_dim, config.hidden_dim, config.num_layers, config.dropout,
         config.weight_decay, config.lr, config.id_emb_l2, config.patience, n_params,
+        config.use_gated_residual,
+        (
+            f" gated_hidden={config.gated_hidden_dim} dropout={config.gated_dropout:.2f} "
+            f"scale_init={config.residual_scale_init:.3f} learn_scale={config.learn_residual_scale} "
+            f"residual_params={n_resid}"
+        ) if config.use_gated_residual else "",
     )
 
     t0 = time.perf_counter()
@@ -682,6 +706,37 @@ def main() -> None:
         help="Disable the tqdm progress bar (e.g. for non-interactive logs).",
     )
 
+    # ---- Gated MLP residual (optional, off by default) -------------------
+    ap.add_argument(
+        "--use-gated-residual", action="store_true", default=False,
+        help="Layer a SwiGLU-style scalar residual on top of the latent-factor "
+             "base logit. Off by default -> baseline behavior is preserved.",
+    )
+    ap.add_argument(
+        "--gated-hidden-dim", type=int, default=64,
+        help="Hidden dim of the SwiGLU residual block (gate_proj/up_proj output).",
+    )
+    ap.add_argument(
+        "--gated-dropout", type=float, default=0.05,
+        help="Dropout applied after the SiLU(gate) * up product, before down_proj.",
+    )
+    ap.add_argument(
+        "--residual-scale-init", type=float, default=0.0,
+        help="Initial value of the scalar residual_scale that multiplies the "
+             "gated residual. Default 0.0 -> at t=0 the residual contributes "
+             "exactly nothing, so the strong latent-factor baseline dominates.",
+    )
+    ap.add_argument(
+        "--learn-residual-scale", dest="learn_residual_scale",
+        action="store_true", default=True,
+        help="Make residual_scale a trainable parameter. (default on)",
+    )
+    ap.add_argument(
+        "--no-learn-residual-scale", dest="learn_residual_scale",
+        action="store_false",
+        help="Freeze residual_scale at --residual-scale-init (saved as a buffer).",
+    )
+
     ap.add_argument("--official-seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--official-n", type=int, default=5000)
     ap.add_argument("--official-k", type=int, default=5)
@@ -791,6 +846,12 @@ def main() -> None:
         seed=args.seed,
         log_every_steps=int(args.log_every_steps),
         show_progress_bar=bool(args.progress_bar),
+        # ---- gated MLP residual (off unless --use-gated-residual) -------
+        use_gated_residual=bool(args.use_gated_residual),
+        gated_hidden_dim=int(args.gated_hidden_dim),
+        gated_dropout=float(args.gated_dropout),
+        residual_scale_init=float(args.residual_scale_init),
+        learn_residual_scale=bool(args.learn_residual_scale),
     )
 
     print(f"Precomputing preprocessor + tensors -> {cache_dir} ...")
