@@ -51,6 +51,27 @@ LOG = logging.getLogger("embeddings")
 # ---------------------------------------------------------------------------
 
 
+def _try_colab_userdata() -> str | None:
+    """Best-effort fetch of HF_TOKEN from the Colab userdata secret store.
+
+    Requires running inside Google Colab with an `HF_TOKEN` secret created
+    via the left-rail "Secrets" panel. Silently returns None outside Colab
+    or if the secret is absent / not authorized for the current notebook.
+    """
+    try:
+        from google.colab import userdata  # type: ignore
+    except Exception:
+        return None
+    try:
+        token = userdata.get("HF_TOKEN")
+    except Exception:
+        return None
+    if not token:
+        return None
+    token = str(token).strip()
+    return token or None
+
+
 def _try_secret_manager() -> str | None:
     """Best-effort fetch of HF_TOKEN from Google Secret Manager.
 
@@ -79,10 +100,18 @@ def _try_secret_manager() -> str | None:
 def resolve_hf_token(*, interactive: bool = True) -> str | None:
     """Resolve the HF token without ever printing or persisting it.
 
-    Order: os.environ['HF_TOKEN'] -> Google Secret Manager -> getpass prompt.
-    Returns None if all three fail (caller must handle that).
+    Order:
+      1. ``os.environ['HF_TOKEN']``
+      2. Google Colab ``userdata.get('HF_TOKEN')`` secret (no-op outside Colab)
+      3. Google Secret Manager ``HF_TOKEN`` (no-op outside GCP)
+      4. ``getpass`` prompt (only if ``interactive=True``)
+
+    Returns None if all sources fail (caller must handle that).
     """
     token = os.environ.get("HF_TOKEN", "").strip()
+    if token:
+        return token
+    token = _try_colab_userdata()
     if token:
         return token
     token = _try_secret_manager()

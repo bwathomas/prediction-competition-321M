@@ -43,15 +43,16 @@ splits:
 # Encoder (Hugging Face transformer for item / subject text)
 # ----------------------------------------------------------------------------
 encoder:
-  # Heavy default for A100. Swap to a lighter model if memory is tight:
+  # Default A100 encoder: Qwen3-Embedding-4B. Last-token pooled,
+  # instruction-aware. Swap to a lighter model if memory is tight:
   #   sentence-transformers/all-mpnet-base-v2
   #   intfloat/e5-large-v2
   #   BAAI/bge-large-en-v1.5
-  model_id: "intfloat/e5-mistral-7b-instruct"
+  model_id: "Qwen/Qwen3-Embedding-4B"
   max_length: 512
-  batch_size: 32                 # encoder forward-pass batch size
+  batch_size: 128                # encoder forward-pass batch size (A100 default)
   bf16: true
-  pooling: "mean"                # mean | cls | last_token
+  pooling: "last_token"          # mean | cls | last_token (Qwen3 needs last_token)
   # Add the e5 / instruct prefix when required by the encoder.
   query_prefix: ""               # set to "query: " for e5 models if desired
   passage_prefix: ""             # set to "passage: " for e5 models if desired
@@ -77,9 +78,12 @@ train:
   dropout: 0.1
   weight_decay: 1.0e-4
   learning_rate: 3.0e-3
-  batch_size: 4096
-  epochs: 30
-  warmup_steps: 200
+  # A100 large-batch defaults. With batch_size=65536 the effective LR is
+  # already large; use shorter training (10 epochs) and a small warmup.
+  batch_size: 65536
+  epochs: 10
+  warmup_steps: 30
+  num_workers: 0
   lambda_resid_init: 0.1
   lambda_resid_trainable: true
   freeze_embeddings: true

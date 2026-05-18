@@ -455,6 +455,10 @@ def logistic_baseline_on_embeddings(
 
     No subject features; this exists as a *lower* bound -- if a k-factor
     model can't beat it, something is wrong.
+
+    Materializes the full ``[N, D]`` train / val matrices in RAM. For very
+    large datasets and high-dimensional encoders (e.g. Qwen3-Embedding-4B
+    at d=2560), prefer ``logistic_baseline_on_embeddings_streaming``.
     """
     from sklearn.linear_model import LogisticRegression
 
@@ -466,6 +470,134 @@ def logistic_baseline_on_embeddings(
     )
     clf.fit(item_emb_train, yb)
     return clf.predict_proba(item_emb_val)[:, 1].astype(np.float32)
+
+
+def logistic_baseline_on_embeddings_streaming(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    item_emb_lookup: "dict[str, np.ndarray]",
+    *,
+    label_col: str = "label",
+    key_col: str = "item_key",
+    batch_size: int = 16384,
+    epochs: int = 3,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    bf16: bool = True,
+    device: str | None = None,
+    progress: bool = True,
+) -> np.ndarray:
+    """Memory-safe logistic baseline on item embeddings.
+
+    Trains ``logit = w^T x + b`` minibatch-by-minibatch, looking embeddings up
+    from ``item_emb_lookup`` on the fly so the full ``[N, D]`` matrix never
+    materializes. This is what you want when ``D`` is large (Qwen3, e5-mistral)
+    and ``N`` is on the order of millions.
+
+    Returns clipped val probabilities of shape ``[len(val_df)]``.
+    """
+    import gc
+    import math
+
+    import torch
+    from tqdm.auto import tqdm
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    first_key = str(train_df[key_col].iloc[0])
+    d = int(np.asarray(item_emb_lookup[first_key]).shape[0])
+
+    model = torch.nn.Linear(d, 1).to(device)
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay
+    )
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+
+    train_keys = train_df[key_col].astype(str).to_numpy()
+    train_y = train_df[label_col].to_numpy(dtype=np.float32)
+
+    def _lookup_batch(keys: np.ndarray) -> np.ndarray:
+        return np.stack([item_emb_lookup[str(k)] for k in keys]).astype(
+            np.float32, copy=False
+        )
+
+    n = len(train_y)
+    use_amp = bool(bf16 and device == "cuda")
+
+    for epoch in range(epochs):
+        perm = np.random.permutation(n)
+
+        iterator = range(0, n, batch_size)
+        if progress:
+            iterator = tqdm(
+                iterator,
+                total=math.ceil(n / batch_size),
+                desc=f"logistic baseline epoch {epoch + 1}/{epochs}",
+                dynamic_ncols=True,
+            )
+
+        running_loss = 0.0
+        seen = 0
+        model.train()
+
+        for start in iterator:
+            idx = perm[start : start + batch_size]
+
+            xb_np = _lookup_batch(train_keys[idx])
+            yb_np = train_y[idx]
+
+            xb = torch.from_numpy(xb_np).to(device, non_blocking=True)
+            yb = torch.from_numpy(yb_np).to(device, non_blocking=True).view(-1, 1)
+
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=use_amp
+            ):
+                logits = model(xb)
+                loss = loss_fn(logits, yb)
+            loss.backward()
+            opt.step()
+
+            bs = len(idx)
+            running_loss += float(loss.detach().cpu()) * bs
+            seen += bs
+
+            if progress:
+                iterator.set_postfix({"loss": f"{running_loss / max(1, seen):.5f}"})
+
+            del xb, yb, logits, loss
+
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    val_keys = val_df[key_col].astype(str).to_numpy()
+    p_val = np.empty(len(val_keys), dtype=np.float32)
+
+    model.eval()
+    with torch.no_grad():
+        iterator = range(0, len(val_keys), batch_size)
+        if progress:
+            iterator = tqdm(
+                iterator,
+                total=math.ceil(len(val_keys) / batch_size),
+                desc="logistic baseline predict",
+                dynamic_ncols=True,
+            )
+        for start in iterator:
+            end = min(start + batch_size, len(val_keys))
+            xb_np = _lookup_batch(val_keys[start:end])
+            xb = torch.from_numpy(xb_np).to(device, non_blocking=True)
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=use_amp
+            ):
+                logits = model(xb).view(-1)
+                probs = torch.sigmoid(logits)
+            p_val[start:end] = probs.float().cpu().numpy()
+            del xb, logits, probs
+
+    return np.clip(p_val, 1e-6, 1.0 - 1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +637,7 @@ __all__ = [
     "global_mean_baseline",
     "log_loss",
     "logistic_baseline_on_embeddings",
+    "logistic_baseline_on_embeddings_streaming",
     "metrics_by_group",
     "metrics_by_token_length",
     "plot_calibration_curves",

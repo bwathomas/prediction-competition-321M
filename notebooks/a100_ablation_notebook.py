@@ -9,7 +9,7 @@
 # Heavy lifting:
 # - Downloads `aims-foundations/measurement-db` from Hugging Face.
 # - Embeds every unique item / subject text once with a configurable HF
-#   encoder (default: `intfloat/e5-mistral-7b-instruct`) on the A100.
+#   encoder (default: `Qwen/Qwen3-Embedding-4B`) on the A100.
 # - Trains all three model variants across multiple seeds.
 # - Reports primary metric = item-cold-start val log-loss (lower is better).
 # - Lets you pick which run to export to a Codabench-compatible submission.
@@ -165,9 +165,11 @@ print(json.dumps(CFG, indent=2))
 #
 # Order:
 # 1. ``HF_TOKEN`` environment variable
-# 2. Google Secret Manager secret named ``HF_TOKEN`` (if running on GCP and
+# 2. Google Colab ``userdata.get('HF_TOKEN')`` secret (auto on Colab; create
+#    it once via the Secrets panel and grant this notebook access)
+# 3. Google Secret Manager secret named ``HF_TOKEN`` (if running on GCP and
 #    google-cloud-secret-manager is installed)
-# 3. Interactive ``getpass`` prompt
+# 4. Interactive ``getpass`` prompt
 #
 # The token is **never** logged or written to disk.
 
@@ -272,26 +274,228 @@ print_results(data_checks)
 # lighter one in CFG if GPU memory is tight.
 
 # %%
+from tqdm.auto import tqdm
+
 from src.embeddings import (
     EncoderConfig,
     TransformerEmbedder,
-    embed_unique_items,
-    embed_unique_subjects,
+    item_contextual_text,
+    item_only_text,
+    subject_text,
 )
 
+
+def _fmt_time(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _embed_batches_with_progress(
+    *,
+    texts: list[str],
+    keys: list[str],
+    embedder: TransformerEmbedder,
+    folder,
+    batch_size: int,
+    desc: str,
+    benchmarks: list[str] | None = None,
+) -> dict[str, np.ndarray]:
+    """Progress-wrapped wrapper around ``embedder.embed_texts``.
+
+    Returns ``{key: embedding}``. Reports rate, ETA, and cache hit / miss
+    counts so the user can tell whether the run is hitting cold encoder
+    forward passes or just walking the on-disk cache.
+    """
+    assert len(texts) == len(keys), "texts and keys must have same length"
+    if benchmarks is not None:
+        assert len(benchmarks) == len(texts), (
+            "benchmarks and texts must have same length"
+        )
+
+    n = len(texts)
+    lookup: dict[str, np.ndarray] = {}
+
+    t0 = time.time()
+    last_cache_hits = embedder.stats.cache_hits
+    last_cache_misses = embedder.stats.cache_misses
+
+    pbar = tqdm(total=n, desc=desc, unit="text", dynamic_ncols=True)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        batch_texts = texts[start:end]
+        batch_keys = keys[start:end]
+        batch_benchmarks = (
+            benchmarks[start:end] if benchmarks is not None else None
+        )
+        batch_t0 = time.time()
+
+        vecs = embedder.embed_texts(
+            batch_texts,
+            folder=folder,
+            keys=batch_keys,
+            benchmarks=batch_benchmarks,
+        )
+
+        if not np.isfinite(vecs).all():
+            raise ValueError(
+                f"NaN/inf detected in embeddings for batch {start}:{end}"
+            )
+
+        for k, v in zip(batch_keys, vecs):
+            lookup[k] = v
+
+        elapsed = time.time() - t0
+        done = end
+        rate = done / max(elapsed, 1e-9)
+        eta = (n - done) / max(rate, 1e-9)
+        new_hits = embedder.stats.cache_hits - last_cache_hits
+        new_misses = embedder.stats.cache_misses - last_cache_misses
+
+        pbar.update(end - start)
+        pbar.set_postfix(
+            {
+                "rate": f"{rate:.2f}/s",
+                "elapsed": _fmt_time(elapsed),
+                "ETA": _fmt_time(eta),
+                "cache_hit": new_hits,
+                "cache_miss": new_misses,
+                "batch": _fmt_time(time.time() - batch_t0),
+            }
+        )
+
+    pbar.close()
+
+    total = time.time() - t0
+    print(
+        f"{desc} complete: {n:,} texts in {_fmt_time(total)} "
+        f"({n / max(total, 1e-9):.2f} texts/sec)"
+    )
+    return lookup
+
+
+# Encoder defaults are loaded from configs/default.yaml. Override CFG["encoder"]
+# here if you want to A/B different encoders without editing the yaml.
 enc_cfg = EncoderConfig(**CFG["encoder"])
 embedder = TransformerEmbedder(enc_cfg)
-print(f"Encoder            : {enc_cfg.model_id}")
-print(f"Embedding dim      : {embedder.embedding_dim}")
 
+print(f"Encoder             : {enc_cfg.model_id}")
+print(f"Embedding dim       : {embedder.embedding_dim}")
+print(f"Embedding batch size: {enc_cfg.batch_size}")
+print(f"Max length          : {enc_cfg.max_length}")
+print(f"Pooling             : {enc_cfg.pooling}")
+print(f"Contextual items    : {enc_cfg.use_contextual_item_text}")
+
+# Prepare unique items.
+required_cols = {"item_key", "benchmark", "condition", "item_content"}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"df is missing required item columns: {sorted(missing)}")
+
+item_df = (
+    df[["item_key", "benchmark", "condition", "item_content"]]
+    .drop_duplicates(subset=["item_key"])
+    .reset_index(drop=True)
+)
+
+if enc_cfg.use_contextual_item_text:
+    item_texts = [
+        item_contextual_text(b, c, t, prefix=enc_cfg.passage_prefix)
+        for b, c, t in zip(
+            item_df["benchmark"].astype(str),
+            item_df["condition"].astype(str),
+            item_df["item_content"].astype(str),
+        )
+    ]
+    item_folder = embedder.dir_ctx
+else:
+    item_texts = [
+        item_only_text(t, prefix=enc_cfg.passage_prefix)
+        for t in item_df["item_content"].astype(str)
+    ]
+    item_folder = embedder.dir_item
+
+item_keys = item_df["item_key"].astype(str).tolist()
+item_benchmarks = item_df["benchmark"].astype(str).tolist()
+print(f"\nUnique items to embed: {len(item_texts):,}")
+
+# Quick timing estimate on a small sample so the user knows what to expect.
+estimate_n = min(len(item_texts), max(enc_cfg.batch_size * 3, 32))
+if estimate_n > 0:
+    print(f"Running quick timing estimate on {estimate_n:,} items...")
+    t_est = time.time()
+    _ = _embed_batches_with_progress(
+        texts=item_texts[:estimate_n],
+        keys=item_keys[:estimate_n],
+        embedder=embedder,
+        folder=item_folder,
+        batch_size=enc_cfg.batch_size,
+        desc="Timing sample",
+        benchmarks=item_benchmarks[:estimate_n],
+    )
+    sample_dt = time.time() - t_est
+    sample_rate = estimate_n / max(sample_dt, 1e-9)
+    est_full = len(item_texts) / max(sample_rate, 1e-9)
+    print(
+        f"Estimated full item embedding time: {_fmt_time(est_full)} "
+        f"at {sample_rate:.2f} items/sec"
+    )
+    print(
+        "Note: this estimate includes cache behavior. If the sample was "
+        "already cached the estimate will be too optimistic."
+    )
+
+# Embed unique items.
 t0 = time.time()
-item_emb_lookup = embed_unique_items(df, embedder)
+item_emb_lookup = _embed_batches_with_progress(
+    texts=item_texts,
+    keys=item_keys,
+    embedder=embedder,
+    folder=item_folder,
+    batch_size=enc_cfg.batch_size,
+    desc="Embedding unique items",
+    benchmarks=item_benchmarks,
+)
 LOG.info("Embedded %d unique items in %.1fs", len(item_emb_lookup), time.time() - t0)
 
+# Prepare unique subjects.
+required_cols = {"subject_key", "subject_content"}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"df is missing required subject columns: {sorted(missing)}")
+
+subject_df = (
+    df[["subject_key", "subject_content"]]
+    .drop_duplicates(subset=["subject_key"])
+    .reset_index(drop=True)
+)
+subject_keys_list = subject_df["subject_key"].astype(str).tolist()
+subject_texts = [
+    subject_text(t, prefix=enc_cfg.query_prefix)
+    for t in subject_df["subject_content"].astype(str)
+]
+print(f"\nUnique subjects to embed: {len(subject_texts):,}")
+
 t0 = time.time()
-subject_emb_lookup = embed_unique_subjects(df, embedder)
+subject_emb_lookup = _embed_batches_with_progress(
+    texts=subject_texts,
+    keys=subject_keys_list,
+    embedder=embedder,
+    folder=embedder.dir_subject,
+    batch_size=enc_cfg.batch_size,
+    desc="Embedding unique subjects",
+    benchmarks=None,
+)
 LOG.info(
-    "Embedded %d unique subjects in %.1fs", len(subject_emb_lookup), time.time() - t0
+    "Embedded %d unique subjects in %.1fs",
+    len(subject_emb_lookup),
+    time.time() - t0,
 )
 
 emb_stats = embedder.stats.report()
@@ -432,12 +636,11 @@ from src.eval import (
     bc_mean_with_shrinkage,
     compute_metrics,
     global_mean_baseline,
-    logistic_baseline_on_embeddings,
+    logistic_baseline_on_embeddings_streaming,
     subject_mean_with_shrinkage,
 )
 
-per_run_predictions: dict[str, dict[str, np.ndarray]] = {}
-
+per_run_predictions: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
 all_results: list[dict] = []
 
 
@@ -459,41 +662,98 @@ def _add_baseline(name: str, split_name: str, y_val: np.ndarray, p_val: np.ndarr
     per_run_predictions.setdefault(split_name, {})[name] = (y_val, p_val)
 
 
+# Cheap baselines (every split).
 for split_name, art in splits.items():
     y_val = art.val["label"].to_numpy().astype(float)
     y_train = art.train["label"].to_numpy().astype(float)
-    # Global mean
+
     p_gm = global_mean_baseline(y_train, y_val)
     _add_baseline("baseline_global_mean", split_name, y_val, p_gm)
 
-    # Subject shrinkage
     p_sub = subject_mean_with_shrinkage(art.train, art.val, alpha=20.0)
     _add_baseline("baseline_subject_shrinkage", split_name, y_val, p_sub)
 
-    # Benchmark-condition shrinkage
     p_bc = bc_mean_with_shrinkage(art.train, art.val, alpha=20.0)
     _add_baseline("baseline_bc_shrinkage", split_name, y_val, p_bc)
 
-# Logistic baseline on item embeddings (only on primary split -- it's slow)
-y_train = primary.train["label"].to_numpy().astype(float)
+# Memory-safe streaming logistic baseline on item embeddings (primary split).
+# Avoids materializing [n_rows, embedding_dim] -- important for high-dim
+# encoders like Qwen3-Embedding-4B (d=2560) on multi-million-row datasets.
 y_val = primary.val["label"].to_numpy().astype(float)
-ie_train = stack_lookup(primary.train["item_key"], item_emb_lookup)
-ie_val = stack_lookup(primary.val["item_key"], item_emb_lookup)
-p_log = logistic_baseline_on_embeddings(ie_train, ie_val, y_train)
-_add_baseline("baseline_logistic_items", "item_cold_start", y_val, p_log)
+p_log = logistic_baseline_on_embeddings_streaming(
+    primary.train,
+    primary.val,
+    item_emb_lookup,
+    batch_size=16384,        # bump to 65536 if GPU is underutilized
+    epochs=3,                # baseline only; do not over-invest
+    lr=1e-3,
+    weight_decay=1e-4,
+    bf16=bool(CFG["encoder"]["bf16"]),
+)
+_add_baseline("baseline_logistic_items_streaming", "item_cold_start", y_val, p_log)
 
-print(pd.DataFrame(all_results).to_string(index=False))
+baseline_df = pd.DataFrame(all_results).sort_values(["split", "val_log_loss"])
+print(baseline_df.to_string(index=False))
 
 # %% [markdown]
-# ## 13. Train all three model variants across seeds and k values
+# ## 13. Gated-MLP residual-strength sweep
 #
-# Saves best checkpoint per run by item-cold-start val log-loss.
+# Sweeps the residual-gate initial strength on `kfactor_gated_mlp` across
+# the configured ``k_factors`` and ``seeds``. Saves best checkpoint per
+# run by item-cold-start val log-loss. The trainer streams JSONL progress
+# events to ``PROGRESS_FILE`` so you can tail it from another shell.
 
 # %%
-from src.train import TrainConfig, train_many
+import subprocess
+
+from src.train import TrainConfig, train_one
+
+# Make sure the `train` logger inherits INFO from the root logger configured
+# in section 1 -- without this, info-level progress lines are swallowed in
+# Colab when other libraries reset the root logger.
+logging.getLogger("train").setLevel(logging.INFO)
+
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+    print("CUDA:", torch.version.cuda)
+    print("bf16 supported:", torch.cuda.is_bf16_supported())
+    torch.set_float32_matmul_precision("high")
+else:
+    print("WARNING: CUDA not available. Training will be slow.")
+
+
+def fmt_seconds(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def gpu_status() -> str:
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).strip()
+        util, mem_used, mem_total, power = [x.strip() for x in out.split(",")[:4]]
+        return f"GPU util={util}% mem={mem_used}/{mem_total}MB power={power}W"
+    except Exception:
+        return "GPU status unavailable"
+
 
 CKPT_DIR = ROOT / CFG["eval"]["checkpoints_dir"]
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
+PROGRESS_FILE = ROOT / "artifacts" / "training_progress.jsonl"
+PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 train_cfg = TrainConfig(
     learning_rate=float(CFG["train"]["learning_rate"]),
@@ -505,47 +765,154 @@ train_cfg = TrainConfig(
     grad_clip=float(CFG["train"]["grad_clip"]),
     early_stopping_patience=int(CFG["train"]["early_stopping_patience"]),
     bf16=bool(CFG["encoder"]["bf16"]),
+    num_workers=int(CFG["train"].get("num_workers", 0)),
+    progress=True,
+    log_every_batches=1,
+    progress_file=str(PROGRESS_FILE),
 )
+
+print("Train config:")
 print(asdict(train_cfg))
+print(gpu_status())
+print("Progress file:", PROGRESS_FILE)
 
-ALL_RUNS = []  # type: list[dict]
+# ---------------------------------------------------------------------------
+# Gated-MLP lambda sweep
+#
+# We sweep the residual gate strength on `kfactor_gated_mlp` across a few
+# initial values, with the gate trainable. Item-cold-start val log-loss is
+# the primary metric.
+# ---------------------------------------------------------------------------
 
-for model_name in CFG["train"]["models"]:
-    for k in CFG["train"]["k_factors"]:
-        model_cfg = _model_cfg(int(k), model_name)
-        seed_results = train_many(
-            model_name=model_name,
-            model_cfg=model_cfg,
-            train_cfg=train_cfg,
-            train_ds=train_ds,
-            val_ds=val_ds,
-            indexer=indexer,
-            seeds=list(CFG["train"]["seeds"]),
-            checkpoint_dir=CKPT_DIR,
-            extra_metadata={
-                "encoder_model_id": CFG["encoder"]["model_id"],
-                "use_subject_text_embedding": USE_SUBJECT_EMB,
-            },
-        )
-        for r in seed_results:
-            ALL_RUNS.append(
-                {
-                    "run_id": r.run_id,
-                    "model_name": r.model_name,
-                    "k": r.k,
-                    "seed": r.seed,
-                    "best_val_log_loss": r.best_val_log_loss,
-                    "best_val_brier": r.best_val_brier,
-                    "best_val_auc": r.best_val_auc,
-                    "checkpoint_path": r.checkpoint_path,
-                    "metadata_path": r.metadata_path,
-                    "elapsed_seconds": r.elapsed_seconds,
-                }
-            )
+model_name = "kfactor_gated_mlp"
+ks = [int(k) for k in CFG["train"]["k_factors"]]
+seeds = [1]
+
+lambda_jobs = [
+    {"lambda_resid_init": 0.50, "lambda_resid_trainable": True, "lambda_tag": "learn_lam050"},
+    {"lambda_resid_init": 0.05, "lambda_resid_trainable": True, "lambda_tag": "learn_lam005"},
+    {"lambda_resid_init": 0.10, "lambda_resid_trainable": True, "lambda_tag": "learn_lam010"},
+    {"lambda_resid_init": 0.20, "lambda_resid_trainable": True, "lambda_tag": "learn_lam020"},
+]
+
+jobs = [
+    (model_name, k, seed, lj)
+    for k in ks
+    for seed in seeds
+    for lj in lambda_jobs
+]
+
+print(f"\nTotal jobs: {len(jobs)}")
+print("Model:", model_name)
+print("k values:", ks)
+print("Seeds:", seeds)
+print("Lambda configs:")
+for lj in lambda_jobs:
+    print(lj)
+
+ALL_RUNS: list[dict] = []
+completed_times: list[float] = []
+global_t0 = time.time()
+
+from tqdm.auto import tqdm
+
+pbar = tqdm(jobs, desc="Gated MLP lambda sweep", unit="run", dynamic_ncols=True)
+
+for job_idx, (model_name, k, seed, lambda_cfg) in enumerate(pbar, start=1):
+    lambda_init = float(lambda_cfg["lambda_resid_init"])
+    lambda_trainable = bool(lambda_cfg["lambda_resid_trainable"])
+    lambda_tag = str(lambda_cfg["lambda_tag"])
+
+    run_id = f"{model_name}_k{k}_seed{seed}_{lambda_tag}"
+    model_cfg = _model_cfg(k, model_name)
+    model_cfg.lambda_resid_init = lambda_init
+    model_cfg.lambda_resid_trainable = lambda_trainable
+
+    pbar.set_description(f"gated k={k} seed={seed} {lambda_tag}")
+
+    print("\n" + "=" * 100)
+    print(f"Starting {job_idx}/{len(jobs)}: {run_id}")
+    print("Model config:")
+    print(asdict(model_cfg))
+    print(gpu_status())
+
+    job_t0 = time.time()
+    r = train_one(
+        model_name=model_name,
+        model_cfg=model_cfg,
+        train_cfg=train_cfg,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        indexer=indexer,
+        seed=seed,
+        run_id=run_id,
+        checkpoint_dir=CKPT_DIR,
+        extra_metadata={
+            "encoder_model_id": CFG["encoder"]["model_id"],
+            "use_subject_text_embedding": USE_SUBJECT_EMB,
+            "lambda_resid_init": lambda_init,
+            "lambda_resid_trainable": lambda_trainable,
+            "lambda_tag": lambda_tag,
+        },
+    )
+
+    job_elapsed = time.time() - job_t0
+    completed_times.append(job_elapsed)
+
+    ALL_RUNS.append(
+        {
+            "run_id": r.run_id,
+            "model_name": r.model_name,
+            "k": r.k,
+            "seed": r.seed,
+            "lambda_resid_init": lambda_init,
+            "lambda_resid_trainable": lambda_trainable,
+            "lambda_tag": lambda_tag,
+            "epoch_best": r.epoch_best,
+            "best_val_log_loss": r.best_val_log_loss,
+            "best_val_brier": r.best_val_brier,
+            "best_val_auc": r.best_val_auc,
+            "checkpoint_path": r.checkpoint_path,
+            "metadata_path": r.metadata_path,
+            "elapsed_seconds": r.elapsed_seconds,
+        }
+    )
+
+    avg_time = sum(completed_times) / len(completed_times)
+    remaining_runs = len(jobs) - job_idx
+    eta = avg_time * remaining_runs
+    total_elapsed = time.time() - global_t0
+
+    pbar.set_postfix(
+        {
+            "last": fmt_seconds(job_elapsed),
+            "avg": fmt_seconds(avg_time),
+            "ETA": fmt_seconds(eta),
+            "best_ll": f"{r.best_val_log_loss:.5f}",
+        }
+    )
+
+    runs_df_live = pd.DataFrame(ALL_RUNS).sort_values(
+        "best_val_log_loss", ascending=True
+    )
+    print(f"\nFinished {job_idx}/{len(jobs)}: {run_id}")
+    print(f"Run time: {fmt_seconds(job_elapsed)}")
+    print(f"Total elapsed: {fmt_seconds(total_elapsed)}")
+    print(f"Estimated remaining: {fmt_seconds(eta)}")
+    print(f"Best epoch: {r.epoch_best}")
+    print(
+        f"Best val log-loss: {r.best_val_log_loss:.6f} | "
+        f"Brier: {r.best_val_brier:.6f} | "
+        f"AUC: {r.best_val_auc if r.best_val_auc is not None else 'n/a'}"
+    )
+    print(gpu_status())
+    print("\nCurrent top runs:")
+    print(runs_df_live.head(10).to_string(index=False))
 
 runs_df = pd.DataFrame(ALL_RUNS).sort_values("best_val_log_loss", ascending=True)
-print("\n=== Trained runs (sorted by item-cold-start val log-loss) ===")
+print("\n=== Gated MLP lambda sweep sorted by item-cold-start val log-loss ===")
 print(runs_df.to_string(index=False))
+print(f"\nTotal sweep time: {fmt_seconds(time.time() - global_t0)}")
 
 # %% [markdown]
 # ## 14. Evaluate trained checkpoints on every split + slicewise metrics
@@ -583,8 +950,9 @@ def _predict_with_checkpoint(model_name: str, ckpt_path: Path, split_art) -> np.
         split_art, indexer, item_emb_lookup, subject_emb_lookup, USE_SUBJECT_EMB
     )[1]
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    eval_bs = max(int(CFG["train"]["batch_size"]), 4096)
     ll, brier_val, auc_val, p_val, y_val = evaluate_model(
-        mdl, val_ds_split, device=device, batch_size=4096, bf16=bool(CFG["encoder"]["bf16"])
+        mdl, val_ds_split, device=device, batch_size=eval_bs, bf16=bool(CFG["encoder"]["bf16"])
     )
     return p_val, y_val
 
