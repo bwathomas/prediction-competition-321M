@@ -1,0 +1,116 @@
+# Default configuration for the Predictive AI Evaluation Challenge
+# A100-oriented k-factor / residual ablation pipeline.
+#
+# Everything in this file is overridable from the notebook by editing the
+# loaded dict before passing it to the training entry points.
+
+seed: 0
+allow_cpu: false                 # if true, falls through when no GPU present
+
+# ----------------------------------------------------------------------------
+# Data
+# ----------------------------------------------------------------------------
+data:
+  # Hugging Face dataset repo (loaded via huggingface_hub.snapshot_download
+  # and the per-benchmark parquet pattern documented in the starter kit).
+  hf_repo_id: "aims-foundations/measurement-db"
+  # Local cache for parquet downloads (relative to the project root).
+  local_data_dir: "artifacts/data"
+  # Optional whitelist of benchmark response tables. null = load all.
+  benchmarks: null
+  # Cap rows per benchmark for fast iteration. null = use everything.
+  max_rows_per_benchmark: null
+  # Drop rows whose response field is null.
+  drop_nan_labels: true
+  # Binarize labels >= this threshold to 1, else 0. Soft labels stay soft.
+  binarize_threshold: 0.5
+  # Whether to keep soft labels in [0, 1] (true) or hard-binarize (false).
+  keep_soft_labels: true
+  # Minimum observations per subject / item to retain.
+  min_subject_obs: 3
+  min_item_obs: 1
+
+# ----------------------------------------------------------------------------
+# Validation splits
+# ----------------------------------------------------------------------------
+splits:
+  primary: "item_cold_start"     # primary metric uses this split
+  val_fraction: 0.10
+  holdout_benchmarks: []         # for benchmark_heldout split
+  enable_random_row_debug: true  # leaky split; reported separately
+
+# ----------------------------------------------------------------------------
+# Encoder (Hugging Face transformer for item / subject text)
+# ----------------------------------------------------------------------------
+encoder:
+  # Heavy default for A100. Swap to a lighter model if memory is tight:
+  #   sentence-transformers/all-mpnet-base-v2
+  #   intfloat/e5-large-v2
+  #   BAAI/bge-large-en-v1.5
+  model_id: "intfloat/e5-mistral-7b-instruct"
+  max_length: 512
+  batch_size: 32                 # encoder forward-pass batch size
+  bf16: true
+  pooling: "mean"                # mean | cls | last_token
+  # Add the e5 / instruct prefix when required by the encoder.
+  query_prefix: ""               # set to "query: " for e5 models if desired
+  passage_prefix: ""             # set to "passage: " for e5 models if desired
+  # If true, use contextual item text "Benchmark: .. Condition: .. Item: ..".
+  # Item-only embeddings are still computed (cheaper) and stored separately.
+  use_contextual_item_text: true
+  cache_dir: "artifacts/embeddings"
+  trust_remote_code: false
+  # Skip the encoder entirely (debug only): use random unit vectors.
+  use_random_embeddings: false
+  random_embedding_dim: 256
+
+# ----------------------------------------------------------------------------
+# Models / training
+# ----------------------------------------------------------------------------
+train:
+  # Which model variants to train.
+  models: ["kfactor", "kfactor_mlp", "kfactor_gated_mlp"]
+  # Hyperparameters
+  k_factors: [16, 32]            # ablate over multiple k
+  item_map_hidden_dim: 512
+  residual_hidden_dim: 256
+  dropout: 0.1
+  weight_decay: 1.0e-4
+  learning_rate: 3.0e-3
+  batch_size: 4096
+  epochs: 30
+  warmup_steps: 200
+  lambda_resid_init: 0.1
+  lambda_resid_trainable: true
+  freeze_embeddings: true
+  seeds: [0, 1, 2]
+  early_stopping_patience: 5
+  grad_clip: 1.0
+  scheduler: "cosine"            # cosine | linear | none
+  # Future hook: fine-tune the encoder with LoRA. Not implemented in v1.
+  enable_lora: false
+
+# ----------------------------------------------------------------------------
+# Evaluation / artifact paths
+# ----------------------------------------------------------------------------
+eval:
+  results_path: "artifacts/results/results.csv"
+  plots_dir: "artifacts/plots"
+  checkpoints_dir: "artifacts/checkpoints"
+  ece_bins: 10
+  primary_metric: "log_loss"     # lower is better; selection done on item cold-start
+
+# ----------------------------------------------------------------------------
+# Submission export
+# ----------------------------------------------------------------------------
+submission:
+  dir: "submission"
+  zip_path: "submission.zip"
+  declared_models_max: 5         # platform cap
+
+# ----------------------------------------------------------------------------
+# Optional GCS sync
+# ----------------------------------------------------------------------------
+gcs:
+  bucket: null                   # set to "gs://your-bucket/path" to enable
+  sync_artifacts: false

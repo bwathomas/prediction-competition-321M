@@ -1,11 +1,33 @@
-﻿starting_kit/Data/
+# Existing project data
+starting_kit/Data/
 Google_Collab_harness/outputs/
 validation_harness/splits/
 
+# Python bytecode
 **/__pycache__/
 *.py[cod]
+*.pyo
+*.pyd
 
+# Local data and artifacts (downloaded / generated)
+artifacts/
+submission/
+submission.zip
 *.pt
 *.pkl
 *.joblib
 *.parquet
+
+# Caches
+.hf_cache/
+.cache/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Environments
+.venv/
+.env
+
+# OS noise
+.DS_Store
+Thumbs.db
