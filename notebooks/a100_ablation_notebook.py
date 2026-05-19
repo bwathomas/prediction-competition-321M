@@ -113,6 +113,74 @@ if INSTALL_REQUIREMENTS and REQUIREMENTS_PATH.exists():
         check=False,
     )
 
+
+def _install_flash_attention() -> bool:
+    """Install Flash Attention 2 from a prebuilt wheel where possible.
+
+    The PyPI `flash-attn` package builds from source via nvcc by default,
+    which takes 20-40 minutes on Colab and frequently OOMs. The reliable
+    path is ``pip install flash-attn --no-build-isolation`` which makes pip
+    pull a matching prebuilt wheel from Dao-AILab's GitHub releases when
+    one exists for the current Python / torch / CUDA combo.
+
+    If the install fails (no matching wheel, no nvcc fallback, slow runner,
+    etc.) we swallow the error and return False -- the embedder's SDPA
+    fallback path keeps the pipeline working.
+    """
+    try:
+        import flash_attn  # type: ignore  # noqa: F401
+
+        print(f"[flash-attn] already installed: {flash_attn.__version__}")
+        return True
+    except Exception:
+        pass
+
+    try:
+        import torch as _torch  # local import: torch was just pip-installed
+    except Exception:
+        print("[flash-attn] torch unavailable; skipping install")
+        return False
+    if not _torch.cuda.is_available():
+        print("[flash-attn] no CUDA device; skipping install (SDPA fallback)")
+        return False
+
+    print(
+        "[flash-attn] installing prebuilt wheel via "
+        "`pip install flash-attn --no-build-isolation` ..."
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--no-build-isolation",
+            "flash-attn",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        try:
+            import flash_attn  # type: ignore  # noqa: F401
+
+            print(f"[flash-attn] installed: {flash_attn.__version__}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[flash-attn] post-install import failed: {exc}")
+            return False
+    print("[flash-attn] install failed; falling back to SDPA")
+    tail = (proc.stderr or proc.stdout or "")[-400:].strip()
+    if tail:
+        print(f"[flash-attn] last lines:\n{tail}")
+    return False
+
+
+INSTALL_FLASH_ATTN = bool(int(os.environ.get("INSTALL_FLASH_ATTN", "1")))
+if INSTALL_REQUIREMENTS and INSTALL_FLASH_ATTN:
+    _install_flash_attention()
+
 import json
 import logging
 import time

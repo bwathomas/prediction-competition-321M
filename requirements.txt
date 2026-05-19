@@ -27,10 +27,13 @@ safetensors>=0.4
 sentencepiece>=0.2
 tokenizers>=0.19
 
-# Optional: Flash Attention 2 (large encoder speedup on A100/H100). The
-# embedder gracefully falls back to SDPA when this wheel fails to install
-# (no nvcc, mismatched CUDA, T4/L4 etc.), so this line is best-effort.
-flash-attn>=2.5.0 ; platform_system == "Linux"
+# NOTE on Flash Attention 2: do NOT list `flash-attn` here. The PyPI package
+# defaults to building from source via nvcc which takes 20-40 minutes on
+# Colab and frequently OOMs. Install it separately via the notebook's
+# optional install cell (or `pip install flash-attn --no-build-isolation`),
+# which pulls a prebuilt wheel from Dao-AILab's GitHub releases. The
+# embedder gracefully falls back to SDPA when FA2 is unavailable, so the
+# pipeline runs end-to-end either way.
 
 # Optional: FAISS for fast nearest-neighbor lookup over the shipped
 # training-item cache. If the wheel cannot install, the runtime falls back
