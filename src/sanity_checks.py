@@ -192,11 +192,15 @@ def check_embedding_shape(
 
 def check_embedding_determinism(embedder: TransformerEmbedder) -> CheckResult:
     """Same text -> same key -> same embedding (within float tolerance)."""
+    import hashlib
+
     text = "deterministic sanity probe"
-    folder = embedder.dir_item
-    key = embedder._cache_key_for_text(text)
-    a = embedder.embed_texts([text], folder=folder, keys=[key])
-    b = embedder.embed_texts([text], folder=folder, keys=[key])
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    out_a, _ = embedder.embed_unique(kind="item", keys=[key], texts=[text])
+    # Second call should hit the in-memory cache and return the same vector.
+    out_b, _ = embedder.embed_unique(kind="item", keys=[key], texts=[text])
+    a = out_a[key]
+    b = out_b[key]
     diff = float(np.max(np.abs(a - b)))
     return CheckResult(
         name="embed.same_text_same_embedding",

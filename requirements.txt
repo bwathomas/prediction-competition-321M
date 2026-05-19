@@ -27,6 +27,16 @@ safetensors>=0.4
 sentencepiece>=0.2
 tokenizers>=0.19
 
+# Optional: Flash Attention 2 (large encoder speedup on A100/H100). The
+# embedder gracefully falls back to SDPA when this wheel fails to install
+# (no nvcc, mismatched CUDA, T4/L4 etc.), so this line is best-effort.
+flash-attn>=2.5.0 ; platform_system == "Linux"
+
+# Optional: FAISS for fast nearest-neighbor lookup over the shipped
+# training-item cache. If the wheel cannot install, the runtime falls back
+# to a numpy brute-force lookup (~50ms for 200k x 256-dim) automatically.
+faiss-cpu>=1.7.4
+
 # Optional Google Cloud secret access (used only if HF_TOKEN env var is absent)
 google-cloud-secret-manager>=2.20 ; python_version >= "3.9"
 

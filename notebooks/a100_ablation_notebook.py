@@ -268,21 +268,27 @@ print_results(data_checks)
 # %% [markdown]
 # ## 8. Build the encoder and embed unique items / subjects
 #
-# We embed each unique ``item_key`` and ``subject_key`` once. Caches live in
-# ``artifacts/embeddings/{encoder_slug}/``. Truncation rates and token-length
-# quantiles are reported. Encoder defaults to a heavy 7B model: swap for a
-# lighter one in CFG if GPU memory is tight.
+# We embed each unique ``item_key`` and ``subject_key`` once and persist the
+# result to ``artifacts/embeddings/{encoder_slug}/`` as ``items.parquet`` /
+# ``subjects.parquet`` + ``meta.json`` + ``encoding_log.json``.
+#
+# When ``drive_cache.enabled`` is true (the Colab default) we first try to
+# pull a previously-encoded cache from Google Drive. On a content-hash hit
+# the encoder is never even loaded.
 
 # %%
-from tqdm.auto import tqdm
+import time
 
 from src.embeddings import (
     EncoderConfig,
     TransformerEmbedder,
-    item_contextual_text,
-    item_only_text,
-    subject_text,
+    assert_deduplicated,
+    build_unique_items,
+    build_unique_subjects,
+    content_hash_for_items,
+    encoder_slug as _encoder_slug,
 )
+from src import drive_cache as drive_cache_mod
 
 
 def _fmt_time(seconds: float) -> str:
@@ -296,207 +302,148 @@ def _fmt_time(seconds: float) -> str:
     return f"{s}s"
 
 
-def _embed_batches_with_progress(
-    *,
-    texts: list[str],
-    keys: list[str],
-    embedder: TransformerEmbedder,
-    folder,
-    batch_size: int,
-    desc: str,
-    benchmarks: list[str] | None = None,
-) -> dict[str, np.ndarray]:
-    """Progress-wrapped wrapper around ``embedder.embed_texts``.
-
-    Returns ``{key: embedding}``. Reports rate, ETA, and cache hit / miss
-    counts so the user can tell whether the run is hitting cold encoder
-    forward passes or just walking the on-disk cache.
-    """
-    assert len(texts) == len(keys), "texts and keys must have same length"
-    if benchmarks is not None:
-        assert len(benchmarks) == len(texts), (
-            "benchmarks and texts must have same length"
-        )
-
-    n = len(texts)
-    lookup: dict[str, np.ndarray] = {}
-
-    t0 = time.time()
-    last_cache_hits = embedder.stats.cache_hits
-    last_cache_misses = embedder.stats.cache_misses
-
-    pbar = tqdm(total=n, desc=desc, unit="text", dynamic_ncols=True)
-
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        batch_texts = texts[start:end]
-        batch_keys = keys[start:end]
-        batch_benchmarks = (
-            benchmarks[start:end] if benchmarks is not None else None
-        )
-        batch_t0 = time.time()
-
-        vecs = embedder.embed_texts(
-            batch_texts,
-            folder=folder,
-            keys=batch_keys,
-            benchmarks=batch_benchmarks,
-        )
-
-        if not np.isfinite(vecs).all():
-            raise ValueError(
-                f"NaN/inf detected in embeddings for batch {start}:{end}"
-            )
-
-        for k, v in zip(batch_keys, vecs):
-            lookup[k] = v
-
-        elapsed = time.time() - t0
-        done = end
-        rate = done / max(elapsed, 1e-9)
-        eta = (n - done) / max(rate, 1e-9)
-        new_hits = embedder.stats.cache_hits - last_cache_hits
-        new_misses = embedder.stats.cache_misses - last_cache_misses
-
-        pbar.update(end - start)
-        pbar.set_postfix(
-            {
-                "rate": f"{rate:.2f}/s",
-                "elapsed": _fmt_time(elapsed),
-                "ETA": _fmt_time(eta),
-                "cache_hit": new_hits,
-                "cache_miss": new_misses,
-                "batch": _fmt_time(time.time() - batch_t0),
-            }
-        )
-
-    pbar.close()
-
-    total = time.time() - t0
-    print(
-        f"{desc} complete: {n:,} texts in {_fmt_time(total)} "
-        f"({n / max(total, 1e-9):.2f} texts/sec)"
-    )
-    return lookup
-
-
 # Encoder defaults are loaded from configs/default.yaml. Override CFG["encoder"]
 # here if you want to A/B different encoders without editing the yaml.
 enc_cfg = EncoderConfig(**CFG["encoder"])
 embedder = TransformerEmbedder(enc_cfg)
+slug = _encoder_slug(enc_cfg.model_id)
 
 print(f"Encoder             : {enc_cfg.model_id}")
-print(f"Embedding dim       : {embedder.embedding_dim}")
-print(f"Embedding batch size: {enc_cfg.batch_size}")
-print(f"Max length          : {enc_cfg.max_length}")
+print(f"Embedding cache dir : {embedder.base}")
+print(f"Batch size (config) : {enc_cfg.batch_size} (fallback {enc_cfg.batch_size_fallback})")
+print(f"max_length          : {enc_cfg.max_length or 'auto (99th pct, /64)'}")
+print(f"Use Flash Attn 2    : {enc_cfg.use_flash_attention}")
 print(f"Pooling             : {enc_cfg.pooling}")
 print(f"Contextual items    : {enc_cfg.use_contextual_item_text}")
 
-# Prepare unique items.
+# Build the dedup'd item / subject lists. Dedup is verified loudly at the
+# top of every encode call -- duplicate forwards are typically the largest
+# source of wasted encoder time.
 required_cols = {"item_key", "benchmark", "condition", "item_content"}
 missing = required_cols - set(df.columns)
 if missing:
     raise ValueError(f"df is missing required item columns: {sorted(missing)}")
+required_cols = {"subject_key", "subject_content"}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"df is missing required subject columns: {sorted(missing)}")
 
 item_df = (
     df[["item_key", "benchmark", "condition", "item_content"]]
     .drop_duplicates(subset=["item_key"])
     .reset_index(drop=True)
 )
-
-if enc_cfg.use_contextual_item_text:
-    item_texts = [
-        item_contextual_text(b, c, t, prefix=enc_cfg.passage_prefix)
-        for b, c, t in zip(
-            item_df["benchmark"].astype(str),
-            item_df["condition"].astype(str),
-            item_df["item_content"].astype(str),
-        )
-    ]
-    item_folder = embedder.dir_ctx
-else:
-    item_texts = [
-        item_only_text(t, prefix=enc_cfg.passage_prefix)
-        for t in item_df["item_content"].astype(str)
-    ]
-    item_folder = embedder.dir_item
-
-item_keys = item_df["item_key"].astype(str).tolist()
-item_benchmarks = item_df["benchmark"].astype(str).tolist()
-print(f"\nUnique items to embed: {len(item_texts):,}")
-
-# Quick timing estimate on a small sample so the user knows what to expect.
-estimate_n = min(len(item_texts), max(enc_cfg.batch_size * 3, 32))
-if estimate_n > 0:
-    print(f"Running quick timing estimate on {estimate_n:,} items...")
-    t_est = time.time()
-    _ = _embed_batches_with_progress(
-        texts=item_texts[:estimate_n],
-        keys=item_keys[:estimate_n],
-        embedder=embedder,
-        folder=item_folder,
-        batch_size=enc_cfg.batch_size,
-        desc="Timing sample",
-        benchmarks=item_benchmarks[:estimate_n],
-    )
-    sample_dt = time.time() - t_est
-    sample_rate = estimate_n / max(sample_dt, 1e-9)
-    est_full = len(item_texts) / max(sample_rate, 1e-9)
-    print(
-        f"Estimated full item embedding time: {_fmt_time(est_full)} "
-        f"at {sample_rate:.2f} items/sec"
-    )
-    print(
-        "Note: this estimate includes cache behavior. If the sample was "
-        "already cached the estimate will be too optimistic."
-    )
-
-# Embed unique items.
-t0 = time.time()
-item_emb_lookup = _embed_batches_with_progress(
-    texts=item_texts,
-    keys=item_keys,
-    embedder=embedder,
-    folder=item_folder,
-    batch_size=enc_cfg.batch_size,
-    desc="Embedding unique items",
-    benchmarks=item_benchmarks,
+item_keys_list, item_texts_list, item_benches_list = build_unique_items(
+    item_df,
+    contextual=enc_cfg.use_contextual_item_text,
+    passage_prefix=embedder._resolve_passage_prefix(),
 )
-LOG.info("Embedded %d unique items in %.1fs", len(item_emb_lookup), time.time() - t0)
-
-# Prepare unique subjects.
-required_cols = {"subject_key", "subject_content"}
-missing = required_cols - set(df.columns)
-if missing:
-    raise ValueError(f"df is missing required subject columns: {sorted(missing)}")
+assert_deduplicated(item_keys_list, kind="item")
 
 subject_df = (
     df[["subject_key", "subject_content"]]
     .drop_duplicates(subset=["subject_key"])
     .reset_index(drop=True)
 )
-subject_keys_list = subject_df["subject_key"].astype(str).tolist()
-subject_texts = [
-    subject_text(t, prefix=enc_cfg.query_prefix)
-    for t in subject_df["subject_content"].astype(str)
-]
-print(f"\nUnique subjects to embed: {len(subject_texts):,}")
+subject_keys_list, subject_texts_list = build_unique_subjects(
+    subject_df, query_prefix=embedder._resolve_query_prefix()
+)
+assert_deduplicated(subject_keys_list, kind="subject")
+
+# Content hash detects whether the underlying texts changed since the last
+# encoder run; persisted to meta.json so future runs (including the Drive
+# cache) can do a strict "skip encoding" check.
+item_pairs = list(zip(item_keys_list, item_texts_list))
+subject_pairs = list(zip(subject_keys_list, subject_texts_list))
+CONTENT_HASH = content_hash_for_items(item_pairs + subject_pairs)
+print(f"Content hash        : {CONTENT_HASH[:16]}...  (over {len(item_pairs):,} items + {len(subject_pairs):,} subjects)")
+
+# 1. Drive cache lookup (no-op outside Colab / when disabled).
+cache_root = ROOT / CFG["encoder"]["cache_dir"]
+drive_status = drive_cache_mod.resolve_cache(
+    cfg=CFG,
+    encoder_slug=slug,
+    local_cache_root=cache_root,
+    expected_hash=CONTENT_HASH,
+)
+print(f"\nDrive cache decision: {drive_status.reason}")
+print(json.dumps(drive_status.as_dict(), indent=2))
+
+# 2. Warm in-memory caches from disk (drive sync writes parquet files there).
+embedder.warm_caches_from_disk()
+
+# 3. Encode whatever is still missing. On a strict drive hit every key is
+#    already in the parquet cache and the encoder is never loaded.
+phase_times: dict[str, float] = {}
+t0 = time.time()
+print(f"\nEncoding unique items: {len(item_keys_list):,}")
+item_emb_lookup, item_log = embedder.embed_unique(
+    kind="item",
+    keys=item_keys_list,
+    texts=item_texts_list,
+    benchmarks=item_benches_list,
+)
+phase_times["items"] = float(time.time() - t0)
+LOG.info(
+    "items: total=%d cached=%d encoded=%d elapsed=%.1fs",
+    item_log["n_total"],
+    item_log["n_cache_hits"],
+    item_log["n_encoded"],
+    phase_times["items"],
+)
 
 t0 = time.time()
-subject_emb_lookup = _embed_batches_with_progress(
-    texts=subject_texts,
+print(f"Encoding unique subjects: {len(subject_keys_list):,}")
+subject_emb_lookup, subject_log = embedder.embed_unique(
+    kind="subject",
     keys=subject_keys_list,
-    embedder=embedder,
-    folder=embedder.dir_subject,
-    batch_size=enc_cfg.batch_size,
-    desc="Embedding unique subjects",
-    benchmarks=None,
+    texts=subject_texts_list,
 )
+phase_times["subjects"] = float(time.time() - t0)
 LOG.info(
-    "Embedded %d unique subjects in %.1fs",
-    len(subject_emb_lookup),
-    time.time() - t0,
+    "subjects: total=%d cached=%d encoded=%d elapsed=%.1fs",
+    subject_log["n_total"],
+    subject_log["n_cache_hits"],
+    subject_log["n_encoded"],
+    phase_times["subjects"],
 )
+
+# 4. Persist parquet caches + meta + encoding_log.json.
+embedder.finalize(
+    content_hash=CONTENT_HASH,
+    n_items=len(item_keys_list),
+    n_subjects=len(subject_keys_list),
+    extra_log={
+        "items": item_log,
+        "subjects": subject_log,
+        "drive_cache": drive_status.as_dict(),
+        "phase_seconds": phase_times,
+    },
+)
+
+# 5. Upload to Drive if anything new was encoded (or if the on-disk hash
+#    differed from Drive's).
+drive_cfg = (CFG.get("drive_cache") or {})
+if (
+    drive_cfg.get("enabled")
+    and drive_cfg.get("upload_on_completion", True)
+    and drive_status.mounted
+):
+    if (
+        drive_status.cache_hit
+        and item_log["n_encoded"] == 0
+        and subject_log["n_encoded"] == 0
+    ):
+        print("Drive cache up to date; skipping upload.")
+    else:
+        drive_folder = Path(drive_cfg["folder"]) / slug
+        upload_summary = drive_cache_mod.upload_from_local(
+            local_folder=embedder.base,
+            drive_folder=drive_folder,
+        )
+        print(f"Drive upload: {json.dumps(upload_summary, indent=2)}")
+elif drive_cfg.get("enabled") and not drive_status.mounted:
+    print("Drive cache enabled but mount unavailable -- skipping upload.")
 
 emb_stats = embedder.stats.report()
 print("\nEncoder diagnostics:")
@@ -1710,7 +1657,7 @@ print(f"SELECTED_RUN_ID = {SELECTED_RUN_ID}")
 # - ``submission.zip``
 
 # %%
-from src.export_submission import export_run, make_submission_zip
+from src.export_submission import bundle_training_cache, export_run, make_submission_zip
 from src.train import TrainResult
 
 selected = runs_df[runs_df["run_id"] == SELECTED_RUN_ID].iloc[0]
@@ -1737,6 +1684,35 @@ sel_result = TrainResult(
     elapsed_seconds=float(selected_dict.get("elapsed_seconds", 0.0)),
 )
 
+# 19a. Build the quantized training-item cache (int8 + optional PCA + FAISS).
+# This is the artifact shipped inside submission/cache/ for runtime nearest-
+# neighbor lookup. Fails loudly if max_bundle_size_mb is exceeded.
+training_cache_dir = ROOT / "artifacts" / "submission_cache"
+submission_cache_cfg = CFG.get("submission_cache", {}) or {}
+training_cache_result = None
+if bool(submission_cache_cfg.get("enabled", True)):
+    cluster_assign_map = (
+        dict(cluster_assignments) if cluster_assignments is not None else None
+    )
+    training_cache_result = bundle_training_cache(
+        items_parquet_path=embedder.items_path,
+        out_dir=training_cache_dir,
+        submission_cache_cfg=submission_cache_cfg,
+        encoder_cfg=CFG["encoder"],
+        items_meta_df=item_df,
+        cluster_assignments=cluster_assign_map,
+        n_clusters=N_CLUSTERS if USE_CLUSTER_FEATURES else 0,
+        train_df=primary.train,
+    )
+    print(
+        f"Training cache: {training_cache_result.total_mb:.2f} MB at "
+        f"{training_cache_dir.relative_to(ROOT)}"
+    )
+    for fname, mb in training_cache_result.sizes_mb.items():
+        print(f"  {fname:32s} {mb:7.2f} MB")
+else:
+    print("submission_cache.enabled = false; not shipping training-item cache")
+
 sub_dir = export_run(
     result=sel_result,
     encoder_cfg=CFG["encoder"],
@@ -1746,12 +1722,17 @@ sub_dir = export_run(
     pool_stats_path=POOL_STATS_PATH if USE_POOL_FEATURES else None,
     cluster_centroids_path=CENTROIDS_PATH if USE_CLUSTER_FEATURES else None,
     pool_feature_names=list(POOL_FEATURE_NAMES),
+    training_cache_dir=training_cache_dir if training_cache_result is not None else None,
 )
 zip_path = make_submission_zip(
     submission_dir=sub_dir,
     zip_path=ROOT / CFG["submission"]["zip_path"],
 )
+sub_bundle_mb = sum(
+    p.stat().st_size for p in sub_dir.rglob("*") if p.is_file()
+) / (1024 * 1024)
 print(f"Submission ready: {sub_dir}")
+print(f"Submission size : {sub_bundle_mb:.2f} MB")
 print(f"Zip             : {zip_path}")
 
 # %% [markdown]
@@ -1785,7 +1766,43 @@ for _, row in smoke_rows.iterrows():
     if not (isinstance(p, float) and np.isfinite(p) and 0.0 <= p <= 1.0):
         print(f"FAIL: {p!r} for inp keys {list(inp)}")
         ok = False
-print(f"Smoke test: {'OK' if ok else 'FAIL'} -- elapsed {time.time() - t0:.2f}s")
+print(f"Smoke test (predict): {'OK' if ok else 'FAIL'} -- elapsed {time.time() - t0:.2f}s")
+
+# 20b. Nearest-neighbor lookup smoke test. Pick 3 val items, fetch the
+# encoder embedding from the model module, and verify TRAINING_CACHE
+# returns well-formed (indices, scores) of the right shape and value range.
+training_cache = getattr(sub_model, "TRAINING_CACHE", None)
+nn_ok = True
+if training_cache is None:
+    print("NN smoke test: SKIP (TRAINING_CACHE not loaded)")
+else:
+    K_NN = 10
+    nn_rows = primary.val.sample(n=min(3, len(primary.val)), random_state=1)
+    n_total = int(training_cache.embeddings_q.shape[0])
+    for _, row in nn_rows.iterrows():
+        item_emb = sub_model._get_item_embedding(
+            str(row["benchmark"]),
+            str(row["condition"]),
+            str(row["item_content"]),
+        )
+        idx, scores = training_cache.nearest(item_emb, k=K_NN)
+        if idx.shape != (K_NN,) or scores.shape != (K_NN,):
+            print(f"FAIL: bad NN shapes idx={idx.shape} scores={scores.shape}")
+            nn_ok = False
+            continue
+        if not np.all(np.isfinite(scores)):
+            print(f"FAIL: non-finite NN scores {scores}")
+            nn_ok = False
+            continue
+        if int(idx.min()) < 0 or int(idx.max()) >= n_total:
+            print(f"FAIL: NN indices out of range: min={idx.min()} max={idx.max()} n={n_total}")
+            nn_ok = False
+            continue
+        print(
+            f"NN OK item_key={str(row['item_key'])[:8]}... "
+            f"top-{K_NN} score range [{float(scores.min()):.3f}, {float(scores.max()):.3f}]"
+        )
+    print(f"Smoke test (NN lookup): {'OK' if nn_ok else 'FAIL'}")
 
 # %% [markdown]
 # ## 21. Optional GCS sync

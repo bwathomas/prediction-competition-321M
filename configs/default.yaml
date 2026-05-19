@@ -49,21 +49,57 @@ encoder:
   #   intfloat/e5-large-v2
   #   BAAI/bge-large-en-v1.5
   model_id: "Qwen/Qwen3-Embedding-4B"
-  max_length: 512
-  batch_size: 128                # encoder forward-pass batch size (A100 default)
+  # max_length: optional hard cap. If null, the pipeline computes the 99th
+  # percentile token length over the actual data, rounds up to a multiple
+  # of 64, and persists the chosen value to meta.json for reproducibility.
+  max_length: null
+  max_length_floor: 256          # never go below this many tokens
+  max_length_ceiling: 4096       # never go above this many tokens
+  batch_size: 64                 # A100 40GB, Qwen3-Embedding-4B, bf16
+  batch_size_fallback: 16        # used after OOM-retry halves itself out
   bf16: true
+  # Try Flash Attention 2 first, fall back to SDPA if the wheel is missing.
+  use_flash_attention: true
   pooling: "last_token"          # mean | cls | last_token (Qwen3 needs last_token)
   # Add the e5 / instruct prefix when required by the encoder.
   query_prefix: ""               # set to "query: " for e5 models if desired
   passage_prefix: ""             # set to "passage: " for e5 models if desired
+  # Qwen3-Embedding accepts an instruction prefix. Automatically applied
+  # to both query and passage texts when the model id matches "Qwen3-Embedding".
+  qwen3_instruction: "Represent this AI evaluation context for difficulty prediction"
   # If true, use contextual item text "Benchmark: .. Condition: .. Item: ..".
-  # Item-only embeddings are still computed (cheaper) and stored separately.
   use_contextual_item_text: true
   cache_dir: "artifacts/embeddings"
   trust_remote_code: false
   # Skip the encoder entirely (debug only): use random unit vectors.
   use_random_embeddings: false
   random_embedding_dim: 256
+
+# ----------------------------------------------------------------------------
+# Google Drive cache (Colab-only persistence of the encoded embedding cache)
+# ----------------------------------------------------------------------------
+drive_cache:
+  enabled: true                  # Colab default: persist encoder cache across sessions
+  folder: "/content/drive/MyDrive/prediction-competition-321M/embeddings"
+  upload_on_completion: true     # push after encoding finishes
+  download_on_start: true        # pull before checking local cache
+
+# ----------------------------------------------------------------------------
+# Submission-bundled training-item cache (int8 + optional PCA + FAISS)
+# Used at test time for nearest-neighbor lookup over training items.
+# ----------------------------------------------------------------------------
+submission_cache:
+  enabled: true
+  quantize: "int8"               # int8 | fp16 | none
+  pca_dim: 256                   # null = skip PCA; lower = smaller bundle
+  include_faiss_index: true      # ship a FAISS HNSW index for fast lookup
+  faiss_index_type: "HNSW32"     # HNSW32 | IVF | flat
+  max_bundle_size_mb: 200        # hard cap; export fails if exceeded
+  # Per-subject pass-rate aggregations bundled for runtime NN features.
+  # "cluster" is always cheap (n_subjects * k_clusters floats). "sparse"
+  # ships the full (subject, item) -> pass_rate CSR matrix; only safe when
+  # the training matrix is genuinely sparse.
+  passrate_format: "cluster"     # cluster | sparse | none
 
 # ----------------------------------------------------------------------------
 # Pool features (hand-engineered per-item scalars, fed *into* the MLP)

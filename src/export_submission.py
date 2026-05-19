@@ -30,6 +30,7 @@ from typing import Mapping
 
 import torch
 
+from .cache_export import CacheExportConfig, CacheExportResult, export_item_cache
 from .models import ModelConfig
 from .train import TrainResult
 
@@ -78,6 +79,7 @@ CKPT_PATH = ARTIFACTS / "checkpoint.pt"
 META_PATH = ARTIFACTS / "runtime_meta.json"
 POOL_STATS_PATH = ARTIFACTS / "pool_features_stats.json"
 CLUSTER_CENTROIDS_PATH = ARTIFACTS / "cluster_centroids.npy"
+TRAINING_CACHE_DIR = HERE / "cache"
 EPS = 1e-6
 
 # ---------------------------------------------------------------------------
@@ -646,6 +648,183 @@ def _fit_temp_intercept(ps: list[float], ys: list[float]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Training-item cache (nearest-neighbor lookup over training items).
+#
+# This is the int8-quantized (and optionally PCA-projected) snapshot of the
+# *training* item embedding matrix. It lets predict() find similar training
+# items for a test query without round-tripping the encoder over the whole
+# training set at every test call.
+#
+# By contract this cache is for *training* items only: at test time we look
+# up neighbors of a test query inside the training set. We never read it as
+# ground truth for a test item.
+# ---------------------------------------------------------------------------
+
+
+class _TrainingItemCache:
+    """Quantized training-item embeddings + (optional) FAISS / cluster table."""
+
+    def __init__(self, cache_dir: Path):
+        self.cache_dir = Path(cache_dir)
+        meta_path = self.cache_dir / "cache_meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"cache_meta.json not found at {meta_path}")
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            self.meta: dict = json.load(fh)
+
+        embeddings_path = self.cache_dir / "embeddings_int8.npy"
+        scales_path = self.cache_dir / "scales.npy"
+        pca_path = self.cache_dir / "pca.npy"
+        keys_path = self.cache_dir / "item_keys.parquet"
+
+        self.embeddings_q: np.ndarray = np.load(embeddings_path)
+        self.scales: np.ndarray = np.load(scales_path).astype(np.float32)
+        self.pca: np.ndarray | None = (
+            np.load(pca_path).astype(np.float32) if pca_path.exists() else None
+        )
+        try:
+            import pandas as _pd  # type: ignore
+
+            self.keys = _pd.read_parquet(keys_path)
+        except Exception:
+            self.keys = None
+        self._index: object | None = None
+        self._index_path = self.cache_dir / "faiss.index"
+        self._dequant_cache: np.ndarray | None = None
+        # Optional per-subject cluster pass-rate table.
+        self.subject_cluster_passrates: np.ndarray | None = None
+        self.subject_passrates_sparse: object | None = None
+        self.subject_key_to_row: dict[str, int] = {}
+        spp_dense = self.cache_dir / "subject_cluster_passrates.npy"
+        spp_sparse = self.cache_dir / "subject_passrates.npz"
+        subject_keys_path = self.cache_dir / "subject_keys.parquet"
+        if subject_keys_path.exists():
+            try:
+                import pandas as _pd  # type: ignore
+
+                skdf = _pd.read_parquet(subject_keys_path)
+                self.subject_key_to_row = {
+                    str(k): int(i) for i, k in zip(skdf["row_index"], skdf["subject_key"])
+                }
+            except Exception:
+                self.subject_key_to_row = {}
+        if spp_dense.exists():
+            try:
+                self.subject_cluster_passrates = np.load(spp_dense).astype(np.float32)
+            except Exception:
+                self.subject_cluster_passrates = None
+        if spp_sparse.exists():
+            try:
+                from scipy import sparse as _sparse  # type: ignore
+
+                self.subject_passrates_sparse = _sparse.load_npz(spp_sparse)
+            except Exception:
+                self.subject_passrates_sparse = None
+
+    def _ensure_index(self) -> None:
+        if self._index is not None:
+            return
+        if not self._index_path.exists():
+            return
+        try:
+            import faiss  # type: ignore
+
+            self._index = faiss.read_index(str(self._index_path))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("FAISS read failed (%s); falling back to brute-force", exc)
+            self._index = None
+
+    def project(self, embed: np.ndarray) -> np.ndarray:
+        """Apply the same PCA used at export time. No-op if PCA missing."""
+        x = np.asarray(embed, dtype=np.float32)
+        if self.pca is None:
+            return x
+        return (x @ self.pca).astype(np.float32)
+
+    def _dequantized(self) -> np.ndarray:
+        """Lazy fp32 reconstruction (only built when the FAISS index missing)."""
+        if self._dequant_cache is None:
+            self._dequant_cache = self.embeddings_q.astype(np.float32) * self.scales[:, None]
+        return self._dequant_cache
+
+    def nearest(self, query_embed: np.ndarray, k: int = 10) -> tuple[np.ndarray, np.ndarray]:
+        """Return (indices, scores). Higher score = more similar (inner product).
+
+        The query is the *raw* fp32/fp16 encoder output. We apply the same
+        projection used at export time before lookup.
+        """
+        q = self.project(query_embed).reshape(1, -1)
+        self._ensure_index()
+        if self._index is not None:
+            try:
+                D, I = self._index.search(np.ascontiguousarray(q, dtype=np.float32), int(k))
+                return I[0].astype(np.int64), D[0].astype(np.float32)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("FAISS search failed (%s); brute-force fallback", exc)
+        recon = self._dequantized()
+        sims = recon @ q[0]
+        kk = min(int(k), recon.shape[0])
+        topk = np.argpartition(-sims, kk - 1)[:kk] if kk < recon.shape[0] else np.arange(recon.shape[0])
+        order = np.argsort(-sims[topk])
+        return topk[order].astype(np.int64), sims[topk][order].astype(np.float32)
+
+    def subject_cluster_features(
+        self,
+        subject_content: str,
+        neighbor_indices: np.ndarray,
+        neighbor_scores: np.ndarray,
+    ) -> dict[str, float] | None:
+        """Aggregate per-cluster pass rates for the NN items of `subject_content`.
+
+        Returns ``None`` if no per-subject lookup table is bundled, or if the
+        subject is unseen. Otherwise returns a small dict of summary stats
+        (mean, max, weighted mean by similarity) suitable for use as
+        additional features inside a model variant that consumes them.
+        """
+        if self.subject_cluster_passrates is None or self.keys is None:
+            return None
+        key = stable_sha256(str(subject_content or ""))
+        row = self.subject_key_to_row.get(key)
+        if row is None:
+            return None
+        # Look up cluster ids of the neighbor items.
+        if "cluster_id" not in self.keys.columns:
+            return None
+        clusters_for_neighbors = self.keys["cluster_id"].to_numpy(dtype=np.int64)
+        try:
+            cluster_ids = clusters_for_neighbors[neighbor_indices]
+        except Exception:
+            return None
+        rates = self.subject_cluster_passrates[row][cluster_ids]
+        weights = np.clip(neighbor_scores, 0.0, None)
+        if float(weights.sum()) < 1e-9:
+            weights = np.ones_like(weights)
+        weighted = float((rates * weights).sum() / max(float(weights.sum()), 1e-9))
+        return {
+            "nn_passrate_mean": float(rates.mean()) if rates.size else 0.0,
+            "nn_passrate_max": float(rates.max()) if rates.size else 0.0,
+            "nn_passrate_min": float(rates.min()) if rates.size else 0.0,
+            "nn_passrate_weighted_mean": weighted,
+        }
+
+
+TRAINING_CACHE: _TrainingItemCache | None = None
+if TRAINING_CACHE_DIR.exists() and (TRAINING_CACHE_DIR / "cache_meta.json").exists():
+    try:
+        TRAINING_CACHE = _TrainingItemCache(TRAINING_CACHE_DIR)
+        LOG.info(
+            "Loaded training-item cache: n=%d dim=%d pca=%s faiss=%s",
+            TRAINING_CACHE.embeddings_q.shape[0],
+            TRAINING_CACHE.embeddings_q.shape[1] if TRAINING_CACHE.embeddings_q.ndim > 1 else 0,
+            bool(TRAINING_CACHE.pca is not None),
+            bool(TRAINING_CACHE._index_path.exists()),
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to load training-item cache (%s); continuing without NN lookup", exc)
+        TRAINING_CACHE = None
+
+
+# ---------------------------------------------------------------------------
 # Module-level init: load tokenizer + encoder + checkpoint (all from local
 # Hugging Face cache, no network).
 # ---------------------------------------------------------------------------
@@ -974,6 +1153,9 @@ def acquisition_function(input: dict) -> float:
 
 
 _RUNTIME_REQUIREMENTS = """numpy>=1.26
+pandas>=2.2
+pyarrow>=14.0
+scipy>=1.12
 torch>=2.2
 transformers>=4.41
 safetensors>=0.4
@@ -982,6 +1164,10 @@ sentencepiece>=0.2
 # Optional: enables langdetect-based pool feature 'lang_en'. Falls back to
 # an ASCII heuristic if missing so the submission never breaks on import.
 langdetect>=1.0.9
+# Optional: FAISS for sub-millisecond nearest-neighbor lookup over the
+# shipped training-item cache. Brute-force numpy fallback is used if the
+# wheel is unavailable on the runner.
+faiss-cpu>=1.7.4
 """
 
 
@@ -1001,6 +1187,7 @@ def export_run(
     pool_stats_path: str | os.PathLike[str] | None = None,
     cluster_centroids_path: str | os.PathLike[str] | None = None,
     pool_feature_names: list[str] | None = None,
+    training_cache_dir: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -1011,6 +1198,10 @@ def export_run(
     ``pool_stats_path`` / ``cluster_centroids_path`` at the artifacts so the
     submission bundle can reconstruct them at test time. Both default to the
     standard locations under ``artifacts/`` if omitted.
+
+    If ``training_cache_dir`` is provided (the quantized training-item cache
+    written by ``bundle_training_cache``), its contents are copied into
+    ``submission/cache/`` for nearest-neighbor lookup at test time.
 
     Returns the submission directory path.
     """
@@ -1040,17 +1231,37 @@ def export_run(
     if centroids_src.exists():
         shutil.copy2(centroids_src, artifacts / "cluster_centroids.npy")
 
+    # Optional training-item cache (quantized + PCA + FAISS). Copied to
+    # ``submission/cache/`` so the runtime can mmap it for NN lookup.
+    if training_cache_dir is not None:
+        src_cache = Path(training_cache_dir)
+        if src_cache.exists():
+            dst_cache = sub / "cache"
+            if dst_cache.exists():
+                shutil.rmtree(dst_cache)
+            shutil.copytree(src_cache, dst_cache)
+            LOG.info("Bundled training cache from %s -> %s", src_cache, dst_cache)
+        else:
+            LOG.warning(
+                "training_cache_dir=%s does not exist; skipping cache bundle",
+                src_cache,
+            )
+
     runtime_meta = {
         "run_id": result.run_id,
         "model_name": result.model_name,
         "encoder_model_id": encoder_cfg["model_id"],
-        "max_length": int(encoder_cfg.get("max_length", 512)),
+        # The encoder side may have promoted max_length from config-null to a
+        # data-driven cap. We persist the *effective* number so the runtime
+        # tokenizes consistently with the offline cache.
+        "max_length": int(encoder_cfg.get("max_length") or 512),
         "pooling": encoder_cfg.get("pooling", "mean"),
         "use_contextual_item_text": bool(
             encoder_cfg.get("use_contextual_item_text", True)
         ),
         "query_prefix": encoder_cfg.get("query_prefix", ""),
         "passage_prefix": encoder_cfg.get("passage_prefix", ""),
+        "qwen3_instruction": encoder_cfg.get("qwen3_instruction", ""),
         "default_prob": 0.5,
         "default_calibrator": dict(default_calibrator or {"kind": "identity"}),
         "best_val_log_loss": float(result.best_val_log_loss),
@@ -1090,6 +1301,51 @@ def export_run(
     return sub
 
 
+def bundle_training_cache(
+    *,
+    items_parquet_path: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    submission_cache_cfg: Mapping,
+    encoder_cfg: Mapping,
+    items_meta_df=None,
+    cluster_assignments=None,
+    n_clusters: int = 0,
+    train_df=None,
+) -> CacheExportResult:
+    """Build the int8 / PCA / FAISS training-item cache.
+
+    Thin wrapper around ``src.cache_export.export_item_cache`` that pulls
+    arguments from the config blocks the notebook already has at hand.
+
+    Raises RuntimeError if ``submission_cache_cfg.max_bundle_size_mb`` is
+    exceeded so the notebook can fail loudly before zip time.
+    """
+    cfg = CacheExportConfig(
+        enabled=bool(submission_cache_cfg.get("enabled", True)),
+        quantize=str(submission_cache_cfg.get("quantize", "int8")),
+        pca_dim=submission_cache_cfg.get("pca_dim"),
+        include_faiss_index=bool(submission_cache_cfg.get("include_faiss_index", True)),
+        faiss_index_type=str(submission_cache_cfg.get("faiss_index_type", "HNSW32")),
+        max_bundle_size_mb=float(submission_cache_cfg.get("max_bundle_size_mb", 200)),
+        passrate_format=str(submission_cache_cfg.get("passrate_format", "cluster")),
+        encoder_id=str(encoder_cfg.get("model_id", "")),
+        query_prefix=str(encoder_cfg.get("query_prefix", "")),
+        passage_prefix=str(encoder_cfg.get("passage_prefix", "")),
+    )
+    result = export_item_cache(
+        items_parquet_path=Path(items_parquet_path),
+        out_dir=Path(out_dir),
+        cfg=cfg,
+        items_meta_df=items_meta_df,
+        cluster_assignments=cluster_assignments,
+        n_clusters=int(n_clusters),
+        train_df=train_df,
+    )
+    if result.failed:
+        raise RuntimeError(result.error or "submission cache export failed")
+    return result
+
+
 def make_submission_zip(
     submission_dir: str | os.PathLike[str] = "submission",
     zip_path: str | os.PathLike[str] = "submission.zip",
@@ -1107,4 +1363,4 @@ def make_submission_zip(
     return zip_path
 
 
-__all__ = ["export_run", "make_submission_zip"]
+__all__ = ["bundle_training_cache", "export_run", "make_submission_zip"]
