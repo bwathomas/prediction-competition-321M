@@ -623,6 +623,175 @@ def build_results_dataframe(
     return df.reset_index(drop=True)
 
 
+# ---------------------------------------------------------------------------
+# Component decomposition + feature-ablation diagnostics (Analysis A / B
+# from the design doc; consumed by the notebook's cell 14b)
+# ---------------------------------------------------------------------------
+
+
+def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if a.size == 0 or b.size == 0 or a.std() < 1e-12 or b.std() < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _solo_nll(component: np.ndarray, y: np.ndarray) -> float:
+    """Solo NLL: fit sigmoid(a * c + b) on (component, y) and return its NLL.
+
+    Each component gets its own scale and intercept so the metric reflects
+    the *information* in ``c``, not its raw magnitude. Falls back to a
+    global-mean predictor when the inputs are degenerate.
+    """
+    c = np.asarray(component, dtype=np.float64).reshape(-1, 1)
+    yb = (np.asarray(y, dtype=np.float64) >= 0.5).astype(int)
+    if c.size == 0:
+        return float("nan")
+    if yb.sum() == 0 or (1 - yb).sum() == 0:
+        return float("nan")
+    if np.allclose(c.std(), 0.0):
+        # constant column -- best 2-param logreg is just an intercept
+        p = float(np.clip(yb.mean(), 1e-7, 1.0 - 1e-7))
+        return float(-(yb * np.log(p) + (1 - yb) * np.log(1.0 - p)).mean())
+
+    try:
+        from sklearn.linear_model import LogisticRegression
+
+        clf = LogisticRegression(C=1e6, max_iter=200, solver="lbfgs")
+        clf.fit(c, yb)
+        p = clf.predict_proba(c)[:, 1]
+        return log_loss(yb.astype(float), p)
+    except Exception:
+        return float("nan")
+
+
+def _solo_auc(component: np.ndarray, y: np.ndarray) -> float | None:
+    """Solo AUC: scale-invariant ranking quality of ``c`` against ``y``.
+
+    The Solo NLL trick rewards information regardless of scale; Solo AUC
+    is a complementary signal that is *only* a ranking measure.
+    """
+    return auc_roc(np.asarray(y, dtype=float), np.asarray(component, dtype=float))
+
+
+def component_decomposition_table(
+    components: dict[str, np.ndarray],
+    y: np.ndarray,
+) -> pd.DataFrame:
+    """Build the Analysis-B dataframe from a dict of per-row components.
+
+    The expected keys for IRT variants are ``{"irt", "offset", "mlp"}``.
+    For the kfactor family the keys are ``{"factor", "mlp"}``. Any extra
+    component keys are tolerated and shown alongside.
+    """
+    rows: list[dict] = []
+    for name, c in components.items():
+        if not isinstance(c, np.ndarray):
+            c = np.asarray(c)
+        if c.ndim > 1:
+            c = c.reshape(-1)
+        rows.append(
+            {
+                "component": name,
+                "var": float(np.var(c)),
+                "pearson_y": _pearson_corr(c, y),
+                "solo_nll": _solo_nll(c, y),
+                "solo_auc": _solo_auc(c, y),
+            }
+        )
+    out = pd.DataFrame(rows)
+    return out.sort_values("solo_nll", ascending=True).reset_index(drop=True)
+
+
+def plot_component_variance(
+    components: dict[str, np.ndarray],
+    out_path: str | os.PathLike[str],
+    *,
+    title: str = "Logit-component variance breakdown",
+) -> Path:
+    """Stacked bar of variance per component (Analysis B sidecar plot)."""
+    p = _ensure(out_path)
+    names = list(components.keys())
+    variances = [float(np.var(c)) for c in components.values()]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.bar(names, variances, color="#4c72b0")
+    ax.set_ylabel("Var(component)")
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(p, dpi=144)
+    plt.close(fig)
+    return p
+
+
+# Feature-ablation -----------------------------------------------------------
+
+
+def _bce_from_logits(logits: np.ndarray, y: np.ndarray) -> float:
+    """Numerically-stable BCE from raw logits."""
+    z = np.asarray(logits, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).clip(0.0, 1.0)
+    # log1pexp(-|z|) + max(-z, 0) is the stable form of log(1 + exp(-z*y_sign))
+    # but for soft labels we evaluate p = sigmoid(z) directly with clipping.
+    p = 1.0 / (1.0 + np.exp(-z))
+    p = np.clip(p, 1e-7, 1.0 - 1e-7)
+    return float(-(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)).mean())
+
+
+def feature_ablation_table(
+    ablations: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    full_key: str = "full",
+) -> pd.DataFrame:
+    """Build the Analysis-A dataframe from precomputed (p, y) per ablation.
+
+    ``ablations`` maps a label (e.g. "without_pool", "without_alpha",
+    "pool_feature[char_len]") to ``(p, y)`` arrays. The row with key
+    ``full_key`` is treated as the baseline and Δ-columns are computed
+    relative to it.
+    """
+    rows = []
+    for name, (p, y) in ablations.items():
+        rows.append(
+            {
+                "channel_removed": name,
+                "val_nll": log_loss(y, p),
+                "val_auc": auc_roc(y, p),
+            }
+        )
+    df = pd.DataFrame(rows)
+    base = df.loc[df["channel_removed"] == full_key]
+    base_nll = float(base["val_nll"].iloc[0]) if not base.empty else float("nan")
+    base_auc = base["val_auc"].iloc[0] if not base.empty else None
+    base_auc_f = float(base_auc) if base_auc is not None else float("nan")
+    df["delta_nll"] = df["val_nll"] - base_nll
+    df["delta_auc"] = df["val_auc"].astype(float) - base_auc_f
+    return df.sort_values("delta_nll", ascending=False).reset_index(drop=True)
+
+
+def plot_feature_ablation(
+    df: pd.DataFrame,
+    out_path: str | os.PathLike[str],
+    *,
+    title: str = "Feature ablation by Δ NLL",
+) -> Path:
+    """Horizontal bar of Δ NLL by channel removed (positive = channel matters)."""
+    p = _ensure(out_path)
+    sub = df.sort_values("delta_nll", ascending=True)
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.4 * len(sub))))
+    colors = ["#55a868" if d <= 0 else "#c44e52" for d in sub["delta_nll"]]
+    ax.barh(sub["channel_removed"], sub["delta_nll"], color=colors)
+    ax.axvline(0, color="black", linewidth=0.5)
+    ax.set_xlabel("Δ NLL (positive = channel is contributing)")
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(p, dpi=144)
+    plt.close(fig)
+    return p
+
+
 __all__ = [
     "MetricBundle",
     "accuracy_at_half",
@@ -632,8 +801,10 @@ __all__ = [
     "brier",
     "build_results_dataframe",
     "calibration_table",
+    "component_decomposition_table",
     "compute_metrics",
     "expected_calibration_error",
+    "feature_ablation_table",
     "global_mean_baseline",
     "log_loss",
     "logistic_baseline_on_embeddings",
@@ -641,6 +812,8 @@ __all__ = [
     "metrics_by_group",
     "metrics_by_token_length",
     "plot_calibration_curves",
+    "plot_component_variance",
+    "plot_feature_ablation",
     "plot_logloss_by_benchmark",
     "plot_perf_vs_token_length",
     "plot_residual_improvement_by_benchmark",

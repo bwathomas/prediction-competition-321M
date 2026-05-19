@@ -66,11 +66,38 @@ encoder:
   random_embedding_dim: 256
 
 # ----------------------------------------------------------------------------
+# Pool features (hand-engineered per-item scalars, fed *into* the MLP)
+# ----------------------------------------------------------------------------
+item_features:
+  enabled: true
+  use_pool: true                 # concat z-scored pool features into MLP input
+  use_clusters: true             # concat learned cluster embedding into MLP input
+  pool_feature_dim: 9            # update if the pool-feature list changes
+  cluster_embed_dim: 16
+  cache_dir: "artifacts/item_features"
+
+# ----------------------------------------------------------------------------
+# Clustering (k-means on cached item embeddings, fed *into* the MLP)
+# ----------------------------------------------------------------------------
+clustering:
+  k: 64
+  seed: 0
+  centroids_path: "artifacts/cluster_centroids.npy"
+  assignments_path: "artifacts/item_clusters.parquet"
+
+# ----------------------------------------------------------------------------
 # Models / training
 # ----------------------------------------------------------------------------
 train:
-  # Which model variants to train.
-  models: ["kfactor", "kfactor_mlp", "kfactor_gated_mlp"]
+  # Which model variants to train. The first three are the original
+  # baselines; the last three add the Item-IRT channel.
+  models:
+    - kfactor
+    - kfactor_mlp
+    - kfactor_gated_mlp
+    - kfactor_irt_item
+    - kfactor_irt_item_mlp
+    - kfactor_irt_item_gated_mlp
   # Hyperparameters
   k_factors: [16, 32]            # ablate over multiple k
   item_map_hidden_dim: 512
@@ -91,6 +118,12 @@ train:
   early_stopping_patience: 5
   grad_clip: 1.0
   scheduler: "cosine"            # cosine | linear | none
+  # Soft regularization on the Item-IRT heads: prevents beta from exploding
+  # and keeps log(alpha) close to zero so the IRT head and the residual MLP
+  # don't collude in degenerate ways.
+  irt_reg:
+    lambda_beta: 1.0e-4
+    lambda_alpha: 1.0e-4
   # Future hook: fine-tune the encoder with LoRA. Not implemented in v1.
   enable_lora: false
 

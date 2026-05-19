@@ -8,6 +8,25 @@ Codabench platform actually scores against:
 1. **K-factor / neural-IRT** (`kfactor`)
 2. **K-factor + ordinary MLP residual** (`kfactor_mlp`)
 3. **K-factor + gated MLP / SwiGLU residual** (`kfactor_gated_mlp`)
+4. **Item-IRT** (`kfactor_irt_item`) -- parallel 2PL Item-IRT channel:
+   `logit = alpha(item) * (theta_subj - beta(item)) + offsets`
+5. **Item-IRT + ordinary MLP residual** (`kfactor_irt_item_mlp`)
+6. **Item-IRT + gated MLP / SwiGLU residual** (`kfactor_irt_item_gated_mlp`)
+
+The Item-IRT variants add an explicit multiplicative subject-item channel
+(`alpha(item) * (theta - beta(item))`) *outside* the residual MLP, plus two
+new channels that go *inside* the MLP: nine z-scored pool features
+(token length, has-latex, has-code, MC indicators, language, etc.) and a
+learned k-means cluster embedding fit on the cached item embeddings. The
+notebook's cell 14b emits a **feature-contribution + component-decomposition
+diagnostic** for the best run: Analysis A leaves out each channel in turn
+to attribute ΔNLL, and Analysis B decomposes the final logit into its
+additive components and reports each component's variance, Pearson
+correlation with the label, **Solo NLL** (fitted 2-param logistic on that
+component alone), and Solo AUC. CSVs and plots land in
+`artifacts/results/feature_ablation_{run_id}.csv` /
+`artifacts/results/component_decomp_{run_id}.csv` and the matching files
+under `artifacts/plots/`.
 
 The notebook downloads the dataset, embeds every unique item / subject text
 once with a heavy HF encoder (default: `intfloat/e5-mistral-7b-instruct`),
@@ -36,9 +55,11 @@ which trained run to export into the required Codabench submission format.
 ├── src/
 │   ├── data.py                       # HF download + join + keys + splits
 │   ├── embeddings.py                 # HF encoder + caching + token stats
-│   ├── models.py                     # KFactor, MLP, gated MLP (SwiGLU)
+│   ├── models.py                     # KFactor + Item-IRT model variants
+│   ├── item_features.py              # per-item pool features + z-score stats
+│   ├── clustering.py                 # k-means on cached item embeddings
 │   ├── train.py                      # AdamW + bf16 + cosine + early stop
-│   ├── eval.py                       # metrics, ECE, slices, plots
+│   ├── eval.py                       # metrics, ECE, slices, ablation diags
 │   ├── calibration.py                # temperature / intercept calibrator
 │   ├── sanity_checks.py              # data/embedding/model invariants
 │   └── export_submission.py          # bundle to submission/ + submission.zip
@@ -166,10 +187,40 @@ The notebook iterates over every combination in:
 
 ```yaml
 train:
-  models: ["kfactor", "kfactor_mlp", "kfactor_gated_mlp"]
+  models:
+    - kfactor
+    - kfactor_mlp
+    - kfactor_gated_mlp
+    - kfactor_irt_item
+    - kfactor_irt_item_mlp
+    - kfactor_irt_item_gated_mlp
   k_factors: [16, 32]
   seeds: [0, 1, 2]
+  irt_reg:
+    lambda_beta: 1.0e-4
+    lambda_alpha: 1.0e-4
 ```
+
+Per-channel knobs live in two new YAML blocks:
+
+```yaml
+item_features:
+  enabled: true
+  use_pool: true                 # z-scored pool features (inside the MLP)
+  use_clusters: true             # learned cluster embedding (inside the MLP)
+  pool_feature_dim: 9
+  cluster_embed_dim: 16
+
+clustering:
+  k: 64
+  seed: 0
+```
+
+In cell 13 set ``RUN_FEATURE_TOGGLE_GRID = True`` to re-run the MLP /
+gated-MLP / Item-IRT-MLP / Item-IRT-gated-MLP variants with pool and
+cluster channels disabled. Cell 14b reads from whichever runs are
+present and writes ``artifacts/results/feature_ablation_{run_id}.csv`` and
+``artifacts/results/component_decomp_{run_id}.csv`` for the best run.
 
 Each `(model_name, k, seed)` becomes one checkpoint in
 `artifacts/checkpoints/{run_id}.pt` plus a sibling

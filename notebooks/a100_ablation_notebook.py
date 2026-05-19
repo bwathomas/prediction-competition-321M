@@ -503,6 +503,91 @@ print("\nEncoder diagnostics:")
 print(json.dumps(emb_stats, indent=2))
 
 # %% [markdown]
+# ## 8b. Pool features and k-means clustering on items
+#
+# Two cheap item-side channels that the new Item-IRT variants compose with
+# the embedding:
+#
+# - **Pool features**: hand-engineered scalars (token / char length, has-latex,
+#   has-code, question count, MC indicators, language). Computed once per
+#   unique item, cached to ``artifacts/item_features/pool_features.parquet``,
+#   z-scored using *train-only* stats persisted alongside.
+# - **Clusters**: k-means on the cached item embeddings. Centroids go to
+#   ``artifacts/cluster_centroids.npy`` and per-item assignments to
+#   ``artifacts/item_clusters.parquet``. Cluster id 0 is reserved for UNK.
+
+# %%
+from src.clustering import fit_and_assign, load_centroids
+from src.item_features import (
+    POOL_FEATURE_NAMES,
+    apply_zscore,
+    compute_features_for_items,
+    fit_zscore_stats,
+    load_pool_features,
+    load_zscore_stats,
+    save_pool_features,
+    save_zscore_stats,
+)
+
+ITEM_FEATURES_CFG = CFG.get("item_features", {}) or {}
+USE_POOL_FEATURES = bool(ITEM_FEATURES_CFG.get("use_pool", True))
+USE_CLUSTER_FEATURES = bool(ITEM_FEATURES_CFG.get("use_clusters", True))
+POOL_FEATURE_DIM = int(ITEM_FEATURES_CFG.get("pool_feature_dim", len(POOL_FEATURE_NAMES)))
+CLUSTER_EMBED_DIM = int(ITEM_FEATURES_CFG.get("cluster_embed_dim", 16))
+POOL_FEATURES_DIR = ROOT / ITEM_FEATURES_CFG.get("cache_dir", "artifacts/item_features")
+POOL_FEATURES_PATH = POOL_FEATURES_DIR / "pool_features.parquet"
+POOL_STATS_PATH = POOL_FEATURES_DIR / "pool_features_stats.json"
+
+CLUSTERING_CFG = CFG.get("clustering", {}) or {}
+N_CLUSTERS = int(CLUSTERING_CFG.get("k", 64))
+CLUSTERING_SEED = int(CLUSTERING_CFG.get("seed", 0))
+CENTROIDS_PATH = ROOT / CLUSTERING_CFG.get(
+    "centroids_path", "artifacts/cluster_centroids.npy"
+)
+ASSIGNMENTS_PATH = ROOT / CLUSTERING_CFG.get(
+    "assignments_path", "artifacts/item_clusters.parquet"
+)
+
+# 1) Pool features ----------------------------------------------------------
+if USE_POOL_FEATURES:
+    pool_df = load_pool_features(POOL_FEATURES_PATH)
+    if pool_df is None or set(POOL_FEATURE_NAMES).difference(pool_df.columns):
+        print(f"Computing pool features for {len(item_df):,} unique items ...")
+        pool_df = compute_features_for_items(item_df, progress=True)
+        save_pool_features(pool_df, POOL_FEATURES_PATH)
+        print(f"Cached pool features -> {POOL_FEATURES_PATH.relative_to(ROOT)}")
+    else:
+        print(f"Loaded cached pool features ({len(pool_df):,} rows) from {POOL_FEATURES_PATH.relative_to(ROOT)}")
+else:
+    pool_df = None
+    print("Pool features disabled (CFG.item_features.use_pool = false).")
+
+print(f"Pool feature columns: {list(POOL_FEATURE_NAMES)}")
+
+# 2) k-means on item embeddings -------------------------------------------
+if USE_CLUSTER_FEATURES:
+    item_keys_for_clusters = item_df["item_key"].astype(str).tolist()
+    item_emb_matrix = np.stack(
+        [item_emb_lookup[k] for k in item_keys_for_clusters], axis=0
+    ).astype(np.float32)
+    centroids, cluster_assignments = fit_and_assign(
+        item_keys_for_clusters,
+        item_emb_matrix,
+        k=N_CLUSTERS,
+        seed=CLUSTERING_SEED,
+        centroids_path=CENTROIDS_PATH,
+        assignments_path=ASSIGNMENTS_PATH,
+    )
+    print(
+        f"Clusters: k={N_CLUSTERS} centroids={CENTROIDS_PATH.relative_to(ROOT)} "
+        f"assignments={ASSIGNMENTS_PATH.relative_to(ROOT)}"
+    )
+else:
+    centroids = None
+    cluster_assignments = None
+    print("Cluster features disabled (CFG.item_features.use_clusters = false).")
+
+# %% [markdown]
 # ## 9. Embedding sanity checks
 
 # %%
@@ -533,9 +618,43 @@ print_results(embed_checks)
 # %%
 from src.models import Indexer, LookupDataset, ModelConfig
 from src.embeddings import stack_lookup
+from src.item_features import build_feature_matrix
 
 
-def _build_arrays(split_art, indexer, item_lookup, subject_lookup, use_subject_emb=False):
+def _pool_matrix(keys, features_df):
+    """Build a [N, pool_feature_dim] z-scored matrix for the given item keys.
+
+    Returns ``None`` if pool features are disabled / missing.
+    """
+    if features_df is None:
+        return None
+    return build_feature_matrix(
+        [str(k) for k in keys],
+        features_df,
+        feature_cols=list(POOL_FEATURE_NAMES),
+        key_col="item_key",
+    )
+
+
+def _cluster_vector(keys, assignments):
+    """Build a [N] int64 cluster-id vector. Unknown keys map to 0 (UNK)."""
+    if assignments is None:
+        return None
+    return np.array(
+        [int(assignments.get(str(k), 0)) for k in keys], dtype=np.int64
+    )
+
+
+def _build_arrays(
+    split_art,
+    indexer,
+    item_lookup,
+    subject_lookup,
+    *,
+    use_subject_emb: bool = False,
+    pool_features_z=None,
+    cluster_assignments=None,
+):
     train = split_art.train
     val = split_art.val
     s_train = np.array([indexer.subject_id(k) for k in train["subject_key"]])
@@ -549,11 +668,19 @@ def _build_arrays(split_art, indexer, item_lookup, subject_lookup, use_subject_e
     if use_subject_emb:
         se_train = stack_lookup(train["subject_key"], subject_lookup)
         se_val = stack_lookup(val["subject_key"], subject_lookup)
+    pf_train = _pool_matrix(train["item_key"], pool_features_z)
+    pf_val = _pool_matrix(val["item_key"], pool_features_z)
+    ci_train = _cluster_vector(train["item_key"], cluster_assignments)
+    ci_val = _cluster_vector(val["item_key"], cluster_assignments)
     y_train = train["label"].astype(float).to_numpy()
     y_val = val["label"].astype(float).to_numpy()
     return (
-        LookupDataset(s_train, bc_train, ie_train, y_train, se_train),
-        LookupDataset(s_val, bc_val, ie_val, y_val, se_val),
+        LookupDataset(
+            s_train, bc_train, ie_train, y_train, se_train, pf_train, ci_train
+        ),
+        LookupDataset(
+            s_val, bc_val, ie_val, y_val, se_val, pf_val, ci_val
+        ),
     )
 
 
@@ -568,10 +695,36 @@ USE_SUBJECT_EMB = False  # set True to feed subject text embeddings to the resid
 SUBJECT_EMB_DIM = embedder.embedding_dim if USE_SUBJECT_EMB else 0
 ITEM_EMB_DIM = embedder.embedding_dim
 
+# Fit z-score stats on the TRAIN items only, then apply to all items.
+if USE_POOL_FEATURES and pool_df is not None:
+    train_item_keys = set(primary.train["item_key"].astype(str).tolist())
+    train_features = pool_df[pool_df["item_key"].astype(str).isin(train_item_keys)]
+    pool_stats = load_zscore_stats(POOL_STATS_PATH)
+    if pool_stats is None:
+        pool_stats = fit_zscore_stats(train_features, feature_cols=list(POOL_FEATURE_NAMES))
+        save_zscore_stats(pool_stats, POOL_STATS_PATH)
+        print(f"Fit pool-feature z-score stats on {len(train_features):,} train items -> {POOL_STATS_PATH.relative_to(ROOT)}")
+    else:
+        print(f"Loaded pool-feature z-score stats from {POOL_STATS_PATH.relative_to(ROOT)}")
+    pool_features_z = apply_zscore(pool_df, pool_stats)
+else:
+    pool_stats = None
+    pool_features_z = None
+
 train_ds, val_ds = _build_arrays(
-    primary, indexer, item_emb_lookup, subject_emb_lookup, USE_SUBJECT_EMB
+    primary,
+    indexer,
+    item_emb_lookup,
+    subject_emb_lookup,
+    use_subject_emb=USE_SUBJECT_EMB,
+    pool_features_z=pool_features_z,
+    cluster_assignments=cluster_assignments,
 )
-print(f"train rows: {len(train_ds)} | val rows: {len(val_ds)}")
+print(
+    f"train rows: {len(train_ds)} | val rows: {len(val_ds)} | "
+    f"pool_feats: {'on' if USE_POOL_FEATURES else 'off'} | "
+    f"clusters: {'on' if USE_CLUSTER_FEATURES else 'off'}"
+)
 
 # %% [markdown]
 # ## 11. Model sanity checks: forward pass, tiny-batch overfit, random labels
@@ -585,7 +738,21 @@ from src.sanity_checks import (
 )
 
 
-def _model_cfg(k: int, model_name: str) -> ModelConfig:
+def _model_cfg(
+    k: int,
+    model_name: str,
+    *,
+    use_pool: bool | None = None,
+    use_clusters: bool | None = None,
+) -> ModelConfig:
+    """Construct a ModelConfig honoring the pool / cluster flags.
+
+    ``use_pool`` and ``use_clusters`` default to the global notebook flags;
+    pass explicit booleans in the ablation grid to toggle them per run.
+    """
+    irt_reg = (CFG["train"].get("irt_reg") or {})
+    up = USE_POOL_FEATURES if use_pool is None else bool(use_pool)
+    uc = USE_CLUSTER_FEATURES if use_clusters is None else bool(use_clusters)
     return ModelConfig(
         k=k,
         item_embed_dim=ITEM_EMB_DIM,
@@ -598,6 +765,13 @@ def _model_cfg(k: int, model_name: str) -> ModelConfig:
         subject_embed_dim=SUBJECT_EMB_DIM,
         lambda_resid_init=float(CFG["train"]["lambda_resid_init"]),
         lambda_resid_trainable=bool(CFG["train"]["lambda_resid_trainable"]),
+        use_pool_features=bool(up and pool_features_z is not None),
+        pool_feature_dim=POOL_FEATURE_DIM if up else 0,
+        use_cluster_features=bool(uc and cluster_assignments is not None),
+        n_clusters=N_CLUSTERS if uc else 0,
+        cluster_embed_dim=CLUSTER_EMBED_DIM if uc else 0,
+        irt_lambda_beta=float(irt_reg.get("lambda_beta", 1.0e-4)),
+        irt_lambda_alpha=float(irt_reg.get("lambda_alpha", 1.0e-4)),
     )
 
 
@@ -696,12 +870,23 @@ baseline_df = pd.DataFrame(all_results).sort_values(["split", "val_log_loss"])
 print(baseline_df.to_string(index=False))
 
 # %% [markdown]
-# ## 13. Gated-MLP residual-strength sweep
+# ## 13. Extended ablation grid
 #
-# Sweeps the residual-gate initial strength on `kfactor_gated_mlp` across
-# the configured ``k_factors`` and ``seeds``. Saves best checkpoint per
-# run by item-cold-start val log-loss. The trainer streams JSONL progress
-# events to ``PROGRESS_FILE`` so you can tail it from another shell.
+# Trains every configured model variant across the configured ``k_factors``
+# and ``seeds``. The three new variants (``kfactor_irt_item``,
+# ``kfactor_irt_item_mlp``, ``kfactor_irt_item_gated_mlp``) add a parallel
+# Item-IRT channel: ``logit = alpha(item) * (theta_subj - beta(item))`` plus
+# the existing offsets and (optionally) a residual MLP that can also see
+# pool features and cluster embeddings.
+#
+# When ``RUN_FEATURE_TOGGLE_GRID`` is true we also re-run the variants that
+# *can* consume pool / cluster features with those channels off, so the
+# diagnostic in cell 14b can attribute gains cleanly. Set it to ``False``
+# for fast iteration.
+#
+# Saves best checkpoint per run by item-cold-start val log-loss. The trainer
+# streams JSONL progress events to ``PROGRESS_FILE`` so you can tail it from
+# another shell.
 
 # %%
 import subprocess
@@ -777,38 +962,55 @@ print(gpu_status())
 print("Progress file:", PROGRESS_FILE)
 
 # ---------------------------------------------------------------------------
-# Gated-MLP lambda sweep
+# Extended ablation grid
 #
-# We sweep the residual gate strength on `kfactor_gated_mlp` across a few
-# initial values, with the gate trainable. Item-cold-start val log-loss is
-# the primary metric.
+# Trains every configured model variant. When RUN_FEATURE_TOGGLE_GRID is
+# True, models that can consume pool / cluster features are also trained
+# with those channels disabled so the diagnostic in cell 14b can attribute
+# gains cleanly.
 # ---------------------------------------------------------------------------
 
-model_name = "kfactor_gated_mlp"
+models_to_train = list(CFG["train"]["models"])
 ks = [int(k) for k in CFG["train"]["k_factors"]]
-seeds = [1]
+seeds = [int(s) for s in CFG["train"]["seeds"]]
 
-lambda_jobs = [
-    {"lambda_resid_init": 0.50, "lambda_resid_trainable": True, "lambda_tag": "learn_lam050"},
-    {"lambda_resid_init": 0.05, "lambda_resid_trainable": True, "lambda_tag": "learn_lam005"},
-    {"lambda_resid_init": 0.10, "lambda_resid_trainable": True, "lambda_tag": "learn_lam010"},
-    {"lambda_resid_init": 0.20, "lambda_resid_trainable": True, "lambda_tag": "learn_lam020"},
-]
+# Set to False for fast iteration; the toggle grid adds ~2x runs.
+RUN_FEATURE_TOGGLE_GRID = True
+
+# Variants that have a residual MLP can actually consume pool / cluster
+# features; toggling them on the pure kfactor / pure IRT variants is a no-op
+# so we skip those rows in the toggle grid.
+_MLP_VARIANTS = {
+    "kfactor_mlp",
+    "kfactor_gated_mlp",
+    "kfactor_irt_item_mlp",
+    "kfactor_irt_item_gated_mlp",
+}
+
+
+def _feature_toggles_for(model_name: str) -> list[tuple[str, bool, bool]]:
+    """Return a list of (tag, use_pool, use_clusters) to train for this model."""
+    if not RUN_FEATURE_TOGGLE_GRID or model_name not in _MLP_VARIANTS:
+        return [("full", USE_POOL_FEATURES, USE_CLUSTER_FEATURES)]
+    return [
+        ("full", USE_POOL_FEATURES, USE_CLUSTER_FEATURES),
+        ("nofeat", False, False),
+    ]
+
 
 jobs = [
-    (model_name, k, seed, lj)
+    (model_name, k, seed, tag, up, uc)
+    for model_name in models_to_train
     for k in ks
     for seed in seeds
-    for lj in lambda_jobs
+    for (tag, up, uc) in _feature_toggles_for(model_name)
 ]
 
 print(f"\nTotal jobs: {len(jobs)}")
-print("Model:", model_name)
+print("Models:", models_to_train)
 print("k values:", ks)
 print("Seeds:", seeds)
-print("Lambda configs:")
-for lj in lambda_jobs:
-    print(lj)
+print(f"Feature-toggle grid: {'on' if RUN_FEATURE_TOGGLE_GRID else 'off'}")
 
 ALL_RUNS: list[dict] = []
 completed_times: list[float] = []
@@ -816,19 +1018,13 @@ global_t0 = time.time()
 
 from tqdm.auto import tqdm
 
-pbar = tqdm(jobs, desc="Gated MLP lambda sweep", unit="run", dynamic_ncols=True)
+pbar = tqdm(jobs, desc="Extended ablation grid", unit="run", dynamic_ncols=True)
 
-for job_idx, (model_name, k, seed, lambda_cfg) in enumerate(pbar, start=1):
-    lambda_init = float(lambda_cfg["lambda_resid_init"])
-    lambda_trainable = bool(lambda_cfg["lambda_resid_trainable"])
-    lambda_tag = str(lambda_cfg["lambda_tag"])
+for job_idx, (model_name, k, seed, tag, up, uc) in enumerate(pbar, start=1):
+    run_id = f"{model_name}_k{k}_seed{seed}_{tag}"
+    model_cfg = _model_cfg(k, model_name, use_pool=up, use_clusters=uc)
 
-    run_id = f"{model_name}_k{k}_seed{seed}_{lambda_tag}"
-    model_cfg = _model_cfg(k, model_name)
-    model_cfg.lambda_resid_init = lambda_init
-    model_cfg.lambda_resid_trainable = lambda_trainable
-
-    pbar.set_description(f"gated k={k} seed={seed} {lambda_tag}")
+    pbar.set_description(f"{model_name} k={k} seed={seed} {tag}")
 
     print("\n" + "=" * 100)
     print(f"Starting {job_idx}/{len(jobs)}: {run_id}")
@@ -850,9 +1046,9 @@ for job_idx, (model_name, k, seed, lambda_cfg) in enumerate(pbar, start=1):
         extra_metadata={
             "encoder_model_id": CFG["encoder"]["model_id"],
             "use_subject_text_embedding": USE_SUBJECT_EMB,
-            "lambda_resid_init": lambda_init,
-            "lambda_resid_trainable": lambda_trainable,
-            "lambda_tag": lambda_tag,
+            "use_pool_features": bool(model_cfg.use_pool_features),
+            "use_cluster_features": bool(model_cfg.use_cluster_features),
+            "feature_tag": tag,
         },
     )
 
@@ -865,9 +1061,9 @@ for job_idx, (model_name, k, seed, lambda_cfg) in enumerate(pbar, start=1):
             "model_name": r.model_name,
             "k": r.k,
             "seed": r.seed,
-            "lambda_resid_init": lambda_init,
-            "lambda_resid_trainable": lambda_trainable,
-            "lambda_tag": lambda_tag,
+            "feature_tag": tag,
+            "use_pool_features": bool(model_cfg.use_pool_features),
+            "use_cluster_features": bool(model_cfg.use_cluster_features),
             "epoch_best": r.epoch_best,
             "best_val_log_loss": r.best_val_log_loss,
             "best_val_brier": r.best_val_brier,
@@ -910,9 +1106,9 @@ for job_idx, (model_name, k, seed, lambda_cfg) in enumerate(pbar, start=1):
     print(runs_df_live.head(10).to_string(index=False))
 
 runs_df = pd.DataFrame(ALL_RUNS).sort_values("best_val_log_loss", ascending=True)
-print("\n=== Gated MLP lambda sweep sorted by item-cold-start val log-loss ===")
+print("\n=== Extended ablation grid sorted by item-cold-start val log-loss ===")
 print(runs_df.to_string(index=False))
-print(f"\nTotal sweep time: {fmt_seconds(time.time() - global_t0)}")
+print(f"\nTotal grid time: {fmt_seconds(time.time() - global_t0)}")
 
 # %% [markdown]
 # ## 14. Evaluate trained checkpoints on every split + slicewise metrics
@@ -946,8 +1142,18 @@ def _predict_with_checkpoint(model_name: str, ckpt_path: Path, split_art) -> np.
     ck, mcfg = _load_for_inference(ckpt_path)
     mdl = build_model(model_name, mcfg)
     mdl.load_state_dict(ck["model_state"], strict=False)
+    # Mirror the checkpoint's feature-channel config when building the val
+    # dataset so pool / cluster channels line up with the trained model.
+    pf_z = pool_features_z if getattr(mcfg, "use_pool_features", False) else None
+    ca = cluster_assignments if getattr(mcfg, "use_cluster_features", False) else None
     val_ds_split = _build_arrays(
-        split_art, indexer, item_emb_lookup, subject_emb_lookup, USE_SUBJECT_EMB
+        split_art,
+        indexer,
+        item_emb_lookup,
+        subject_emb_lookup,
+        use_subject_emb=USE_SUBJECT_EMB,
+        pool_features_z=pf_z,
+        cluster_assignments=ca,
     )[1]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     eval_bs = max(int(CFG["train"]["batch_size"]), 4096)
@@ -999,6 +1205,292 @@ print(f"Wrote {RESULTS_PATH.relative_to(ROOT)}")
 print(results_df.to_string(index=False))
 
 # %% [markdown]
+# ## 14b. Feature contribution and component decomposition (diagnostic)
+#
+# Two analyses on the *item-cold-start val split* for the best-performing
+# trained model:
+#
+# **Analysis A -- Leave-one-out feature ablation.** For each channel in the
+# model (pool features, cluster embedding, IRT alpha, IRT beta, residual
+# MLP, and each individual pool feature), we zero / clamp that channel at
+# inference and record val NLL / AUC vs. the unablated baseline. The
+# inference-only ablation is fast and directionally honest: it shows how
+# much *the trained model relies on* each channel today. To upgrade to a
+# "retrain only the residual head" estimate (more accurate when channels
+# strongly interact), retrain the residual MLP with the same masks applied
+# during training -- the helpers below take a model factory so wrapping
+# that loop is straightforward.
+#
+# **Analysis B -- Logit-component decomposition.** For each val example we
+# decompose the final logit into its additive components (IRT, offsets,
+# MLP) and report Var, Pearson(c_i, y), Solo NLL (a 2-param logistic on c_i
+# alone, so the metric reflects information not scale), and Solo AUC.
+#
+# Save CSVs to ``artifacts/results/`` and plots to ``artifacts/plots/``.
+
+# %%
+import torch
+import torch.nn.functional as F
+
+from src.eval import (
+    component_decomposition_table,
+    feature_ablation_table,
+    plot_component_variance,
+    plot_feature_ablation,
+)
+from src.item_features import POOL_FEATURE_NAMES
+from src.models import build_model as _build_model_for_diag
+from src.train import evaluate_model as _eval_for_diag
+
+
+def _predict_with_ablation(
+    model: torch.nn.Module,
+    val_ds_split,
+    *,
+    device: str,
+    batch_size: int,
+    bf16: bool,
+    pool_mask: np.ndarray | None = None,
+    zero_cluster: bool = False,
+    force_alpha_one: bool = False,
+    force_beta_zero: bool = False,
+    zero_mlp: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run val inference with a specific channel zeroed / forced.
+
+    Returns ``(probs, y_true)``. Designed to call the same forward path as
+    training: pool features are multiplied element-wise by ``pool_mask``
+    (default all-ones) so individual features can be zeroed surgically.
+    """
+    model.eval()
+    loader = torch.utils.data.DataLoader(
+        val_ds_split,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=0,
+        pin_memory=device.startswith("cuda"),
+    )
+    autocast = (
+        torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=bf16)
+        if device.startswith("cuda")
+        else torch.amp.autocast("cpu", enabled=False)
+    )
+    preds, targets = [], []
+    with torch.inference_mode():
+        with autocast:
+            for batch in loader:
+                s, bc, ie, se, pf, ci, y = [b.to(device, non_blocking=True) for b in batch]
+                se_use = se if se.shape[-1] > 0 else None
+                pf_use = pf if pf.shape[-1] > 0 else None
+                ci_use = ci if ci.numel() > 0 else None
+                if pf_use is not None and pool_mask is not None:
+                    mask = torch.from_numpy(np.asarray(pool_mask, dtype=np.float32)).to(
+                        pf_use.device
+                    )
+                    pf_use = pf_use * mask
+                if zero_cluster and ci_use is not None:
+                    ci_use = torch.zeros_like(ci_use)
+                kwargs: dict = {}
+                if force_alpha_one and getattr(model, "has_irt_heads", False):
+                    kwargs["override_alpha"] = torch.ones(
+                        s.shape[0], device=device, dtype=torch.float32
+                    )
+                if force_beta_zero and getattr(model, "has_irt_heads", False):
+                    kwargs["override_beta"] = torch.zeros(
+                        s.shape[0], device=device, dtype=torch.float32
+                    )
+                if zero_mlp and getattr(model, "has_residual", False) and hasattr(
+                    model, "lambda_resid"
+                ):
+                    kwargs["override_mlp_zero"] = True
+                try:
+                    logits = model(s, bc, ie, se_use, pf_use, ci_use, **kwargs)
+                except TypeError:
+                    # The model doesn't expose override kwargs (e.g. pure
+                    # kfactor); fall back to the plain forward.
+                    logits = model(s, bc, ie, se_use, pf_use, ci_use)
+                probs = torch.sigmoid(logits).float().cpu().numpy()
+                preds.append(probs)
+                targets.append(y.float().cpu().numpy())
+    return np.concatenate(preds), np.concatenate(targets)
+
+
+def _decompose_on_val(
+    model: torch.nn.Module,
+    val_ds_split,
+    *,
+    device: str,
+    batch_size: int,
+    bf16: bool,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Run ``model.decompose`` across val_ds_split and stack components."""
+    model.eval()
+    loader = torch.utils.data.DataLoader(
+        val_ds_split,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=0,
+        pin_memory=device.startswith("cuda"),
+    )
+    autocast = (
+        torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=bf16)
+        if device.startswith("cuda")
+        else torch.amp.autocast("cpu", enabled=False)
+    )
+    parts: dict[str, list[np.ndarray]] = {}
+    ys: list[np.ndarray] = []
+    with torch.inference_mode():
+        with autocast:
+            for batch in loader:
+                s, bc, ie, se, pf, ci, y = [b.to(device, non_blocking=True) for b in batch]
+                se_use = se if se.shape[-1] > 0 else None
+                pf_use = pf if pf.shape[-1] > 0 else None
+                ci_use = ci if ci.numel() > 0 else None
+                d = model.decompose(s, bc, ie, se_use, pf_use, ci_use)
+                for name, tensor in d.items():
+                    # We only care about per-row scalar components for the
+                    # table (irt / offset / mlp / factor). Skip multi-dim
+                    # auxiliary entries like theta/beta_i/alpha_i for the
+                    # table but expose them via the dict if useful later.
+                    if tensor.dim() == 1:
+                        parts.setdefault(name, []).append(
+                            tensor.float().cpu().numpy()
+                        )
+                ys.append(y.float().cpu().numpy())
+    stacked = {k: np.concatenate(v) for k, v in parts.items()}
+    return stacked, np.concatenate(ys)
+
+
+PLOTS_DIR = ROOT / CFG["eval"]["plots_dir"]
+RESULTS_DIR = (ROOT / CFG["eval"]["results_path"]).parent
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+best_row = (
+    runs_df.sort_values("best_val_log_loss", ascending=True).iloc[0]
+    if len(runs_df)
+    else None
+)
+if best_row is None:
+    print("No trained runs found; skipping diagnostic.")
+else:
+    BEST_RUN_ID = str(best_row["run_id"])
+    BEST_MODEL_NAME = str(best_row["model_name"])
+    BEST_CKPT = Path(str(best_row["checkpoint_path"]))
+    print(f"Diagnostic on best run: {BEST_RUN_ID}  (model={BEST_MODEL_NAME})")
+
+    ck_diag = torch.load(BEST_CKPT, map_location="cpu")
+    mcfg_diag = ModelConfig(**dict(ck_diag["model_cfg"]))
+    diag_device = "cuda" if torch.cuda.is_available() else "cpu"
+    diag_bs = max(int(CFG["train"]["batch_size"]), 4096)
+    diag_bf16 = bool(CFG["encoder"]["bf16"])
+
+    mdl_diag = _build_model_for_diag(BEST_MODEL_NAME, mcfg_diag).to(diag_device)
+    mdl_diag.load_state_dict(ck_diag["model_state"], strict=False)
+
+    diag_pf_z = pool_features_z if getattr(mcfg_diag, "use_pool_features", False) else None
+    diag_ca = cluster_assignments if getattr(mcfg_diag, "use_cluster_features", False) else None
+    _, val_ds_diag = _build_arrays(
+        primary,
+        indexer,
+        item_emb_lookup,
+        subject_emb_lookup,
+        use_subject_emb=USE_SUBJECT_EMB,
+        pool_features_z=diag_pf_z,
+        cluster_assignments=diag_ca,
+    )
+
+    # ----- Analysis A: feature ablation ------------------------------------
+    ablations: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    p_full, y_full = _predict_with_ablation(
+        mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs, bf16=diag_bf16
+    )
+    ablations["full"] = (p_full, y_full)
+
+    if getattr(mcfg_diag, "use_pool_features", False):
+        mask_zero = np.zeros(int(mcfg_diag.pool_feature_dim), dtype=np.float32)
+        ablations["without_pool"] = _predict_with_ablation(
+            mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+            bf16=diag_bf16, pool_mask=mask_zero,
+        )
+        # individual pool features
+        names = list(POOL_FEATURE_NAMES)
+        for i, name in enumerate(names[: int(mcfg_diag.pool_feature_dim)]):
+            mask_one = np.ones(int(mcfg_diag.pool_feature_dim), dtype=np.float32)
+            mask_one[i] = 0.0
+            ablations[f"pool_feature[{name}]"] = _predict_with_ablation(
+                mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+                bf16=diag_bf16, pool_mask=mask_one,
+            )
+
+    if getattr(mcfg_diag, "use_cluster_features", False):
+        ablations["without_cluster"] = _predict_with_ablation(
+            mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+            bf16=diag_bf16, zero_cluster=True,
+        )
+
+    if getattr(mdl_diag, "has_irt_heads", False):
+        ablations["without_alpha"] = _predict_with_ablation(
+            mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+            bf16=diag_bf16, force_alpha_one=True,
+        )
+        ablations["without_beta"] = _predict_with_ablation(
+            mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+            bf16=diag_bf16, force_beta_zero=True,
+        )
+
+    if getattr(mdl_diag, "has_residual", False):
+        ablations["without_mlp"] = _predict_with_ablation(
+            mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+            bf16=diag_bf16, zero_mlp=True,
+        )
+
+    ablation_df = feature_ablation_table(ablations, full_key="full")
+    ablation_csv = RESULTS_DIR / f"feature_ablation_{BEST_RUN_ID}.csv"
+    ablation_df.to_csv(ablation_csv, index=False)
+    ablation_plot = PLOTS_DIR / f"feature_ablation_{BEST_RUN_ID}.png"
+    plot_feature_ablation(
+        ablation_df, ablation_plot, title=f"Feature ablation: {BEST_RUN_ID}"
+    )
+    print("\n=== Analysis A: feature ablation ===")
+    print(ablation_df.to_string(index=False, float_format=lambda v: f"{v:.5f}"))
+    print(f"Wrote {ablation_csv.relative_to(ROOT)}")
+    print(f"Wrote {ablation_plot.relative_to(ROOT)}")
+
+    # ----- Analysis B: logit-component decomposition ----------------------
+    components, y_dec = _decompose_on_val(
+        mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs, bf16=diag_bf16
+    )
+    decomp_df = component_decomposition_table(components, y_dec)
+    decomp_csv = RESULTS_DIR / f"component_decomp_{BEST_RUN_ID}.csv"
+    decomp_df.to_csv(decomp_csv, index=False)
+    decomp_plot = PLOTS_DIR / f"component_decomp_{BEST_RUN_ID}.png"
+    plot_component_variance(
+        components, decomp_plot, title=f"Component variance: {BEST_RUN_ID}"
+    )
+    print("\n=== Analysis B: logit-component decomposition ===")
+    print(decomp_df.to_string(index=False, float_format=lambda v: f"{v:.5f}"))
+    print(f"Wrote {decomp_csv.relative_to(ROOT)}")
+    print(f"Wrote {decomp_plot.relative_to(ROOT)}")
+
+    # One-line summaries
+    non_full = ablation_df[ablation_df["channel_removed"] != "full"]
+    if not non_full.empty:
+        top = non_full.sort_values("delta_nll", ascending=False).iloc[0]
+        print(
+            f"\nLargest single contributor: {top['channel_removed']} "
+            f"(Δ NLL = {float(top['delta_nll']):.5f})"
+        )
+    if not decomp_df.empty:
+        best_comp = decomp_df.sort_values("solo_nll", ascending=True).iloc[0]
+        print(
+            f"Best solo component: {best_comp['component']} "
+            f"(Solo NLL = {float(best_comp['solo_nll']):.5f})"
+        )
+
+# %% [markdown]
 # ## 15. Random-row overfit flag
 #
 # If a residual model only improves random-row val but not item-cold-start
@@ -1010,7 +1502,13 @@ def _mean_metric(df, model, split, metric="val_log_loss"):
     return float(sub[metric].mean()) if len(sub) else float("nan")
 
 
-for residual_name in ("kfactor_mlp", "kfactor_gated_mlp"):
+for residual_name in (
+    "kfactor_mlp",
+    "kfactor_gated_mlp",
+    "kfactor_irt_item",
+    "kfactor_irt_item_mlp",
+    "kfactor_irt_item_gated_mlp",
+):
     base = "kfactor"
     if "random_row_debug" not in {row["split"] for row in all_results}:
         continue
@@ -1121,7 +1619,13 @@ def _avg_per_bench(model_name: str):
 
 
 base_pb = _avg_per_bench("kfactor")
-for chal in ("kfactor_mlp", "kfactor_gated_mlp"):
+for chal in (
+    "kfactor_mlp",
+    "kfactor_gated_mlp",
+    "kfactor_irt_item",
+    "kfactor_irt_item_mlp",
+    "kfactor_irt_item_gated_mlp",
+):
     chal_pb = _avg_per_bench(chal)
     if not base_pb.empty and not chal_pb.empty:
         plot_residual_improvement_by_benchmark(
@@ -1239,6 +1743,9 @@ sub_dir = export_run(
     submission_dir=ROOT / CFG["submission"]["dir"],
     include_labeling=True,
     extra_models_txt=None,
+    pool_stats_path=POOL_STATS_PATH if USE_POOL_FEATURES else None,
+    cluster_centroids_path=CENTROIDS_PATH if USE_CLUSTER_FEATURES else None,
+    pool_feature_names=list(POOL_FEATURE_NAMES),
 )
 zip_path = make_submission_zip(
     submission_dir=sub_dir,

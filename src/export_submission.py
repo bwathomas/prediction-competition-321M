@@ -59,6 +59,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -75,6 +76,8 @@ HERE = Path(__file__).resolve().parent
 ARTIFACTS = HERE / "artifacts"
 CKPT_PATH = ARTIFACTS / "checkpoint.pt"
 META_PATH = ARTIFACTS / "runtime_meta.json"
+POOL_STATS_PATH = ARTIFACTS / "pool_features_stats.json"
+CLUSTER_CENTROIDS_PATH = ARTIFACTS / "cluster_centroids.npy"
 EPS = 1e-6
 
 # ---------------------------------------------------------------------------
@@ -91,6 +94,22 @@ USE_CONTEXTUAL_ITEM_TEXT: bool = bool(META.get("use_contextual_item_text", True)
 QUERY_PREFIX: str = META.get("query_prefix", "")
 PASSAGE_PREFIX: str = META.get("passage_prefix", "")
 DEFAULT_PROB: float = float(META.get("default_prob", 0.5))
+POOL_FEATURE_NAMES: tuple = tuple(
+    META.get(
+        "pool_feature_names",
+        (
+            "token_len",
+            "char_len",
+            "has_latex",
+            "has_code",
+            "n_questions",
+            "n_numbers",
+            "is_multiple_choice",
+            "n_choices",
+            "lang_en",
+        ),
+    )
+)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +178,62 @@ def subject_text_for(subject_content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pool features (must match src/item_features.py exactly)
+# ---------------------------------------------------------------------------
+
+
+_RE_LATEX = re.compile(
+    r"\$\$.+?\$\$|\$[^\$\n]+?\$|\\\(.+?\\\)|\\\[.+?\\\]|\\begin\{[^}]+\}",
+    re.DOTALL,
+)
+_RE_CODE_FENCE = re.compile(r"```")
+_RE_CODE_INDENT = re.compile(r"(?:^|\n)(?: {4,}|\t)\S", re.MULTILINE)
+_RE_NUMBER = re.compile(r"\b\d+(?:\.\d+)?\b")
+_RE_MC = re.compile(r"(?m)^\s*(?:\([A-Ea-e]\)|[A-Ea-e][\)\.])")
+
+
+def _detect_english_runtime(text: str) -> float:
+    if not text.strip():
+        return 1.0
+    try:
+        from langdetect import DetectorFactory, detect  # type: ignore
+
+        DetectorFactory.seed = 0
+        return 1.0 if detect(text[:2000]) == "en" else 0.0
+    except Exception:
+        ascii_alpha = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+        total_alpha = sum(1 for ch in text if ch.isalpha())
+        if total_alpha == 0:
+            return 1.0
+        return 1.0 if ascii_alpha / total_alpha >= 0.85 else 0.0
+
+
+def compute_pool_features_runtime(item_text: str) -> dict:
+    s = str(item_text or "")
+    char_len = float(len(s))
+    token_len = float(char_len / 4.0 + 1.0)
+    has_latex = 1.0 if _RE_LATEX.search(s) else 0.0
+    has_code = 1.0 if (_RE_CODE_FENCE.search(s) or _RE_CODE_INDENT.search(s)) else 0.0
+    n_questions = float(s.count("?"))
+    n_numbers = float(len(_RE_NUMBER.findall(s)))
+    mc_matches = _RE_MC.findall(s)
+    n_choices = float(len(mc_matches))
+    is_mc = 1.0 if len(mc_matches) >= 2 else 0.0
+    lang_en = _detect_english_runtime(s)
+    return {
+        "token_len": token_len,
+        "char_len": char_len,
+        "has_latex": has_latex,
+        "has_code": has_code,
+        "n_questions": n_questions,
+        "n_numbers": n_numbers,
+        "is_multiple_choice": is_mc,
+        "n_choices": n_choices,
+        "lang_en": lang_en,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Inlined model classes (mirror src/models.py)
 # ---------------------------------------------------------------------------
 
@@ -178,6 +253,39 @@ class _ItemParameterMap(nn.Module):
         return self.head_factor(h), self.head_diff(h).squeeze(-1)
 
 
+class _ItemIRTHeads(nn.Module):
+    def __init__(self, item_dim: int, hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.beta_head = nn.Sequential(
+            nn.LayerNorm(item_dim),
+            nn.Linear(item_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self.alpha_head = nn.Sequential(
+            nn.LayerNorm(item_dim),
+            nn.Linear(item_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self._alpha_pre_bias = 0.54
+
+    def forward(self, ie):
+        beta = self.beta_head(ie).squeeze(-1)
+        alpha_pre = self.alpha_head(ie).squeeze(-1) + self._alpha_pre_bias
+        return beta, F.softplus(alpha_pre)
+
+
+def _cluster_emb_runtime(cfg, cluster_embedding, cluster_ids):
+    if cluster_embedding is None or cluster_ids is None:
+        return None
+    if cluster_ids.numel() == 0 or cluster_ids.dim() < 1:
+        return None
+    return cluster_embedding(cluster_ids.long())
+
+
 class _KFactorBase(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
@@ -192,6 +300,17 @@ class _KFactorBase(nn.Module):
             hidden=cfg["item_map_hidden_dim"],
             dropout=cfg.get("dropout", 0.0),
         )
+        self.cluster_embedding = None
+        if (
+            cfg.get("use_cluster_features")
+            and cfg.get("n_clusters", 0) > 0
+            and cfg.get("cluster_embed_dim", 0) > 0
+        ):
+            self.cluster_embedding = nn.Embedding(
+                cfg["n_clusters"] + 1,
+                cfg["cluster_embed_dim"],
+                padding_idx=0,
+            )
 
     def _factor(self, s, bc, ie):
         u_s = self.u(s)
@@ -205,15 +324,23 @@ class _KFactorBase(nn.Module):
 
 
 class _KFactor(_KFactorBase):
-    def forward(self, s, bc, ie, se=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
         eta, *_ = self._factor(s, bc, ie)
         return eta
 
 
-def _residual_features(cfg, u_s, v_i, ie, beta_bc, se):
+def _residual_features(cfg, u_s, v_i, ie, beta_bc, se, pool_feats, cluster_emb):
     parts = [u_s, v_i, u_s * v_i, ie, beta_bc]
     if cfg.get("use_subject_text_embedding") and se is not None and se.shape[-1] > 0:
         parts.append(se)
+    if cfg.get("use_pool_features") and pool_feats is not None and pool_feats.shape[-1] > 0:
+        parts.append(pool_feats)
+    if (
+        cfg.get("use_cluster_features")
+        and cluster_emb is not None
+        and cluster_emb.shape[-1] > 0
+    ):
+        parts.append(cluster_emb)
     return torch.cat(parts, dim=-1)
 
 
@@ -221,6 +348,21 @@ def _residual_input_dim(cfg: dict) -> int:
     base = cfg["k"] * 3 + cfg["item_embed_dim"] + 1
     if cfg.get("use_subject_text_embedding"):
         base += int(cfg.get("subject_embed_dim", 0))
+    if cfg.get("use_pool_features"):
+        base += int(cfg.get("pool_feature_dim", 0))
+    if cfg.get("use_cluster_features") and cfg.get("n_clusters", 0) > 0:
+        base += int(cfg.get("cluster_embed_dim", 0))
+    return base
+
+
+def _residual_input_dim_irt(cfg: dict) -> int:
+    base = cfg["item_embed_dim"] + 3
+    if cfg.get("use_subject_text_embedding"):
+        base += int(cfg.get("subject_embed_dim", 0))
+    if cfg.get("use_pool_features"):
+        base += int(cfg.get("pool_feature_dim", 0))
+    if cfg.get("use_cluster_features") and cfg.get("n_clusters", 0) > 0:
+        base += int(cfg.get("cluster_embed_dim", 0))
     return base
 
 
@@ -270,10 +412,13 @@ class _ResidualKFactor(_KFactorBase):
             requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
         )
 
-    def forward(self, s, bc, ie, se=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
         eta_factor, u_s, v_i, ie_out = self._factor(s, bc, ie)
         beta_bc = self.beta(bc)
-        x = _residual_features(self.cfg, u_s, v_i, ie_out, beta_bc, se)
+        cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
+        x = _residual_features(
+            self.cfg, u_s, v_i, ie_out, beta_bc, se, pool_feats, cluster_emb
+        )
         return eta_factor + self.lambda_resid * self.residual(x)
 
 
@@ -285,10 +430,109 @@ class _GatedMLPResidual(_ResidualKFactor):
     residual_cls = _GatedResidual
 
 
+class _IRTItemBase(nn.Module):
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg
+        self.mu = nn.Parameter(torch.zeros(1))
+        self.theta = nn.Embedding(cfg["n_subjects"], 1)
+        self.beta = nn.Embedding(cfg["n_benchmark_conditions"], 1)
+        self.irt_heads = _ItemIRTHeads(
+            item_dim=cfg["item_embed_dim"],
+            hidden=cfg["item_map_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+        self.cluster_embedding = None
+        if (
+            cfg.get("use_cluster_features")
+            and cfg.get("n_clusters", 0) > 0
+            and cfg.get("cluster_embed_dim", 0) > 0
+        ):
+            self.cluster_embedding = nn.Embedding(
+                cfg["n_clusters"] + 1,
+                cfg["cluster_embed_dim"],
+                padding_idx=0,
+            )
+
+    def _irt_components(self, s, bc, ie):
+        theta = self.theta(s).squeeze(-1)
+        bc_off = self.beta(bc).squeeze(-1)
+        beta_i, alpha_i = self.irt_heads(ie)
+        c_irt = alpha_i * (theta - beta_i)
+        c_offset = bc_off + self.mu
+        return {
+            "irt": c_irt,
+            "offset": c_offset,
+            "theta": theta,
+            "beta_i": beta_i,
+            "alpha_i": alpha_i,
+        }
+
+
+class _IRTItemKFactor(_IRTItemBase):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
+        comps = self._irt_components(s, bc, ie)
+        return comps["irt"] + comps["offset"]
+
+
+def _residual_features_irt(cfg, comps, ie, se, pool_feats, cluster_emb):
+    parts = [
+        ie,
+        comps["theta"].unsqueeze(-1),
+        comps["beta_i"].unsqueeze(-1),
+        comps["alpha_i"].unsqueeze(-1),
+    ]
+    if cfg.get("use_subject_text_embedding") and se is not None and se.shape[-1] > 0:
+        parts.append(se)
+    if cfg.get("use_pool_features") and pool_feats is not None and pool_feats.shape[-1] > 0:
+        parts.append(pool_feats)
+    if (
+        cfg.get("use_cluster_features")
+        and cluster_emb is not None
+        and cluster_emb.shape[-1] > 0
+    ):
+        parts.append(cluster_emb)
+    return torch.cat(parts, dim=-1)
+
+
+class _ResidualIRTItem(_IRTItemBase):
+    residual_cls = _DenseResidual
+
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        in_dim = _residual_input_dim_irt(cfg)
+        self.residual = self.residual_cls(
+            in_dim=in_dim,
+            hidden=cfg["residual_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+        self.lambda_resid = nn.Parameter(
+            torch.tensor(float(cfg.get("lambda_resid_init", 0.1))),
+            requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
+        )
+
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
+        comps = self._irt_components(s, bc, ie)
+        cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
+        x = _residual_features_irt(self.cfg, comps, ie, se, pool_feats, cluster_emb)
+        return comps["irt"] + comps["offset"] + self.lambda_resid * self.residual(x)
+
+
+class _IRTItemKFactorMLP(_ResidualIRTItem):
+    residual_cls = _DenseResidual
+
+
+class _IRTItemKFactorGatedMLP(_ResidualIRTItem):
+    residual_cls = _GatedResidual
+
+
 _REGISTRY = {
     "kfactor": _KFactor,
     "kfactor_mlp": _MLPResidual,
     "kfactor_gated_mlp": _GatedMLPResidual,
+    "kfactor_irt_item": _IRTItemKFactor,
+    "kfactor_irt_item_mlp": _IRTItemKFactorMLP,
+    "kfactor_irt_item_gated_mlp": _IRTItemKFactorGatedMLP,
 }
 
 
@@ -442,6 +686,23 @@ _MODEL = _REGISTRY[_MODEL_NAME](_MODEL_CFG)
 _MODEL.load_state_dict(_CKPT["model_state"], strict=False)
 _MODEL.eval().to(_DEVICE)
 
+# Pool-feature stats (z-score normalization, fit on training items only).
+_POOL_STATS: dict = {}
+if POOL_STATS_PATH.exists():
+    try:
+        with open(POOL_STATS_PATH, "r", encoding="utf-8") as fh:
+            _POOL_STATS = json.load(fh) or {}
+    except Exception:
+        _POOL_STATS = {}
+
+# Cluster centroids (nearest-centroid lookup for unseen items).
+_CLUSTER_CENTROIDS: np.ndarray | None = None
+if CLUSTER_CENTROIDS_PATH.exists():
+    try:
+        _CLUSTER_CENTROIDS = np.load(CLUSTER_CENTROIDS_PATH).astype(np.float32, copy=False)
+    except Exception:
+        _CLUSTER_CENTROIDS = None
+
 _ITEM_EMB_CACHE: dict[str, np.ndarray] = {}
 _SUBJECT_EMB_CACHE: dict[str, np.ndarray] = {}
 _PROB_CACHE: dict[tuple[str, str], float] = {}
@@ -530,6 +791,39 @@ def _get_subject_embedding(subject_content: str) -> np.ndarray:
     return vec
 
 
+def _compute_pool_features_vec(item_content: str) -> np.ndarray:
+    """Compute the z-scored pool feature vector for a single item."""
+    if not _MODEL_CFG.get("use_pool_features"):
+        return np.zeros(0, dtype=np.float32)
+    feats = compute_pool_features_runtime(item_content)
+    out = np.zeros(len(POOL_FEATURE_NAMES), dtype=np.float32)
+    for i, name in enumerate(POOL_FEATURE_NAMES):
+        v = float(feats.get(name, 0.0))
+        s = _POOL_STATS.get(name) or {}
+        mean = float(s.get("mean", 0.0))
+        std = float(s.get("std", 1.0))
+        if not math.isfinite(std) or std < 1e-6:
+            std = 1.0
+        out[i] = (v - mean) / std
+    return out
+
+
+def _assign_cluster_id(item_emb: np.ndarray) -> int:
+    """Assign a cluster id to an item embedding via nearest centroid.
+
+    Returns 0 (UNK) if the centroid artifact is missing or the model
+    doesn't use cluster features.
+    """
+    if not _MODEL_CFG.get("use_cluster_features"):
+        return 0
+    if _CLUSTER_CENTROIDS is None or _CLUSTER_CENTROIDS.size == 0:
+        return 0
+    x = item_emb.astype(np.float32)[None, :]
+    C = _CLUSTER_CENTROIDS
+    d2 = (x * x).sum(axis=1, keepdims=True) + (C * C).sum(axis=1)[None, :] - 2.0 * x @ C.T
+    return int(d2.argmin(axis=1)[0]) + 1
+
+
 # ---------------------------------------------------------------------------
 # Uncalibrated probability (used both by predict() and by the calibrator's
 # fit step on the `labeled` revealed by adaptive labeling).
@@ -555,14 +849,26 @@ def _predict_uncalibrated(
 
     item_emb = _get_item_embedding(benchmark, condition, item_content)
     subject_emb = _get_subject_embedding(subject_content)
+    pool_vec = _compute_pool_features_vec(item_content)
+    cluster_id = _assign_cluster_id(item_emb)
 
     ie = torch.from_numpy(item_emb).to(_DEVICE).unsqueeze(0)
     se = torch.from_numpy(subject_emb).to(_DEVICE).unsqueeze(0) if subject_emb.size > 0 else None
+    pf = (
+        torch.from_numpy(pool_vec).to(_DEVICE).unsqueeze(0)
+        if pool_vec.size > 0
+        else None
+    )
+    ci = (
+        torch.tensor([cluster_id], dtype=torch.long, device=_DEVICE)
+        if _MODEL_CFG.get("use_cluster_features")
+        else None
+    )
     s = torch.tensor([s_id], dtype=torch.long, device=_DEVICE)
     bc = torch.tensor([bc_id], dtype=torch.long, device=_DEVICE)
 
     with torch.inference_mode():
-        logit = _MODEL(s, bc, ie, se)
+        logit = _MODEL(s, bc, ie, se, pf, ci)
         prob = torch.sigmoid(logit).float().cpu().item()
     if not math.isfinite(prob):
         prob = DEFAULT_PROB
@@ -673,6 +979,9 @@ transformers>=4.41
 safetensors>=0.4
 tokenizers>=0.19
 sentencepiece>=0.2
+# Optional: enables langdetect-based pool feature 'lang_en'. Falls back to
+# an ASCII heuristic if missing so the submission never breaks on import.
+langdetect>=1.0.9
 """
 
 
@@ -689,11 +998,19 @@ def export_run(
     include_labeling: bool = True,
     extra_models_txt: list[str] | None = None,
     default_calibrator: Mapping | None = None,
+    pool_stats_path: str | os.PathLike[str] | None = None,
+    cluster_centroids_path: str | os.PathLike[str] | None = None,
+    pool_feature_names: list[str] | None = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
     The caller chooses *which* run to export (the notebook offers an
-    ipywidgets dropdown or a `SELECTED_RUN_ID` fallback variable).
+    ipywidgets dropdown or a ``SELECTED_RUN_ID`` fallback variable).
+
+    If the exported run uses pool features and/or cluster embeddings, point
+    ``pool_stats_path`` / ``cluster_centroids_path`` at the artifacts so the
+    submission bundle can reconstruct them at test time. Both default to the
+    standard locations under ``artifacts/`` if omitted.
 
     Returns the submission directory path.
     """
@@ -708,6 +1025,20 @@ def export_run(
     if not ckpt_src.exists():
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_src}")
     shutil.copy2(ckpt_src, artifacts / "checkpoint.pt")
+
+    # Optional pool-feature stats and cluster centroids. We always copy what
+    # we can find so the submission keeps working even if the model variant
+    # is later swapped from non-pool to pool.
+    pool_src = Path(pool_stats_path) if pool_stats_path else Path("artifacts/item_features/pool_features_stats.json")
+    if pool_src.exists():
+        shutil.copy2(pool_src, artifacts / "pool_features_stats.json")
+    centroids_src = (
+        Path(cluster_centroids_path)
+        if cluster_centroids_path
+        else Path("artifacts/cluster_centroids.npy")
+    )
+    if centroids_src.exists():
+        shutil.copy2(centroids_src, artifacts / "cluster_centroids.npy")
 
     runtime_meta = {
         "run_id": result.run_id,
@@ -727,6 +1058,17 @@ def export_run(
         "best_val_auc": result.best_val_auc,
         "k": int(result.k),
         "epoch_best": int(result.epoch_best),
+        "pool_feature_names": list(pool_feature_names) if pool_feature_names else [
+            "token_len",
+            "char_len",
+            "has_latex",
+            "has_code",
+            "n_questions",
+            "n_numbers",
+            "is_multiple_choice",
+            "n_choices",
+            "lang_en",
+        ],
     }
     (artifacts / "runtime_meta.json").write_text(
         json.dumps(runtime_meta, indent=2, default=str)

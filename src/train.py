@@ -43,6 +43,8 @@ from .models import (
     LookupDataset,
     ModelConfig,
     build_model,
+    irt_regularization,
+    model_has_irt_heads,
 )
 
 LOG = logging.getLogger("train")
@@ -241,6 +243,31 @@ def _move_batch(batch, device: str):
     return [b.to(device, non_blocking=True) for b in batch]
 
 
+def _unpack_batch(batch, device: str):
+    """Unpack the 7-tuple yielded by ``LookupDataset`` onto ``device``.
+
+    Returns ``(s, bc, ie, se_or_none, pf_or_none, ci_or_none, y)``. Empty
+    optional channels are returned as ``None`` so the model can fast-path
+    around them.
+    """
+    moved = _move_batch(batch, device)
+    s, bc, ie, se, pf, ci, y = moved
+    se_use = se if se.shape[-1] > 0 else None
+    pf_use = pf if pf.shape[-1] > 0 else None
+    ci_use = ci if (ci.numel() > 0 and ci.dim() >= 1) else None
+    return s, bc, ie, se_use, pf_use, ci_use, y
+
+
+def _forward_model(model, s, bc, ie, se, pf, ci):
+    """Call ``model.forward`` with the channels the model supports.
+
+    All current variants accept the full kwargs signature; the wrapper exists
+    so callers can stay agnostic if we later add variants with different
+    signatures.
+    """
+    return model(s, bc, ie, se, pf, ci)
+
+
 def evaluate_model(
     model: nn.Module,
     val_ds: LookupDataset,
@@ -306,8 +333,8 @@ def evaluate_model(
     with torch.inference_mode():
         with autocast_ctx:
             for batch_idx, batch in enumerate(iterator, start=1):
-                s, bc, ie, se, y = _move_batch(batch, device)
-                logits = model(s, bc, ie, se if se.shape[-1] > 0 else None)
+                s, bc, ie, se, pf, ci, y = _unpack_batch(batch, device)
+                logits = _forward_model(model, s, bc, ie, se, pf, ci)
                 p = torch.sigmoid(logits).float().cpu().numpy()
 
                 preds.append(p)
@@ -510,13 +537,24 @@ def train_one(
         )
 
         for batch_idx, batch in enumerate(iterator, start=1):
-            s, bc, ie, se, y = _move_batch(batch, device)
+            s, bc, ie, se, pf, ci, y = _unpack_batch(batch, device)
 
             opt.zero_grad(set_to_none=True)
 
             with autocast_ctx_factory():
-                logits = model(s, bc, ie, se if se.shape[-1] > 0 else None)
+                logits = _forward_model(model, s, bc, ie, se, pf, ci)
                 loss = loss_fn(logits, y)
+                # Soft IRT regularization: keep beta from exploding and
+                # log(alpha) close to 0 so the IRT head and the residual MLP
+                # don't collude in degenerate ways.
+                if model_has_irt_heads(model):
+                    beta_i, alpha_i = model.irt_heads(ie)
+                    loss = loss + irt_regularization(
+                        beta_i,
+                        alpha_i,
+                        lambda_beta=float(model_cfg.irt_lambda_beta),
+                        lambda_alpha=float(model_cfg.irt_lambda_alpha),
+                    )
 
             loss.backward()
 
