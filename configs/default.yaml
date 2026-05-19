@@ -93,13 +93,36 @@ submission_cache:
   quantize: "int8"               # int8 | fp16 | none
   pca_dim: 256                   # null = skip PCA; lower = smaller bundle
   include_faiss_index: true      # ship a FAISS HNSW index for fast lookup
+  include_top_k_index: true      # alias for include_faiss_index (preferred)
   faiss_index_type: "HNSW32"     # HNSW32 | IVF | flat
   max_bundle_size_mb: 200        # hard cap; export fails if exceeded
   # Per-subject pass-rate aggregations bundled for runtime NN features.
   # "cluster" is always cheap (n_subjects * k_clusters floats). "sparse"
   # ships the full (subject, item) -> pass_rate CSR matrix; only safe when
   # the training matrix is genuinely sparse.
-  passrate_format: "cluster"     # cluster | sparse | none
+  passrate_format: "sparse"      # cluster | sparse | none
+  # Runtime NN feature computation: top-K used by the compressed cache.
+  # Should match the training-time k by default. Drop it only if the
+  # bundle is tight on size budget.
+  runtime_k: 16
+
+# ----------------------------------------------------------------------------
+# Nearest-neighbor features (full-fidelity index used at training + eval time)
+# These eight scalars per (subject, item) prediction summarize the subject's
+# performance on the top-K nearest training items. They feed *into* the
+# residual MLP alongside pool, cluster, and judge channels.
+# ----------------------------------------------------------------------------
+nn_features:
+  enabled: true
+  k: 16
+  similarity: "cosine"
+  exclude_self_in_training: true
+  cache_dir: "artifacts/nn_features"
+  # Fallback values when no labeled neighbor is found. The model learns to
+  # down-weight the NN aggregate via the `coverage` / `n_labeled_neighbors`
+  # features when these fallbacks fire.
+  fallback_value: 0.0
+  top1_missing_sentinel: -1.0
 
 # ----------------------------------------------------------------------------
 # Pool features (hand-engineered per-item scalars, fed *into* the MLP)
@@ -183,13 +206,34 @@ train:
 judge:
   enabled: true
   model_id: "Qwen/Qwen3-4B-Instruct-2507"
-  batch_size: 16
+  # Default tuned for a single A100 (40/80 GB) with Qwen3-4B in bf16 + FA2
+  # at max_prompt_tokens=1024. Drop to 16 on T4 / smaller GPUs. The forward
+  # uses use_cache=False so no KV cache is allocated -- only activations.
+  batch_size: 32
   max_prompt_tokens: 1024
   max_new_tokens: 1
   bf16: true
   use_flash_attention: true
   trust_remote_code: false
   cache_dir: "artifacts/judge"
+  # ---- Parallelism / throughput (A100-friendly) ----------------------------
+  # Number of CPU threads doing prompt prep (template format + truncation
+  # re-tokenize loop). HF fast tokenizers release the GIL during .encode so
+  # threads parallelize without the per-process model-load cost of MP.
+  # 0 = auto (min(8, os.cpu_count())). Set to 1 to disable CPU parallelism.
+  num_workers: 0
+  # Number of batches kept on the host-device boundary at all times. A
+  # background thread pads + pins the next ``prefetch_batches`` while the
+  # GPU is busy. 2 hides nearly all CPU latency for variable-length data.
+  prefetch_batches: 2
+  # Sort prompts by token length descending before batching so each batch
+  # has near-uniform length. Slashes padding waste and is the single biggest
+  # win for A100 throughput on heterogeneous item content.
+  length_bucket: true
+  # Allocate pinned host memory for prefetched batches so the H2D copy can
+  # run asynchronously alongside the previous forward pass. Auto-disabled
+  # when CUDA is unavailable.
+  pin_memory: true
   # When true the residual MLP receives [lp_yes, lp_no, lp_diff, p_yes]
   # as additional inputs. Toggle off to ablate while keeping the cache.
   feature_in_residual: true

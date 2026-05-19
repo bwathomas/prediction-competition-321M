@@ -41,11 +41,14 @@ Implementation notes
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import hashlib
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,7 +92,7 @@ class JudgeConfig:
 
     model_id: str = "Qwen/Qwen3-4B-Instruct-2507"
     max_new_tokens: int = 1                       # we only read next-token logits
-    batch_size: int = 16
+    batch_size: int = 32
     max_prompt_tokens: int = 1024                 # truncate item/subject if needed
     bf16: bool = True
     use_flash_attention: bool = True
@@ -111,6 +114,26 @@ class JudgeConfig:
     # logic guarantees at least this many tokens are kept for the suffix
     # after item / subject content has been truncated from the start.
     suffix_reserve_tokens: int = 256
+
+    # ---- Parallelism / throughput knobs (A100-friendly defaults) -----------
+    # Number of CPU threads used to prep prompts (format + truncate). HF fast
+    # tokenizers release the GIL during ``.encode``, so threads parallelize
+    # without the per-process model-loading cost of multiprocessing. 0 means
+    # auto: ``min(8, max(1, os.cpu_count()))``.
+    num_workers: int = 0
+    # Number of batches kept ready on the device-host boundary at all times.
+    # A background thread tokenizes/pads/pins the next ``prefetch_batches``
+    # while the GPU is busy with the current one. >=2 hides almost all CPU
+    # latency for variable-length prompts; raising further mainly costs RAM.
+    prefetch_batches: int = 2
+    # Sort prompts by tokenized length descending before batching so each
+    # batch has near-uniform length. Slashes padding waste in half-or-more
+    # for typical item-content distributions and is the single biggest win
+    # for A100 throughput on this workload.
+    length_bucket: bool = True
+    # Allocate pinned host memory for the prefetched batches so the GPU
+    # copy can run asynchronously alongside the previous forward pass.
+    pin_memory: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +331,176 @@ def _truncate_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Parallel prompt prep + length-bucket batching + async prefetch
+#
+# For a single A100 with a ~4B-param judge, the right architecture is:
+#
+#   CPU threads (N workers)          GPU (single in-process model)
+#   ┌──────────────────────┐         ┌──────────────────────────┐
+#   │ format + truncate    │  ───►   │ forward pass             │
+#   │ tokenize-all         │ queue   │ extract yes/no logits    │
+#   │ length-sort          │ ◄───►   │ scatter back to row order │
+#   │ pad + pin host mem   │  ◄───   │                          │
+#   └──────────────────────┘         └──────────────────────────┘
+#
+# Loading multiple copies of the 4B model in separate processes would waste
+# A100 memory and cause kernel-launch contention; one model instance fed by
+# many CPU producers is what wins.
+# ---------------------------------------------------------------------------
+
+
+def _auto_num_workers() -> int:
+    """Reasonable default thread count when ``cfg.num_workers == 0``.
+
+    HF fast tokenizers release the GIL inside ``.encode`` and have their own
+    Rust thread pool, so going beyond ~8 Python-side threads has diminishing
+    returns; we cap there. Falls back to 1 if ``os.cpu_count()`` is unknown.
+    """
+    n = os.cpu_count() or 1
+    return max(1, min(8, n))
+
+
+def _make_prompt(tokenizer, cfg: JudgeConfig, row: Mapping[str, object]) -> str:
+    """Format + truncate a single row's prompt. Pure CPU; thread-safe."""
+    return _truncate_prompt(
+        tokenizer,
+        cfg,
+        benchmark=str(row.get("benchmark", "") or ""),
+        condition=str(row.get("condition", "none") or "none"),
+        subject_content=str(row.get("subject_content", "") or ""),
+        item_content=str(row.get("item_content", "") or ""),
+    )
+
+
+def _prepare_prompts_parallel(
+    tokenizer,
+    cfg: JudgeConfig,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    num_workers: int,
+) -> list[str]:
+    """Run :func:`_make_prompt` over ``rows`` in parallel via threads.
+
+    Threads (not processes) are the right tool here:
+
+    * HF fast tokenizers release the GIL during ``.encode``, so multiple
+      threads truly run encode kernels concurrently in the Rust backend.
+    * Each thread shares the *same* tokenizer instance -- no per-worker
+      load cost (a HF Qwen tokenizer is ~50-200 MB).
+    * No pickling of strings between processes; for long item content
+      that overhead would dominate.
+
+    Falls back to a serial loop when ``num_workers <= 1`` or the input is
+    tiny (overhead of spinning up the pool would outweigh the gain).
+    """
+    n = len(rows)
+    if n == 0:
+        return []
+    if num_workers <= 1 or n < 32:
+        return [_make_prompt(tokenizer, cfg, r) for r in rows]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=num_workers, thread_name_prefix="judge-prep"
+    ) as ex:
+        return list(ex.map(lambda r: _make_prompt(tokenizer, cfg, r), rows))
+
+
+_PREFETCH_SENTINEL: object = object()
+
+
+class _BatchPrefetcher:
+    """Background thread that pads + pins the next batches ahead of the GPU.
+
+    Given the global token-id list ``all_ids`` and a list of ``batches``
+    (each a sequence of original-row indices to include in that batch),
+    this class lazily produces ``(idxs, input_ids_tensor, attn_mask_tensor)``
+    triples in order. The tensors come back with pinned host memory so the
+    main thread can issue ``.to(device, non_blocking=True)`` and overlap
+    the H2D copy with the previous batch's forward pass.
+
+    Exceptions from the producer thread are re-raised on the next ``get``.
+    """
+
+    def __init__(
+        self,
+        *,
+        batches: Sequence[np.ndarray],
+        all_ids: Sequence[Sequence[int]],
+        pad_id: int,
+        pin_memory: bool,
+        prefetch: int,
+    ):
+        self._batches = list(batches)
+        self._all_ids = all_ids
+        self._pad_id = int(pad_id)
+        self._pin_memory = bool(pin_memory)
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(prefetch)))
+        self._stop = threading.Event()
+        self._exc: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run, name="judge-prefetch", daemon=True
+        )
+        self._thread.start()
+
+    def _pad_batch(self, idxs: np.ndarray):
+        """Pad a single batch's token ids into a CPU tensor (optionally pinned)."""
+        import torch
+
+        ids_batch = [self._all_ids[int(i)] for i in idxs]
+        max_len = max((len(ids) for ids in ids_batch), default=1)
+        max_len = max(1, max_len)
+        bsz = len(ids_batch)
+        input_ids = np.full((bsz, max_len), self._pad_id, dtype=np.int64)
+        attn = np.zeros((bsz, max_len), dtype=np.int64)
+        for i, ids in enumerate(ids_batch):
+            L = len(ids)
+            if L > 0:
+                input_ids[i, :L] = np.asarray(ids, dtype=np.int64)
+                attn[i, :L] = 1
+        t_ids = torch.from_numpy(input_ids)
+        t_attn = torch.from_numpy(attn)
+        if self._pin_memory:
+            try:
+                t_ids = t_ids.pin_memory()
+                t_attn = t_attn.pin_memory()
+            except RuntimeError:
+                # CUDA not available or pinned-memory unsupported: silently
+                # fall back to pageable memory. Correctness is unaffected.
+                pass
+        return t_ids, t_attn
+
+    def _run(self) -> None:
+        try:
+            for idxs in self._batches:
+                if self._stop.is_set():
+                    break
+                t_ids, t_attn = self._pad_batch(idxs)
+                self._queue.put((idxs, t_ids, t_attn))
+        except BaseException as exc:  # noqa: BLE001
+            self._exc = exc
+        finally:
+            self._queue.put(_PREFETCH_SENTINEL)
+
+    def get(self):
+        """Pop the next ``(idxs, input_ids, attn_mask)`` or return ``None``."""
+        item = self._queue.get()
+        if item is _PREFETCH_SENTINEL:
+            if self._exc is not None:
+                raise self._exc
+            return None
+        return item
+
+    def close(self) -> None:
+        """Stop the producer; safe to call multiple times."""
+        self._stop.set()
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
 # LLMJudge
 # ---------------------------------------------------------------------------
 
@@ -435,12 +628,33 @@ class LLMJudge:
 
     # --------------------------------------------------------------- score
 
-    def score(self, rows: Sequence[Mapping[str, object]]) -> np.ndarray:
+    def score(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        progress: bool = False,
+    ) -> np.ndarray:
         """Score a list of dicts in batches. Returns ``[N, 4]`` float32.
 
         Each row must contain ``benchmark``, ``condition``, ``subject_content``,
         ``item_content``. This bypasses the cache: ``score_dataframe`` is
         the public entry point that consults the cache before calling us.
+
+        Pipeline (per call):
+
+        1. **Parallel prompt prep** -- a thread pool (size ``num_workers``)
+           runs :func:`_make_prompt` to format and truncate each prompt.
+        2. **Batched tokenization** -- one ``tokenizer(prompts)`` call uses
+           the HF Rust thread pool to encode every prompt at once.
+        3. **Length-bucketed batching** -- prompts are sorted by length
+           descending so each ``batch_size`` chunk has near-uniform length,
+           cutting padding overhead drastically.
+        4. **Async prefetch** -- a background thread pads + pins the next
+           ``prefetch_batches`` worth of tensors while the GPU is busy.
+        5. **GPU forward** -- single in-process model handles the batches
+           with ``use_cache=False`` (no autoregressive generation, so the
+           KV cache is wasted memory).
+        6. **Scatter** -- per-row outputs go back to original row order.
         """
         if not rows:
             return np.zeros((0, JUDGE_FEATURE_DIM), dtype=np.float32)
@@ -450,58 +664,102 @@ class LLMJudge:
         n = len(rows)
         out = np.zeros((n, JUDGE_FEATURE_DIM), dtype=np.float32)
         bs = max(1, int(self.cfg.batch_size))
+        num_workers = (
+            int(self.cfg.num_workers)
+            if self.cfg.num_workers and self.cfg.num_workers > 0
+            else _auto_num_workers()
+        )
 
         t0 = time.time()
 
-        for i in range(0, n, bs):
-            chunk = rows[i : i + bs]
-            prompts = [
-                _truncate_prompt(
-                    self._tok,
-                    self.cfg,
-                    benchmark=str(r.get("benchmark", "") or ""),
-                    condition=str(r.get("condition", "none") or "none"),
-                    subject_content=str(r.get("subject_content", "") or ""),
-                    item_content=str(r.get("item_content", "") or ""),
-                )
-                for r in chunk
-            ]
-            enc = self._tok(
-                prompts,
-                padding="longest",
-                truncation=True,
-                max_length=self.cfg.max_prompt_tokens,
-                return_tensors="pt",
-            )
-            input_ids = enc["input_ids"].to(self.device)
-            attn = enc["attention_mask"].to(self.device)
-            with torch.inference_mode():
-                outputs = self._model(input_ids=input_ids, attention_mask=attn)
-            logits = outputs.logits  # [B, T, V]
+        # --- Phase 1: parallel prompt prep -----------------------------------
+        prompts = _prepare_prompts_parallel(
+            self._tok, self.cfg, rows, num_workers=num_workers
+        )
 
-            # Right-padded: the answer position is the last real token. We
-            # read logits[:, last] = next-token distribution at the answer.
-            seq_lens = attn.sum(dim=1) - 1
-            seq_lens = seq_lens.clamp(min=0)
-            batch_idx = torch.arange(logits.size(0), device=logits.device)
-            next_logits = logits[batch_idx, seq_lens]   # [B, V]
-            logprobs = torch.log_softmax(next_logits.float(), dim=-1)
+        # --- Phase 2: batched tokenize (Rust thread pool inside) -------------
+        enc_all = self._tok(
+            prompts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=True,
+            max_length=int(self.cfg.max_prompt_tokens),
+        )
+        all_ids: list[list[int]] = list(enc_all["input_ids"])
+        lengths = np.fromiter(
+            (len(ids) for ids in all_ids), dtype=np.int64, count=n
+        )
 
-            yes_ids = torch.tensor(self._yes_ids, dtype=torch.long, device=logprobs.device)
-            no_ids = torch.tensor(self._no_ids, dtype=torch.long, device=logprobs.device)
-            # logsumexp across variants -- this is exactly "sum exp(lp), take log"
-            log_sum_yes = torch.logsumexp(logprobs.index_select(1, yes_ids), dim=-1)
-            log_sum_no = torch.logsumexp(logprobs.index_select(1, no_ids), dim=-1)
-            # Renormalize over the two-class restricted distribution.
-            # p_yes = exp(log_sum_yes) / (exp(log_sum_yes) + exp(log_sum_no))
-            #       = sigmoid(log_sum_yes - log_sum_no)
-            lp_diff = log_sum_yes - log_sum_no
-            p_yes = torch.sigmoid(lp_diff)
+        # --- Phase 3: length-bucketed batching -------------------------------
+        if self.cfg.length_bucket:
+            # Stable descending sort by length keeps a deterministic order
+            # for identical-length runs (helps reproducibility logging).
+            order = np.argsort(-lengths, kind="stable")
+        else:
+            order = np.arange(n, dtype=np.int64)
+        batches: list[np.ndarray] = [order[s : s + bs] for s in range(0, n, bs)]
 
-            out[i : i + len(chunk), 0] = log_sum_yes.float().cpu().numpy()
-            out[i : i + len(chunk), 1] = log_sum_no.float().cpu().numpy()
-            out[i : i + len(chunk), 2] = lp_diff.float().cpu().numpy()
-            out[i : i + len(chunk), 3] = p_yes.float().cpu().numpy()
+        # --- Phase 4 + 5: prefetch + GPU forward -----------------------------
+        pad_id = int(self._tok.pad_token_id) if self._tok.pad_token_id is not None else 0
+        pin = bool(self.cfg.pin_memory) and self.device.startswith("cuda")
+        prefetcher = _BatchPrefetcher(
+            batches=batches,
+            all_ids=all_ids,
+            pad_id=pad_id,
+            pin_memory=pin,
+            prefetch=int(self.cfg.prefetch_batches),
+        )
+
+        yes_ids_t = torch.tensor(self._yes_ids, dtype=torch.long, device=self.device)
+        no_ids_t = torch.tensor(self._no_ids, dtype=torch.long, device=self.device)
+
+        iterator = tqdm(
+            range(len(batches)),
+            desc=f"judge {self.cfg.model_id.split('/')[-1]}",
+            unit="batch",
+            leave=False,
+            disable=not progress,
+        )
+
+        try:
+            for _ in iterator:
+                item = prefetcher.get()
+                if item is None:
+                    break
+                idxs, t_ids, t_attn = item
+                input_ids = t_ids.to(self.device, non_blocking=pin)
+                attn = t_attn.to(self.device, non_blocking=pin)
+
+                with torch.inference_mode():
+                    outputs = self._model(
+                        input_ids=input_ids,
+                        attention_mask=attn,
+                        use_cache=False,
+                    )
+                logits = outputs.logits  # [B, T, V]
+
+                # Right-padded: the answer position is the last real token. We
+                # read logits[:, last] = next-token distribution at the answer.
+                seq_lens = attn.sum(dim=1) - 1
+                seq_lens = seq_lens.clamp(min=0)
+                batch_idx = torch.arange(logits.size(0), device=logits.device)
+                next_logits = logits[batch_idx, seq_lens]
+                logprobs = torch.log_softmax(next_logits.float(), dim=-1)
+
+                log_sum_yes = torch.logsumexp(logprobs.index_select(1, yes_ids_t), dim=-1)
+                log_sum_no = torch.logsumexp(logprobs.index_select(1, no_ids_t), dim=-1)
+                lp_diff = log_sum_yes - log_sum_no
+                p_yes = torch.sigmoid(lp_diff)
+
+                # Scatter back to original row positions (length-bucketing
+                # may have permuted them).
+                idx_np = np.asarray(idxs, dtype=np.int64)
+                out[idx_np, 0] = log_sum_yes.float().cpu().numpy()
+                out[idx_np, 1] = log_sum_no.float().cpu().numpy()
+                out[idx_np, 2] = lp_diff.float().cpu().numpy()
+                out[idx_np, 3] = p_yes.float().cpu().numpy()
+        finally:
+            prefetcher.close()
 
         self._wall_time_seconds += time.time() - t0
         self._n_scored += n
@@ -637,28 +895,32 @@ class LLMJudge:
     def _batched_score_with_progress(
         self, rows: list[dict], *, progress: bool
     ) -> list[np.ndarray]:
-        """Run ``score`` in batches, optionally wrapping with tqdm."""
-        bs = max(1, int(self.cfg.batch_size))
-        n = len(rows)
-        chunks: list[np.ndarray] = []
-        starts = list(range(0, n, bs))
-        iterator = tqdm(
-            starts,
-            desc=f"judge {self.cfg.model_id.split('/')[-1]}",
-            unit="batch",
-            leave=False,
-            disable=not progress,
-        )
-        for s in iterator:
-            chunk = rows[s : s + bs]
-            scored = self.score(chunk)
-            chunks.append(scored)
-        return chunks
+        """Drive ``score`` end-to-end with internal batching + tqdm.
+
+        Returns the scored block wrapped in a single-element list so
+        ``score_dataframe``'s ``np.concatenate`` call below is unchanged.
+        The new ``score`` does its own parallel prep + length-bucket
+        batching + GPU prefetch, so we no longer chunk on the outside.
+        """
+        if not rows:
+            return []
+        scored = self.score(rows, progress=progress)
+        return [scored]
 
     # --------------------------------------------------------------- stats
 
     def stats(self) -> dict:
         """Cheap diagnostic snapshot for the notebook to print."""
+        num_workers_effective = (
+            int(self.cfg.num_workers)
+            if self.cfg.num_workers and self.cfg.num_workers > 0
+            else _auto_num_workers()
+        )
+        throughput = (
+            float(self._n_scored) / float(self._wall_time_seconds)
+            if self._wall_time_seconds > 0
+            else 0.0
+        )
         return {
             "model_id": self.cfg.model_id,
             "slug": self.slug,
@@ -667,6 +929,12 @@ class LLMJudge:
             "attn_implementation": self._attn_impl,
             "n_scored_this_session": int(self._n_scored),
             "wall_time_seconds": float(self._wall_time_seconds),
+            "throughput_pairs_per_sec": float(throughput),
+            "batch_size": int(self.cfg.batch_size),
+            "num_workers_effective": int(num_workers_effective),
+            "prefetch_batches": int(self.cfg.prefetch_batches),
+            "length_bucket": bool(self.cfg.length_bucket),
+            "pin_memory": bool(self.cfg.pin_memory),
         }
 
 
