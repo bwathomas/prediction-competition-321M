@@ -136,32 +136,29 @@ clustering:
 # Models / training
 # ----------------------------------------------------------------------------
 train:
-  # Which model variants to train. The first three are the original
-  # baselines; the last three add the Item-IRT channel.
+  # Default scoped to a single fast variant for iteration speed.
+  # The full ablation grid (all six variants, multiple ks/seeds) is
+  # re-enabled by editing this list + flipping
+  # ``RUN_FEATURE_TOGGLE_GRID = True`` in notebook cell 13.
   models:
-    - kfactor
-    - kfactor_mlp
-    - kfactor_gated_mlp
-    - kfactor_irt_item
-    - kfactor_irt_item_mlp
     - kfactor_irt_item_gated_mlp
   # Hyperparameters
-  k_factors: [16, 32]            # ablate over multiple k
+  k_factors: [16]                # scoped: single k for fast iteration
   item_map_hidden_dim: 512
   residual_hidden_dim: 256
   dropout: 0.1
   weight_decay: 1.0e-4
   learning_rate: 3.0e-3
   # A100 large-batch defaults. With batch_size=65536 the effective LR is
-  # already large; use shorter training (10 epochs) and a small warmup.
+  # already large; use shorter training (5 epochs by default).
   batch_size: 65536
-  epochs: 10
+  epochs: 5
   warmup_steps: 30
   num_workers: 0
   lambda_resid_init: 0.1
   lambda_resid_trainable: true
   freeze_embeddings: true
-  seeds: [0, 1, 2]
+  seeds: [0]                     # scoped: single seed for fast iteration
   early_stopping_patience: 5
   grad_clip: 1.0
   scheduler: "cosine"            # cosine | linear | none
@@ -173,6 +170,45 @@ train:
     lambda_alpha: 1.0e-4
   # Future hook: fine-tune the encoder with LoRA. Not implemented in v1.
   enable_lora: false
+
+# ----------------------------------------------------------------------------
+# LLM-as-judge (local HF model that scores P(correct) per (subject, item))
+# Outputs four scalar features fed *into* the residual MLP:
+#   [lp_yes, lp_no, lp_yes - lp_no, p_yes_renormalized]
+# Cache the scores once per (subject_key, item_key) pair; never re-score.
+# IMPORTANT: do not change `model_id` or the prompt template casually -- any
+# change invalidates the on-disk cache (the `prompt_version` hash covers
+# template + token list, model_id covers tokenizer + weights).
+# ----------------------------------------------------------------------------
+judge:
+  enabled: true
+  model_id: "Qwen/Qwen3-4B-Instruct-2507"
+  batch_size: 16
+  max_prompt_tokens: 1024
+  max_new_tokens: 1
+  bf16: true
+  use_flash_attention: true
+  trust_remote_code: false
+  cache_dir: "artifacts/judge"
+  # When true the residual MLP receives [lp_yes, lp_no, lp_diff, p_yes]
+  # as additional inputs. Toggle off to ablate while keeping the cache.
+  feature_in_residual: true
+  # If true the export bundles the judge model id into models.txt and runs
+  # the judge live at test time inside predict(). If false the export uses
+  # the (cheaper) distillation fallback -- a judge-free head trained on
+  # the judge-aware model's predictions.
+  ship_at_runtime: true
+
+# ----------------------------------------------------------------------------
+# Drive cache for the LLM-as-judge scores parquet
+# Mirrors the embedding drive cache; keyed by judge slug (model id + prompt
+# version hash). Survives across Colab sessions.
+# ----------------------------------------------------------------------------
+judge_drive_cache:
+  enabled: true
+  folder: "/content/drive/MyDrive/prediction-competition-321M/judge"
+  upload_on_completion: true
+  download_on_start: true
 
 # ----------------------------------------------------------------------------
 # Evaluation / artifact paths

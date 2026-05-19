@@ -790,6 +790,171 @@ else:
     print("Cluster features disabled (CFG.item_features.use_clusters = false).")
 
 # %% [markdown]
+# ## 8c. Score training items with LLM-as-judge (cached)
+#
+# Run a local instruction-tuned LM (default ``Qwen/Qwen3-4B-Instruct-2507``)
+# as a judge over every unique ``(subject_key, item_key)`` pair that appears
+# in training data. For each pair we read the next-token distribution at
+# the "Answer:" position and extract four scalar features:
+#
+#     [lp_yes, lp_no, lp_yes - lp_no, p_yes_renormalized]
+#
+# These features are stored to ``artifacts/judge/{judge_slug}/scores.parquet``
+# keyed by ``(subject_key, item_key)`` and (when Colab Drive is available)
+# pushed to Google Drive so re-running the notebook skips the GPU pass.
+#
+# The four features are fed *into* the residual MLP alongside the item
+# embedding, pool features, and cluster embedding -- the head learns where
+# to trust the judge rather than applying a global blend weight. See
+# ``src/judge.py`` for the implementation and locked prompt template.
+#
+# Two practical warnings:
+#   * The prompt template is locked once the cache is populated; changing
+#     it costs GPU-hours to re-score. The on-disk slug encodes the prompt
+#     version hash so accidental edits show up as a cache miss.
+#   * If ``CFG['judge']['enabled']`` is False this cell is a no-op and the
+#     downstream model is trained without judge features (regression test).
+
+# %%
+from src.judge import (
+    JUDGE_FEATURE_DIM,
+    JudgeConfig,
+    LLMJudge,
+    build_judge_matrix,
+    compute_prompt_version,
+    features_lookup_from_dataframe,
+    judge_slug as _judge_slug_fn,
+    load_cache as _load_judge_cache,
+    write_meta_snapshot as _write_judge_meta,
+)
+
+JUDGE_CFG = (CFG.get("judge") or {})
+JUDGE_ENABLED = bool(JUDGE_CFG.get("enabled", False))
+JUDGE_FEATURES_IN_RESIDUAL = bool(JUDGE_CFG.get("feature_in_residual", True))
+
+judge_features_lookup: dict[tuple[str, str], np.ndarray] = {}
+judge_dataframe = None
+judge_pairs_cached_before = 0
+judge_pairs_newly_scored = 0
+judge_total_pairs = 0
+judge_wall_time = 0.0
+judge_slug = ""
+judge_prompt_version = ""
+
+if not JUDGE_ENABLED:
+    print("Judge disabled (CFG.judge.enabled = false). Skipping LLM-as-judge step.")
+else:
+    cfg_jdg = JudgeConfig(
+        model_id=str(JUDGE_CFG.get("model_id", "Qwen/Qwen3-4B-Instruct-2507")),
+        batch_size=int(JUDGE_CFG.get("batch_size", 16)),
+        max_prompt_tokens=int(JUDGE_CFG.get("max_prompt_tokens", 1024)),
+        bf16=bool(JUDGE_CFG.get("bf16", True)),
+        use_flash_attention=bool(JUDGE_CFG.get("use_flash_attention", True)),
+        trust_remote_code=bool(JUDGE_CFG.get("trust_remote_code", False)),
+        cache_dir=str(JUDGE_CFG.get("cache_dir", "artifacts/judge")),
+    )
+    judge_slug = _judge_slug_fn(cfg_jdg)
+    judge_prompt_version = compute_prompt_version(cfg_jdg)
+    print(f"Judge model         : {cfg_jdg.model_id}")
+    print(f"Judge slug          : {judge_slug}")
+    print(f"Prompt version hash : {judge_prompt_version}")
+
+    # 1) Try to pull the judge cache from Drive (mirror of the embedding cache).
+    judge_cache_root = ROOT / cfg_jdg.cache_dir
+    judge_cache_root.mkdir(parents=True, exist_ok=True)
+    judge_drive_status = drive_cache_mod.resolve_judge_cache(
+        cfg=CFG,
+        judge_slug=judge_slug,
+        local_cache_root=judge_cache_root,
+        expected_hash=judge_prompt_version,
+    )
+    print(f"Judge Drive cache   : {judge_drive_status.reason}")
+
+    # 2) Build the dedup'd (subject_key, item_key) frame for the training set.
+    # Validation items are scored too when they share pairs already in the
+    # training data; unseen pairs at val time fall back to zeros (and the
+    # MLP's input LayerNorm absorbs the shift).
+    train_df = splits["item_cold_start"].train
+    pair_cols = [
+        "subject_key",
+        "item_key",
+        "benchmark",
+        "condition",
+        "subject_content",
+        "item_content",
+    ]
+    missing_pair_cols = [c for c in pair_cols if c not in train_df.columns]
+    if missing_pair_cols:
+        raise ValueError(
+            f"Training frame is missing required columns for the judge: {missing_pair_cols}"
+        )
+    judge_input_df = (
+        train_df[pair_cols]
+        .drop_duplicates(subset=["subject_key", "item_key"])
+        .reset_index(drop=True)
+    )
+    judge_total_pairs = len(judge_input_df)
+
+    # 3) Count how many pairs are already in the parquet cache before scoring.
+    pre_cache = _load_judge_cache(cfg_jdg)
+    judge_pairs_cached_before = int(len(pre_cache))
+
+    # 4) Run the judge (no-op when every pair is already cached).
+    judge = LLMJudge(cfg_jdg)
+    _t_judge_0 = time.time()
+    judge_dataframe = judge.score_dataframe(judge_input_df, progress=True)
+    judge_wall_time = float(time.time() - _t_judge_0)
+    judge_pairs_newly_scored = max(0, judge_total_pairs - judge_pairs_cached_before)
+
+    # 5) Persist the meta.json snapshot describing the slug and upload to Drive.
+    n_rows_after = len(_load_judge_cache(cfg_jdg))
+    _write_judge_meta(cfg_jdg, n_rows=int(n_rows_after))
+    jdc_cfg = (CFG.get("judge_drive_cache") or {})
+    if (
+        jdc_cfg.get("enabled")
+        and jdc_cfg.get("upload_on_completion", True)
+        and judge_drive_status.mounted
+    ):
+        drive_folder_judge = Path(jdc_cfg["folder"]) / judge_slug
+        upload_summary = drive_cache_mod.upload_judge_cache(
+            local_folder=judge_cache_root / judge_slug,
+            drive_folder=drive_folder_judge,
+        )
+        print(f"Judge Drive upload  : {json.dumps(upload_summary, indent=2)}")
+    elif jdc_cfg.get("enabled") and not judge_drive_status.mounted:
+        print("Judge Drive cache enabled but mount unavailable -- skipping upload.")
+
+    # 6) Build the per-pair lookup used by `_build_arrays` below to attach
+    #    judge features to each training / val row.
+    judge_features_lookup = features_lookup_from_dataframe(judge_dataframe)
+
+    # 7) Diagnostics: number cached / scored, wall time, p_yes deciles.
+    p_yes_vals = judge_dataframe["p_yes_renorm"].to_numpy() if (
+        judge_dataframe is not None and not judge_dataframe.empty
+    ) else np.zeros(0)
+    print(
+        f"Judge pairs         : total={judge_total_pairs:,} "
+        f"cached_before={judge_pairs_cached_before:,} "
+        f"newly_scored={judge_pairs_newly_scored:,}"
+    )
+    print(f"Judge wall-time     : {_fmt_time(judge_wall_time)}")
+    if p_yes_vals.size:
+        deciles = np.quantile(p_yes_vals, np.arange(0, 11) / 10)
+        print(
+            "p_yes deciles       : "
+            + " ".join(f"{q:.3f}" for q in deciles)
+        )
+        print(
+            f"p_yes summary       : mean={float(p_yes_vals.mean()):.3f} "
+            f"std={float(p_yes_vals.std()):.3f}"
+        )
+    else:
+        print("p_yes deciles       : (no rows scored)")
+
+    print(f"Judge stats         : {json.dumps(judge.stats(), indent=2)}")
+
+
+# %% [markdown]
 # ## 9. Embedding sanity checks
 
 # %%
@@ -821,6 +986,7 @@ print_results(embed_checks)
 from src.models import Indexer, LookupDataset, ModelConfig
 from src.embeddings import stack_lookup
 from src.item_features import build_feature_matrix
+from src.judge import build_judge_matrix
 
 
 def _pool_matrix(keys, features_df):
@@ -847,6 +1013,24 @@ def _cluster_vector(keys, assignments):
     )
 
 
+def _judge_matrix(subject_keys, item_keys, lookup):
+    """Build the [N, 4] judge-feature matrix; missing pairs get zeros.
+
+    Unknown ``(subject_key, item_key)`` pairs (very rare in training data,
+    possible in val if val has pairs the judge step didn't see) fall back
+    to the zero vector. The residual MLP's input LayerNorm absorbs the
+    shift, and the model can learn to recognize the "no judge data"
+    fingerprint.
+    """
+    if not lookup:
+        return None
+    return build_judge_matrix(
+        [str(k) for k in subject_keys],
+        [str(k) for k in item_keys],
+        lookup,
+    )
+
+
 def _build_arrays(
     split_art,
     indexer,
@@ -856,6 +1040,7 @@ def _build_arrays(
     use_subject_emb: bool = False,
     pool_features_z=None,
     cluster_assignments=None,
+    judge_lookup=None,
 ):
     train = split_art.train
     val = split_art.val
@@ -874,14 +1059,16 @@ def _build_arrays(
     pf_val = _pool_matrix(val["item_key"], pool_features_z)
     ci_train = _cluster_vector(train["item_key"], cluster_assignments)
     ci_val = _cluster_vector(val["item_key"], cluster_assignments)
+    jf_train = _judge_matrix(train["subject_key"], train["item_key"], judge_lookup or {})
+    jf_val = _judge_matrix(val["subject_key"], val["item_key"], judge_lookup or {})
     y_train = train["label"].astype(float).to_numpy()
     y_val = val["label"].astype(float).to_numpy()
     return (
         LookupDataset(
-            s_train, bc_train, ie_train, y_train, se_train, pf_train, ci_train
+            s_train, bc_train, ie_train, y_train, se_train, pf_train, ci_train, jf_train
         ),
         LookupDataset(
-            s_val, bc_val, ie_val, y_val, se_val, pf_val, ci_val
+            s_val, bc_val, ie_val, y_val, se_val, pf_val, ci_val, jf_val
         ),
     )
 
@@ -913,6 +1100,10 @@ else:
     pool_stats = None
     pool_features_z = None
 
+USE_JUDGE_FEATURES = bool(
+    JUDGE_ENABLED and JUDGE_FEATURES_IN_RESIDUAL and judge_features_lookup
+)
+
 train_ds, val_ds = _build_arrays(
     primary,
     indexer,
@@ -921,11 +1112,13 @@ train_ds, val_ds = _build_arrays(
     use_subject_emb=USE_SUBJECT_EMB,
     pool_features_z=pool_features_z,
     cluster_assignments=cluster_assignments,
+    judge_lookup=judge_features_lookup if USE_JUDGE_FEATURES else None,
 )
 print(
     f"train rows: {len(train_ds)} | val rows: {len(val_ds)} | "
     f"pool_feats: {'on' if USE_POOL_FEATURES else 'off'} | "
-    f"clusters: {'on' if USE_CLUSTER_FEATURES else 'off'}"
+    f"clusters: {'on' if USE_CLUSTER_FEATURES else 'off'} | "
+    f"judge: {'on' if USE_JUDGE_FEATURES else 'off'}"
 )
 
 # %% [markdown]
@@ -955,6 +1148,7 @@ def _model_cfg(
     irt_reg = (CFG["train"].get("irt_reg") or {})
     up = USE_POOL_FEATURES if use_pool is None else bool(use_pool)
     uc = USE_CLUSTER_FEATURES if use_clusters is None else bool(use_clusters)
+    uj = bool(USE_JUDGE_FEATURES)
     return ModelConfig(
         k=k,
         item_embed_dim=ITEM_EMB_DIM,
@@ -974,6 +1168,8 @@ def _model_cfg(
         cluster_embed_dim=CLUSTER_EMBED_DIM if uc else 0,
         irt_lambda_beta=float(irt_reg.get("lambda_beta", 1.0e-4)),
         irt_lambda_alpha=float(irt_reg.get("lambda_alpha", 1.0e-4)),
+        use_judge_features=bool(uj),
+        judge_feature_dim=int(JUDGE_FEATURE_DIM) if uj else 0,
     )
 
 
@@ -1176,8 +1372,10 @@ models_to_train = list(CFG["train"]["models"])
 ks = [int(k) for k in CFG["train"]["k_factors"]]
 seeds = [int(s) for s in CFG["train"]["seeds"]]
 
-# Set to False for fast iteration; the toggle grid adds ~2x runs.
-RUN_FEATURE_TOGGLE_GRID = True
+# Scoped to one variant for fast iteration; flip the model list / seeds /
+# RUN_FEATURE_TOGGLE_GRID for a full ablation. With the default config this
+# trains exactly one run: kfactor_irt_item_gated_mlp, k=16, seed=0, 5 epochs.
+RUN_FEATURE_TOGGLE_GRID = False
 
 # Variants that have a residual MLP can actually consume pool / cluster
 # features; toggling them on the pure kfactor / pure IRT variants is a no-op
@@ -1345,9 +1543,14 @@ def _predict_with_checkpoint(model_name: str, ckpt_path: Path, split_art) -> np.
     mdl = build_model(model_name, mcfg)
     mdl.load_state_dict(ck["model_state"], strict=False)
     # Mirror the checkpoint's feature-channel config when building the val
-    # dataset so pool / cluster channels line up with the trained model.
+    # dataset so pool / cluster / judge channels line up with the trained model.
     pf_z = pool_features_z if getattr(mcfg, "use_pool_features", False) else None
     ca = cluster_assignments if getattr(mcfg, "use_cluster_features", False) else None
+    jl = (
+        judge_features_lookup
+        if getattr(mcfg, "use_judge_features", False)
+        else None
+    )
     val_ds_split = _build_arrays(
         split_art,
         indexer,
@@ -1356,6 +1559,7 @@ def _predict_with_checkpoint(model_name: str, ckpt_path: Path, split_art) -> np.
         use_subject_emb=USE_SUBJECT_EMB,
         pool_features_z=pf_z,
         cluster_assignments=ca,
+        judge_lookup=jl,
     )[1]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     eval_bs = max(int(CFG["train"]["batch_size"]), 4096)
@@ -1457,12 +1661,17 @@ def _predict_with_ablation(
     force_alpha_one: bool = False,
     force_beta_zero: bool = False,
     zero_mlp: bool = False,
+    judge_mask: np.ndarray | None = None,
+    zero_judge: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run val inference with a specific channel zeroed / forced.
 
     Returns ``(probs, y_true)``. Designed to call the same forward path as
     training: pool features are multiplied element-wise by ``pool_mask``
     (default all-ones) so individual features can be zeroed surgically.
+    Judge features behave the same way: ``judge_mask`` is a length-4 mask
+    over ``[lp_yes, lp_no, lp_diff, p_yes]`` and ``zero_judge=True`` zeroes
+    the whole 4-vector for an all-out without_judge ablation.
     """
     model.eval()
     loader = torch.utils.data.DataLoader(
@@ -1482,10 +1691,13 @@ def _predict_with_ablation(
     with torch.inference_mode():
         with autocast:
             for batch in loader:
-                s, bc, ie, se, pf, ci, y = [b.to(device, non_blocking=True) for b in batch]
+                s, bc, ie, se, pf, ci, y, jf = [
+                    b.to(device, non_blocking=True) for b in batch
+                ]
                 se_use = se if se.shape[-1] > 0 else None
                 pf_use = pf if pf.shape[-1] > 0 else None
                 ci_use = ci if ci.numel() > 0 else None
+                jf_use = jf if jf.shape[-1] > 0 else None
                 if pf_use is not None and pool_mask is not None:
                     mask = torch.from_numpy(np.asarray(pool_mask, dtype=np.float32)).to(
                         pf_use.device
@@ -1493,6 +1705,14 @@ def _predict_with_ablation(
                     pf_use = pf_use * mask
                 if zero_cluster and ci_use is not None:
                     ci_use = torch.zeros_like(ci_use)
+                if jf_use is not None:
+                    if judge_mask is not None:
+                        jmask = torch.from_numpy(
+                            np.asarray(judge_mask, dtype=np.float32)
+                        ).to(jf_use.device)
+                        jf_use = jf_use * jmask
+                    if zero_judge:
+                        jf_use = torch.zeros_like(jf_use)
                 kwargs: dict = {}
                 if force_alpha_one and getattr(model, "has_irt_heads", False):
                     kwargs["override_alpha"] = torch.ones(
@@ -1507,11 +1727,11 @@ def _predict_with_ablation(
                 ):
                     kwargs["override_mlp_zero"] = True
                 try:
-                    logits = model(s, bc, ie, se_use, pf_use, ci_use, **kwargs)
+                    logits = model(s, bc, ie, se_use, pf_use, ci_use, jf_use, **kwargs)
                 except TypeError:
                     # The model doesn't expose override kwargs (e.g. pure
-                    # kfactor); fall back to the plain forward.
-                    logits = model(s, bc, ie, se_use, pf_use, ci_use)
+                    # kfactor); fall back to the plain positional forward.
+                    logits = model(s, bc, ie, se_use, pf_use, ci_use, jf_use)
                 probs = torch.sigmoid(logits).float().cpu().numpy()
                 preds.append(probs)
                 targets.append(y.float().cpu().numpy())
@@ -1546,11 +1766,14 @@ def _decompose_on_val(
     with torch.inference_mode():
         with autocast:
             for batch in loader:
-                s, bc, ie, se, pf, ci, y = [b.to(device, non_blocking=True) for b in batch]
+                s, bc, ie, se, pf, ci, y, jf = [
+                    b.to(device, non_blocking=True) for b in batch
+                ]
                 se_use = se if se.shape[-1] > 0 else None
                 pf_use = pf if pf.shape[-1] > 0 else None
                 ci_use = ci if ci.numel() > 0 else None
-                d = model.decompose(s, bc, ie, se_use, pf_use, ci_use)
+                jf_use = jf if jf.shape[-1] > 0 else None
+                d = model.decompose(s, bc, ie, se_use, pf_use, ci_use, jf_use)
                 for name, tensor in d.items():
                     # We only care about per-row scalar components for the
                     # table (irt / offset / mlp / factor). Skip multi-dim
@@ -1594,6 +1817,11 @@ else:
 
     diag_pf_z = pool_features_z if getattr(mcfg_diag, "use_pool_features", False) else None
     diag_ca = cluster_assignments if getattr(mcfg_diag, "use_cluster_features", False) else None
+    diag_jl = (
+        judge_features_lookup
+        if getattr(mcfg_diag, "use_judge_features", False)
+        else None
+    )
     _, val_ds_diag = _build_arrays(
         primary,
         indexer,
@@ -1602,6 +1830,7 @@ else:
         use_subject_emb=USE_SUBJECT_EMB,
         pool_features_z=diag_pf_z,
         cluster_assignments=diag_ca,
+        judge_lookup=diag_jl,
     )
 
     # ----- Analysis A: feature ablation ------------------------------------
@@ -1648,6 +1877,23 @@ else:
             mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
             bf16=diag_bf16, zero_mlp=True,
         )
+
+    # LLM-as-judge ablations: drop the whole 4-vector and each scalar
+    # individually so the diagnostic shows whether the head leans on
+    # lp_yes / lp_no / lp_diff / p_yes_renorm individually.
+    if getattr(mdl_diag, "has_judge_features", False):
+        ablations["without_judge"] = _predict_with_ablation(
+            mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+            bf16=diag_bf16, zero_judge=True,
+        )
+        judge_feature_names = ("lp_yes", "lp_no", "lp_diff", "p_yes_renorm")
+        for i, name in enumerate(judge_feature_names):
+            mask = np.ones(int(mcfg_diag.judge_feature_dim), dtype=np.float32)
+            mask[i] = 0.0
+            ablations[f"judge[{name}]"] = _predict_with_ablation(
+                mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+                bf16=diag_bf16, judge_mask=mask,
+            )
 
     ablation_df = feature_ablation_table(ablations, full_key="full")
     ablation_csv = RESULTS_DIR / f"feature_ablation_{BEST_RUN_ID}.csv"
@@ -1978,6 +2224,12 @@ sub_dir = export_run(
     cluster_centroids_path=CENTROIDS_PATH if USE_CLUSTER_FEATURES else None,
     pool_feature_names=list(POOL_FEATURE_NAMES),
     training_cache_dir=training_cache_dir if training_cache_result is not None else None,
+    judge_cfg=CFG.get("judge"),
+)
+print(
+    f"Judge in bundle     : enabled={bool((CFG.get('judge') or {}).get('enabled'))} "
+    f"ship_at_runtime={bool((CFG.get('judge') or {}).get('ship_at_runtime', True))} "
+    f"model_id={(CFG.get('judge') or {}).get('model_id', '')}"
 )
 zip_path = make_submission_zip(
     submission_dir=sub_dir,

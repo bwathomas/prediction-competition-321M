@@ -113,6 +113,37 @@ POOL_FEATURE_NAMES: tuple = tuple(
     )
 )
 
+# LLM-as-judge config (Path A: ship the judge model and run it live).
+JUDGE_META: dict = dict(META.get("judge") or {})
+JUDGE_ENABLED: bool = bool(JUDGE_META.get("enabled", False))
+JUDGE_SHIP_AT_RUNTIME: bool = bool(JUDGE_META.get("ship_at_runtime", True))
+JUDGE_MODEL_ID: str = str(JUDGE_META.get("model_id", ""))
+JUDGE_MAX_PROMPT_TOKENS: int = int(JUDGE_META.get("max_prompt_tokens", 1024))
+JUDGE_BF16: bool = bool(JUDGE_META.get("bf16", True))
+JUDGE_USE_FLASH_ATTENTION: bool = bool(JUDGE_META.get("use_flash_attention", True))
+JUDGE_PROMPT_TEMPLATE: str = str(
+    JUDGE_META.get(
+        "prompt_template",
+        (
+            "You will see a description of an AI subject and an evaluation item. "
+            "Decide whether the subject would answer the item correctly. "
+            "Reply with a single token: yes or no.\n\n"
+            "Benchmark: {benchmark}\n"
+            "Condition: {condition}\n"
+            "Subject: {subject_content}\n"
+            "Item: {item_content}\n"
+            "Answer:"
+        ),
+    )
+)
+JUDGE_YES_TOKENS: tuple = tuple(
+    JUDGE_META.get("yes_tokens", (" yes", "yes", " Yes", "Yes"))
+)
+JUDGE_NO_TOKENS: tuple = tuple(
+    JUDGE_META.get("no_tokens", (" no", "no", " No", "No"))
+)
+JUDGE_SUFFIX_RESERVE_TOKENS: int = int(JUDGE_META.get("suffix_reserve_tokens", 256))
+
 
 # ---------------------------------------------------------------------------
 # Cache resolution: HF cache should live next to the submission so the
@@ -326,12 +357,12 @@ class _KFactorBase(nn.Module):
 
 
 class _KFactor(_KFactorBase):
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
         eta, *_ = self._factor(s, bc, ie)
         return eta
 
 
-def _residual_features(cfg, u_s, v_i, ie, beta_bc, se, pool_feats, cluster_emb):
+def _residual_features(cfg, u_s, v_i, ie, beta_bc, se, pool_feats, cluster_emb, judge_feats):
     parts = [u_s, v_i, u_s * v_i, ie, beta_bc]
     if cfg.get("use_subject_text_embedding") and se is not None and se.shape[-1] > 0:
         parts.append(se)
@@ -343,6 +374,12 @@ def _residual_features(cfg, u_s, v_i, ie, beta_bc, se, pool_feats, cluster_emb):
         and cluster_emb.shape[-1] > 0
     ):
         parts.append(cluster_emb)
+    if (
+        cfg.get("use_judge_features")
+        and judge_feats is not None
+        and judge_feats.shape[-1] > 0
+    ):
+        parts.append(judge_feats)
     return torch.cat(parts, dim=-1)
 
 
@@ -354,6 +391,8 @@ def _residual_input_dim(cfg: dict) -> int:
         base += int(cfg.get("pool_feature_dim", 0))
     if cfg.get("use_cluster_features") and cfg.get("n_clusters", 0) > 0:
         base += int(cfg.get("cluster_embed_dim", 0))
+    if cfg.get("use_judge_features"):
+        base += int(cfg.get("judge_feature_dim", 0))
     return base
 
 
@@ -365,6 +404,8 @@ def _residual_input_dim_irt(cfg: dict) -> int:
         base += int(cfg.get("pool_feature_dim", 0))
     if cfg.get("use_cluster_features") and cfg.get("n_clusters", 0) > 0:
         base += int(cfg.get("cluster_embed_dim", 0))
+    if cfg.get("use_judge_features"):
+        base += int(cfg.get("judge_feature_dim", 0))
     return base
 
 
@@ -414,12 +455,12 @@ class _ResidualKFactor(_KFactorBase):
             requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
         )
 
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
         eta_factor, u_s, v_i, ie_out = self._factor(s, bc, ie)
         beta_bc = self.beta(bc)
         cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
         x = _residual_features(
-            self.cfg, u_s, v_i, ie_out, beta_bc, se, pool_feats, cluster_emb
+            self.cfg, u_s, v_i, ie_out, beta_bc, se, pool_feats, cluster_emb, judge_feats
         )
         return eta_factor + self.lambda_resid * self.residual(x)
 
@@ -472,12 +513,12 @@ class _IRTItemBase(nn.Module):
 
 
 class _IRTItemKFactor(_IRTItemBase):
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
         comps = self._irt_components(s, bc, ie)
         return comps["irt"] + comps["offset"]
 
 
-def _residual_features_irt(cfg, comps, ie, se, pool_feats, cluster_emb):
+def _residual_features_irt(cfg, comps, ie, se, pool_feats, cluster_emb, judge_feats):
     parts = [
         ie,
         comps["theta"].unsqueeze(-1),
@@ -494,6 +535,12 @@ def _residual_features_irt(cfg, comps, ie, se, pool_feats, cluster_emb):
         and cluster_emb.shape[-1] > 0
     ):
         parts.append(cluster_emb)
+    if (
+        cfg.get("use_judge_features")
+        and judge_feats is not None
+        and judge_feats.shape[-1] > 0
+    ):
+        parts.append(judge_feats)
     return torch.cat(parts, dim=-1)
 
 
@@ -513,10 +560,12 @@ class _ResidualIRTItem(_IRTItemBase):
             requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
         )
 
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
         comps = self._irt_components(s, bc, ie)
         cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
-        x = _residual_features_irt(self.cfg, comps, ie, se, pool_feats, cluster_emb)
+        x = _residual_features_irt(
+            self.cfg, comps, ie, se, pool_feats, cluster_emb, judge_feats
+        )
         return comps["irt"] + comps["offset"] + self.lambda_resid * self.residual(x)
 
 
@@ -808,6 +857,192 @@ class _TrainingItemCache:
         }
 
 
+# ---------------------------------------------------------------------------
+# LLM-as-judge runtime (Path A: ship a local instruction-tuned LM and run
+# it per-call). Loaded once at module scope. The per-call score is cached
+# in-process on (subject_hash, item_hash) so the same pair is only scored
+# once per round even if the platform asks for it many times.
+# ---------------------------------------------------------------------------
+
+
+def _judge_first_token_id(tokenizer, variant: str) -> int | None:
+    ids = tokenizer.encode(variant, add_special_tokens=False)
+    if not ids:
+        return None
+    return int(ids[0])
+
+
+def _judge_token_ids(tokenizer, variants) -> list[int]:
+    seen: dict[int, None] = {}
+    for v in variants:
+        tid = _judge_first_token_id(tokenizer, v)
+        if tid is None:
+            continue
+        seen.setdefault(tid, None)
+    return list(seen.keys())
+
+
+def _judge_truncate(
+    tokenizer,
+    *,
+    benchmark: str,
+    condition: str,
+    subject_content: str,
+    item_content: str,
+) -> str:
+    """Char-based shrink of item / subject content until the rendered prompt
+    fits in JUDGE_MAX_PROMPT_TOKENS - JUDGE_SUFFIX_RESERVE_TOKENS."""
+    rendered = JUDGE_PROMPT_TEMPLATE.format(
+        benchmark=benchmark,
+        condition=condition,
+        subject_content=subject_content,
+        item_content=item_content,
+    )
+    if JUDGE_MAX_PROMPT_TOKENS <= 0:
+        return rendered
+    ids = tokenizer.encode(rendered, add_special_tokens=False)
+    if len(ids) <= JUDGE_MAX_PROMPT_TOKENS:
+        return rendered
+    suffix_reserve = max(64, int(JUDGE_SUFFIX_RESERVE_TOKENS))
+    budget = max(64, int(JUDGE_MAX_PROMPT_TOKENS) - suffix_reserve)
+    it_text, sb_text = item_content, subject_content
+
+    def _try(it_t: str, sb_t: str):
+        s = JUDGE_PROMPT_TEMPLATE.format(
+            benchmark=benchmark,
+            condition=condition,
+            subject_content=sb_t,
+            item_content=it_t,
+        )
+        return s, len(tokenizer.encode(s, add_special_tokens=False))
+
+    s, n = _try(it_text, sb_text)
+    while n > budget and len(it_text) > 64:
+        shrink = max(64, (n - budget) * 4)
+        it_text = it_text[: max(64, len(it_text) - shrink)]
+        s, n = _try(it_text, sb_text)
+    while n > budget and len(sb_text) > 64:
+        shrink = max(64, (n - budget) * 4)
+        sb_text = sb_text[: max(64, len(sb_text) - shrink)]
+        s, n = _try(it_text, sb_text)
+    if n > JUDGE_MAX_PROMPT_TOKENS:
+        ids = tokenizer.encode(s, add_special_tokens=False)
+        ids = ids[: int(JUDGE_MAX_PROMPT_TOKENS) - 8]
+        s = tokenizer.decode(ids, skip_special_tokens=False) + "\nAnswer:"
+    return s
+
+
+class _LLMJudgeRuntime:
+    """Inline LLM-as-judge for the submission runtime. Loaded once."""
+
+    def __init__(self, model_id: str):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(
+            model_id, cache_dir=_CACHE_DIR, local_files_only=True, use_fast=True
+        )
+        if tok.padding_side != "right":
+            tok.padding_side = "right"
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+        self.tokenizer = tok
+
+        dtype = (
+            torch.bfloat16
+            if (_DEVICE == "cuda" and torch.cuda.is_bf16_supported() and JUDGE_BF16)
+            else torch.float32
+        )
+        attn_kwargs: dict = {}
+        if JUDGE_USE_FLASH_ATTENTION and _DEVICE == "cuda":
+            attn_kwargs["attn_implementation"] = "flash_attention_2"
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=_CACHE_DIR,
+                torch_dtype=dtype,
+                local_files_only=True,
+                **attn_kwargs,
+            )
+        except (ImportError, ValueError, RuntimeError):
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=_CACHE_DIR,
+                torch_dtype=dtype,
+                local_files_only=True,
+            )
+        self.model.eval().to(_DEVICE)
+
+        self.yes_ids = _judge_token_ids(tok, JUDGE_YES_TOKENS)
+        self.no_ids = _judge_token_ids(tok, JUDGE_NO_TOKENS)
+        if not self.yes_ids or not self.no_ids:
+            raise RuntimeError(
+                f"Judge yes/no token resolution failed: yes={self.yes_ids} no={self.no_ids}"
+            )
+        # In-process score cache keyed by (subject_hash, item_hash). Cleared
+        # in predict() when the labeled fingerprint changes (new round).
+        self.score_cache: dict[tuple[str, str], np.ndarray] = {}
+
+    def score(self, *, benchmark: str, condition: str, subject_content: str, item_content: str) -> np.ndarray:
+        prompt = _judge_truncate(
+            self.tokenizer,
+            benchmark=benchmark,
+            condition=condition,
+            subject_content=subject_content,
+            item_content=item_content,
+        )
+        enc = self.tokenizer(
+            [prompt],
+            padding="longest",
+            truncation=True,
+            max_length=JUDGE_MAX_PROMPT_TOKENS,
+            return_tensors="pt",
+        )
+        input_ids = enc["input_ids"].to(_DEVICE)
+        attn = enc["attention_mask"].to(_DEVICE)
+        with torch.inference_mode():
+            out = self.model(input_ids=input_ids, attention_mask=attn)
+        logits = out.logits
+        seq_lens = attn.sum(dim=1) - 1
+        seq_lens = seq_lens.clamp(min=0)
+        next_logits = logits[torch.arange(logits.size(0), device=logits.device), seq_lens]
+        logprobs = torch.log_softmax(next_logits.float(), dim=-1)
+        yes_t = torch.tensor(self.yes_ids, dtype=torch.long, device=logprobs.device)
+        no_t = torch.tensor(self.no_ids, dtype=torch.long, device=logprobs.device)
+        lp_yes = torch.logsumexp(logprobs.index_select(1, yes_t), dim=-1)
+        lp_no = torch.logsumexp(logprobs.index_select(1, no_t), dim=-1)
+        lp_diff = lp_yes - lp_no
+        p_yes = torch.sigmoid(lp_diff)
+        return np.asarray(
+            [
+                float(lp_yes.item()),
+                float(lp_no.item()),
+                float(lp_diff.item()),
+                float(p_yes.item()),
+            ],
+            dtype=np.float32,
+        )
+
+    def score_cached(self, *, benchmark: str, condition: str, subject_content: str, item_content: str) -> np.ndarray:
+        key = (
+            stable_sha256(subject_content),
+            stable_sha256(benchmark, condition, item_content),
+        )
+        cached = self.score_cache.get(key)
+        if cached is not None:
+            return cached
+        vec = self.score(
+            benchmark=benchmark,
+            condition=condition,
+            subject_content=subject_content,
+            item_content=item_content,
+        )
+        self.score_cache[key] = vec
+        return vec
+
+
+JUDGE: _LLMJudgeRuntime | None = None  # populated in the module-init section below
+
+
 TRAINING_CACHE: _TrainingItemCache | None = None
 if TRAINING_CACHE_DIR.exists() and (TRAINING_CACHE_DIR / "cache_meta.json").exists():
     try:
@@ -835,6 +1070,15 @@ LOG.info("Loading submission artifacts ...")
 
 _CACHE_DIR = _resolve_cache_dir()
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# LLM-as-judge: load now that _CACHE_DIR / _DEVICE are resolved.
+if JUDGE_ENABLED and JUDGE_SHIP_AT_RUNTIME and JUDGE_MODEL_ID:
+    try:
+        JUDGE = _LLMJudgeRuntime(JUDGE_MODEL_ID)
+        LOG.info("Loaded LLM-as-judge runtime: %s on %s", JUDGE_MODEL_ID, _DEVICE)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to load judge runtime (%s); falling back to zeros", exc)
+        JUDGE = None
 
 from transformers import AutoModel, AutoTokenizer
 
@@ -1003,6 +1247,39 @@ def _assign_cluster_id(item_emb: np.ndarray) -> int:
     return int(d2.argmin(axis=1)[0]) + 1
 
 
+def _get_judge_features(
+    benchmark: str, condition: str, subject_content: str, item_content: str
+) -> np.ndarray:
+    """Return the length-4 judge feature vector for this (subject, item).
+
+    Falls back to zeros if the judge is disabled, didn't load, or the trained
+    model wasn't configured with judge features. The trained model's input
+    LayerNorm absorbs the shift from zeros for the "no judge" fingerprint.
+    """
+    if not _MODEL_CFG.get("use_judge_features"):
+        return np.zeros(0, dtype=np.float32)
+    dim = int(_MODEL_CFG.get("judge_feature_dim", 4))
+    if JUDGE is None:
+        return np.zeros(dim, dtype=np.float32)
+    try:
+        vec = JUDGE.score_cached(
+            benchmark=benchmark,
+            condition=condition,
+            subject_content=subject_content,
+            item_content=item_content,
+        )
+    except Exception:
+        LOG.exception("judge.score_cached failed; returning zeros")
+        return np.zeros(dim, dtype=np.float32)
+    if vec.size != dim:
+        # Defensive: pad or truncate so dims match the trained head.
+        out = np.zeros(dim, dtype=np.float32)
+        n = min(dim, int(vec.size))
+        out[:n] = vec[:n]
+        return out
+    return vec.astype(np.float32, copy=False)
+
+
 # ---------------------------------------------------------------------------
 # Uncalibrated probability (used both by predict() and by the calibrator's
 # fit step on the `labeled` revealed by adaptive labeling).
@@ -1030,6 +1307,7 @@ def _predict_uncalibrated(
     subject_emb = _get_subject_embedding(subject_content)
     pool_vec = _compute_pool_features_vec(item_content)
     cluster_id = _assign_cluster_id(item_emb)
+    judge_vec = _get_judge_features(benchmark, condition, subject_content, item_content)
 
     ie = torch.from_numpy(item_emb).to(_DEVICE).unsqueeze(0)
     se = torch.from_numpy(subject_emb).to(_DEVICE).unsqueeze(0) if subject_emb.size > 0 else None
@@ -1043,11 +1321,16 @@ def _predict_uncalibrated(
         if _MODEL_CFG.get("use_cluster_features")
         else None
     )
+    jf = (
+        torch.from_numpy(judge_vec).to(_DEVICE).unsqueeze(0)
+        if judge_vec.size > 0
+        else None
+    )
     s = torch.tensor([s_id], dtype=torch.long, device=_DEVICE)
     bc = torch.tensor([bc_id], dtype=torch.long, device=_DEVICE)
 
     with torch.inference_mode():
-        logit = _MODEL(s, bc, ie, se, pf, ci)
+        logit = _MODEL(s, bc, ie, se, pf, ci, jf)
         prob = torch.sigmoid(logit).float().cpu().item()
     if not math.isfinite(prob):
         prob = DEFAULT_PROB
@@ -1188,6 +1471,7 @@ def export_run(
     cluster_centroids_path: str | os.PathLike[str] | None = None,
     pool_feature_names: list[str] | None = None,
     training_cache_dir: str | os.PathLike[str] | None = None,
+    judge_cfg: Mapping | None = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -1247,6 +1531,44 @@ def export_run(
                 src_cache,
             )
 
+    # Normalize the judge block for the runtime. We persist the locked
+    # prompt template + yes/no token lists so the runtime never diverges
+    # from training-time scoring -- changing them invalidates the cache.
+    jcfg = dict(judge_cfg or {})
+    judge_block = {
+        "enabled": bool(jcfg.get("enabled", False)),
+        "ship_at_runtime": bool(jcfg.get("ship_at_runtime", True)),
+        "model_id": str(jcfg.get("model_id", "")),
+        "batch_size": int(jcfg.get("batch_size", 16)),
+        "max_prompt_tokens": int(jcfg.get("max_prompt_tokens", 1024)),
+        "bf16": bool(jcfg.get("bf16", True)),
+        "use_flash_attention": bool(jcfg.get("use_flash_attention", True)),
+        "trust_remote_code": bool(jcfg.get("trust_remote_code", False)),
+        "suffix_reserve_tokens": int(jcfg.get("suffix_reserve_tokens", 256)),
+        "yes_tokens": list(
+            jcfg.get("yes_tokens", (" yes", "yes", " Yes", "Yes"))
+        ),
+        "no_tokens": list(
+            jcfg.get("no_tokens", (" no", "no", " No", "No"))
+        ),
+        "prompt_template": str(
+            jcfg.get(
+                "prompt_template",
+                (
+                    "You will see a description of an AI subject and an evaluation item. "
+                    "Decide whether the subject would answer the item correctly. "
+                    "Reply with a single token: yes or no.\n\n"
+                    "Benchmark: {benchmark}\n"
+                    "Condition: {condition}\n"
+                    "Subject: {subject_content}\n"
+                    "Item: {item_content}\n"
+                    "Answer:"
+                ),
+            )
+        ),
+        "feature_in_residual": bool(jcfg.get("feature_in_residual", True)),
+    }
+
     runtime_meta = {
         "run_id": result.run_id,
         "model_name": result.model_name,
@@ -1280,6 +1602,7 @@ def export_run(
             "n_choices",
             "lang_en",
         ],
+        "judge": judge_block,
     }
     (artifacts / "runtime_meta.json").write_text(
         json.dumps(runtime_meta, indent=2, default=str)
@@ -1289,7 +1612,16 @@ def export_run(
     if include_labeling:
         (sub / "labeling.py").write_text(_RUNTIME_LABELING_PY, encoding="utf-8")
 
+    # models.txt: encoder first, then (optionally) the judge so the platform
+    # pre-fetches both. Caller-provided extras come last and are deduped.
     declared = [encoder_cfg["model_id"]]
+    if (
+        judge_block["enabled"]
+        and judge_block["ship_at_runtime"]
+        and judge_block["model_id"]
+        and judge_block["model_id"] not in declared
+    ):
+        declared.append(judge_block["model_id"])
     if extra_models_txt:
         for m in extra_models_txt:
             if m and m not in declared:
@@ -1297,7 +1629,9 @@ def export_run(
     (sub / "models.txt").write_text("\n".join(declared) + "\n", encoding="utf-8")
     (sub / "requirements.txt").write_text(_RUNTIME_REQUIREMENTS, encoding="utf-8")
 
-    LOG.info("Wrote submission to %s", sub.resolve())
+    LOG.info(
+        "Wrote submission to %s (declared models: %s)", sub.resolve(), declared
+    )
     return sub
 
 

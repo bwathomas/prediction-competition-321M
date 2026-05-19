@@ -377,10 +377,193 @@ def resolve_cache(
     )
 
 
+# ---------------------------------------------------------------------------
+# Judge cache helpers (symmetric to the encoder embedding cache)
+#
+# The judge cache lives at:
+#     local:  {cache_dir}/{judge_slug}/scores.parquet  (+ meta.json)
+#     drive:  {drive_folder}/{judge_slug}/scores.parquet
+#
+# The slug already encodes (model_id, prompt_version), so a hit on the slug
+# is a strict hit -- but we still verify ``content_hash`` (= prompt_version)
+# in meta.json before promoting a partial-overlap parquet as authoritative.
+# ---------------------------------------------------------------------------
+
+
+_JUDGE_CACHE_FILES = ("scores.parquet", "meta.json")
+
+
+def download_judge_to_local(
+    *,
+    drive_folder: Path,
+    local_folder: Path,
+    expected_hash: str,
+) -> DriveCacheStatus:
+    """Try to populate the local judge cache from a Drive folder.
+
+    The "cache hit" predicate is: the Drive folder exists, contains a
+    ``meta.json`` whose ``content_hash`` field equals ``expected_hash``
+    (which the caller computes as the judge prompt-version hash), and
+    ``scores.parquet`` exists. We always copy whatever files are present so
+    incremental encoding can resume from a partial cache.
+    """
+    local_folder = Path(local_folder)
+    local_folder.mkdir(parents=True, exist_ok=True)
+
+    drive_meta_path = drive_folder / "meta.json"
+    if not drive_meta_path.exists():
+        return DriveCacheStatus(
+            enabled=True,
+            mounted=True,
+            drive_folder=drive_folder,
+            local_folder=local_folder,
+            cache_hit=False,
+            partial_hit=False,
+            expected_hash=expected_hash,
+            cached_hash=None,
+            encoded_n_items_cached=0,
+            encoded_n_subjects_cached=0,
+            reason="judge drive cache empty (no meta.json)",
+        )
+    try:
+        meta = json.loads(drive_meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+
+    cached_hash = str(meta.get("content_hash") or "") or None
+    n_rows_cached = int(meta.get("n_rows", 0) or 0)
+
+    files_present = [f for f in _JUDGE_CACHE_FILES if (drive_folder / f).exists()]
+    if files_present:
+        _copy_files_atomic(drive_folder, local_folder, files=files_present)
+
+    has_scores = (local_folder / "scores.parquet").exists()
+    full_hit = bool(cached_hash == expected_hash and has_scores)
+    partial_hit = (cached_hash is not None) and not full_hit and files_present
+
+    if full_hit:
+        reason = "judge drive cache HIT (prompt_version matches; skipping re-score)"
+    elif partial_hit:
+        reason = (
+            "judge drive cache PARTIAL hit (prompt_version differs; will append "
+            "missing pairs then upload the merged cache)"
+        )
+    else:
+        reason = "judge drive cache MISS"
+
+    return DriveCacheStatus(
+        enabled=True,
+        mounted=True,
+        drive_folder=drive_folder,
+        local_folder=local_folder,
+        cache_hit=full_hit,
+        partial_hit=partial_hit,
+        expected_hash=expected_hash,
+        cached_hash=cached_hash,
+        encoded_n_items_cached=n_rows_cached,
+        encoded_n_subjects_cached=0,
+        reason=reason,
+    )
+
+
+def resolve_judge_cache(
+    *,
+    cfg: Mapping,
+    judge_slug: str,
+    local_cache_root: Path,
+    expected_hash: str,
+) -> DriveCacheStatus:
+    """One-shot helper: mount Drive + download the judge cache if available.
+
+    ``cfg`` is the full config dict (we look at ``cfg["judge_drive_cache"]``).
+    ``judge_slug`` is the directory name produced by ``src.judge.judge_slug``
+    so a hit on the slug already implies a (model_id, prompt_version) match.
+    """
+    local_folder = Path(local_cache_root) / judge_slug
+    local_folder.mkdir(parents=True, exist_ok=True)
+
+    dc = cfg.get("judge_drive_cache") if cfg else None
+    enabled = bool(dc and dc.get("enabled", False))
+    if not enabled:
+        return DriveCacheStatus(
+            enabled=False,
+            mounted=False,
+            drive_folder=None,
+            local_folder=local_folder,
+            cache_hit=False,
+            partial_hit=False,
+            expected_hash=expected_hash,
+            cached_hash=None,
+            encoded_n_items_cached=0,
+            encoded_n_subjects_cached=0,
+            reason="judge_drive_cache.enabled = false",
+        )
+
+    if not bool(dc.get("download_on_start", True)):
+        mounted = mount_drive_if_needed()
+        return DriveCacheStatus(
+            enabled=True,
+            mounted=bool(mounted),
+            drive_folder=Path(dc.get("folder", "")) / judge_slug if dc.get("folder") else None,
+            local_folder=local_folder,
+            cache_hit=False,
+            partial_hit=False,
+            expected_hash=expected_hash,
+            cached_hash=None,
+            encoded_n_items_cached=0,
+            encoded_n_subjects_cached=0,
+            reason="judge_drive_cache.download_on_start = false",
+        )
+
+    mounted = mount_drive_if_needed()
+    if not mounted:
+        return DriveCacheStatus(
+            enabled=True,
+            mounted=False,
+            drive_folder=None,
+            local_folder=local_folder,
+            cache_hit=False,
+            partial_hit=False,
+            expected_hash=expected_hash,
+            cached_hash=None,
+            encoded_n_items_cached=0,
+            encoded_n_subjects_cached=0,
+            reason="judge drive mount unavailable (not in Colab or mount failed)",
+        )
+
+    drive_root = Path(dc.get("folder", ""))
+    drive_folder = drive_root / judge_slug
+    return download_judge_to_local(
+        drive_folder=drive_folder,
+        local_folder=local_folder,
+        expected_hash=expected_hash,
+    )
+
+
+def upload_judge_cache(
+    *,
+    local_folder: Path,
+    drive_folder: Path,
+) -> dict:
+    """Publish the local judge cache (scores.parquet + meta.json) to Drive.
+
+    Atomic via ``{drive_folder}.tmp/`` staging + rename to avoid consumers
+    reading a half-written parquet.
+    """
+    return upload_from_local(
+        local_folder=local_folder,
+        drive_folder=drive_folder,
+        files=list(_JUDGE_CACHE_FILES),
+    )
+
+
 __all__ = [
     "DriveCacheStatus",
+    "download_judge_to_local",
     "download_to_local",
     "mount_drive_if_needed",
     "resolve_cache",
+    "resolve_judge_cache",
     "upload_from_local",
+    "upload_judge_cache",
 ]

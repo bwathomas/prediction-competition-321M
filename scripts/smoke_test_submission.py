@@ -107,6 +107,29 @@ def make_zip(submission_dir: Path, zip_path: Path) -> Path:
     return zip_path
 
 
+def _read_models_txt(submission_dir: Path) -> list[str]:
+    p = submission_dir / "models.txt"
+    if not p.exists():
+        return []
+    return [
+        line.strip()
+        for line in p.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _read_runtime_meta(submission_dir: Path) -> dict:
+    p = submission_dir / "artifacts" / "runtime_meta.json"
+    if not p.exists():
+        return {}
+    try:
+        import json as _json
+
+        return _json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--submission", default="submission")
@@ -119,6 +142,15 @@ def main() -> int:
     parser.add_argument("--n", type=int, default=20)
     parser.add_argument("--zip-path", default="submission.zip")
     parser.add_argument("--skip-zip", action="store_true")
+    parser.add_argument(
+        "--latency-warn-ms",
+        type=float,
+        default=500.0,
+        help=(
+            "Warn (don't fail) if mean per-call latency exceeds this, in ms. "
+            "Helps catch broken batching / oversize judge models."
+        ),
+    )
     args = parser.parse_args()
 
     submission_dir = Path(args.submission)
@@ -128,6 +160,33 @@ def main() -> int:
     if not (submission_dir / "models.txt").exists():
         print(f"FAIL: {submission_dir / 'models.txt'} does not exist")
         return 2
+
+    # --- models.txt + runtime_meta cross-check ----------------------------
+    declared = _read_models_txt(submission_dir)
+    meta = _read_runtime_meta(submission_dir)
+    encoder_id = str(meta.get("encoder_model_id", ""))
+    judge_block = dict(meta.get("judge") or {})
+    judge_enabled = bool(judge_block.get("enabled", False))
+    judge_ship_at_runtime = bool(judge_block.get("ship_at_runtime", True))
+    judge_id = str(judge_block.get("model_id", ""))
+
+    models_txt_violations: list[str] = []
+    if encoder_id and encoder_id not in declared:
+        models_txt_violations.append(
+            f"models.txt is missing the encoder ({encoder_id!r})"
+        )
+    if judge_enabled and judge_ship_at_runtime and judge_id and judge_id not in declared:
+        models_txt_violations.append(
+            f"models.txt is missing the judge ({judge_id!r}); the platform "
+            "won't pre-fetch it and predict() will fail at first call."
+        )
+
+    print(f"declared models     : {declared}")
+    print(f"judge.enabled       : {judge_enabled}")
+    print(f"judge.ship_at_runtime: {judge_ship_at_runtime}")
+    print(f"judge.model_id      : {judge_id}")
+    for v in models_txt_violations:
+        print(f"  models.txt FAIL   : {v}")
 
     captured = io.StringIO()
     with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
@@ -171,19 +230,67 @@ def main() -> int:
     total = time.time() - t0
     leak_flags = _detect_token_leak(captured.getvalue())
 
+    # In-process judge cache check: predict on the same row twice; the second
+    # call should be measurably faster (judge result cached). Skipped if the
+    # submission has no judge or if the first call was already <1ms.
+    cache_check_ok = True
+    cache_check_note = "skipped (no judge runtime)"
+    judge_runtime_present = getattr(model_module, "JUDGE", None) is not None
+    if rows and judge_runtime_present:
+        # Clear PROB_CACHE so the encoder/model path runs both times, isolating
+        # the judge cache speedup. We pre-warm with one call, then time two
+        # back-to-back calls on the same input.
+        first_row = rows[0]
+        try:
+            getattr(model_module, "_PROB_CACHE", {}).clear()
+        except Exception:
+            pass
+        c0 = time.time()
+        _ = model_module.predict(first_row, None)
+        c1 = time.time()
+        try:
+            getattr(model_module, "_PROB_CACHE", {}).clear()
+        except Exception:
+            pass
+        c2 = time.time()
+        _ = model_module.predict(first_row, None)
+        c3 = time.time()
+        first_ms = (c1 - c0) * 1000.0
+        second_ms = (c3 - c2) * 1000.0
+        cache_check_ok = second_ms < first_ms + 1e-6
+        cache_check_note = (
+            f"first={first_ms:.1f}ms second={second_ms:.1f}ms "
+            f"(judge cache speedup expected)"
+        )
+
+    mean_ms = (sum(per_call) / max(1, len(per_call))) * 1000.0
+    max_ms = max(per_call) * 1000.0 if per_call else 0.0
+    latency_warn = mean_ms > float(args.latency_warn_ms)
+
     print()
     print(f"calls               : {len(rows)}")
     print(f"total elapsed       : {total:.3f}s")
-    print(f"per-call mean       : {sum(per_call) / max(1, len(per_call)):.3f}s")
-    print(f"per-call max        : {max(per_call):.3f}s")
+    print(f"per-call mean       : {mean_ms:.1f}ms")
+    print(f"per-call max        : {max_ms:.1f}ms")
+    if latency_warn:
+        print(
+            f"  WARN              : mean latency {mean_ms:.1f}ms exceeds "
+            f"{args.latency_warn_ms:.0f}ms threshold; check batching / judge size"
+        )
     print(f"contract violations : {len(bad)}")
     for b in bad[:5]:
         print(f"  {b}")
     print(f"token-leak warnings : {len(leak_flags)}")
     for f in leak_flags:
         print(f"  {f}")
+    print(f"judge cache check   : {'OK' if cache_check_ok else 'FAIL'} -- {cache_check_note}")
 
-    ok = (not bad) and (not leak_flags)
+    ok = (
+        (not bad)
+        and (not leak_flags)
+        and (not models_txt_violations)
+        and cache_check_ok
+    )
 
     if ok and not args.skip_zip:
         zip_path = make_zip(submission_dir, Path(args.zip_path))
