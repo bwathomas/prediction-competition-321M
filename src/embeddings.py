@@ -54,6 +54,12 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 import pandas as pd
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional
+    def tqdm(x, *args, **kwargs):
+        return x
+
 LOG = logging.getLogger("embeddings")
 
 
@@ -131,6 +137,37 @@ def login_huggingface(token: str | None) -> bool:
     except Exception as exc:  # noqa: BLE001
         LOG.warning("huggingface_hub.login failed: %s", type(exc).__name__)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Flash Attention availability
+# ---------------------------------------------------------------------------
+
+
+def verify_flash_attention(requested: bool = True) -> tuple[bool, str]:
+    """Verify that Flash Attention 2 is actually usable.
+
+    The PyPI ``flash-attn`` wheel ships a Python shim plus a CUDA kernel
+    extension (``flash_attn_2_cuda``). The Python shim can import even when
+    the CUDA extension is missing or ABI-mismatched against the running
+    torch build; the kernel binding only blows up later, inside the first
+    forward pass. We probe both eagerly here so callers can downgrade to
+    SDPA before constructing the encoder.
+
+    Returns a ``(active, message)`` pair so callers can log a clear status
+    line without re-deriving the failure mode.
+    """
+    if not requested:
+        return False, "disabled in config"
+    try:
+        import flash_attn  # type: ignore
+        import flash_attn_2_cuda  # type: ignore  # noqa: F401  (kernel binding)
+        return True, f"flash_attn=={flash_attn.__version__}"
+    except Exception as exc:  # noqa: BLE001
+        return (
+            False,
+            f"unavailable ({type(exc).__name__}: {exc}); falling back to SDPA",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +316,9 @@ class EncoderConfig:
     trust_remote_code: bool = False
     use_random_embeddings: bool = False
     random_embedding_dim: int = 256
+    # Sample size for the data-driven max_length percentile scan. Smaller =
+    # faster startup; the 99th percentile is stable on a few-thousand sample.
+    max_length_sample_size: int = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -390,19 +430,38 @@ def _write_parquet_cache(
 def _tokenize_lengths(
     tokenizer, texts: list[str], max_length: int
 ) -> np.ndarray:
-    """Tokenize once on CPU to get the per-text token length (clipped)."""
+    """Tokenize once on CPU to get the per-text token length (clipped).
+
+    Uses a single batched call so the fast tokenizer can parallelize across
+    Rust threads. Falls back to a per-text loop only if the batched path
+    raises (which can happen with some custom slow tokenizers).
+    """
     if not texts:
         return np.zeros((0,), dtype=np.int64)
-    enc = tokenizer(
-        texts,
-        add_special_tokens=True,
-        truncation=True,
-        max_length=max_length,
-        padding=False,
-        return_attention_mask=False,
-        return_token_type_ids=False,
-    )
-    return np.asarray([len(x) for x in enc["input_ids"]], dtype=np.int64)
+    try:
+        enc = tokenizer(
+            texts,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        return np.asarray([len(x) for x in enc["input_ids"]], dtype=np.int64)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(
+            "Batched length-tokenization failed (%s: %s); falling back to per-text loop",
+            type(exc).__name__,
+            exc,
+        )
+        out = np.zeros((len(texts),), dtype=np.int64)
+        for i, t in enumerate(tqdm(texts, desc="length-scan", unit="txt", leave=False)):
+            ids = tokenizer.encode(
+                t, add_special_tokens=True, truncation=True, max_length=max_length
+            )
+            out[i] = len(ids)
+        return out
 
 
 def choose_max_length(
@@ -516,10 +575,24 @@ class TransformerEmbedder:
         import torch
         from transformers import AutoModel, AutoTokenizer
 
-        LOG.info("Loading encoder %s", self.cfg.model_id)
+        LOG.info("Loading tokenizer %s (use_fast=True)", self.cfg.model_id)
         self._tok = AutoTokenizer.from_pretrained(
-            self.cfg.model_id, trust_remote_code=self.cfg.trust_remote_code
+            self.cfg.model_id,
+            trust_remote_code=self.cfg.trust_remote_code,
+            use_fast=True,
         )
+        tok_kind = type(self._tok).__name__
+        if "Fast" not in tok_kind:
+            LOG.warning(
+                "Tokenizer is the slow Python variant (%s). The data-driven "
+                "max_length scan and per-batch tokenization will be much slower. "
+                "Consider `pip install -U tokenizers` or pinning max_length via "
+                "the config to skip the scan.",
+                tok_kind,
+            )
+        else:
+            LOG.info("Tokenizer loaded: %s", tok_kind)
+
         dtype = self._pick_dtype()
         kwargs: dict[str, Any] = {
             "torch_dtype": dtype,
@@ -528,6 +601,7 @@ class TransformerEmbedder:
         loaded = False
         if self.cfg.use_flash_attention and self.device.startswith("cuda"):
             try:
+                LOG.info("Loading encoder %s with Flash Attention 2", self.cfg.model_id)
                 self._model = AutoModel.from_pretrained(
                     self.cfg.model_id,
                     attn_implementation="flash_attention_2",
@@ -543,6 +617,7 @@ class TransformerEmbedder:
                     exc,
                 )
         if not loaded:
+            LOG.info("Loading encoder %s with SDPA", self.cfg.model_id)
             try:
                 self._model = AutoModel.from_pretrained(
                     self.cfg.model_id, attn_implementation="sdpa", **kwargs
@@ -553,7 +628,10 @@ class TransformerEmbedder:
                 self._model = AutoModel.from_pretrained(self.cfg.model_id, **kwargs)
                 self._attn_impl = "default"
         self._model.eval()
+        LOG.info("Moving encoder to %s ...", self.device)
+        t0 = time.time()
         self._model.to(self.device)
+        LOG.info("Encoder ready on %s (%.1fs)", self.device, time.time() - t0)
         self._hidden_size = int(getattr(self._model.config, "hidden_size", 0)) or None
 
     def _pick_dtype(self):
@@ -624,6 +702,7 @@ class TransformerEmbedder:
         *,
         max_length: int,
         benchmarks: list[str] | None = None,
+        progress_desc: str = "encode",
     ) -> tuple[np.ndarray, list[int]]:
         """Encode a list of texts in length-sorted order.
 
@@ -636,7 +715,16 @@ class TransformerEmbedder:
             return np.zeros((0, self.embedding_dim), dtype=np.float32), []
 
         # Step 1: tokenize once to get per-text lengths (CPU bound).
+        LOG.info("Tokenizing %d texts to compute per-text length...", n)
+        t0 = time.time()
         lengths = _tokenize_lengths(self._tok, texts, max_length)
+        LOG.info(
+            "Length scan done in %.1fs (p50=%d p99=%d max=%d)",
+            time.time() - t0,
+            int(np.quantile(lengths, 0.5)) if lengths.size else 0,
+            int(np.quantile(lengths, 0.99)) if lengths.size else 0,
+            int(lengths.max()) if lengths.size else 0,
+        )
         order = np.argsort(lengths, kind="stable")
         inv_order = np.argsort(order, kind="stable")
         sorted_texts = [texts[i] for i in order]
@@ -645,36 +733,52 @@ class TransformerEmbedder:
         embeds_sorted: list[np.ndarray] = []
         i = 0
         bs = max(1, int(self._effective_batch_size))
-        while i < n:
-            batch = sorted_texts[i : i + bs]
-            try:
-                vecs = self._forward_batch(batch, max_length=max_length)
-                embeds_sorted.append(vecs)
-                i += len(batch)
-            except torch.cuda.OutOfMemoryError as exc:
-                # Halve, clear cache, and retry from the same offset.
-                old = bs
-                bs = max(1, bs // 2)
-                self._oom_events.append(
-                    {
-                        "at_index": int(i),
-                        "old_batch_size": int(old),
-                        "new_batch_size": int(bs),
-                        "max_length": int(max_length),
-                        "error": str(exc)[:200],
-                    }
-                )
-                LOG.warning(
-                    "OOM at index=%d bs=%d -> retrying with bs=%d (max_len=%d)",
-                    i,
-                    old,
-                    bs,
-                    max_length,
-                )
-                self._effective_batch_size = bs
-                torch.cuda.empty_cache()
-                if bs <= 0:
-                    raise
+        pbar = tqdm(
+            total=n,
+            desc=progress_desc,
+            unit="txt",
+            dynamic_ncols=True,
+            leave=False,
+        )
+        try:
+            while i < n:
+                batch = sorted_texts[i : i + bs]
+                try:
+                    vecs = self._forward_batch(batch, max_length=max_length)
+                    embeds_sorted.append(vecs)
+                    i += len(batch)
+                    pbar.update(len(batch))
+                    # Show effective batch size & longest seq in this batch
+                    pbar.set_postfix(
+                        bs=bs,
+                        seq_pad=int(lengths[order[max(0, i - 1)]]) if lengths.size else 0,
+                    )
+                except torch.cuda.OutOfMemoryError as exc:
+                    # Halve, clear cache, and retry from the same offset.
+                    old = bs
+                    bs = max(1, bs // 2)
+                    self._oom_events.append(
+                        {
+                            "at_index": int(i),
+                            "old_batch_size": int(old),
+                            "new_batch_size": int(bs),
+                            "max_length": int(max_length),
+                            "error": str(exc)[:200],
+                        }
+                    )
+                    LOG.warning(
+                        "OOM at index=%d bs=%d -> retrying with bs=%d (max_len=%d)",
+                        i,
+                        old,
+                        bs,
+                        max_length,
+                    )
+                    self._effective_batch_size = bs
+                    torch.cuda.empty_cache()
+                    if bs <= 0:
+                        raise
+        finally:
+            pbar.close()
 
         embeds_sorted_arr = np.concatenate(embeds_sorted, axis=0)
         return embeds_sorted_arr[inv_order], lengths.tolist()
@@ -744,6 +848,14 @@ class TransformerEmbedder:
                 self.stats.cache_misses += 1
         self.stats.n_texts += len(keys)
 
+        LOG.info(
+            "embed_unique[%s]: total=%d cached=%d to_encode=%d",
+            kind,
+            len(keys),
+            len(keys) - len(missing_keys),
+            len(missing_keys),
+        )
+
         t0 = time.time()
         if missing_texts:
             if self.cfg.use_random_embeddings:
@@ -756,6 +868,7 @@ class TransformerEmbedder:
                     missing_texts,
                     max_length=self._effective_max_length,
                     benchmarks=missing_bench if missing_bench else None,
+                    progress_desc=f"encode {kind}",
                 )
                 self._record_token_diagnostics(
                     tok_lengths,
@@ -813,16 +926,38 @@ class TransformerEmbedder:
             return chosen
         # Use the encoder's own configured upper bound as a ceiling fallback.
         model_max = int(getattr(self._tok, "model_max_length", 0) or 0)
-        ceiling = min(self.cfg.max_length_ceiling, model_max) if model_max else self.cfg.max_length_ceiling
-        # Sample at most 5000 texts for the length quantile (cheap).
-        if len(sample_texts) > 5000:
+        ceiling = (
+            min(self.cfg.max_length_ceiling, model_max)
+            if model_max
+            else self.cfg.max_length_ceiling
+        )
+        # Sample at most ``max_length_sample_size`` texts for the length
+        # quantile. The 99th percentile is stable at a few thousand even on
+        # corpora with hundreds of thousands of items, and this keeps the
+        # silent startup window short. Cap the measurement max_length at the
+        # config ceiling instead of overshooting -- we only need to detect
+        # that something exceeds the ceiling, not measure exactly how far.
+        sample_cap = max(64, int(self.cfg.max_length_sample_size))
+        if len(sample_texts) > sample_cap:
             rng = np.random.default_rng(0)
-            idx = rng.choice(len(sample_texts), size=5000, replace=False)
+            idx = rng.choice(len(sample_texts), size=sample_cap, replace=False)
             sample = [sample_texts[i] for i in idx]
         else:
             sample = sample_texts
-        # Tokenize with a generous max so we measure the *true* length.
-        lengths = _tokenize_lengths(self._tok, sample, max(ceiling, 8192))
+        LOG.info(
+            "max_length: scanning %d sample texts (cap=%d) for percentile...",
+            len(sample),
+            ceiling,
+        )
+        t0 = time.time()
+        lengths = _tokenize_lengths(self._tok, sample, ceiling)
+        LOG.info(
+            "max_length: scan done in %.1fs (p50=%d p99=%d max=%d)",
+            time.time() - t0,
+            int(np.quantile(lengths, 0.5)) if lengths.size else 0,
+            int(np.quantile(lengths, 0.99)) if lengths.size else 0,
+            int(lengths.max()) if lengths.size else 0,
+        )
         chosen = choose_max_length(
             lengths,
             floor=int(self.cfg.max_length_floor),
@@ -1022,4 +1157,5 @@ __all__ = [
     "resolve_hf_token",
     "stack_lookup",
     "subject_text",
+    "verify_flash_attention",
 ]

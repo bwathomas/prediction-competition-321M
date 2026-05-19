@@ -36,8 +36,15 @@ tokenizers>=0.19
 # pipeline runs end-to-end either way.
 
 # Optional: FAISS for fast nearest-neighbor lookup over the shipped
-# training-item cache. If the wheel cannot install, the runtime falls back
-# to a numpy brute-force lookup (~50ms for 200k x 256-dim) automatically.
+# training-item cache AND for the training-time k-means over item embeddings
+# (~50-100x faster than sklearn on A100s). If the wheel cannot install, the
+# runtime falls back to a numpy brute-force lookup (~50ms for 200k x 256-dim)
+# and the clustering step falls back to sklearn CPU.
+#
+# On Colab / CUDA 12 runtimes you'll want the GPU build instead:
+#   pip install faiss-gpu-cu12
+# (do this from the notebook, not requirements.txt, so non-GPU environments
+# don't fail to install).
 faiss-cpu>=1.7.4
 
 # Optional Google Cloud secret access (used only if HF_TOKEN env var is absent)

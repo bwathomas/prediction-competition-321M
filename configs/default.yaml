@@ -120,6 +120,17 @@ clustering:
   seed: 0
   centroids_path: "artifacts/cluster_centroids.npy"
   assignments_path: "artifacts/item_clusters.parquet"
+  # Backend: "auto" (FAISS GPU when available, else sklearn CPU), "faiss_gpu"
+  # (require GPU, fail loudly if missing), or "sklearn" (force CPU fallback).
+  # FAISS GPU is ~50-100x faster than sklearn on the full corpus on an A100.
+  backend: "auto"
+  # FAISS k-means knobs (ignored by the sklearn path). For closest-to-old
+  # behavior, use niter=100, nredo=4; the defaults below are tuned for speed.
+  faiss_niter: 50
+  faiss_nredo: 1
+  faiss_assign_batch: 65536
+  gpu_id: 0
+  overwrite: false
 
 # ----------------------------------------------------------------------------
 # Models / training

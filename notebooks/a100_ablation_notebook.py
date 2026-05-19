@@ -103,6 +103,7 @@ print(f"ROOT (cwd)    : {ROOT}")
 import importlib
 import subprocess
 import sys
+import time
 
 REQUIREMENTS_PATH = ROOT / "requirements.txt"
 INSTALL_REQUIREMENTS = bool(int(os.environ.get("INSTALL_REQUIREMENTS", "1")))
@@ -115,17 +116,17 @@ if INSTALL_REQUIREMENTS and REQUIREMENTS_PATH.exists():
 
 
 def _install_flash_attention() -> bool:
-    """Install Flash Attention 2 from a prebuilt wheel where possible.
+    """Install Flash Attention 2 from the prebuilt wheel matching this runtime.
 
-    The PyPI `flash-attn` package builds from source via nvcc by default,
-    which takes 20-40 minutes on Colab and frequently OOMs. The reliable
-    path is ``pip install flash-attn --no-build-isolation`` which makes pip
-    pull a matching prebuilt wheel from Dao-AILab's GitHub releases when
-    one exists for the current Python / torch / CUDA combo.
-
-    If the install fails (no matching wheel, no nvcc fallback, slow runner,
-    etc.) we swallow the error and return False -- the embedder's SDPA
-    fallback path keeps the pipeline working.
+    The PyPI ``flash-attn`` package defaults to building from source via
+    nvcc, which takes 20-40 minutes on Colab and frequently OOMs. We avoid
+    that entirely by constructing the exact prebuilt wheel URL from torch's
+    CUDA version, the C++ ABI flag, and the Python version, then
+    pip-installing that URL directly. If that 404s (or the constructed
+    triple has no wheel), we fall back to ``pip install flash-attn
+    --no-build-isolation`` which lets pip's resolver find any matching
+    prebuilt wheel before resorting to source. The embedder's SDPA path
+    keeps the pipeline alive if both routes fail.
     """
     try:
         import flash_attn  # type: ignore  # noqa: F401
@@ -144,20 +145,33 @@ def _install_flash_attention() -> bool:
         print("[flash-attn] no CUDA device; skipping install (SDPA fallback)")
         return False
 
-    print(
-        "[flash-attn] installing prebuilt wheel via "
-        "`pip install flash-attn --no-build-isolation` ..."
+    # Pin to a known-good release. Bump this when you upgrade torch.
+    FA_VERSION = "2.7.4.post1"
+
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    torch_major_minor = ".".join(_torch.__version__.split(".")[:2])  # e.g. "2.4"
+    cuda_major = _torch.version.cuda.split(".")[0]                   # e.g. "12"
+    # Flash-attn wheels are built with the pre-C++11 ABI for torch <2.5
+    # and with cxx11abiTRUE for torch >=2.5 nightly builds. Stable torch
+    # wheels still use FALSE; if you upgrade torch and hit "no matching
+    # wheel," flip this to TRUE.
+    cxx11_abi = "FALSE"
+
+    wheel_name = (
+        f"flash_attn-{FA_VERSION}+cu{cuda_major}torch{torch_major_minor}"
+        f"cxx11abi{cxx11_abi}-{py_tag}-{py_tag}-linux_x86_64.whl"
     )
+    wheel_url = (
+        f"https://github.com/Dao-AILab/flash-attention/releases/download/"
+        f"v{FA_VERSION}/{wheel_name}"
+    )
+
+    print(f"[flash-attn] target: py={py_tag} torch={torch_major_minor} cuda={cuda_major}")
+    print(f"[flash-attn] url   : {wheel_url}")
+
+    t0 = time.time()
     proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "--no-build-isolation",
-            "flash-attn",
-        ],
+        [sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", wheel_url],
         capture_output=True,
         text=True,
     )
@@ -165,11 +179,37 @@ def _install_flash_attention() -> bool:
         try:
             import flash_attn  # type: ignore  # noqa: F401
 
-            print(f"[flash-attn] installed: {flash_attn.__version__}")
+            print(f"[flash-attn] installed: {flash_attn.__version__} in {time.time()-t0:.1f}s")
             return True
         except Exception as exc:  # noqa: BLE001
             print(f"[flash-attn] post-install import failed: {exc}")
             return False
+
+    print(
+        f"[flash-attn] direct wheel install failed in {time.time()-t0:.1f}s, "
+        "retrying via pip resolver"
+    )
+    tail = (proc.stderr or proc.stdout or "")[-400:].strip()
+    if tail:
+        print(f"[flash-attn] last lines:\n{tail}")
+
+    # Fallback: let pip find any matching prebuilt. If it falls through to a
+    # source build it can hang for ages -- kill the cell if that happens.
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "flash-attn"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        try:
+            import flash_attn  # type: ignore  # noqa: F401
+
+            print(f"[flash-attn] installed (fallback): {flash_attn.__version__}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[flash-attn] post-install import failed: {exc}")
+            return False
+
     print("[flash-attn] install failed; falling back to SDPA")
     tail = (proc.stderr or proc.stdout or "")[-400:].strip()
     if tail:
@@ -181,9 +221,65 @@ INSTALL_FLASH_ATTN = bool(int(os.environ.get("INSTALL_FLASH_ATTN", "1")))
 if INSTALL_REQUIREMENTS and INSTALL_FLASH_ATTN:
     _install_flash_attention()
 
+
+def _install_faiss_gpu() -> bool:
+    """Upgrade ``faiss-cpu`` -> ``faiss-gpu-cu12`` when running on CUDA 12.
+
+    The training-time k-means path in ``src.clustering`` automatically uses
+    FAISS GPU when ``faiss.get_num_gpus() > 0``; that requires the
+    ``faiss-gpu-cu12`` wheel (the CPU build reports zero GPUs). On
+    non-GPU / non-CUDA-12 environments we leave the existing ``faiss-cpu``
+    install alone and the clustering step transparently falls back to
+    sklearn CPU.
+    """
+    try:
+        import torch as _torch
+    except Exception:
+        print("[faiss-gpu] torch unavailable; keeping faiss-cpu")
+        return False
+    if not _torch.cuda.is_available():
+        print("[faiss-gpu] no CUDA device; keeping faiss-cpu")
+        return False
+    cuda_major = _torch.version.cuda.split(".")[0] if _torch.version.cuda else "0"
+    if cuda_major != "12":
+        print(f"[faiss-gpu] CUDA {cuda_major}.x: only cu12 wheel is published; skipping")
+        return False
+    try:
+        import faiss  # type: ignore
+
+        if int(getattr(faiss, "get_num_gpus", lambda: 0)()) > 0:
+            print("[faiss-gpu] already installed with GPU support")
+            return True
+    except Exception:
+        pass
+    print("[faiss-gpu] installing faiss-gpu-cu12 ...")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "faiss-gpu-cu12"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-400:].strip()
+        print(f"[faiss-gpu] install failed; clustering will use sklearn CPU\n{tail}")
+        return False
+    try:
+        import faiss  # type: ignore  # noqa: F401
+
+        n = int(faiss.get_num_gpus())
+        print(f"[faiss-gpu] installed; visible GPUs: {n}")
+        return n > 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[faiss-gpu] post-install import failed: {exc}")
+        return False
+
+
+INSTALL_FAISS_GPU = bool(int(os.environ.get("INSTALL_FAISS_GPU", "1")))
+if INSTALL_REQUIREMENTS and INSTALL_FAISS_GPU:
+    _install_faiss_gpu()
+
+
 import json
 import logging
-import time
 from dataclasses import asdict
 
 import numpy as np
@@ -346,6 +442,9 @@ print_results(data_checks)
 
 # %%
 import time
+import warnings
+
+from tqdm.auto import tqdm
 
 from src.embeddings import (
     EncoderConfig,
@@ -355,6 +454,7 @@ from src.embeddings import (
     build_unique_subjects,
     content_hash_for_items,
     encoder_slug as _encoder_slug,
+    verify_flash_attention,
 )
 from src import drive_cache as drive_cache_mod
 
@@ -369,6 +469,21 @@ def _fmt_time(seconds: float) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
+
+# Verify Flash Attention 2 is actually usable before constructing the
+# embedder. The Python `flash_attn` shim can import even when the CUDA
+# kernel binding is missing or ABI-mismatched against the running torch;
+# verifying both eagerly here lets us downgrade to SDPA in the config
+# instead of crashing at the first forward pass.
+requested_fa = bool(CFG["encoder"].get("use_flash_attention", False))
+fa_active, fa_msg = verify_flash_attention(requested_fa)
+print(f"Flash Attention 2   : {'ACTIVE' if fa_active else 'OFF'} -- {fa_msg}")
+if requested_fa and not fa_active:
+    warnings.warn(
+        "use_flash_attention=True in config but flash_attn is not importable. "
+        "Downgrading to SDPA for this run."
+    )
+    CFG["encoder"]["use_flash_attention"] = False
 
 # Encoder defaults are loaded from configs/default.yaml. Override CFG["encoder"]
 # here if you want to A/B different encoders without editing the yaml.
@@ -426,7 +541,28 @@ subject_pairs = list(zip(subject_keys_list, subject_texts_list))
 CONTENT_HASH = content_hash_for_items(item_pairs + subject_pairs)
 print(f"Content hash        : {CONTENT_HASH[:16]}...  (over {len(item_pairs):,} items + {len(subject_pairs):,} subjects)")
 
+# Phase-level progress bar so a long encoding pass shows where we are at a
+# glance. The per-batch progress comes from the embedder's built-in tqdm.
+phases = [
+    "drive-resolve",
+    "warm-cache",
+    "encode-items",
+    "encode-subjects",
+    "finalize",
+    "drive-upload",
+]
+phase_pbar = tqdm(phases, desc="Embedding pipeline", leave=True)
+phase_times: dict[str, float] = {}
+
+
+def _next_phase(name: str) -> float:
+    phase_pbar.set_postfix_str(name)
+    phase_pbar.update(1)
+    return time.time()
+
+
 # 1. Drive cache lookup (no-op outside Colab / when disabled).
+t0 = _next_phase("drive-resolve")
 cache_root = ROOT / CFG["encoder"]["cache_dir"]
 drive_status = drive_cache_mod.resolve_cache(
     cfg=CFG,
@@ -434,16 +570,18 @@ drive_status = drive_cache_mod.resolve_cache(
     local_cache_root=cache_root,
     expected_hash=CONTENT_HASH,
 )
+phase_times["drive_resolve"] = float(time.time() - t0)
 print(f"\nDrive cache decision: {drive_status.reason}")
 print(json.dumps(drive_status.as_dict(), indent=2))
 
 # 2. Warm in-memory caches from disk (drive sync writes parquet files there).
+t0 = _next_phase("warm-cache")
 embedder.warm_caches_from_disk()
+phase_times["warm_cache"] = float(time.time() - t0)
 
 # 3. Encode whatever is still missing. On a strict drive hit every key is
 #    already in the parquet cache and the encoder is never loaded.
-phase_times: dict[str, float] = {}
-t0 = time.time()
+t0 = _next_phase("encode-items")
 print(f"\nEncoding unique items: {len(item_keys_list):,}")
 item_emb_lookup, item_log = embedder.embed_unique(
     kind="item",
@@ -453,15 +591,15 @@ item_emb_lookup, item_log = embedder.embed_unique(
 )
 phase_times["items"] = float(time.time() - t0)
 LOG.info(
-    "items: total=%d cached=%d encoded=%d elapsed=%.1fs",
+    "items: total=%d cached=%d encoded=%d elapsed=%s",
     item_log["n_total"],
     item_log["n_cache_hits"],
     item_log["n_encoded"],
-    phase_times["items"],
+    _fmt_time(phase_times["items"]),
 )
 
-t0 = time.time()
-print(f"Encoding unique subjects: {len(subject_keys_list):,}")
+t0 = _next_phase("encode-subjects")
+print(f"\nEncoding unique subjects: {len(subject_keys_list):,}")
 subject_emb_lookup, subject_log = embedder.embed_unique(
     kind="subject",
     keys=subject_keys_list,
@@ -469,14 +607,15 @@ subject_emb_lookup, subject_log = embedder.embed_unique(
 )
 phase_times["subjects"] = float(time.time() - t0)
 LOG.info(
-    "subjects: total=%d cached=%d encoded=%d elapsed=%.1fs",
+    "subjects: total=%d cached=%d encoded=%d elapsed=%s",
     subject_log["n_total"],
     subject_log["n_cache_hits"],
     subject_log["n_encoded"],
-    phase_times["subjects"],
+    _fmt_time(phase_times["subjects"]),
 )
 
 # 4. Persist parquet caches + meta + encoding_log.json.
+t0 = _next_phase("finalize")
 embedder.finalize(
     content_hash=CONTENT_HASH,
     n_items=len(item_keys_list),
@@ -486,11 +625,14 @@ embedder.finalize(
         "subjects": subject_log,
         "drive_cache": drive_status.as_dict(),
         "phase_seconds": phase_times,
+        "flash_attention_active": fa_active,
     },
 )
+phase_times["finalize"] = float(time.time() - t0)
 
 # 5. Upload to Drive if anything new was encoded (or if the on-disk hash
 #    differed from Drive's).
+t0 = _next_phase("drive-upload")
 drive_cfg = (CFG.get("drive_cache") or {})
 if (
     drive_cfg.get("enabled")
@@ -512,8 +654,13 @@ if (
         print(f"Drive upload: {json.dumps(upload_summary, indent=2)}")
 elif drive_cfg.get("enabled") and not drive_status.mounted:
     print("Drive cache enabled but mount unavailable -- skipping upload.")
+phase_times["drive_upload"] = float(time.time() - t0)
+phase_pbar.close()
 
 emb_stats = embedder.stats.report()
+print("\nPhase timings:")
+for k, v in phase_times.items():
+    print(f"  {k:<16s} {_fmt_time(v)}")
 print("\nEncoder diagnostics:")
 print(json.dumps(emb_stats, indent=2))
 
@@ -562,6 +709,15 @@ CENTROIDS_PATH = ROOT / CLUSTERING_CFG.get(
 ASSIGNMENTS_PATH = ROOT / CLUSTERING_CFG.get(
     "assignments_path", "artifacts/item_clusters.parquet"
 )
+# FAISS GPU k-means controls. For closest-to-old sklearn behavior, use
+# niter=100, nredo=4. For faster feature engineering, niter=30-50 and
+# nredo=1 is usually enough on A100s.
+FAISS_NITER = int(CLUSTERING_CFG.get("faiss_niter", 50))
+FAISS_NREDO = int(CLUSTERING_CFG.get("faiss_nredo", 1))
+FAISS_ASSIGN_BATCH = int(CLUSTERING_CFG.get("faiss_assign_batch", 65536))
+FAISS_GPU_ID = int(CLUSTERING_CFG.get("gpu_id", 0))
+CLUSTERING_BACKEND = str(CLUSTERING_CFG.get("backend", "auto"))
+OVERWRITE_CLUSTERS = bool(CLUSTERING_CFG.get("overwrite", False))
 
 # 1) Pool features ----------------------------------------------------------
 if USE_POOL_FEATURES:
@@ -580,11 +736,36 @@ else:
 print(f"Pool feature columns: {list(POOL_FEATURE_NAMES)}")
 
 # 2) k-means on item embeddings -------------------------------------------
+# Uses FAISS GPU k-means when faiss-gpu is available (~50-100x faster than
+# sklearn on full-corpus A100 runs); falls back to sklearn CPU otherwise.
+# Both paths produce identical on-disk artifacts.
 if USE_CLUSTER_FEATURES:
+    from tqdm.auto import tqdm as _tqdm
+
     item_keys_for_clusters = item_df["item_key"].astype(str).tolist()
-    item_emb_matrix = np.stack(
-        [item_emb_lookup[k] for k in item_keys_for_clusters], axis=0
-    ).astype(np.float32)
+    missing_keys = [k for k in item_keys_for_clusters if k not in item_emb_lookup]
+    if missing_keys:
+        raise KeyError(
+            f"Missing {len(missing_keys):,} item embeddings before clustering. "
+            f"First missing keys: {missing_keys[:10]}"
+        )
+    first_vec = np.asarray(item_emb_lookup[item_keys_for_clusters[0]], dtype=np.float32)
+    emb_dim = int(first_vec.shape[-1])
+    item_emb_matrix = np.empty((len(item_keys_for_clusters), emb_dim), dtype=np.float32)
+    for i, k in _tqdm(
+        enumerate(item_keys_for_clusters),
+        total=len(item_keys_for_clusters),
+        desc="Building item embedding matrix",
+        unit="item",
+        leave=False,
+    ):
+        vec = np.asarray(item_emb_lookup[k], dtype=np.float32)
+        if vec.shape != (emb_dim,):
+            raise ValueError(
+                f"Embedding for item_key={k!r} has shape {vec.shape}; expected {(emb_dim,)}"
+            )
+        item_emb_matrix[i] = vec
+
     centroids, cluster_assignments = fit_and_assign(
         item_keys_for_clusters,
         item_emb_matrix,
@@ -592,6 +773,12 @@ if USE_CLUSTER_FEATURES:
         seed=CLUSTERING_SEED,
         centroids_path=CENTROIDS_PATH,
         assignments_path=ASSIGNMENTS_PATH,
+        overwrite=OVERWRITE_CLUSTERS,
+        niter=FAISS_NITER,
+        nredo=FAISS_NREDO,
+        gpu_id=FAISS_GPU_ID,
+        assign_batch_size=FAISS_ASSIGN_BATCH,
+        backend=CLUSTERING_BACKEND,
     )
     print(
         f"Clusters: k={N_CLUSTERS} centroids={CENTROIDS_PATH.relative_to(ROOT)} "
