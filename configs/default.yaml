@@ -209,8 +209,8 @@ judge:
   # Default tuned for a single A100 (40/80 GB) with Qwen3-4B in bf16 + FA2
   # at max_prompt_tokens=1024. Drop to 16 on T4 / smaller GPUs. The forward
   # uses use_cache=False so no KV cache is allocated -- only activations.
-  batch_size: 32
-  max_prompt_tokens: 1024
+  batch_size: 512
+  max_prompt_tokens: 256
   max_new_tokens: 1
   bf16: true
   use_flash_attention: true
@@ -221,11 +221,11 @@ judge:
   # re-tokenize loop). HF fast tokenizers release the GIL during .encode so
   # threads parallelize without the per-process model-load cost of MP.
   # 0 = auto (min(8, os.cpu_count())). Set to 1 to disable CPU parallelism.
-  num_workers: 0
+  num_workers: 4
   # Number of batches kept on the host-device boundary at all times. A
   # background thread pads + pins the next ``prefetch_batches`` while the
   # GPU is busy. 2 hides nearly all CPU latency for variable-length data.
-  prefetch_batches: 2
+  prefetch_batches: 4
   # Sort prompts by token length descending before batching so each batch
   # has near-uniform length. Slashes padding waste and is the single biggest
   # win for A100 throughput on heterogeneous item content.
