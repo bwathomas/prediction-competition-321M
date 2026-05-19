@@ -144,6 +144,20 @@ JUDGE_NO_TOKENS: tuple = tuple(
 )
 JUDGE_SUFFIX_RESERVE_TOKENS: int = int(JUDGE_META.get("suffix_reserve_tokens", 256))
 
+# NN feature schema. Must match src/nn_features.py exactly -- the runtime
+# refuses to load the cache if its nn_features_config.json reports a
+# different feature_dim. ``NN_RUNTIME_K`` may be < the training-time K when
+# bundle size is tight; the model is robust to that via the coverage /
+# n_labeled_neighbors features.
+NN_META: dict = dict(META.get("nn_features") or {})
+NN_ENABLED: bool = bool(NN_META.get("enabled", False))
+NN_FEATURE_DIM: int = int(NN_META.get("feature_dim", 8))
+NN_RUNTIME_K: int = int(NN_META.get("runtime_k", NN_META.get("k", 16)))
+NN_FALLBACK_VALUE: float = float(NN_META.get("fallback_value", 0.0))
+NN_TOP1_MISSING_SENTINEL: float = float(
+    NN_META.get("top1_missing_sentinel", -1.0)
+)
+
 
 # ---------------------------------------------------------------------------
 # Cache resolution: HF cache should live next to the submission so the
@@ -267,6 +281,85 @@ def compute_pool_features_runtime(item_text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Nearest-neighbor feature aggregation (mirror of
+# src/nn_features.py::_aggregate_nn_features -- if you change one, change
+# the other; the validation harness asserts byte-identical schema).
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_nn_features(
+    neighbor_passrates: np.ndarray,
+    neighbor_masks: np.ndarray,
+    similarities: np.ndarray,
+    *,
+    fallback_value: float,
+    top1_missing_sentinel: float,
+) -> np.ndarray:
+    passrates = np.asarray(neighbor_passrates, dtype=np.float32)
+    masks = np.asarray(neighbor_masks, dtype=np.float32)
+    sims = np.asarray(similarities, dtype=np.float32)
+
+    if passrates.ndim == 1:
+        passrates = passrates[None, :]
+        masks = masks[None, :]
+        sims = sims[None, :]
+
+    B, K = passrates.shape
+
+    pr_safe = np.where(masks > 0, passrates, 0.0).astype(np.float32)
+
+    n_labeled = masks.sum(axis=1)
+    has_any = n_labeled > 0
+
+    mean_sim = sims.mean(axis=1).astype(np.float32)
+
+    pr_sum = pr_safe.sum(axis=1)
+    pr_mean = np.where(has_any, pr_sum / np.maximum(n_labeled, 1.0), fallback_value)
+
+    sim_safe = np.where(masks > 0, sims, 0.0).astype(np.float32)
+    weights = np.clip(sim_safe, 0.0, None)
+    weight_sum = weights.sum(axis=1)
+    weighted = np.where(
+        (weight_sum > 1e-9) & has_any,
+        (weights * pr_safe).sum(axis=1) / np.maximum(weight_sum, 1e-9),
+        np.where(has_any, pr_mean, fallback_value),
+    ).astype(np.float32)
+
+    diff = (pr_safe - pr_mean[:, None]) * masks
+    sq = (diff * diff).sum(axis=1)
+    var = np.where(has_any, sq / np.maximum(n_labeled, 1.0), 0.0)
+    pr_std = np.sqrt(np.clip(var, 0.0, None)).astype(np.float32)
+    pr_std = np.where(has_any, pr_std, fallback_value).astype(np.float32)
+
+    coverage = (n_labeled / float(max(1, K))).astype(np.float32)
+
+    top1_mask = masks[:, 0]
+    top1_label = np.where(top1_mask > 0, passrates[:, 0], top1_missing_sentinel)
+    top1_label = top1_label.astype(np.float32)
+    top1_sim = sims[:, 0].astype(np.float32)
+
+    n_labeled_log = np.log1p(n_labeled).astype(np.float32)
+
+    out = np.stack(
+        [
+            pr_mean.astype(np.float32),
+            weighted,
+            pr_std,
+            coverage,
+            top1_label,
+            top1_sim,
+            mean_sim,
+            n_labeled_log,
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+    if not np.all(np.isfinite(out)):
+        out = np.nan_to_num(out, nan=fallback_value, posinf=0.0, neginf=0.0)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Inlined model classes (mirror src/models.py)
 # ---------------------------------------------------------------------------
 
@@ -357,12 +450,12 @@ class _KFactorBase(nn.Module):
 
 
 class _KFactor(_KFactorBase):
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None, nn_feats=None):
         eta, *_ = self._factor(s, bc, ie)
         return eta
 
 
-def _residual_features(cfg, u_s, v_i, ie, beta_bc, se, pool_feats, cluster_emb, judge_feats):
+def _residual_features(cfg, u_s, v_i, ie, beta_bc, se, pool_feats, cluster_emb, judge_feats, nn_feats):
     parts = [u_s, v_i, u_s * v_i, ie, beta_bc]
     if cfg.get("use_subject_text_embedding") and se is not None and se.shape[-1] > 0:
         parts.append(se)
@@ -380,6 +473,12 @@ def _residual_features(cfg, u_s, v_i, ie, beta_bc, se, pool_feats, cluster_emb, 
         and judge_feats.shape[-1] > 0
     ):
         parts.append(judge_feats)
+    if (
+        cfg.get("use_nn_features")
+        and nn_feats is not None
+        and nn_feats.shape[-1] > 0
+    ):
+        parts.append(nn_feats)
     return torch.cat(parts, dim=-1)
 
 
@@ -393,6 +492,8 @@ def _residual_input_dim(cfg: dict) -> int:
         base += int(cfg.get("cluster_embed_dim", 0))
     if cfg.get("use_judge_features"):
         base += int(cfg.get("judge_feature_dim", 0))
+    if cfg.get("use_nn_features"):
+        base += int(cfg.get("nn_feature_dim", 0))
     return base
 
 
@@ -406,6 +507,8 @@ def _residual_input_dim_irt(cfg: dict) -> int:
         base += int(cfg.get("cluster_embed_dim", 0))
     if cfg.get("use_judge_features"):
         base += int(cfg.get("judge_feature_dim", 0))
+    if cfg.get("use_nn_features"):
+        base += int(cfg.get("nn_feature_dim", 0))
     return base
 
 
@@ -455,12 +558,12 @@ class _ResidualKFactor(_KFactorBase):
             requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
         )
 
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None, nn_feats=None):
         eta_factor, u_s, v_i, ie_out = self._factor(s, bc, ie)
         beta_bc = self.beta(bc)
         cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
         x = _residual_features(
-            self.cfg, u_s, v_i, ie_out, beta_bc, se, pool_feats, cluster_emb, judge_feats
+            self.cfg, u_s, v_i, ie_out, beta_bc, se, pool_feats, cluster_emb, judge_feats, nn_feats
         )
         return eta_factor + self.lambda_resid * self.residual(x)
 
@@ -513,12 +616,12 @@ class _IRTItemBase(nn.Module):
 
 
 class _IRTItemKFactor(_IRTItemBase):
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None, nn_feats=None):
         comps = self._irt_components(s, bc, ie)
         return comps["irt"] + comps["offset"]
 
 
-def _residual_features_irt(cfg, comps, ie, se, pool_feats, cluster_emb, judge_feats):
+def _residual_features_irt(cfg, comps, ie, se, pool_feats, cluster_emb, judge_feats, nn_feats):
     parts = [
         ie,
         comps["theta"].unsqueeze(-1),
@@ -541,6 +644,12 @@ def _residual_features_irt(cfg, comps, ie, se, pool_feats, cluster_emb, judge_fe
         and judge_feats.shape[-1] > 0
     ):
         parts.append(judge_feats)
+    if (
+        cfg.get("use_nn_features")
+        and nn_feats is not None
+        and nn_feats.shape[-1] > 0
+    ):
+        parts.append(nn_feats)
     return torch.cat(parts, dim=-1)
 
 
@@ -560,11 +669,11 @@ class _ResidualIRTItem(_IRTItemBase):
             requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
         )
 
-    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None):
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None, nn_feats=None):
         comps = self._irt_components(s, bc, ie)
         cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
         x = _residual_features_irt(
-            self.cfg, comps, ie, se, pool_feats, cluster_emb, judge_feats
+            self.cfg, comps, ie, se, pool_feats, cluster_emb, judge_feats, nn_feats
         )
         return comps["irt"] + comps["offset"] + self.lambda_resid * self.residual(x)
 
@@ -770,6 +879,45 @@ class _TrainingItemCache:
             except Exception:
                 self.subject_passrates_sparse = None
 
+        # NN-feature cache. Same sparse format as `subject_passrates.npz`
+        # above but always keyed by the trainer's subject indexer (so the
+        # row index matches `subject_key_to_id`); paired with a binary
+        # mask matrix so we can distinguish 0-passrate from no-data.
+        self.nn_passrate: object | None = None
+        self.nn_passrate_mask: object | None = None
+        self.nn_cfg: dict = {}
+        self.subject_key_to_id: dict[str, int] = {}
+        self._nn_feat_cache: dict[tuple[int, str], np.ndarray] = {}
+        nn_pr_path = self.cache_dir / "subject_passrate.npz"
+        nn_mask_path = self.cache_dir / "subject_passrate_mask.npz"
+        nn_cfg_path = self.cache_dir / "nn_features_config.json"
+        sk2id_path = self.cache_dir / "subject_key_to_id.json"
+        if nn_pr_path.exists() and nn_mask_path.exists():
+            try:
+                from scipy import sparse as _sparse  # type: ignore
+
+                self.nn_passrate = _sparse.load_npz(nn_pr_path)
+                self.nn_passrate_mask = _sparse.load_npz(nn_mask_path)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("NN passrate sparse load failed: %s", exc)
+                self.nn_passrate = None
+                self.nn_passrate_mask = None
+        if nn_cfg_path.exists():
+            try:
+                with open(nn_cfg_path, "r", encoding="utf-8") as fh:
+                    self.nn_cfg = dict(json.load(fh) or {})
+            except Exception:
+                self.nn_cfg = {}
+        if sk2id_path.exists():
+            try:
+                with open(sk2id_path, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh) or {}
+                self.subject_key_to_id = {
+                    str(k): int(v) for k, v in raw.items()
+                }
+            except Exception:
+                self.subject_key_to_id = {}
+
     def _ensure_index(self) -> None:
         if self._index is not None:
             return
@@ -816,6 +964,77 @@ class _TrainingItemCache:
         topk = np.argpartition(-sims, kk - 1)[:kk] if kk < recon.shape[0] else np.arange(recon.shape[0])
         order = np.argsort(-sims[topk])
         return topk[order].astype(np.int64), sims[topk][order].astype(np.float32)
+
+    def compute_nn_features(
+        self,
+        query_embed: np.ndarray,
+        subject_id: int,
+        *,
+        k: int | None = None,
+    ) -> np.ndarray:
+        """Return the locked 8-scalar NN feature vector for a (subject, item).
+
+        Steps:
+        1. Apply the cache's PCA projection (no-op if PCA missing).
+        2. Query the nearest neighbors via FAISS / brute-force.
+        3. Look up per-(subject, neighbor) passrate + mask from the sparse
+           matrices shipped with the cache.
+        4. Aggregate via the same ``_aggregate_nn_features`` helper used at
+           training time (the function is copied verbatim into this file
+           by ``src/export_submission.py``; if you change one, change both).
+        """
+        dim = NN_FEATURE_DIM
+        if (
+            self.nn_passrate is None
+            or self.nn_passrate_mask is None
+            or subject_id is None
+            or subject_id < 0
+        ):
+            return np.zeros(dim, dtype=np.float32)
+        kk = int(k or NN_RUNTIME_K)
+        if kk < 1:
+            return np.zeros(dim, dtype=np.float32)
+        idx, sims = self.nearest(query_embed, k=kk)
+        if idx.size == 0:
+            return np.zeros(dim, dtype=np.float32)
+        n_rows = self.nn_passrate.shape[0]
+        if subject_id >= n_rows:
+            return np.zeros(dim, dtype=np.float32)
+        row_pr = self.nn_passrate.getrow(int(subject_id))
+        row_mk = self.nn_passrate_mask.getrow(int(subject_id))
+        n_items = int(self.nn_passrate.shape[1])
+        passrates = np.zeros(kk, dtype=np.float32)
+        masks = np.zeros(kk, dtype=np.float32)
+        if row_pr.nnz > 0:
+            cols = row_pr.indices
+            vals = row_pr.data
+            order = np.argsort(cols)
+            sorted_cols = cols[order]
+            sorted_vals = vals[order]
+            valid_idx = np.clip(idx, 0, n_items - 1)
+            pos = np.searchsorted(sorted_cols, valid_idx)
+            pos_clipped = np.clip(pos, 0, sorted_cols.size - 1)
+            hit = (pos < sorted_cols.size) & (sorted_cols[pos_clipped] == valid_idx)
+            passrates = np.where(hit, sorted_vals[pos_clipped], 0.0).astype(
+                np.float32
+            )
+        if row_mk.nnz > 0:
+            mcols = row_mk.indices
+            order = np.argsort(mcols)
+            sorted_m = mcols[order]
+            valid_idx = np.clip(idx, 0, n_items - 1)
+            pos = np.searchsorted(sorted_m, valid_idx)
+            pos_clipped = np.clip(pos, 0, sorted_m.size - 1)
+            hit = (pos < sorted_m.size) & (sorted_m[pos_clipped] == valid_idx)
+            masks = hit.astype(np.float32)
+        feats = _aggregate_nn_features(
+            passrates,
+            masks,
+            sims.astype(np.float32),
+            fallback_value=NN_FALLBACK_VALUE,
+            top1_missing_sentinel=NN_TOP1_MISSING_SENTINEL,
+        )
+        return feats.reshape(-1)[:dim].astype(np.float32, copy=False)
 
     def subject_cluster_features(
         self,
@@ -1247,6 +1466,48 @@ def _assign_cluster_id(item_emb: np.ndarray) -> int:
     return int(d2.argmin(axis=1)[0]) + 1
 
 
+def _get_nn_features(
+    subject_id: int, item_emb: np.ndarray, item_cache_key: str
+) -> np.ndarray:
+    """Return the locked 8-scalar NN feature vector for this (subject, item).
+
+    Caches results by ``(subject_id, item_cache_key)`` so the same pair is
+    only computed once per round. Falls back to zeros if NN features were
+    not declared at training time, the cache failed to load, or the subject
+    is unseen at runtime (mirrors how the trainer handles UNK subjects).
+    """
+    if not _MODEL_CFG.get("use_nn_features"):
+        return np.zeros(0, dtype=np.float32)
+    dim = int(_MODEL_CFG.get("nn_feature_dim", NN_FEATURE_DIM))
+    if TRAINING_CACHE is None:
+        return np.zeros(dim, dtype=np.float32)
+    if getattr(TRAINING_CACHE, "nn_passrate", None) is None:
+        return np.zeros(dim, dtype=np.float32)
+    if subject_id is None or int(subject_id) < 0:
+        return np.zeros(dim, dtype=np.float32)
+    cache = TRAINING_CACHE._nn_feat_cache
+    key = (int(subject_id), str(item_cache_key))
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        vec = TRAINING_CACHE.compute_nn_features(
+            query_embed=item_emb,
+            subject_id=int(subject_id),
+            k=NN_RUNTIME_K,
+        )
+    except Exception:
+        LOG.exception("TRAINING_CACHE.compute_nn_features failed; returning zeros")
+        return np.zeros(dim, dtype=np.float32)
+    if vec.size != dim:
+        out = np.zeros(dim, dtype=np.float32)
+        n = min(dim, int(vec.size))
+        out[:n] = vec[:n]
+        vec = out
+    cache[key] = vec.astype(np.float32, copy=False)
+    return cache[key]
+
+
 def _get_judge_features(
     benchmark: str, condition: str, subject_content: str, item_content: str
 ) -> np.ndarray:
@@ -1308,6 +1569,16 @@ def _predict_uncalibrated(
     pool_vec = _compute_pool_features_vec(item_content)
     cluster_id = _assign_cluster_id(item_emb)
     judge_vec = _get_judge_features(benchmark, condition, subject_content, item_content)
+    item_cache_key = stable_sha256(benchmark, condition, item_content)
+    # Look up subject_id from the shipped indexer map first; fall back to
+    # the checkpoint's indexer so we still get a usable id when the cache
+    # is absent. -1 means unseen -> zero NN feature vector.
+    subject_nn_id: int = -1
+    if TRAINING_CACHE is not None and TRAINING_CACHE.subject_key_to_id:
+        subject_nn_id = int(TRAINING_CACHE.subject_key_to_id.get(subject_key, -1))
+    elif s_id > 0:
+        subject_nn_id = int(s_id)
+    nn_vec = _get_nn_features(subject_nn_id, item_emb, item_cache_key)
 
     ie = torch.from_numpy(item_emb).to(_DEVICE).unsqueeze(0)
     se = torch.from_numpy(subject_emb).to(_DEVICE).unsqueeze(0) if subject_emb.size > 0 else None
@@ -1326,11 +1597,16 @@ def _predict_uncalibrated(
         if judge_vec.size > 0
         else None
     )
+    nf = (
+        torch.from_numpy(nn_vec).to(_DEVICE).unsqueeze(0)
+        if nn_vec.size > 0
+        else None
+    )
     s = torch.tensor([s_id], dtype=torch.long, device=_DEVICE)
     bc = torch.tensor([bc_id], dtype=torch.long, device=_DEVICE)
 
     with torch.inference_mode():
-        logit = _MODEL(s, bc, ie, se, pf, ci, jf)
+        logit = _MODEL(s, bc, ie, se, pf, ci, jf, nf)
         prob = torch.sigmoid(logit).float().cpu().item()
     if not math.isfinite(prob):
         prob = DEFAULT_PROB
@@ -1472,6 +1748,7 @@ def export_run(
     pool_feature_names: list[str] | None = None,
     training_cache_dir: str | os.PathLike[str] | None = None,
     judge_cfg: Mapping | None = None,
+    nn_features_cfg: Mapping | None = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -1603,6 +1880,29 @@ def export_run(
             "lang_en",
         ],
         "judge": judge_block,
+        "nn_features": {
+            "enabled": bool(
+                (nn_features_cfg or {}).get("enabled", False)
+            ),
+            "k": int((nn_features_cfg or {}).get("k", 16)),
+            "runtime_k": int(
+                (nn_features_cfg or {}).get(
+                    "runtime_k", (nn_features_cfg or {}).get("k", 16)
+                )
+            ),
+            "similarity": str(
+                (nn_features_cfg or {}).get("similarity", "cosine")
+            ),
+            "feature_dim": int(
+                (nn_features_cfg or {}).get("feature_dim", 8)
+            ),
+            "fallback_value": float(
+                (nn_features_cfg or {}).get("fallback_value", 0.0)
+            ),
+            "top1_missing_sentinel": float(
+                (nn_features_cfg or {}).get("top1_missing_sentinel", -1.0)
+            ),
+        },
     }
     (artifacts / "runtime_meta.json").write_text(
         json.dumps(runtime_meta, indent=2, default=str)
@@ -1645,6 +1945,8 @@ def bundle_training_cache(
     cluster_assignments=None,
     n_clusters: int = 0,
     train_df=None,
+    nn_features_cfg: Mapping | None = None,
+    subject_to_id: Mapping[str, int] | None = None,
 ) -> CacheExportResult:
     """Build the int8 / PCA / FAISS training-item cache.
 
@@ -1653,19 +1955,47 @@ def bundle_training_cache(
 
     Raises RuntimeError if ``submission_cache_cfg.max_bundle_size_mb`` is
     exceeded so the notebook can fail loudly before zip time.
+
+    When ``nn_features_cfg`` and ``subject_to_id`` are provided, the
+    submission cache additionally ships the per-(subject, item) pass-rate
+    sparse matrix, the matching observation mask, the explicit subject
+    indexer mapping, and the locked NN feature schema -- everything the
+    runtime needs to compute the same 8-scalar NN feature vector it was
+    trained on. The asymmetric two-cache design (full-fidelity training
+    index vs. compressed runtime index) is intentional; see ``src.nn_features``.
     """
+    runtime_k = int(submission_cache_cfg.get("runtime_k", 16))
+    if nn_features_cfg is not None:
+        runtime_k = int(
+            submission_cache_cfg.get(
+                "runtime_k", int(nn_features_cfg.get("k", runtime_k))
+            )
+        )
     cfg = CacheExportConfig(
         enabled=bool(submission_cache_cfg.get("enabled", True)),
         quantize=str(submission_cache_cfg.get("quantize", "int8")),
         pca_dim=submission_cache_cfg.get("pca_dim"),
-        include_faiss_index=bool(submission_cache_cfg.get("include_faiss_index", True)),
+        include_faiss_index=bool(
+            submission_cache_cfg.get(
+                "include_top_k_index",
+                submission_cache_cfg.get("include_faiss_index", True),
+            )
+        ),
         faiss_index_type=str(submission_cache_cfg.get("faiss_index_type", "HNSW32")),
         max_bundle_size_mb=float(submission_cache_cfg.get("max_bundle_size_mb", 200)),
         passrate_format=str(submission_cache_cfg.get("passrate_format", "cluster")),
         encoder_id=str(encoder_cfg.get("model_id", "")),
         query_prefix=str(encoder_cfg.get("query_prefix", "")),
         passage_prefix=str(encoder_cfg.get("passage_prefix", "")),
+        runtime_k=runtime_k,
     )
+    # Build a copy of the nn config with runtime_k injected so the runtime
+    # can verify which K it should use at test time (may be smaller than
+    # the training-time K when bundle size is tight).
+    nn_cfg_for_export = None
+    if nn_features_cfg is not None:
+        nn_cfg_for_export = dict(nn_features_cfg)
+        nn_cfg_for_export.setdefault("runtime_k", runtime_k)
     result = export_item_cache(
         items_parquet_path=Path(items_parquet_path),
         out_dir=Path(out_dir),
@@ -1674,6 +2004,8 @@ def bundle_training_cache(
         cluster_assignments=cluster_assignments,
         n_clusters=int(n_clusters),
         train_df=train_df,
+        nn_features_cfg=nn_cfg_for_export,
+        subject_to_id=subject_to_id,
     )
     if result.failed:
         raise RuntimeError(result.error or "submission cache export failed")

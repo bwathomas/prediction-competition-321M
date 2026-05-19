@@ -69,6 +69,10 @@ class CacheExportConfig:
     query_prefix: str = ""
     passage_prefix: str = ""
     pca_seed: int = 0
+    # Runtime K for NN feature computation. When the runtime cache is asked
+    # for NN features, it queries this many neighbors and aggregates the
+    # locked 8-scalar feature schema.
+    runtime_k: int = 16
 
 
 @dataclass
@@ -300,6 +304,70 @@ def build_sparse_passrate_csr(
 
 
 # ---------------------------------------------------------------------------
+# NN-features cache: subject_passrate + mask + subject_key_to_id + cfg
+# ---------------------------------------------------------------------------
+
+
+def build_nn_passrate_csr(
+    train_df: pd.DataFrame,
+    *,
+    item_keys: list[str],
+    subject_to_id: Mapping[str, int],
+):
+    """Sparse CSR pass-rate + mask matrices keyed by the trainer's indexer.
+
+    Unlike :func:`build_sparse_passrate_csr`, this function reuses the
+    training-time ``subject_to_id`` mapping so the runtime can look up a
+    subject by hashing its content and indexing into the same row. The
+    mask matrix is binary (entries are 1.0 wherever an observation exists)
+    and the pass-rate stores the mean label in float32.
+
+    Returns ``(passrate_csr, mask_csr)``.
+    """
+    from scipy import sparse  # type: ignore
+
+    required = {"subject_key", "item_key", "label"}
+    if not required.issubset(train_df.columns):
+        raise ValueError(
+            f"train_df missing required cols: {sorted(required - set(train_df.columns))}"
+        )
+    df = train_df[["subject_key", "item_key", "label"]].copy()
+    df["subject_key"] = df["subject_key"].astype(str)
+    df["item_key"] = df["item_key"].astype(str)
+    item_idx = {k: i for i, k in enumerate(item_keys)}
+    df = df[df["item_key"].isin(item_idx)]
+    df = df[df["subject_key"].isin(subject_to_id)]
+
+    n_subjects = int(max(int(max(subject_to_id.values())) + 1, 1))
+    n_items = int(max(len(item_keys), 1))
+    if df.empty:
+        empty = sparse.csr_matrix(
+            (n_subjects, n_items), dtype=np.float32
+        )
+        return empty, empty.copy()
+
+    grouped = (
+        df.groupby(["subject_key", "item_key"], sort=False)["label"]
+        .mean()
+        .reset_index()
+    )
+    rows = grouped["subject_key"].map(subject_to_id).to_numpy(dtype=np.int64)
+    cols = grouped["item_key"].map(item_idx).to_numpy(dtype=np.int64)
+    vals = grouped["label"].astype(np.float32).to_numpy()
+    passrate = sparse.csr_matrix(
+        (vals, (rows, cols)),
+        shape=(n_subjects, n_items),
+        dtype=np.float32,
+    )
+    mask = sparse.csr_matrix(
+        (np.ones_like(vals, dtype=np.float32), (rows, cols)),
+        shape=(n_subjects, n_items),
+        dtype=np.float32,
+    )
+    return passrate, mask
+
+
+# ---------------------------------------------------------------------------
 # Item-key metadata (kept tiny so the bundle stays small)
 # ---------------------------------------------------------------------------
 
@@ -364,8 +432,24 @@ def export_item_cache(
     cluster_assignments: Mapping[str, int] | None = None,
     n_clusters: int = 0,
     train_df: pd.DataFrame | None = None,
+    nn_features_cfg: Mapping | None = None,
+    subject_to_id: Mapping[str, int] | None = None,
 ) -> CacheExportResult:
     """Build the submission-side training-item cache.
+
+    When ``nn_features_cfg`` and ``subject_to_id`` are provided, the cache
+    additionally emits the four NN-feature artifacts the runtime expects:
+
+    * ``subject_passrate.npz`` -- sparse [n_subjects, n_items] float32 matrix
+      of mean labels per (subject, item) pair (using the trainer's subject
+      indexer).
+    * ``subject_passrate_mask.npz`` -- matching binary mask in CSR form.
+    * ``subject_key_to_id.json`` -- explicit subject_key -> integer id map
+      (the indexer used at training time). Shipping this map is what keeps
+      runtime aligned with training; relying on text-only re-derivation
+      silently drifts.
+    * ``nn_features_config.json`` -- the locked NN feature schema so the
+      runtime can verify a match before consuming the cache.
 
     Returns a CacheExportResult. If the bundle exceeds
     ``cfg.max_bundle_size_mb`` the result is marked failed.
@@ -477,6 +561,56 @@ def export_item_cache(
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("sparse passrate export failed: %s", exc)
 
+    # 6b. NN-features cache (subject_passrate + mask + subject_key_to_id +
+    #     nn_features_config.json). Shipped only when an NN config and a
+    #     subject indexer are provided -- otherwise this whole block is
+    #     skipped and the runtime falls back to zero NN features.
+    nn_meta: dict[str, object] = {"enabled": False}
+    if nn_features_cfg is not None and subject_to_id is not None and train_df is not None and len(train_df):
+        nn_cfg_dict = dict(nn_features_cfg)
+        try:
+            from scipy import sparse  # type: ignore
+
+            passrate, mask = build_nn_passrate_csr(
+                train_df,
+                item_keys=item_keys,
+                subject_to_id=subject_to_id,
+            )
+            sparse.save_npz(out_dir / "subject_passrate.npz", passrate)
+            # Mask is binary so int8 would be free, but scipy.sparse keeps
+            # the dtype of the underlying arrays -- callers can cast on load.
+            sparse.save_npz(out_dir / "subject_passrate_mask.npz", mask)
+            (out_dir / "subject_key_to_id.json").write_text(
+                json.dumps({str(k): int(v) for k, v in subject_to_id.items()}),
+                encoding="utf-8",
+            )
+            nn_config_block = {
+                "enabled": bool(nn_cfg_dict.get("enabled", True)),
+                "k": int(nn_cfg_dict.get("k", 16)),
+                "runtime_k": int(nn_cfg_dict.get("runtime_k", cfg.runtime_k)),
+                "similarity": str(nn_cfg_dict.get("similarity", "cosine")),
+                "feature_dim": int(nn_cfg_dict.get("feature_dim", 8)),
+                "fallback_value": float(nn_cfg_dict.get("fallback_value", 0.0)),
+                "top1_missing_sentinel": float(
+                    nn_cfg_dict.get("top1_missing_sentinel", -1.0)
+                ),
+                "n_subjects": int(passrate.shape[0]),
+                "n_items": int(passrate.shape[1]),
+                "passrate_nnz": int(passrate.nnz),
+            }
+            (out_dir / "nn_features_config.json").write_text(
+                json.dumps(nn_config_block, indent=2), encoding="utf-8"
+            )
+            nn_meta = {
+                "enabled": True,
+                "n_subjects": int(passrate.shape[0]),
+                "n_items": int(passrate.shape[1]),
+                "passrate_nnz": int(passrate.nnz),
+            }
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("NN-features cache export failed: %s", exc)
+            nn_meta = {"enabled": False, "error": str(exc)}
+
     # 7. cache_meta.json
     meta = {
         "encoder_id": cfg.encoder_id,
@@ -492,6 +626,8 @@ def export_item_cache(
         "faiss_index_present": bool((out_dir / "faiss.index").exists()),
         "faiss_error": faiss_err,
         "passrate": passrate_meta,
+        "nn_features": nn_meta,
+        "runtime_k": int(cfg.runtime_k),
     }
     (out_dir / "cache_meta.json").write_text(
         json.dumps(meta, indent=2, default=str), encoding="utf-8"
@@ -525,6 +661,7 @@ __all__ = [
     "build_cluster_passrate_table",
     "build_faiss_index",
     "build_item_keys_df",
+    "build_nn_passrate_csr",
     "build_sparse_passrate_csr",
     "dequantize_int8",
     "export_item_cache",

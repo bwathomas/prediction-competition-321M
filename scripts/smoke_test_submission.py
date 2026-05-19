@@ -267,6 +267,104 @@ def main() -> int:
     max_ms = max(per_call) * 1000.0 if per_call else 0.0
     latency_warn = mean_ms > float(args.latency_warn_ms)
 
+    # --- NN feature smoke tests ------------------------------------------
+    # These assert that the runtime TrainingItemCache.compute_nn_features:
+    #   1) returns a finite [NN_FEATURE_DIM] vector,
+    #   2) puts passrate_mean / coverage in [0, 1],
+    #   3) gives top1_similarity ~ 1 for a query that is a training-item
+    #      duplicate (we pull the first cached embedding back through
+    #      `nearest` so the query IS in the index),
+    #   4) runs in < 50ms per call after the FAISS index is warm.
+    # Skipped cleanly when NN features are disabled in the submission.
+    nn_violations: list[str] = []
+    nn_note = "skipped (NN features disabled or cache absent)"
+    nn_enabled_runtime = bool(getattr(model_module, "NN_ENABLED", False))
+    training_cache = getattr(model_module, "TRAINING_CACHE", None)
+    if nn_enabled_runtime and training_cache is not None:
+        try:
+            import numpy as _np
+
+            nn_dim = int(getattr(model_module, "NN_FEATURE_DIM", 8))
+            n_subjects_nn = (
+                int(training_cache.nn_passrate.shape[0])
+                if getattr(training_cache, "nn_passrate", None) is not None
+                else 0
+            )
+            test_sid = 1 if n_subjects_nn > 1 else 0
+            warmup_emb = _np.zeros(int(training_cache.embeddings_q.shape[1]), dtype=_np.float32) \
+                if hasattr(training_cache, "embeddings_q") else None
+            if warmup_emb is None or warmup_emb.size == 0:
+                nn_note = "skipped (no embeddings_q on TRAINING_CACHE)"
+            else:
+                _ = training_cache.compute_nn_features(warmup_emb, subject_id=test_sid)
+                nn_lat: list[float] = []
+                for j in range(min(5, len(rows))):
+                    inp = rows[j]
+                    enc = getattr(model_module, "ENCODER", None)
+                    if enc is None or not hasattr(enc, "encode"):
+                        item_emb = warmup_emb
+                    else:
+                        item_emb = _np.asarray(
+                            enc.encode(inp["item_content"]), dtype=_np.float32
+                        ).reshape(-1)
+                    t = time.time()
+                    vec = training_cache.compute_nn_features(item_emb, subject_id=test_sid)
+                    nn_lat.append(time.time() - t)
+                    if vec.shape != (nn_dim,):
+                        nn_violations.append(
+                            f"vec shape {vec.shape} != ({nn_dim},)"
+                        )
+                        continue
+                    if not _np.all(_np.isfinite(vec)):
+                        nn_violations.append("non-finite NN feature vector")
+                        continue
+                    pmean = float(vec[0])
+                    cov = float(vec[3])
+                    if not (0.0 <= pmean <= 1.0):
+                        nn_violations.append(
+                            f"passrate_mean out of [0,1]: {pmean:.4f}"
+                        )
+                    if not (0.0 <= cov <= 1.0):
+                        nn_violations.append(f"coverage out of [0,1]: {cov:.4f}")
+                # Self-similarity check: a training-item duplicate's top-1
+                # similarity should be ~1. We pull the dequantized embedding
+                # of the first training item and query the cache with it.
+                top1_sim_dup = None
+                try:
+                    recon0 = training_cache._dequantized()[0:1]
+                    if recon0.size:
+                        dup_vec = training_cache.compute_nn_features(
+                            recon0[0], subject_id=test_sid
+                        )
+                        top1_sim_dup = float(dup_vec[5])
+                        if top1_sim_dup < 0.9:
+                            nn_violations.append(
+                                f"top1_similarity for duplicate is "
+                                f"{top1_sim_dup:.3f} (< 0.9); index may "
+                                "be mis-built"
+                            )
+                except Exception as e:  # noqa: BLE001
+                    nn_violations.append(
+                        f"could not run duplicate-query smoke check: {e!r}"
+                    )
+                nn_lat_ms = [x * 1000.0 for x in nn_lat]
+                worst_post_warmup = max(nn_lat_ms[1:]) if len(nn_lat_ms) > 1 else (
+                    nn_lat_ms[0] if nn_lat_ms else 0.0
+                )
+                if worst_post_warmup > 50.0:
+                    nn_violations.append(
+                        f"NN feature compute > 50ms after warmup: "
+                        f"{worst_post_warmup:.1f}ms"
+                    )
+                nn_note = (
+                    f"n={len(nn_lat)} mean={(sum(nn_lat_ms) / max(1, len(nn_lat_ms))):.1f}ms "
+                    f"max_post_warmup={worst_post_warmup:.1f}ms"
+                )
+                if top1_sim_dup is not None:
+                    nn_note += f" top1_dup_sim={top1_sim_dup:.3f}"
+        except Exception as e:  # noqa: BLE001
+            nn_violations.append(f"NN smoke test crashed: {e!r}")
+
     print()
     print(f"calls               : {len(rows)}")
     print(f"total elapsed       : {total:.3f}s")
@@ -284,12 +382,17 @@ def main() -> int:
     for f in leak_flags:
         print(f"  {f}")
     print(f"judge cache check   : {'OK' if cache_check_ok else 'FAIL'} -- {cache_check_note}")
+    nn_ok = not nn_violations
+    print(f"nn feature smoke    : {'OK' if nn_ok else 'FAIL'} -- {nn_note}")
+    for v in nn_violations[:5]:
+        print(f"  nn FAIL           : {v}")
 
     ok = (
         (not bad)
         and (not leak_flags)
         and (not models_txt_violations)
         and cache_check_ok
+        and nn_ok
     )
 
     if ok and not args.skip_zip:

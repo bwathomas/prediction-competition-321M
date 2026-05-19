@@ -846,12 +846,18 @@ if not JUDGE_ENABLED:
 else:
     cfg_jdg = JudgeConfig(
         model_id=str(JUDGE_CFG.get("model_id", "Qwen/Qwen3-4B-Instruct-2507")),
-        batch_size=int(JUDGE_CFG.get("batch_size", 16)),
+        batch_size=int(JUDGE_CFG.get("batch_size", 32)),
         max_prompt_tokens=int(JUDGE_CFG.get("max_prompt_tokens", 1024)),
         bf16=bool(JUDGE_CFG.get("bf16", True)),
         use_flash_attention=bool(JUDGE_CFG.get("use_flash_attention", True)),
         trust_remote_code=bool(JUDGE_CFG.get("trust_remote_code", False)),
         cache_dir=str(JUDGE_CFG.get("cache_dir", "artifacts/judge")),
+        # Parallelism / throughput knobs (A100-friendly defaults; see
+        # src/judge.py and configs/default.yaml for details).
+        num_workers=int(JUDGE_CFG.get("num_workers", 0)),
+        prefetch_batches=int(JUDGE_CFG.get("prefetch_batches", 2)),
+        length_bucket=bool(JUDGE_CFG.get("length_bucket", True)),
+        pin_memory=bool(JUDGE_CFG.get("pin_memory", True)),
     )
     judge_slug = _judge_slug_fn(cfg_jdg)
     judge_prompt_version = compute_prompt_version(cfg_jdg)
@@ -955,6 +961,218 @@ else:
 
 
 # %% [markdown]
+# ## 8d. Build the training NN index and compute NN features for train / val
+#
+# We build a *full-fidelity* nearest-neighbor index over the **training**
+# items only (so cold-start val items aren't in the index), then precompute
+# the locked 8-scalar NN feature vector per training row and per val row.
+#
+# Schema (8 scalars per (subject, item) prediction):
+#
+#     [passrate_mean, passrate_weighted_mean, passrate_std, coverage,
+#      top1_label, top1_similarity, mean_similarity, n_labeled_neighbors_log1p]
+#
+# The features feed *into* the residual MLP alongside pool / cluster / judge
+# channels. The runtime ships a separate compressed cache (PCA + int8) over
+# the same training items; the asymmetric design is deliberate and the
+# residual head absorbs the compression noise via the `coverage` feature.
+#
+# Sanity check (loud): we report Pearson correlation between
+# `passrate_mean` and the val label. If this is near zero or negative,
+# *something* is mis-keyed -- likely the subject_id derivation or the
+# item_key -> row index map -- and you should debug before training.
+
+# %%
+from src.nn_features import (
+    NN_FEATURE_DIM,
+    NN_FEATURE_NAMES,
+    NNFeaturesConfig,
+    TrainingNNIndex,
+    build_passrate_table,
+    compute_nn_features,
+)
+
+NN_FEATURES_CFG_DICT = (CFG.get("nn_features") or {})
+nn_cfg = NNFeaturesConfig.from_dict(NN_FEATURES_CFG_DICT)
+USE_NN_FEATURES = bool(nn_cfg.enabled)
+NN_CACHE_DIR = ROOT / nn_cfg.cache_dir
+NN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+nn_train_matrix: np.ndarray | None = None
+nn_val_matrix: np.ndarray | None = None
+nn_index: TrainingNNIndex | None = None
+nn_passrate_csr = None
+nn_passrate_mask_csr = None
+nn_subject_to_id_map: dict[str, int] = {}
+
+if not USE_NN_FEATURES:
+    print("NN features disabled (CFG.nn_features.enabled = false). Skipping.")
+else:
+    print(f"NN feature config   : k={nn_cfg.k} similarity={nn_cfg.similarity}")
+    print(f"NN cache dir        : {NN_CACHE_DIR}")
+
+    # 1) Restrict to *training* items only. Val items are cold-start so they
+    # must NOT be in the index.
+    train_item_keys_full = (
+        splits["item_cold_start"].train["item_key"].astype(str).unique().tolist()
+    )
+    train_item_keys_full = [
+        k for k in train_item_keys_full if k in item_emb_lookup
+    ]
+    print(
+        f"NN index over       : {len(train_item_keys_full):,} unique training items"
+    )
+
+    # 2) Build (or load) the full-fidelity index.
+    nn_index = TrainingNNIndex.build_from_lookup(
+        item_emb_lookup={k: item_emb_lookup[k] for k in train_item_keys_full},
+        out_dir=NN_CACHE_DIR / "training",
+        cfg=nn_cfg,
+        item_keys=train_item_keys_full,
+    )
+
+    # 3) Build the per-(subject, item) pass-rate + mask sparse matrices,
+    # keyed by the trainer's Indexer so subject_id semantics match.
+    # We need to fit a temporary indexer here -- the "real" one is built
+    # in cell 10 once the primary split is known. Both will agree because
+    # we pass the same training subject_keys.
+    primary_train_for_nn = splits["item_cold_start"].train
+    nn_subject_to_id_map = {"<unk>": 0}
+    for k in primary_train_for_nn["subject_key"].astype(str):
+        if k not in nn_subject_to_id_map:
+            nn_subject_to_id_map[k] = len(nn_subject_to_id_map)
+    nn_item_index_map = {k: i for i, k in enumerate(train_item_keys_full)}
+
+    nn_passrate_csr, nn_passrate_mask_csr = build_passrate_table(
+        train_df=primary_train_for_nn,
+        item_index_map=nn_item_index_map,
+        subject_index_map=nn_subject_to_id_map,
+    )
+    print(
+        f"Pass-rate matrix    : shape={nn_passrate_csr.shape} "
+        f"nnz={nn_passrate_csr.nnz:,} "
+        f"density={nn_passrate_csr.nnz / max(1, nn_passrate_csr.shape[0] * nn_passrate_csr.shape[1]):.6f}"
+    )
+
+    # 4) Compute NN features for train and val items.
+    nn_train_npy = NN_CACHE_DIR / "train.npy"
+    nn_val_npy = NN_CACHE_DIR / "val.npy"
+
+    def _stack_train_queries(df):
+        keys = df["item_key"].astype(str).tolist()
+        subject_keys = df["subject_key"].astype(str).tolist()
+        sid = np.array(
+            [nn_subject_to_id_map.get(k, 0) for k in subject_keys],
+            dtype=np.int64,
+        )
+        emb = np.empty((len(keys), embedder.embedding_dim), dtype=np.float32)
+        missing = 0
+        for i, k in enumerate(keys):
+            v = item_emb_lookup.get(k)
+            if v is None:
+                # Val items might not be in the encoder cache if the dataset
+                # changed; fall back to zeros and rely on coverage to flag.
+                emb[i] = 0.0
+                missing += 1
+            else:
+                emb[i] = np.asarray(v, dtype=np.float32)
+        if missing:
+            print(f"  WARN: {missing:,} rows had no encoder embedding; zeroed")
+        return emb, keys, sid
+
+    if nn_train_npy.exists() and nn_val_npy.exists():
+        nn_train_matrix = np.load(nn_train_npy)
+        nn_val_matrix = np.load(nn_val_npy)
+        train_df_for_nn = splits["item_cold_start"].train
+        val_df_for_nn = splits["item_cold_start"].val
+        if (
+            nn_train_matrix.shape[0] != len(train_df_for_nn)
+            or nn_val_matrix.shape[0] != len(val_df_for_nn)
+        ):
+            # Sizes drifted; recompute below.
+            nn_train_matrix = None
+            nn_val_matrix = None
+
+    if nn_train_matrix is None or nn_val_matrix is None:
+        train_df_for_nn = splits["item_cold_start"].train
+        val_df_for_nn = splits["item_cold_start"].val
+
+        train_emb, train_keys_for_nn, train_sid = _stack_train_queries(train_df_for_nn)
+        print(f"Computing NN features for {len(train_emb):,} train rows ...")
+        nn_train_matrix = compute_nn_features(
+            query_embeds=train_emb,
+            query_item_keys=train_keys_for_nn,
+            subject_ids=train_sid,
+            nn_index=nn_index,
+            passrate_csr=nn_passrate_csr,
+            passrate_mask_csr=nn_passrate_mask_csr,
+            cfg=nn_cfg,
+            exclude_self=True,
+        )
+        np.save(nn_train_npy, nn_train_matrix)
+
+        val_emb, val_keys_for_nn, val_sid = _stack_train_queries(val_df_for_nn)
+        print(f"Computing NN features for {len(val_emb):,} val rows ...")
+        nn_val_matrix = compute_nn_features(
+            query_embeds=val_emb,
+            query_item_keys=val_keys_for_nn,
+            subject_ids=val_sid,
+            nn_index=nn_index,
+            passrate_csr=nn_passrate_csr,
+            passrate_mask_csr=nn_passrate_mask_csr,
+            cfg=nn_cfg,
+            exclude_self=False,
+        )
+        np.save(nn_val_npy, nn_val_matrix)
+
+    # 5) Sanity-check the wiring. The loudest assertion in the whole task:
+    # passrate_mean should correlate positively with the val label. If it
+    # doesn't, abort before burning a training run.
+    pmean = nn_val_matrix[:, 0].astype(np.float64)
+    coverage = nn_val_matrix[:, 3].astype(np.float64)
+    y_val_for_corr = (
+        splits["item_cold_start"].val["label"].astype(float).to_numpy()
+    )
+    corr = float("nan")
+    if pmean.std() > 1e-9 and y_val_for_corr.std() > 1e-9:
+        corr = float(np.corrcoef(pmean, y_val_for_corr)[0, 1])
+    cov_pos = float((coverage > 0).mean())
+    print(
+        f"NN sanity (val)     : corr(passrate_mean, label) = {corr:.4f} | "
+        f"coverage>0 fraction = {cov_pos:.3f}"
+    )
+    print(
+        f"NN top-K mean sim   : mean={float(nn_train_matrix[:, 6].mean()):.4f} "
+        f"std={float(nn_train_matrix[:, 6].std()):.4f}"
+    )
+    if not np.isfinite(corr) or corr <= 0.0:
+        print(
+            "  WARN: passrate_mean does NOT correlate positively with the "
+            "val label. Likely a mis-keyed subject_id or item_key map. "
+            "Debug before training."
+        )
+
+    # 6) Smoke check: a training item's top-1 neighbor should not be the
+    # item itself (self-exclusion verification).
+    smoke_items = train_item_keys_full[:5]
+    if smoke_items:
+        smoke_emb = np.stack(
+            [item_emb_lookup[k] for k in smoke_items], axis=0
+        ).astype(np.float32)
+        idx, _sims = nn_index.nearest(
+            smoke_emb, k=1, exclude_self=True, query_keys=smoke_items
+        )
+        self_hits = 0
+        for i, k in enumerate(smoke_items):
+            if nn_index.item_keys[int(idx[i, 0])] == k:
+                self_hits += 1
+        print(
+            f"NN self-exclusion   : {self_hits}/{len(smoke_items)} "
+            f"top-1 self-hits (expected 0)"
+        )
+
+
+# %% [markdown]
 # ## 9. Embedding sanity checks
 
 # %%
@@ -1041,6 +1259,8 @@ def _build_arrays(
     pool_features_z=None,
     cluster_assignments=None,
     judge_lookup=None,
+    nn_train: np.ndarray | None = None,
+    nn_val: np.ndarray | None = None,
 ):
     train = split_art.train
     val = split_art.val
@@ -1061,14 +1281,32 @@ def _build_arrays(
     ci_val = _cluster_vector(val["item_key"], cluster_assignments)
     jf_train = _judge_matrix(train["subject_key"], train["item_key"], judge_lookup or {})
     jf_val = _judge_matrix(val["subject_key"], val["item_key"], judge_lookup or {})
+    # NN features are pre-computed once in cell 8d so the per-batch step
+    # never re-hits FAISS or the sparse passrate matrix.
+    nn_train_arr = (
+        np.asarray(nn_train, dtype=np.float32) if nn_train is not None else None
+    )
+    nn_val_arr = (
+        np.asarray(nn_val, dtype=np.float32) if nn_val is not None else None
+    )
+    if nn_train_arr is not None and nn_train_arr.shape[0] != len(train):
+        raise ValueError(
+            f"nn_train rows={nn_train_arr.shape[0]} != train rows={len(train)}"
+        )
+    if nn_val_arr is not None and nn_val_arr.shape[0] != len(val):
+        raise ValueError(
+            f"nn_val rows={nn_val_arr.shape[0]} != val rows={len(val)}"
+        )
     y_train = train["label"].astype(float).to_numpy()
     y_val = val["label"].astype(float).to_numpy()
     return (
         LookupDataset(
-            s_train, bc_train, ie_train, y_train, se_train, pf_train, ci_train, jf_train
+            s_train, bc_train, ie_train, y_train, se_train, pf_train,
+            ci_train, jf_train, nn_train_arr,
         ),
         LookupDataset(
-            s_val, bc_val, ie_val, y_val, se_val, pf_val, ci_val, jf_val
+            s_val, bc_val, ie_val, y_val, se_val, pf_val,
+            ci_val, jf_val, nn_val_arr,
         ),
     )
 
@@ -1103,6 +1341,10 @@ else:
 USE_JUDGE_FEATURES = bool(
     JUDGE_ENABLED and JUDGE_FEATURES_IN_RESIDUAL and judge_features_lookup
 )
+# Use NN features iff we built them in cell 8d and the config says so.
+USE_NN_FEATURES = bool(
+    USE_NN_FEATURES and nn_train_matrix is not None and nn_val_matrix is not None
+)
 
 train_ds, val_ds = _build_arrays(
     primary,
@@ -1113,12 +1355,15 @@ train_ds, val_ds = _build_arrays(
     pool_features_z=pool_features_z,
     cluster_assignments=cluster_assignments,
     judge_lookup=judge_features_lookup if USE_JUDGE_FEATURES else None,
+    nn_train=nn_train_matrix if USE_NN_FEATURES else None,
+    nn_val=nn_val_matrix if USE_NN_FEATURES else None,
 )
 print(
     f"train rows: {len(train_ds)} | val rows: {len(val_ds)} | "
     f"pool_feats: {'on' if USE_POOL_FEATURES else 'off'} | "
     f"clusters: {'on' if USE_CLUSTER_FEATURES else 'off'} | "
-    f"judge: {'on' if USE_JUDGE_FEATURES else 'off'}"
+    f"judge: {'on' if USE_JUDGE_FEATURES else 'off'} | "
+    f"nn: {'on' if USE_NN_FEATURES else 'off'}"
 )
 
 # %% [markdown]
@@ -1139,16 +1384,19 @@ def _model_cfg(
     *,
     use_pool: bool | None = None,
     use_clusters: bool | None = None,
+    use_nn: bool | None = None,
 ) -> ModelConfig:
-    """Construct a ModelConfig honoring the pool / cluster flags.
+    """Construct a ModelConfig honoring the pool / cluster / nn flags.
 
-    ``use_pool`` and ``use_clusters`` default to the global notebook flags;
-    pass explicit booleans in the ablation grid to toggle them per run.
+    ``use_pool`` / ``use_clusters`` / ``use_nn`` default to the global
+    notebook flags; pass explicit booleans in the ablation grid to toggle
+    them per run.
     """
     irt_reg = (CFG["train"].get("irt_reg") or {})
     up = USE_POOL_FEATURES if use_pool is None else bool(use_pool)
     uc = USE_CLUSTER_FEATURES if use_clusters is None else bool(use_clusters)
     uj = bool(USE_JUDGE_FEATURES)
+    un = USE_NN_FEATURES if use_nn is None else bool(use_nn)
     return ModelConfig(
         k=k,
         item_embed_dim=ITEM_EMB_DIM,
@@ -1170,6 +1418,8 @@ def _model_cfg(
         irt_lambda_alpha=float(irt_reg.get("lambda_alpha", 1.0e-4)),
         use_judge_features=bool(uj),
         judge_feature_dim=int(JUDGE_FEATURE_DIM) if uj else 0,
+        use_nn_features=bool(un),
+        nn_feature_dim=int(NN_FEATURE_DIM) if un else 0,
     )
 
 
@@ -1543,12 +1793,25 @@ def _predict_with_checkpoint(model_name: str, ckpt_path: Path, split_art) -> np.
     mdl = build_model(model_name, mcfg)
     mdl.load_state_dict(ck["model_state"], strict=False)
     # Mirror the checkpoint's feature-channel config when building the val
-    # dataset so pool / cluster / judge channels line up with the trained model.
+    # dataset so pool / cluster / judge / nn channels line up with the
+    # trained model.
     pf_z = pool_features_z if getattr(mcfg, "use_pool_features", False) else None
     ca = cluster_assignments if getattr(mcfg, "use_cluster_features", False) else None
     jl = (
         judge_features_lookup
         if getattr(mcfg, "use_judge_features", False)
+        else None
+    )
+    # For NN features we only have a precomputed matrix for the primary
+    # item-cold-start split. Other splits compute zero NN features (the
+    # model's input LayerNorm absorbs the shift) -- the diagnostic in
+    # cell 14b uses the primary split, which has the real NN matrix.
+    nn_t = (
+        nn_train_matrix if getattr(mcfg, "use_nn_features", False) and split_art is splits["item_cold_start"]
+        else None
+    )
+    nn_v = (
+        nn_val_matrix if getattr(mcfg, "use_nn_features", False) and split_art is splits["item_cold_start"]
         else None
     )
     val_ds_split = _build_arrays(
@@ -1560,6 +1823,8 @@ def _predict_with_checkpoint(model_name: str, ckpt_path: Path, split_art) -> np.
         pool_features_z=pf_z,
         cluster_assignments=ca,
         judge_lookup=jl,
+        nn_train=nn_t,
+        nn_val=nn_v,
     )[1]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     eval_bs = max(int(CFG["train"]["batch_size"]), 4096)
@@ -1663,6 +1928,8 @@ def _predict_with_ablation(
     zero_mlp: bool = False,
     judge_mask: np.ndarray | None = None,
     zero_judge: bool = False,
+    nn_mask: np.ndarray | None = None,
+    zero_nn: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run val inference with a specific channel zeroed / forced.
 
@@ -1672,6 +1939,12 @@ def _predict_with_ablation(
     Judge features behave the same way: ``judge_mask`` is a length-4 mask
     over ``[lp_yes, lp_no, lp_diff, p_yes]`` and ``zero_judge=True`` zeroes
     the whole 4-vector for an all-out without_judge ablation.
+
+    NN features (``[passrate_mean, passrate_weighted_mean, passrate_std,
+    coverage, top1_label, top1_similarity, mean_similarity,
+    n_labeled_neighbors_log1p]``) get the same treatment: ``nn_mask`` is a
+    length-8 mask for per-feature ablation and ``zero_nn=True`` zeroes the
+    entire NN vector (the ``without_nn`` ablation).
     """
     model.eval()
     loader = torch.utils.data.DataLoader(
@@ -1691,13 +1964,14 @@ def _predict_with_ablation(
     with torch.inference_mode():
         with autocast:
             for batch in loader:
-                s, bc, ie, se, pf, ci, y, jf = [
+                s, bc, ie, se, pf, ci, jf, nn_t, y = [
                     b.to(device, non_blocking=True) for b in batch
                 ]
                 se_use = se if se.shape[-1] > 0 else None
                 pf_use = pf if pf.shape[-1] > 0 else None
                 ci_use = ci if ci.numel() > 0 else None
                 jf_use = jf if jf.shape[-1] > 0 else None
+                nn_use = nn_t if nn_t.shape[-1] > 0 else None
                 if pf_use is not None and pool_mask is not None:
                     mask = torch.from_numpy(np.asarray(pool_mask, dtype=np.float32)).to(
                         pf_use.device
@@ -1713,6 +1987,14 @@ def _predict_with_ablation(
                         jf_use = jf_use * jmask
                     if zero_judge:
                         jf_use = torch.zeros_like(jf_use)
+                if nn_use is not None:
+                    if nn_mask is not None:
+                        nmask = torch.from_numpy(
+                            np.asarray(nn_mask, dtype=np.float32)
+                        ).to(nn_use.device)
+                        nn_use = nn_use * nmask
+                    if zero_nn:
+                        nn_use = torch.zeros_like(nn_use)
                 kwargs: dict = {}
                 if force_alpha_one and getattr(model, "has_irt_heads", False):
                     kwargs["override_alpha"] = torch.ones(
@@ -1727,11 +2009,13 @@ def _predict_with_ablation(
                 ):
                     kwargs["override_mlp_zero"] = True
                 try:
-                    logits = model(s, bc, ie, se_use, pf_use, ci_use, jf_use, **kwargs)
+                    logits = model(
+                        s, bc, ie, se_use, pf_use, ci_use, jf_use, nn_use, **kwargs
+                    )
                 except TypeError:
                     # The model doesn't expose override kwargs (e.g. pure
                     # kfactor); fall back to the plain positional forward.
-                    logits = model(s, bc, ie, se_use, pf_use, ci_use, jf_use)
+                    logits = model(s, bc, ie, se_use, pf_use, ci_use, jf_use, nn_use)
                 probs = torch.sigmoid(logits).float().cpu().numpy()
                 preds.append(probs)
                 targets.append(y.float().cpu().numpy())
@@ -1766,14 +2050,17 @@ def _decompose_on_val(
     with torch.inference_mode():
         with autocast:
             for batch in loader:
-                s, bc, ie, se, pf, ci, y, jf = [
+                s, bc, ie, se, pf, ci, jf, nn_t, y = [
                     b.to(device, non_blocking=True) for b in batch
                 ]
                 se_use = se if se.shape[-1] > 0 else None
                 pf_use = pf if pf.shape[-1] > 0 else None
                 ci_use = ci if ci.numel() > 0 else None
                 jf_use = jf if jf.shape[-1] > 0 else None
-                d = model.decompose(s, bc, ie, se_use, pf_use, ci_use, jf_use)
+                nn_use = nn_t if nn_t.shape[-1] > 0 else None
+                d = model.decompose(
+                    s, bc, ie, se_use, pf_use, ci_use, jf_use, nn_use
+                )
                 for name, tensor in d.items():
                     # We only care about per-row scalar components for the
                     # table (irt / offset / mlp / factor). Skip multi-dim
@@ -1822,6 +2109,12 @@ else:
         if getattr(mcfg_diag, "use_judge_features", False)
         else None
     )
+    diag_nn_train = (
+        nn_train_matrix if getattr(mcfg_diag, "use_nn_features", False) else None
+    )
+    diag_nn_val = (
+        nn_val_matrix if getattr(mcfg_diag, "use_nn_features", False) else None
+    )
     _, val_ds_diag = _build_arrays(
         primary,
         indexer,
@@ -1831,6 +2124,8 @@ else:
         pool_features_z=diag_pf_z,
         cluster_assignments=diag_ca,
         judge_lookup=diag_jl,
+        nn_train=diag_nn_train,
+        nn_val=diag_nn_val,
     )
 
     # ----- Analysis A: feature ablation ------------------------------------
@@ -1893,6 +2188,36 @@ else:
             ablations[f"judge[{name}]"] = _predict_with_ablation(
                 mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
                 bf16=diag_bf16, judge_mask=mask,
+            )
+
+    # NN-feature ablations: drop the whole 8-vector and each scalar
+    # individually. This is the headline diagnostic for whether the NN
+    # channel is actually contributing -- if without_nn shows a large
+    # Delta NLL, the model has learned to lean on the neighbor signal.
+    # The per-feature breakdown shows whether the residual MLP is using
+    # passrate_mean / weighted_mean / coverage etc. as expected.
+    if getattr(mdl_diag, "has_nn_features", False):
+        ablations["without_nn"] = _predict_with_ablation(
+            mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+            bf16=diag_bf16, zero_nn=True,
+        )
+        nn_feature_names_local = (
+            "passrate_mean",
+            "passrate_weighted_mean",
+            "passrate_std",
+            "coverage",
+            "top1_label",
+            "top1_similarity",
+            "mean_similarity",
+            "n_labeled_neighbors_log1p",
+        )
+        nn_dim_local = int(mcfg_diag.nn_feature_dim)
+        for i, name in enumerate(nn_feature_names_local[:nn_dim_local]):
+            mask = np.ones(nn_dim_local, dtype=np.float32)
+            mask[i] = 0.0
+            ablations[f"nn[{name}]"] = _predict_with_ablation(
+                mdl_diag, val_ds_diag, device=diag_device, batch_size=diag_bs,
+                bf16=diag_bf16, nn_mask=mask,
             )
 
     ablation_df = feature_ablation_table(ablations, full_key="full")

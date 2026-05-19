@@ -98,6 +98,16 @@ class ModelConfig:
     use_judge_features: bool = False
     judge_feature_dim: int = 4
 
+    # --- Nearest-neighbor features (fed into the residual MLP) ---
+    # When True the residual MLP receives an additional 8-scalar feature
+    # vector summarizing the subject's performance on the top-K nearest
+    # training items. ``nn_feature_dim`` is locked to the schema in
+    # ``src.nn_features``; the field is exposed for introspection only and
+    # not user-tunable. See ``src.nn_features._aggregate_nn_features`` for
+    # the exact ordering.
+    use_nn_features: bool = False
+    nn_feature_dim: int = 8
+
     @property
     def use_subject_embed_features(self) -> bool:
         return bool(self.use_subject_text_embedding and self.subject_embed_dim > 0)
@@ -121,6 +131,10 @@ class ModelConfig:
     @property
     def effective_judge_dim(self) -> int:
         return int(self.judge_feature_dim) if self.use_judge_features else 0
+
+    @property
+    def effective_nn_dim(self) -> int:
+        return int(self.nn_feature_dim) if self.use_nn_features else 0
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +236,8 @@ def _residual_feature_dim_kfactor(cfg: ModelConfig) -> int:
         base += cfg.cluster_embed_dim
     if cfg.use_judge_features:
         base += cfg.effective_judge_dim
+    if cfg.use_nn_features:
+        base += cfg.effective_nn_dim
     return base
 
 
@@ -231,7 +247,8 @@ def _residual_feature_dim_irt_item(cfg: ModelConfig) -> int:
     The IRT variants don't have the k-factor interaction; the residual MLP
     is allowed to see the IRT channel's components (theta, beta_i, alpha_i)
     plus the raw item embedding, optional subject embedding, pool features,
-    cluster embedding, and (optionally) judge features.
+    cluster embedding, (optionally) judge features, and the 8-scalar NN
+    feature vector when enabled.
     """
     base = (
         cfg.item_embed_dim
@@ -245,6 +262,8 @@ def _residual_feature_dim_irt_item(cfg: ModelConfig) -> int:
         base += cfg.cluster_embed_dim
     if cfg.use_judge_features:
         base += cfg.effective_judge_dim
+    if cfg.use_nn_features:
+        base += cfg.effective_nn_dim
     return base
 
 
@@ -255,6 +274,7 @@ def _maybe_append(
     pool_z,
     cluster_emb,
     judge_feats=None,
+    nn_feats=None,
 ):
     if cfg.use_pool_features and pool_z is not None and pool_z.shape[-1] > 0:
         parts.append(pool_z)
@@ -266,6 +286,12 @@ def _maybe_append(
         and judge_feats.shape[-1] > 0
     ):
         parts.append(judge_feats)
+    if (
+        cfg.use_nn_features
+        and nn_feats is not None
+        and nn_feats.shape[-1] > 0
+    ):
+        parts.append(nn_feats)
 
 
 def _build_residual_features_kfactor(
@@ -278,11 +304,19 @@ def _build_residual_features_kfactor(
     pool_z: torch.Tensor | None,
     cluster_emb: torch.Tensor | None,
     judge_feats: torch.Tensor | None = None,
+    nn_feats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     parts = [u_s, v_i, u_s * v_i, item_emb, bc_idx_embed]
     if cfg.use_subject_embed_features and subject_emb is not None:
         parts.append(subject_emb)
-    _maybe_append(parts, cfg, pool_z=pool_z, cluster_emb=cluster_emb, judge_feats=judge_feats)
+    _maybe_append(
+        parts,
+        cfg,
+        pool_z=pool_z,
+        cluster_emb=cluster_emb,
+        judge_feats=judge_feats,
+        nn_feats=nn_feats,
+    )
     return torch.cat(parts, dim=-1)
 
 
@@ -296,6 +330,7 @@ def _build_residual_features_irt(
     pool_z: torch.Tensor | None,
     cluster_emb: torch.Tensor | None,
     judge_feats: torch.Tensor | None = None,
+    nn_feats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     parts = [
         item_emb,
@@ -305,7 +340,14 @@ def _build_residual_features_irt(
     ]
     if cfg.use_subject_embed_features and subject_emb is not None:
         parts.append(subject_emb)
-    _maybe_append(parts, cfg, pool_z=pool_z, cluster_emb=cluster_emb, judge_feats=judge_feats)
+    _maybe_append(
+        parts,
+        cfg,
+        pool_z=pool_z,
+        cluster_emb=cluster_emb,
+        judge_feats=judge_feats,
+        nn_feats=nn_feats,
+    )
     return torch.cat(parts, dim=-1)
 
 
@@ -321,6 +363,20 @@ def _maybe_zero_judge(
     if force_judge_zero:
         return torch.zeros_like(judge_feats)
     return judge_feats
+
+
+def _maybe_zero_nn(
+    cfg: ModelConfig,
+    nn_feats: torch.Tensor | None,
+    *,
+    force_nn_zero: bool,
+) -> torch.Tensor | None:
+    """Helper for ablation: return zeros (same shape) when caller requests it."""
+    if not cfg.use_nn_features or nn_feats is None or nn_feats.shape[-1] == 0:
+        return nn_feats
+    if force_nn_zero:
+        return torch.zeros_like(nn_feats)
+    return nn_feats
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +430,10 @@ class KFactorModel(nn.Module):
     def has_judge_features(self) -> bool:
         return bool(self.cfg.use_judge_features and self.cfg.effective_judge_dim > 0)
 
+    @property
+    def has_nn_features(self) -> bool:
+        return bool(self.cfg.use_nn_features and self.cfg.effective_nn_dim > 0)
+
     def _cluster_emb(self, cluster_ids: torch.Tensor | None) -> torch.Tensor | None:
         if self.cluster_embedding is None or cluster_ids is None:
             return None
@@ -407,8 +467,10 @@ class KFactorModel(nn.Module):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
         *,
         force_judge_zero: bool = False,
+        force_nn_zero: bool = False,
     ) -> torch.Tensor:
         eta, _, _, _ = self.factor_logit(subject_idx, bc_idx, item_emb)
         return eta
@@ -422,12 +484,18 @@ class KFactorModel(nn.Module):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Per-row additive components of the final logit.
 
         For the kfactor family we expose (factor, mlp). For IRT variants
         the override below expands this into (irt, offset, mlp). The trainer
         / diagnostic uses whatever keys are present, so adding more is safe.
+
+        NN features ride inside the residual ``mlp`` component (they are an
+        input to the MLP, not a separate additive logit). The diagnostic in
+        cell 14b ablates them via ``force_nn_zero=True`` rather than by
+        splitting out an independent component term.
         """
         eta, u_s, v_i, _ = self.factor_logit(subject_idx, bc_idx, item_emb)
         bsz = item_emb.shape[0]
@@ -521,6 +589,7 @@ class _ResidualKFactor(KFactorModel):
         pool_feats: torch.Tensor | None,
         cluster_ids: torch.Tensor | None,
         judge_feats: torch.Tensor | None,
+        nn_feats: torch.Tensor | None,
     ) -> torch.Tensor:
         cluster_emb = self._cluster_emb(cluster_ids)
         return _build_residual_features_kfactor(
@@ -533,6 +602,7 @@ class _ResidualKFactor(KFactorModel):
             pool_feats,
             cluster_emb,
             judge_feats=judge_feats,
+            nn_feats=nn_feats,
         )
 
     def forward(
@@ -544,9 +614,11 @@ class _ResidualKFactor(KFactorModel):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
         *,
         override_mlp_zero: bool = False,
         force_judge_zero: bool = False,
+        force_nn_zero: bool = False,
     ) -> torch.Tensor:
         eta_factor, u_s, v_i, item_emb_out = self.factor_logit(
             subject_idx, bc_idx, item_emb
@@ -555,8 +627,9 @@ class _ResidualKFactor(KFactorModel):
             return eta_factor
         beta_bc = self.beta(bc_idx)
         jf = _maybe_zero_judge(self.cfg, judge_feats, force_judge_zero=force_judge_zero)
+        nf = _maybe_zero_nn(self.cfg, nn_feats, force_nn_zero=force_nn_zero)
         x = self._residual_input(
-            u_s, v_i, item_emb_out, beta_bc, subject_emb, pool_feats, cluster_ids, jf
+            u_s, v_i, item_emb_out, beta_bc, subject_emb, pool_feats, cluster_ids, jf, nf
         )
         r = self.residual(x)
         return eta_factor + self.lambda_resid * r
@@ -570,13 +643,14 @@ class _ResidualKFactor(KFactorModel):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         eta_factor, u_s, v_i, item_emb_out = self.factor_logit(
             subject_idx, bc_idx, item_emb
         )
         beta_bc = self.beta(bc_idx)
         x = self._residual_input(
-            u_s, v_i, item_emb_out, beta_bc, subject_emb, pool_feats, cluster_ids, judge_feats
+            u_s, v_i, item_emb_out, beta_bc, subject_emb, pool_feats, cluster_ids, judge_feats, nn_feats
         )
         r = self.lambda_resid * self.residual(x)
         return {"factor": eta_factor, "mlp": r}
@@ -642,6 +716,10 @@ class IRTItemKFactor(nn.Module):
     def has_judge_features(self) -> bool:
         return bool(self.cfg.use_judge_features and self.cfg.effective_judge_dim > 0)
 
+    @property
+    def has_nn_features(self) -> bool:
+        return bool(self.cfg.use_nn_features and self.cfg.effective_nn_dim > 0)
+
     def _cluster_emb(self, cluster_ids: torch.Tensor | None) -> torch.Tensor | None:
         if self.cluster_embedding is None or cluster_ids is None:
             return None
@@ -678,10 +756,12 @@ class IRTItemKFactor(nn.Module):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
         *,
         override_alpha: torch.Tensor | None = None,
         override_beta: torch.Tensor | None = None,
         force_judge_zero: bool = False,
+        force_nn_zero: bool = False,
     ) -> torch.Tensor:
         comps = self._irt_components(subject_idx, bc_idx, item_emb)
         alpha_i = override_alpha if override_alpha is not None else comps["alpha_i"]
@@ -698,6 +778,7 @@ class IRTItemKFactor(nn.Module):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         comps = self._irt_components(subject_idx, bc_idx, item_emb)
         bsz = item_emb.shape[0]
@@ -742,6 +823,7 @@ class _ResidualIRTItem(IRTItemKFactor):
         pool_feats: torch.Tensor | None,
         cluster_ids: torch.Tensor | None,
         judge_feats: torch.Tensor | None,
+        nn_feats: torch.Tensor | None,
     ) -> torch.Tensor:
         cluster_emb = self._cluster_emb(cluster_ids)
         return _build_residual_features_irt(
@@ -754,6 +836,7 @@ class _ResidualIRTItem(IRTItemKFactor):
             pool_z=pool_feats,
             cluster_emb=cluster_emb,
             judge_feats=judge_feats,
+            nn_feats=nn_feats,
         )
 
     def forward(
@@ -765,11 +848,13 @@ class _ResidualIRTItem(IRTItemKFactor):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
         *,
         override_alpha: torch.Tensor | None = None,
         override_beta: torch.Tensor | None = None,
         override_mlp_zero: bool = False,
         force_judge_zero: bool = False,
+        force_nn_zero: bool = False,
     ) -> torch.Tensor:
         comps = self._irt_components(subject_idx, bc_idx, item_emb)
         alpha_i = override_alpha if override_alpha is not None else comps["alpha_i"]
@@ -779,8 +864,9 @@ class _ResidualIRTItem(IRTItemKFactor):
         if override_mlp_zero:
             return c_irt + c_off
         jf = _maybe_zero_judge(self.cfg, judge_feats, force_judge_zero=force_judge_zero)
+        nf = _maybe_zero_nn(self.cfg, nn_feats, force_nn_zero=force_nn_zero)
         x = self._residual_input(
-            comps, item_emb, subject_emb, pool_feats, cluster_ids, jf
+            comps, item_emb, subject_emb, pool_feats, cluster_ids, jf, nf
         )
         r = self.lambda_resid * self.residual(x)
         return c_irt + c_off + r
@@ -794,10 +880,11 @@ class _ResidualIRTItem(IRTItemKFactor):
         pool_feats: torch.Tensor | None = None,
         cluster_ids: torch.Tensor | None = None,
         judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         comps = self._irt_components(subject_idx, bc_idx, item_emb)
         x = self._residual_input(
-            comps, item_emb, subject_emb, pool_feats, cluster_ids, judge_feats
+            comps, item_emb, subject_emb, pool_feats, cluster_ids, judge_feats, nn_feats
         )
         r = self.lambda_resid * self.residual(x)
         return {
@@ -937,17 +1024,17 @@ class Indexer:
 
 class LookupDataset(torch.utils.data.Dataset):
     """Yields ``(subject_id, bc_id, item_emb, subject_emb, pool_feats,
-    cluster_id, label, judge_feats)`` per row.
+    cluster_id, judge_feats, nn_feats, label)`` per row.
 
-    Pool features, cluster ids, and judge features are optional: if missing,
-    zero-sized tensors are returned. The trainer + eval code unpacks the
-    8-tuple; downstream models silently ignore zero-sized channels.
+    Pool features, cluster ids, judge features, and NN features are
+    optional: if missing, zero-sized tensors are returned. The trainer +
+    eval code unpacks the 9-tuple; downstream models silently ignore
+    zero-sized channels.
 
-    Note: ``label`` lives at index 6 (before ``judge_feats``) so the existing
-    ``(s, bc, ie, se, pf, ci, y) = batch`` unpack code in ``src.train`` is
-    extended to ``(s, bc, ie, se, pf, ci, y, jf) = batch`` -- a single new
-    trailing tensor that's never touched by the loss or by models that don't
-    consume judge features.
+    The training and val datasets each receive their own ``nn`` matrix
+    (shape ``[N, 8]`` when enabled, ``[N, 0]`` otherwise), pre-computed
+    once at dataset construction time. This keeps the per-batch step
+    free of FAISS / sparse-matrix lookups.
     """
 
     def __init__(
@@ -960,6 +1047,7 @@ class LookupDataset(torch.utils.data.Dataset):
         pool_feats: np.ndarray | None = None,
         cluster_ids: np.ndarray | None = None,
         judge_feats: np.ndarray | None = None,
+        nn_feats: np.ndarray | None = None,
     ):
         self.subject_ids = torch.from_numpy(np.asarray(subject_ids, dtype=np.int64))
         self.bc_ids = torch.from_numpy(np.asarray(bc_ids, dtype=np.int64))
@@ -989,6 +1077,12 @@ class LookupDataset(torch.utils.data.Dataset):
             self.judge_feats = torch.from_numpy(
                 np.asarray(judge_feats, dtype=np.float32)
             )
+        if nn_feats is None:
+            self.nn_feats = torch.zeros((len(labels), 0), dtype=torch.float32)
+        else:
+            self.nn_feats = torch.from_numpy(
+                np.asarray(nn_feats, dtype=np.float32)
+            )
 
     def __len__(self) -> int:
         return self.labels.shape[0]
@@ -1001,8 +1095,9 @@ class LookupDataset(torch.utils.data.Dataset):
             self.subject_emb[idx],
             self.pool_feats[idx],
             self.cluster_ids[idx],
-            self.labels[idx],
             self.judge_feats[idx],
+            self.nn_feats[idx],
+            self.labels[idx],
         )
 
 
