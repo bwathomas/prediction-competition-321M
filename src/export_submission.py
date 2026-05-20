@@ -1286,45 +1286,36 @@ class _LLMJudgeRuntime:
             if (_DEVICE == "cuda" and torch.cuda.is_bf16_supported() and JUDGE_BF16)
             else torch.float32
         )
-        # Explicit fallback chain: ``flash_attention_2`` (~ 2x faster on L4 at
-        # seq=512) -> ``sdpa`` (PyTorch >= 2.1 builtin, ~ 1.3x faster than
-        # eager) -> default (no kwarg, lets transformers pick eager). Each
-        # attempt records the impl that finally loaded into
-        # ``self.attn_impl`` so the runtime-progress file can surface it for
-        # the user even when logs aren't visible.
-        attn_candidates: list[str | None] = []
+        # Fallback chain: ``flash_attention_2`` -> default (no kwarg, lets
+        # transformers pick eager). The previous "FA2 -> SDPA -> default"
+        # chain triggered an OOM on a 24 GB L4 with both 4B models
+        # co-resident at bs=16: SDPA's activation memory is 3-4 GB larger
+        # than eager's at seq=512, which is enough to push us over.
+        # Reverting to the simple FA2-or-default keeps the fast path when
+        # FA2 is installed and lands on the *low*-memory eager path
+        # otherwise, matching the slow-but-completing baseline.
+        attn_kwargs: dict = {}
         if JUDGE_USE_FLASH_ATTENTION and _DEVICE == "cuda":
-            attn_candidates.append("flash_attention_2")
-        if _DEVICE == "cuda":
-            attn_candidates.append("sdpa")
-        attn_candidates.append(None)
-        self.attn_impl = "unknown"
-        last_exc: Exception | None = None
-        for impl in attn_candidates:
-            try:
-                kwargs: dict = {}
-                if impl is not None:
-                    kwargs["attn_implementation"] = impl
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    cache_dir=_CACHE_DIR,
-                    torch_dtype=dtype,
-                    local_files_only=True,
-                    **kwargs,
-                )
-                self.attn_impl = impl or "eager"
-                break
-            except (ImportError, ValueError, RuntimeError, TypeError) as exc:
-                # TypeError covers older transformers versions that don't
-                # know the ``attn_implementation`` kwarg at all and raise
-                # on the unknown keyword instead of ValueError.
-                last_exc = exc
-                continue
-        else:
-            raise RuntimeError(
-                f"Judge model load failed for every attention impl tried "
-                f"({attn_candidates}); last error: {last_exc!r}"
+            attn_kwargs["attn_implementation"] = "flash_attention_2"
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=_CACHE_DIR,
+                torch_dtype=dtype,
+                local_files_only=True,
+                **attn_kwargs,
             )
+            self.attn_impl = (
+                attn_kwargs.get("attn_implementation") or "default"
+            )
+        except (ImportError, ValueError, RuntimeError, TypeError):
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=_CACHE_DIR,
+                torch_dtype=dtype,
+                local_files_only=True,
+            )
+            self.attn_impl = "default"
         self.model.eval().to(_DEVICE)
 
         self.yes_ids = _judge_token_ids(tok, JUDGE_YES_TOKENS)
