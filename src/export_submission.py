@@ -187,14 +187,24 @@ JUDGE_NO_TOKENS: tuple = tuple(
     JUDGE_META.get("no_tokens", (" no", "no", " No", "No"))
 )
 JUDGE_SUFFIX_RESERVE_TOKENS: int = int(JUDGE_META.get("suffix_reserve_tokens", 256))
-# Per-round runtime batch sizes. The defaults assume the *encoder is evicted
-# from VRAM after the encoder phase of the flush*, freeing ~8 GB on L4 for
-# judge activations -- without that eviction the judge has to fit alongside
-# the encoder and is capped at bs=16 (a 2x slowdown on the dominant cost).
+# Per-round runtime batch sizes. These have very different VRAM profiles
+# on L4 (24 GB) and so default to different numbers:
+#
+#   * Encoder runs DURING the co-resident phase (judge weights are also
+#     loaded, ~8 GB). Encoder weights are another ~8 GB. That leaves ~8 GB
+#     for activations -- bs=16 is the proven-safe ceiling. bs=32 has been
+#     observed to OOM on L4 in the wild.
+#
+#   * Judge runs AFTER the encoder is evicted (the
+#     ``FREE_ENCODER_AFTER_FLUSH`` path below freed ~8 GB), so it gets the
+#     full ~16 GB of headroom for activations and is safe at bs=32 -- the
+#     judge phase is the dominant cost, so this is where the speedup
+#     actually matters.
+#
 # Override either knob via ``runtime_meta.json`` for larger/smaller tiers.
 JUDGE_RUNTIME_BATCH_SIZE: int = int(JUDGE_META.get("runtime_batch_size", 32))
 ENCODER_RUNTIME_BATCH_SIZE: int = int(
-    META.get("encoder_runtime_batch_size", 32)
+    META.get("encoder_runtime_batch_size", 16)
 )
 # Free the encoder model from GPU memory after the encoder phase of the
 # flush has populated _ITEM_EMB_CACHE / _SUBJECT_EMB_CACHE. The cache lives
@@ -1304,7 +1314,10 @@ class _LLMJudgeRuntime:
                 )
                 self.attn_impl = impl or "eager"
                 break
-            except (ImportError, ValueError, RuntimeError) as exc:
+            except (ImportError, ValueError, RuntimeError, TypeError) as exc:
+                # TypeError covers older transformers versions that don't
+                # know the ``attn_implementation`` kwarg at all and raise
+                # on the unknown keyword instead of ValueError.
                 last_exc = exc
                 continue
         else:
@@ -2801,19 +2814,18 @@ def export_run(
         # tokenizes consistently with the offline cache.
         "max_length": int(encoder_cfg.get("max_length") or 512),
         # Per-batch size used by the runtime's ``_embed_batch`` flush path.
-        # Default 32 (safe on a 24 GB L4 with Qwen3-Embedding-4B bf16 + FA2
-        # because the encoder is the *only* model running during the
-        # encoder phase of the flush -- the judge's load hasn't yet
-        # produced any activations and the judge gets evicted/loaded
-        # transparently). Raise on bigger tiers via
-        # ``encoder_cfg["runtime_batch_size"]`` or by editing the
-        # shipped ``runtime_meta.json`` before upload.
+        # Default 16 (proven-safe on a 24 GB L4 with Qwen3-Embedding-4B
+        # bf16 + FA2 while Qwen3-4B-Instruct is co-resident -- bs=32 has
+        # OOM'd in the wild). Raise to 32+ once the encoder is evicted
+        # / the runtime no longer keeps both models resident, but note
+        # that the judge phase is the dominant cost and that's where
+        # the bigger batch actually pays off.
         "encoder_runtime_batch_size": int(
             encoder_cfg.get(
                 "runtime_batch_size",
-                32
-                if int(encoder_cfg.get("batch_size", 32) or 32) > 64
-                else encoder_cfg.get("batch_size", 32),
+                16
+                if int(encoder_cfg.get("batch_size", 16) or 16) > 64
+                else encoder_cfg.get("batch_size", 16),
             )
         ),
         # Free the encoder model from VRAM after the encoder phase of

@@ -40,7 +40,10 @@ def patch_runtime_meta(raw: bytes) -> bytes:
     """
     meta = json.loads(raw)
     meta["runtime_architecture"] = "batched_flush_v1"
-    meta["encoder_runtime_batch_size"] = 32
+    # Encoder runs co-resident with the judge -> bs=16 ceiling on L4.
+    # Judge runs after encoder eviction -> bs=32 is safe and gives the
+    # actual speedup (judge phase is the dominant cost).
+    meta["encoder_runtime_batch_size"] = 16
     meta["free_encoder_after_flush"] = True
     judge_block = meta.setdefault("judge", {})
     judge_block["runtime_batch_size"] = 32
@@ -122,7 +125,7 @@ def main() -> None:
     assert "_enqueue_for_batch" in L and "return 0.0" in L
     print("  [OK] labeling.py is enqueue-only")
     assert meta["runtime_architecture"] == "batched_flush_v1"
-    assert meta["encoder_runtime_batch_size"] == 32
+    assert meta["encoder_runtime_batch_size"] == 16
     assert meta["judge"]["runtime_batch_size"] == 32
     assert meta["free_encoder_after_flush"] is True
     print(f"  [OK] runtime_meta.runtime_architecture = {meta['runtime_architecture']!r}")
