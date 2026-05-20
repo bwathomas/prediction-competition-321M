@@ -2059,6 +2059,32 @@ def export_run(
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
+    All exports produced by this function ship the **batched-flush
+    runtime architecture** ("runtime_architecture": "batched_flush_v1"
+    in ``runtime_meta.json``):
+
+    - ``labeling.py`` is enqueue-only: ``acquisition_function`` calls
+      ``model._enqueue_for_batch(...)`` for every candidate the platform
+      surfaces, then returns 0.0 (constant ranking -> platform's random
+      tie-break, identical to not shipping labeling.py at all).
+    - The first ``predict()`` call drains the queue through batched
+      encoder + judge forwards at ``encoder_runtime_batch_size`` and
+      ``judge.runtime_batch_size`` respectively (default 16 each;
+      sized for a 24 GB L4 with both 4 B-param bf16 models co-resident).
+    - Subsequent ``predict()`` calls are pure cache lookups (~5-10 ms).
+
+    This matches the handbook's sec. 3.5 recommendation; without it, an
+    L4 round takes ~5-10 hours on a ~50 k-pair workload because every
+    candidate triggers a bs=1 forward through Qwen3-Embedding-4B and
+    Qwen3-4B-Instruct.
+
+    If you pass ``include_labeling=False`` the batched-flush path is
+    architecturally disabled (no queue gets populated), and ``predict()``
+    falls back to the original bs=1 per-call inference path. The bundle
+    is still functionally correct, just ~10-15x slower at runtime. We
+    log a warning when this happens; flip it back on for any real
+    submission.
+
     The caller chooses *which* run to export (the notebook offers an
     ipywidgets dropdown or a ``SELECTED_RUN_ID`` fallback variable).
 
@@ -2086,6 +2112,16 @@ def export_run(
     """
     import torch as _torch  # local import: keep module import cheap
 
+    if not include_labeling:
+        LOG.warning(
+            "export_run: include_labeling=False -- the batched-flush "
+            "architecture is disabled (acquisition_function won't be "
+            "called by the platform, so model._enqueue_for_batch never "
+            "fires). predict() will fall back to bs=1 inference and the "
+            "bundle will run ~10-15x slower at runtime. Re-enable "
+            "include_labeling=True for any non-diagnostic submission."
+        )
+
     sub = Path(submission_dir)
     artifacts = sub / "artifacts"
     if sub.exists():
@@ -2108,25 +2144,15 @@ def export_run(
         ) from exc
     ckpt_model_cfg = dict(_ckpt.get("model_cfg") or {})
 
-    # Cluster-channel sanity: the trainer's ``ModelConfig.__post_init__`` would
-    # have repaired this in-process, but checkpoints saved before that fix
-    # can still ship ``use_cluster_features=True`` with ``cluster_embed_dim=0``
-    # (a silent runtime no-op). Rewriting it here lets the rest of the
-    # export wire-up reason about the *trained* channel, not the broken dict.
-    if (
-        ckpt_model_cfg.get("use_cluster_features")
-        and int(ckpt_model_cfg.get("n_clusters", 0) or 0) > 0
-        and int(ckpt_model_cfg.get("cluster_embed_dim", 0) or 0) <= 0
-    ):
-        LOG.warning(
-            "export_run: checkpoint model_cfg has use_cluster_features=True, "
-            "n_clusters=%d, cluster_embed_dim=%r; coercing cluster_embed_dim=16 "
-            "to match configs/default.yaml so the runtime cluster channel is "
-            "actually live.",
-            int(ckpt_model_cfg.get("n_clusters", 0) or 0),
-            ckpt_model_cfg.get("cluster_embed_dim"),
-        )
-        ckpt_model_cfg["cluster_embed_dim"] = 16
+    # NB: ``ckpt_model_cfg`` is read *only* to inspect feature flags here.
+    # We intentionally do not mutate it -- the checkpoint's model_cfg is
+    # the single source of truth for tensor shapes, and the runtime
+    # template reads it directly from the on-disk checkpoint at module
+    # init. ``use_cluster_features=True`` combined with
+    # ``cluster_embed_dim=0`` is a valid intentional state (cluster
+    # channel was disabled at training time); the previous "repair" of
+    # coercing it to 16 was the root cause of the
+    # ``size mismatch for residual.norm.weight`` crash at module init.
 
     ckpt_uses_nn = bool(ckpt_model_cfg.get("use_nn_features", False))
     ckpt_uses_judge = bool(ckpt_model_cfg.get("use_judge_features", False))
@@ -2234,11 +2260,26 @@ def export_run(
     # cannot load a judge model the trained head was never connected to,
     # and cannot skip a judge model the head is expecting.
     jcfg = dict(judge_cfg or {})
+    # IMPORTANT: ``judge.batch_size`` in the YAML / training cfg refers to
+    # the *training-time* judge-scoring batch (default 256 on A100). The
+    # *runtime* judge batch is a separate knob -- it gates the bs used
+    # inside ``_LLMJudgeRuntime.score_batch`` at inference time on the
+    # platform's GPU, which is typically much smaller (L4: 24 GB). Default
+    # to 16 here and let callers override via ``judge_cfg["runtime_batch_size"]``.
+    runtime_judge_bs = int(
+        jcfg.get(
+            "runtime_batch_size",
+            16 if int(jcfg.get("batch_size", 16) or 16) > 64 else jcfg.get("batch_size", 16),
+        )
+    )
     judge_block = {
         "enabled": bool(ckpt_uses_judge),
         "ship_at_runtime": bool(jcfg.get("ship_at_runtime", True)),
         "model_id": str(jcfg.get("model_id", "")),
+        # Kept for forensics / log lines; the runtime never reads this field.
         "batch_size": int(jcfg.get("batch_size", 16)),
+        # The runtime batched-flush path reads exactly this field.
+        "runtime_batch_size": runtime_judge_bs,
         "max_prompt_tokens": int(jcfg.get("max_prompt_tokens", 1024)),
         "bf16": bool(jcfg.get("bf16", True)),
         "use_flash_attention": bool(jcfg.get("use_flash_attention", True)),
@@ -2271,11 +2312,27 @@ def export_run(
     runtime_meta = {
         "run_id": result.run_id,
         "model_name": result.model_name,
+        # Tag the shipped runtime architecture so future debug sessions can
+        # tell at a glance which inference plumbing this bundle uses.
+        "runtime_architecture": "batched_flush_v1",
         "encoder_model_id": encoder_cfg["model_id"],
         # The encoder side may have promoted max_length from config-null to a
         # data-driven cap. We persist the *effective* number so the runtime
         # tokenizes consistently with the offline cache.
         "max_length": int(encoder_cfg.get("max_length") or 512),
+        # Per-batch size used by the runtime's ``_embed_batch`` flush path.
+        # Default 16 (safe on a 24 GB L4 with Qwen3-Embedding-4B bf16 + FA2
+        # while Qwen3-4B-Instruct is co-resident). Raise to 32+ on bigger
+        # tiers via ``encoder_cfg["runtime_batch_size"]`` or by editing the
+        # shipped runtime_meta.json before upload.
+        "encoder_runtime_batch_size": int(
+            encoder_cfg.get(
+                "runtime_batch_size",
+                16
+                if int(encoder_cfg.get("batch_size", 16) or 16) > 64
+                else encoder_cfg.get("batch_size", 16),
+            )
+        ),
         "pooling": encoder_cfg.get("pooling", "mean"),
         "use_contextual_item_text": bool(
             encoder_cfg.get("use_contextual_item_text", True)

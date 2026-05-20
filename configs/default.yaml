@@ -57,6 +57,11 @@ encoder:
   max_length_ceiling: 4096       # never go above this many tokens
   batch_size: 64                 # A100 40GB, Qwen3-Embedding-4B, bf16
   batch_size_fallback: 16        # used after OOM-retry halves itself out
+  # Per-batch size used by the *runtime* (Codabench, typically L4 24 GB)
+  # inside the batched-flush path -- distinct from the offline training
+  # batch above. Default 16 because the runtime co-resident judge model
+  # (Qwen3-4B-Instruct, bf16) eats ~10 GB of activations + weights.
+  runtime_batch_size: 16
   bf16: true
   # Try Flash Attention 2 first, fall back to SDPA if the wheel is missing.
   use_flash_attention: true
@@ -217,6 +222,12 @@ judge:
   # at max_prompt_tokens=1024. Drop to 16 on T4 / smaller GPUs. The forward
   # uses use_cache=False so no KV cache is allocated -- only activations.
   batch_size: 256
+  # *Runtime* (Codabench) batch size for the inline judge. Read separately
+  # from ``batch_size`` above because Codabench typically lands on L4
+  # (24 GB), where bs=256 would OOM instantly. The batched-flush runtime
+  # template in src/export_submission.py reads exactly this field via
+  # ``judge.runtime_batch_size`` in the shipped runtime_meta.json.
+  runtime_batch_size: 16
   max_prompt_tokens: 512
   max_new_tokens: 1
   bf16: true
