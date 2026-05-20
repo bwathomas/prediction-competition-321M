@@ -907,6 +907,57 @@ class LLMJudge:
         scored = self.score(rows, progress=progress)
         return [scored]
 
+    # ------------------------------------------------------------- release
+
+    def release(self) -> None:
+        """Drop the GPU model + tokenizer and free CUDA memory.
+
+        Call this once judge scoring is finished and the cache has been
+        persisted. Idempotent: a second call is a no-op. The instance can
+        be re-used afterwards -- a subsequent ``score`` / ``score_dataframe``
+        call will reload weights on demand via ``_load``.
+
+        This exists so the notebook does not have to ``del`` globals and
+        manually empty the CUDA cache to make room for the next stage
+        (NN-index build, training, etc).
+        """
+        if not self._loaded:
+            return
+        try:
+            import torch
+        except Exception:
+            torch = None  # type: ignore[assignment]
+
+        if self._model is not None:
+            try:
+                self._model.to("cpu")
+            except Exception:
+                pass
+        self._model = None
+        self._tok = None
+        self._yes_ids = []
+        self._no_ids = []
+        self._loaded = False
+        self._attn_impl = "sdpa"
+
+        if torch is not None:
+            try:
+                import gc
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        LOG.info("Judge model released; CUDA cache emptied")
+
+    def __enter__(self) -> "LLMJudge":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
     # --------------------------------------------------------------- stats
 
     def stats(self) -> dict:

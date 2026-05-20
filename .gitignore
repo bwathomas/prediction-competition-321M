@@ -31,3 +31,6 @@ submission.zip
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Notebook scratch / diff helpers used while comparing revisions
+notebooks/temp/

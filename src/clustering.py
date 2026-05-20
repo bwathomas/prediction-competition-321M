@@ -23,6 +23,8 @@ was taken.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Sequence
@@ -113,25 +115,37 @@ def _fit_kmeans_faiss_gpu(
     niter: int,
     nredo: int,
     gpu_id: int,
+    max_points_per_centroid: int | None = None,
 ) -> np.ndarray:
-    """Fit k-means on GPU via FAISS. Returns centroids ``[k, d]``."""
+    """Fit k-means on GPU via FAISS. Returns centroids ``[k, d]``.
+
+    ``max_points_per_centroid`` (when set) caps the number of training
+    points per centroid that FAISS uses internally. FAISS' default of 256
+    triggers subsampling on large corpora -- raising it to ~1024 makes
+    centroids reflect the full distribution at the cost of ~4x training
+    time. ``None`` keeps the FAISS default.
+    """
     import faiss  # type: ignore
 
     X = np.ascontiguousarray(np.asarray(item_embeddings, dtype=np.float32))
     n, d = X.shape
     LOG.info(
-        "FAISS GPU k-means: n=%d d=%d k=%d niter=%d nredo=%d gpu_id=%d",
+        "FAISS GPU k-means: n=%d d=%d k=%d niter=%d nredo=%d gpu_id=%d mpc=%s",
         n, d, int(k), int(niter), int(nredo), int(gpu_id),
+        ("default" if max_points_per_centroid is None else int(max_points_per_centroid)),
     )
-    kmeans = faiss.Kmeans(
-        d=int(d),
-        k=int(k),
-        niter=int(niter),
-        nredo=int(nredo),
-        seed=int(seed),
-        gpu=True,
-        verbose=True,
-    )
+    kmeans_kwargs: dict = {
+        "d": int(d),
+        "k": int(k),
+        "niter": int(niter),
+        "nredo": int(nredo),
+        "seed": int(seed),
+        "gpu": True,
+        "verbose": True,
+    }
+    if max_points_per_centroid is not None:
+        kmeans_kwargs["max_points_per_centroid"] = int(max_points_per_centroid)
+    kmeans = faiss.Kmeans(**kmeans_kwargs)
     t0 = time.time()
     kmeans.train(X)
     LOG.info("FAISS GPU k-means trained in %.1fs", time.time() - t0)
@@ -215,10 +229,31 @@ def assign_clusters(
 # Persistence ----------------------------------------------------------------
 
 
+def _atomic_replace(tmp_path: Path, dst: Path) -> None:
+    """Move ``tmp_path`` onto ``dst`` atomically (POSIX + Windows safe).
+
+    Used by the centroid + assignment writers so a crashed run never leaves
+    behind a half-written artifact that the next run would happily reload.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(tmp_path, dst)
+
+
 def save_centroids(centroids: np.ndarray, path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(path, np.asarray(centroids, dtype=np.float32))
+    arr = np.asarray(centroids, dtype=np.float32)
+    with tempfile.NamedTemporaryFile(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=str(path.parent),
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    np.save(tmp_path, arr)
+    # np.save appends ``.npy`` if missing; resolve the real on-disk name.
+    real_tmp = tmp_path if tmp_path.exists() else tmp_path.with_suffix(tmp_path.suffix + ".npy")
+    _atomic_replace(real_tmp, path)
     return path
 
 
@@ -246,7 +281,15 @@ def save_assignments(
             "cluster_id": np.asarray(cluster_ids, dtype=np.int64),
         }
     )
-    df.to_parquet(path, index=False)
+    with tempfile.NamedTemporaryFile(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=str(path.parent),
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    df.to_parquet(tmp_path, index=False)
+    _atomic_replace(tmp_path, path)
     return path
 
 
@@ -301,6 +344,7 @@ def fit_and_assign(
     gpu_id: int = 0,
     assign_batch_size: int = 65536,
     backend: str = "auto",
+    faiss_max_points_per_centroid: int | None = None,
 ) -> tuple[np.ndarray, dict[str, int]]:
     """End-to-end: fit, assign, persist. Returns (centroids, assignments).
 
@@ -355,6 +399,7 @@ def fit_and_assign(
         centroids = _fit_kmeans_faiss_gpu(
             X, k=int(k), seed=int(seed), niter=int(niter),
             nredo=int(nredo), gpu_id=int(gpu_id),
+            max_points_per_centroid=faiss_max_points_per_centroid,
         )
     else:
         LOG.info("Clustering backend: sklearn CPU")

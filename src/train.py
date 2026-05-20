@@ -247,32 +247,37 @@ def _unpack_batch(batch, device: str):
     """Unpack the 9-tuple yielded by ``LookupDataset`` onto ``device``.
 
     Returns ``(s, bc, ie, se_or_none, pf_or_none, ci_or_none, jf_or_none,
-    nn_or_none, y)``. Empty optional channels are returned as ``None`` so
+    nf_or_none, y)``. Empty optional channels are returned as ``None`` so
     the model can fast-path around them. The judge-features tensor ``jf``
     has ``shape[-1] == 0`` when judge scoring is disabled or no scores
-    were attached; ``nn`` follows the same convention for nearest-neighbor
-    features.
+    were attached; ``nf`` (nearest-neighbor features) follows the same
+    convention.
+
+    Note: we deliberately name the NN-features tensor ``nf`` rather than
+    ``nn`` -- the latter would shadow the ``torch.nn`` module imported at
+    the top of this file, which is a subtle footgun for anyone reading or
+    modifying the trainer.
     """
     moved = _move_batch(batch, device)
-    s, bc, ie, se, pf, ci, jf, nn, y = moved
+    s, bc, ie, se, pf, ci, jf, nf, y = moved
     se_use = se if se.shape[-1] > 0 else None
     pf_use = pf if pf.shape[-1] > 0 else None
     ci_use = ci if (ci.numel() > 0 and ci.dim() >= 1) else None
     jf_use = jf if jf.shape[-1] > 0 else None
-    nn_use = nn if nn.shape[-1] > 0 else None
-    return s, bc, ie, se_use, pf_use, ci_use, jf_use, nn_use, y
+    nf_use = nf if nf.shape[-1] > 0 else None
+    return s, bc, ie, se_use, pf_use, ci_use, jf_use, nf_use, y
 
 
-def _forward_model(model, s, bc, ie, se, pf, ci, jf=None, nn=None):
+def _forward_model(model, s, bc, ie, se, pf, ci, jf=None, nf=None):
     """Call ``model.forward`` with the channels the model supports.
 
     All current variants accept the full kwargs signature; the wrapper exists
     so callers can stay agnostic if we later add variants with different
     signatures. ``jf`` is the judge feature tensor (or ``None`` when judge
-    features are disabled); ``nn`` is the nearest-neighbor feature tensor
+    features are disabled); ``nf`` is the nearest-neighbor feature tensor
     (or ``None`` when NN features are disabled).
     """
-    return model(s, bc, ie, se, pf, ci, jf, nn)
+    return model(s, bc, ie, se, pf, ci, jf, nf)
 
 
 def evaluate_model(
@@ -340,8 +345,8 @@ def evaluate_model(
     with torch.inference_mode():
         with autocast_ctx:
             for batch_idx, batch in enumerate(iterator, start=1):
-                s, bc, ie, se, pf, ci, jf, nn, y = _unpack_batch(batch, device)
-                logits = _forward_model(model, s, bc, ie, se, pf, ci, jf, nn)
+                s, bc, ie, se, pf, ci, jf, nf, y = _unpack_batch(batch, device)
+                logits = _forward_model(model, s, bc, ie, se, pf, ci, jf, nf)
                 p = torch.sigmoid(logits).float().cpu().numpy()
 
                 preds.append(p)
@@ -544,12 +549,12 @@ def train_one(
         )
 
         for batch_idx, batch in enumerate(iterator, start=1):
-            s, bc, ie, se, pf, ci, jf, nn, y = _unpack_batch(batch, device)
+            s, bc, ie, se, pf, ci, jf, nf, y = _unpack_batch(batch, device)
 
             opt.zero_grad(set_to_none=True)
 
             with autocast_ctx_factory():
-                logits = _forward_model(model, s, bc, ie, se, pf, ci, jf, nn)
+                logits = _forward_model(model, s, bc, ie, se, pf, ci, jf, nf)
                 loss = loss_fn(logits, y)
                 # Soft IRT regularization: keep beta from exploding and
                 # log(alpha) close to 0 so the IRT head and the residual MLP

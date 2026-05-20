@@ -152,6 +152,10 @@ clustering:
   faiss_niter: 50
   faiss_nredo: 1
   faiss_assign_batch: 65536
+  # Cap on points/centroid FAISS uses during training. null = FAISS default
+  # (256). Raise to ~1024 on large corpora so centroids reflect the full
+  # distribution instead of FAISS's internal subsample (~4x slower fit).
+  faiss_max_points_per_centroid: null
   gpu_id: 0
   overwrite: false
 
