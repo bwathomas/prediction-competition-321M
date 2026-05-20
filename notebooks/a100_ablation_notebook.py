@@ -2510,12 +2510,65 @@ sel_result = TrainResult(
     elapsed_seconds=float(selected_dict.get("elapsed_seconds", 0.0)),
 )
 
-# 19a. Build the quantized training-item cache (int8 + optional PCA + FAISS).
+# 19a. The *selected checkpoint's* model_cfg is the single source of truth
+# for what the runtime needs to ship: ambient notebook flags
+# (USE_NN_FEATURES, USE_JUDGE_FEATURES) reflect this run's *config*, but if
+# the user toggled them off between training and export the trained head
+# would silently see all-zero feature vectors at inference. We re-read the
+# checkpoint here and let it override the notebook-level flags.
+import torch as _torch_export_peek
+
+_ckpt_peek = _torch_export_peek.load(
+    sel_result.checkpoint_path, map_location="cpu", weights_only=False
+)
+_ckpt_model_cfg = dict(_ckpt_peek.get("model_cfg") or {})
+del _ckpt_peek
+CKPT_USE_NN_FEATURES = bool(_ckpt_model_cfg.get("use_nn_features", False))
+CKPT_USE_JUDGE_FEATURES = bool(_ckpt_model_cfg.get("use_judge_features", False))
+print(
+    f"Checkpoint model_cfg: use_nn_features={CKPT_USE_NN_FEATURES} "
+    f"use_judge_features={CKPT_USE_JUDGE_FEATURES} "
+    f"(notebook flags: USE_NN_FEATURES={USE_NN_FEATURES} "
+    f"USE_JUDGE_FEATURES={USE_JUDGE_FEATURES})"
+)
+if CKPT_USE_NN_FEATURES and not USE_NN_FEATURES:
+    raise RuntimeError(
+        "Selected checkpoint was trained with use_nn_features=True but the "
+        "current notebook session has USE_NN_FEATURES=False (so cell 8d did "
+        "not build the NN passrate table). Re-run cell 8d with CFG.nn_features"
+        ".enabled=True before exporting, or pick a checkpoint trained without "
+        "NN features."
+    )
+if CKPT_USE_JUDGE_FEATURES and not USE_JUDGE_FEATURES:
+    raise RuntimeError(
+        "Selected checkpoint was trained with use_judge_features=True but the "
+        "current notebook session has USE_JUDGE_FEATURES=False. Re-run with "
+        "CFG.judge.enabled=True before exporting, or pick a non-judge checkpoint."
+    )
+
+# 19b. Build the quantized training-item cache (int8 + optional PCA + FAISS).
 # This is the artifact shipped inside submission/cache/ for runtime nearest-
 # neighbor lookup. Fails loudly if max_bundle_size_mb is exceeded.
 training_cache_dir = ROOT / "artifacts" / "submission_cache"
 submission_cache_cfg = CFG.get("submission_cache", {}) or {}
 training_cache_result = None
+
+nn_cfg_for_export = NN_FEATURES_CFG_DICT if CKPT_USE_NN_FEATURES else None
+subject_to_id_for_export = (
+    dict(indexer.subject_to_id) if CKPT_USE_NN_FEATURES else None
+)
+if CKPT_USE_NN_FEATURES and nn_subject_to_id_map:
+    drift = [
+        k for k in nn_subject_to_id_map
+        if nn_subject_to_id_map[k] != indexer.subject_to_id.get(k, -1)
+    ]
+    if drift:
+        raise RuntimeError(
+            "NN subject_to_id (cell 8d) and Indexer.subject_to_id (cell 10) "
+            f"disagree on {len(drift)} keys; cannot ship NN features safely. "
+            f"First diverging keys: {drift[:5]}"
+        )
+
 if bool(submission_cache_cfg.get("enabled", True)):
     cluster_assign_map = (
         dict(cluster_assignments) if cluster_assignments is not None else None
@@ -2529,6 +2582,8 @@ if bool(submission_cache_cfg.get("enabled", True)):
         cluster_assignments=cluster_assign_map,
         n_clusters=N_CLUSTERS if USE_CLUSTER_FEATURES else 0,
         train_df=primary.train,
+        nn_features_cfg=nn_cfg_for_export,
+        subject_to_id=subject_to_id_for_export,
     )
     print(
         f"Training cache: {training_cache_result.total_mb:.2f} MB at "
@@ -2536,9 +2591,17 @@ if bool(submission_cache_cfg.get("enabled", True)):
     )
     for fname, mb in training_cache_result.sizes_mb.items():
         print(f"  {fname:32s} {mb:7.2f} MB")
+    print(
+        f"NN features in cache: enabled={CKPT_USE_NN_FEATURES} "
+        f"n_subjects_indexed={len(subject_to_id_for_export or {})} "
+        f"runtime_k={int(submission_cache_cfg.get('runtime_k', nn_cfg.k if USE_NN_FEATURES else 0))}"
+    )
 else:
     print("submission_cache.enabled = false; not shipping training-item cache")
 
+# 19c. Materialize the submission directory. export_run also enforces the
+# checkpoint <-> caller-config consistency described above and will raise
+# if e.g. the NN cache files are missing while the checkpoint expects them.
 sub_dir = export_run(
     result=sel_result,
     encoder_cfg=CFG["encoder"],
@@ -2549,23 +2612,34 @@ sub_dir = export_run(
     cluster_centroids_path=CENTROIDS_PATH if USE_CLUSTER_FEATURES else None,
     pool_feature_names=list(POOL_FEATURE_NAMES),
     training_cache_dir=training_cache_dir if training_cache_result is not None else None,
-    judge_cfg=CFG.get("judge"),
+    judge_cfg=CFG.get("judge") if CKPT_USE_JUDGE_FEATURES else None,
+    nn_features_cfg=nn_cfg_for_export,
 )
 print(
-    f"Judge in bundle     : enabled={bool((CFG.get('judge') or {}).get('enabled'))} "
+    f"Judge in bundle     : ckpt_use_judge={CKPT_USE_JUDGE_FEATURES} "
     f"ship_at_runtime={bool((CFG.get('judge') or {}).get('ship_at_runtime', True))} "
     f"model_id={(CFG.get('judge') or {}).get('model_id', '')}"
+)
+
+# 19d. Zip the submission folder. We enforce a final-zip size cap (default
+# 70 MB) -- anything bigger has historically failed the Codabench upload
+# widget, and silently shipping an un-uploadable bundle is worse than
+# failing here.
+max_zip_size_mb = float(
+    (CFG.get("submission") or {}).get("max_zip_size_mb", 70)
 )
 zip_path = make_submission_zip(
     submission_dir=sub_dir,
     zip_path=ROOT / CFG["submission"]["zip_path"],
+    max_zip_size_mb=max_zip_size_mb,
 )
 sub_bundle_mb = sum(
     p.stat().st_size for p in sub_dir.rglob("*") if p.is_file()
 ) / (1024 * 1024)
 print(f"Submission ready: {sub_dir}")
-print(f"Submission size : {sub_bundle_mb:.2f} MB")
-print(f"Zip             : {zip_path}")
+print(f"Submission size : {sub_bundle_mb:.2f} MB (uncompressed)")
+print(f"Zip             : {zip_path}  ({zip_path.stat().st_size / (1024*1024):.2f} MB)")
+print(f"Zip cap         : {max_zip_size_mb:.0f} MB")
 
 # %% [markdown]
 # ## 20. Submission smoke test (notebook variant)

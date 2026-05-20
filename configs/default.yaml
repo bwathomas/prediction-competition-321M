@@ -95,7 +95,10 @@ submission_cache:
   include_faiss_index: true      # ship a FAISS HNSW index for fast lookup
   include_top_k_index: true      # alias for include_faiss_index (preferred)
   faiss_index_type: "HNSW32"     # HNSW32 | IVF | flat
-  max_bundle_size_mb: 200        # hard cap; export fails if exceeded
+  # Hard cap on the cache *directory* (submission/cache/) -- export fails
+  # if exceeded. The final submission.zip is also capped, separately, by
+  # submission.max_zip_size_mb below.
+  max_bundle_size_mb: 70
   # Per-subject pass-rate aggregations bundled for runtime NN features.
   # "cluster" is always cheap (n_subjects * k_clusters floats). "sparse"
   # ships the full (subject, item) -> pass_rate CSR matrix; only safe when
@@ -275,6 +278,11 @@ submission:
   dir: "submission"
   zip_path: "submission.zip"
   declared_models_max: 5         # platform cap
+  # Hard cap on the final submission.zip (the file the user uploads to
+  # Codabench). Anything larger has historically failed the web-upload
+  # widget. ``make_submission_zip`` deletes the over-cap zip and raises so
+  # we never silently ship an un-uploadable bundle.
+  max_zip_size_mb: 70
 
 # ----------------------------------------------------------------------------
 # Optional GCS sync

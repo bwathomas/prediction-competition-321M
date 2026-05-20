@@ -1101,6 +1101,33 @@ def _judge_token_ids(tokenizer, variants) -> list[int]:
     return list(seen.keys())
 
 
+def _judge_render(
+    template: str,
+    *,
+    benchmark: str,
+    condition: str,
+    subject_content: str,
+    item_content: str,
+) -> str:
+    """Brace-safe substitution of the four named placeholders into the
+    judge prompt template.
+
+    We deliberately avoid ``str.format`` here: the substituted values
+    (especially item_content, which routinely contains LaTeX/JSON/code
+    snippets with ``{`` / ``}``) would otherwise be interpreted as
+    format specs and raise ``KeyError`` / ``IndexError``. The exception
+    bubbles up through ``score`` and gets swallowed by the zero-fallback
+    in ``_get_judge_features``, silently degrading every brace-bearing
+    item to all-zero judge features.
+    """
+    out = template
+    out = out.replace("{benchmark}", str(benchmark))
+    out = out.replace("{condition}", str(condition))
+    out = out.replace("{subject_content}", str(subject_content))
+    out = out.replace("{item_content}", str(item_content))
+    return out
+
+
 def _judge_truncate(
     tokenizer,
     *,
@@ -1111,7 +1138,8 @@ def _judge_truncate(
 ) -> str:
     """Char-based shrink of item / subject content until the rendered prompt
     fits in JUDGE_MAX_PROMPT_TOKENS - JUDGE_SUFFIX_RESERVE_TOKENS."""
-    rendered = JUDGE_PROMPT_TEMPLATE.format(
+    rendered = _judge_render(
+        JUDGE_PROMPT_TEMPLATE,
         benchmark=benchmark,
         condition=condition,
         subject_content=subject_content,
@@ -1127,7 +1155,8 @@ def _judge_truncate(
     it_text, sb_text = item_content, subject_content
 
     def _try(it_t: str, sb_t: str):
-        s = JUDGE_PROMPT_TEMPLATE.format(
+        s = _judge_render(
+            JUDGE_PROMPT_TEMPLATE,
             benchmark=benchmark,
             condition=condition,
             subject_content=sb_t,
@@ -1764,8 +1793,21 @@ def export_run(
     written by ``bundle_training_cache``), its contents are copied into
     ``submission/cache/`` for nearest-neighbor lookup at test time.
 
+    Single source of truth: the checkpoint's ``model_cfg`` decides whether
+    NN / judge features are actually used at inference time. If the
+    checkpoint declares ``use_nn_features=True`` but the caller passes
+    ``nn_features_cfg=None`` (or fails to ship the NN cache), or
+    ``use_judge_features=True`` without a usable ``judge_cfg``, we raise
+    rather than silently shipping a bundle whose runtime feeds the trained
+    head all-zero feature vectors. This is what produced the
+    ``submission_judge`` regression: trainer set ``use_nn_features=True``
+    but the export pipeline got ``nn_features_cfg=None`` and the runtime
+    silently zero-filled the 8-dim NN slot at test time.
+
     Returns the submission directory path.
     """
+    import torch as _torch  # local import: keep module import cheap
+
     sub = Path(submission_dir)
     artifacts = sub / "artifacts"
     if sub.exists():
@@ -1777,6 +1819,84 @@ def export_run(
     if not ckpt_src.exists():
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_src}")
     shutil.copy2(ckpt_src, artifacts / "checkpoint.pt")
+
+    # Read the *trained* model_cfg so it -- not any ambient notebook flag --
+    # decides whether NN / judge features must be wired through at runtime.
+    try:
+        _ckpt = _torch.load(ckpt_src, map_location="cpu", weights_only=False)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"export_run: could not read checkpoint {ckpt_src} to verify model_cfg: {exc}"
+        ) from exc
+    ckpt_model_cfg = dict(_ckpt.get("model_cfg") or {})
+    ckpt_uses_nn = bool(ckpt_model_cfg.get("use_nn_features", False))
+    ckpt_uses_judge = bool(ckpt_model_cfg.get("use_judge_features", False))
+    ckpt_nn_feature_dim = int(ckpt_model_cfg.get("nn_feature_dim", 0))
+    ckpt_judge_feature_dim = int(ckpt_model_cfg.get("judge_feature_dim", 0))
+
+    # --- NN features: enforce consistency between checkpoint, cache, config ---
+    if ckpt_uses_nn:
+        if nn_features_cfg is None:
+            raise RuntimeError(
+                "export_run: checkpoint declares use_nn_features=True "
+                f"(nn_feature_dim={ckpt_nn_feature_dim}) but the caller passed "
+                "nn_features_cfg=None. The runtime would silently feed zeros "
+                "into the trained NN slot. Pass the same nn_features_cfg + "
+                "subject_to_id mapping that bundle_training_cache used."
+            )
+        if training_cache_dir is None:
+            raise RuntimeError(
+                "export_run: checkpoint declares use_nn_features=True but "
+                "training_cache_dir is None. The NN-features sparse passrate "
+                "files live inside the training cache."
+            )
+        cache_src = Path(training_cache_dir)
+        required_nn_files = (
+            "subject_passrate.npz",
+            "subject_passrate_mask.npz",
+            "subject_key_to_id.json",
+            "nn_features_config.json",
+        )
+        missing = [f for f in required_nn_files if not (cache_src / f).exists()]
+        if missing:
+            raise RuntimeError(
+                "export_run: checkpoint declares use_nn_features=True but the "
+                f"training cache at {cache_src} is missing required NN files: "
+                f"{missing}. Re-run bundle_training_cache with a non-None "
+                "nn_features_cfg AND subject_to_id mapping so cache_export "
+                "writes the singular-name 'subject_passrate.npz' (etc.)."
+            )
+    elif nn_features_cfg is not None and bool(
+        (nn_features_cfg or {}).get("enabled", False)
+    ):
+        LOG.warning(
+            "export_run: nn_features_cfg.enabled=True but checkpoint has "
+            "use_nn_features=False. Ignoring caller's nn_features_cfg; "
+            "shipping the bundle without NN-feature runtime metadata."
+        )
+        nn_features_cfg = None
+
+    # --- Judge features: enforce consistency between checkpoint and judge_cfg ---
+    if ckpt_uses_judge:
+        jcfg_chk = dict(judge_cfg or {})
+        if not (
+            bool(jcfg_chk.get("enabled", False))
+            and bool(jcfg_chk.get("ship_at_runtime", True))
+            and str(jcfg_chk.get("model_id", ""))
+        ):
+            raise RuntimeError(
+                "export_run: checkpoint declares use_judge_features=True "
+                f"(judge_feature_dim={ckpt_judge_feature_dim}) but judge_cfg is "
+                "missing one of {enabled, ship_at_runtime, model_id}. The "
+                "runtime would silently feed zeros into the trained judge slot."
+            )
+    elif judge_cfg is not None and bool((judge_cfg or {}).get("enabled", False)):
+        LOG.warning(
+            "export_run: judge_cfg.enabled=True but checkpoint has "
+            "use_judge_features=False. Shipping the bundle without judge "
+            "runtime metadata; trained head has no judge slot to feed."
+        )
+        judge_cfg = None
 
     # Optional pool-feature stats and cluster centroids. We always copy what
     # we can find so the submission keeps working even if the model variant
@@ -1811,9 +1931,12 @@ def export_run(
     # Normalize the judge block for the runtime. We persist the locked
     # prompt template + yes/no token lists so the runtime never diverges
     # from training-time scoring -- changing them invalidates the cache.
+    # NB: ``enabled`` is forced to the checkpoint's verdict so the runtime
+    # cannot load a judge model the trained head was never connected to,
+    # and cannot skip a judge model the head is expecting.
     jcfg = dict(judge_cfg or {})
     judge_block = {
-        "enabled": bool(jcfg.get("enabled", False)),
+        "enabled": bool(ckpt_uses_judge),
         "ship_at_runtime": bool(jcfg.get("ship_at_runtime", True)),
         "model_id": str(jcfg.get("model_id", "")),
         "batch_size": int(jcfg.get("batch_size", 16)),
@@ -1881,9 +2004,9 @@ def export_run(
         ],
         "judge": judge_block,
         "nn_features": {
-            "enabled": bool(
-                (nn_features_cfg or {}).get("enabled", False)
-            ),
+            # ``enabled`` reflects the checkpoint's verdict so the runtime
+            # cannot diverge from the trained head's expectations.
+            "enabled": bool(ckpt_uses_nn),
             "k": int((nn_features_cfg or {}).get("k", 16)),
             "runtime_k": int(
                 (nn_features_cfg or {}).get(
@@ -1894,7 +2017,9 @@ def export_run(
                 (nn_features_cfg or {}).get("similarity", "cosine")
             ),
             "feature_dim": int(
-                (nn_features_cfg or {}).get("feature_dim", 8)
+                (nn_features_cfg or {}).get(
+                    "feature_dim", ckpt_nn_feature_dim or 8
+                )
             ),
             "fallback_value": float(
                 (nn_features_cfg or {}).get("fallback_value", 0.0)
@@ -2015,17 +2140,42 @@ def bundle_training_cache(
 def make_submission_zip(
     submission_dir: str | os.PathLike[str] = "submission",
     zip_path: str | os.PathLike[str] = "submission.zip",
+    *,
+    max_zip_size_mb: float | None = 70.0,
 ) -> Path:
-    """Zip the submission folder. Returns the zip path."""
+    """Zip the submission folder. Returns the zip path.
+
+    ``max_zip_size_mb`` is a hard cap on the size of the resulting ZIP
+    (the file the user uploads to Codabench). If the produced ZIP would
+    exceed this, we delete it and raise -- silently shipping a 400 MB
+    bundle has burned us before. Pass ``None`` to disable the check.
+
+    Entry names are written with POSIX-style forward slashes so a Linux
+    ``unzip`` on the platform extracts them into the expected directory
+    layout (Windows' default writer would otherwise embed backslashes).
+    """
     sub = Path(submission_dir)
     zip_path = Path(zip_path)
     if zip_path.exists():
         zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(
+        zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    ) as zf:
         for path in sub.rglob("*"):
             if path.is_file():
-                zf.write(path, arcname=path.relative_to(sub))
-    LOG.info("Wrote %s", zip_path.resolve())
+                arc = path.relative_to(sub).as_posix()
+                zf.write(path, arcname=arc)
+    size_mb = zip_path.stat().st_size / (1024 * 1024)
+    LOG.info("Wrote %s  (%.2f MB)", zip_path.resolve(), size_mb)
+    if max_zip_size_mb is not None and size_mb > float(max_zip_size_mb):
+        zip_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"submission zip is {size_mb:.2f} MB, exceeds "
+            f"max_zip_size_mb={float(max_zip_size_mb):.0f} MB. "
+            "Drop the unused training cache, lower submission_cache.pca_dim, "
+            "or raise the cap explicitly in configs/default.yaml -> "
+            "submission.max_zip_size_mb."
+        )
     return zip_path
 
 
