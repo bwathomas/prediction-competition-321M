@@ -1419,25 +1419,33 @@ _ENCODER.eval().to(_DEVICE)
 _CKPT = torch.load(CKPT_PATH, map_location=_DEVICE)
 _MODEL_CFG: dict = dict(_CKPT["model_cfg"])
 
-# Repair the cluster-channel cfg shipped with older checkpoints: when
-# ``use_cluster_features=True`` and ``n_clusters > 0`` but the saved dict
-# is missing or has ``cluster_embed_dim<=0``, the trained channel would
-# silently no-op at runtime (``nn.Embedding`` is skipped, ids flow through
-# producing nothing). Coerce to the same default the trainer used so the
-# runtime matches the trained checkpoint.
+# The checkpoint's ``model_cfg`` is the single source of truth for the
+# trained architecture: every shape in ``model_state`` was emitted by
+# instantiating the model from exactly these dims. Mutating any of them
+# here -- including "repairs" that try to interpret zero/missing values
+# as defaults -- desynchronizes the constructed Module's parameter
+# shapes from the saved tensor shapes and crashes ``load_state_dict``.
+# Specifically: ``use_cluster_features=True`` together with
+# ``cluster_embed_dim=0`` is a *valid, intentional* configuration meaning
+# "no cluster embedding layer was trained" (the residual's input dim
+# was computed without the cluster channel). Coercing it to a nonzero
+# default at runtime would add a randomly-initialized embedding that
+# the residual was never trained against, *and* widen the residual's
+# expected input dim, producing exactly the
+# "Error(s) in loading state_dict ... size mismatch for residual.*"
+# failure mode at module init.
 if (
     _MODEL_CFG.get("use_cluster_features")
     and int(_MODEL_CFG.get("n_clusters", 0) or 0) > 0
     and int(_MODEL_CFG.get("cluster_embed_dim", 0) or 0) <= 0
 ):
-    LOG.warning(
-        "checkpoint model_cfg has use_cluster_features=True, n_clusters=%d, "
-        "cluster_embed_dim=%r; coercing cluster_embed_dim=16 so the runtime "
-        "matches the trained channel.",
+    LOG.info(
+        "checkpoint has use_cluster_features=True, n_clusters=%d, "
+        "cluster_embed_dim=%r -- preserving as-is (cluster channel was a "
+        "no-op at training time and must remain a no-op at inference).",
         int(_MODEL_CFG.get("n_clusters", 0) or 0),
         _MODEL_CFG.get("cluster_embed_dim"),
     )
-    _MODEL_CFG["cluster_embed_dim"] = 16
 
 _INDEXER: dict = dict(_CKPT["indexer"])
 _MODEL_NAME: str = META["model_name"]
