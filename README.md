@@ -359,6 +359,48 @@ encoder:
 Lighter encoders will also lower the head's ceiling; ~0.444 is specific to
 the Qwen3-Embedding-4B + judge + NN + IRT + gated-MLP stack.
 
+## Import a previously-built submission (skip retraining)
+
+If a Colab restart wipes your local `artifacts/` directory, you do not
+need to retrain to produce a working submission. Cell 17b in the notebook
+accepts a previously-exported `submission.zip` (uploaded to the Colab
+file browser, mounted from Drive, or sitting on local disk) and unpacks
+it into `submission/`. Cell 19 detects the imported bundle and short-
+circuits the export + cache rebuild; cell 20 (smoke test) runs against
+the imported submission unchanged.
+
+Two ways to point at the ZIP:
+
+```python
+# Cell 17b:
+IMPORT_SUBMISSION_PATH = "/content/drive/MyDrive/predcomp/submission.zip"
+
+# Or via env var (set this in cell 0 / above 17b):
+# %env IMPORT_SUBMISSION_PATH=/content/drive/MyDrive/predcomp/submission.zip
+```
+
+To also surface the imported checkpoint as a regular row in `runs_df`
+(useful when seeding a fresh LoRA pass from a previously-trained head),
+set `IMPORT_AS_RUN = True` in the same cell. That re-materializes the
+checkpoint into `artifacts/checkpoints/{run_id}_imported.pt` so the LoRA
+cell's `base_checkpoint` resolver and the cell-18 selector pick it up
+automatically.
+
+For programmatic use outside the notebook:
+
+```python
+from src.submission_import import import_submission, materialize_as_run
+
+imported = import_submission(
+    src="/path/to/submission.zip",
+    out_dir="submission",          # extracts here, ready for smoke test
+)
+print(imported.run_id, imported.best_val_log_loss)
+
+# (Optional) make it visible to cell 13 / 13-LoRA / 18 as if freshly trained:
+row = materialize_as_run(imported, checkpoints_dir="artifacts/checkpoints")
+```
+
 ## Submission contract
 
 The exported `submission/model.py`:
