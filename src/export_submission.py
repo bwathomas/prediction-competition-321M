@@ -1509,8 +1509,23 @@ def _enqueue_for_batch(
     surfaces. Duplicate (item, subject, judge-pair) keys are deduped against
     both the per-round queue *and* the persistent in-memory caches, so we
     never enqueue work that's already done.
+
+    CRITICAL: every value used to build a cache key here must be passed
+    through the same normalization that ``_predict_uncalibrated`` will
+    apply at lookup time. Otherwise the flush populates keys built from
+    raw inputs while predict() looks up keys built from normalized
+    inputs, every lookup misses, and the runtime falls back to the
+    legacy bs=1 forward path -- the speedup silently does not
+    materialize. ``condition`` is the one field that actually changes
+    under normalization (``"none" -> "none"``, ``"None" -> "none"``,
+    ``"" -> "none"``, ``"nan" -> "none"``, ...); the others are passed
+    through ``str(... or "")`` on both sides, which is idempotent.
     """
     global _FLUSHED
+    benchmark = str(benchmark or "")
+    condition = normalize_condition(condition)
+    subject_content = str(subject_content or "")
+    item_content = str(item_content or "")
     item_key = stable_sha256(benchmark, condition, item_content)
     if (
         item_key not in _ITEM_PENDING_KEYS

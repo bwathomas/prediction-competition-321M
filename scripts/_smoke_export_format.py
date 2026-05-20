@@ -82,4 +82,34 @@ m = re.search(
 assert m and int(m.group(1)) == 16, "encoder runtime batch default not 16"
 print(f"[OK] ENCODER_RUNTIME_BATCH_SIZE defaults to {m.group(1)}")
 
+# 8. Critical invariant: both ``_enqueue_for_batch`` and
+#    ``_predict_uncalibrated`` must apply ``normalize_condition`` *before*
+#    computing any cache key. Otherwise the flush populates raw-condition
+#    keys while predict() looks up normalized-condition keys, every
+#    lookup misses, and the runtime silently falls back to the bs=1
+#    forward path -- the speedup does not materialize. This is the bug
+#    that caused submission_judge_batched.zip to run as slowly as the
+#    unbatched version on Codabench.
+for fn_name in ("_enqueue_for_batch", "_predict_uncalibrated"):
+    body_match = re.search(
+        rf"def {re.escape(fn_name)}\([^)]*\)[^:]*:\n(.+?)\n(?:def |class )",
+        ES._RUNTIME_MODEL_PY,
+        flags=re.DOTALL,
+    )
+    assert body_match, f"could not locate {fn_name} body in runtime template"
+    body = body_match.group(1)
+    normalize_idx = body.find("normalize_condition(")
+    sha_idx = body.find("stable_sha256(")
+    assert normalize_idx >= 0, (
+        f"{fn_name} does not call normalize_condition -- cache keys will "
+        f"diverge from the enqueue side. See "
+        f"'the speedup did not actualize' regression."
+    )
+    assert 0 <= normalize_idx < sha_idx or sha_idx < 0, (
+        f"{fn_name} calls stable_sha256 BEFORE normalize_condition -- "
+        f"cache key is built from raw condition. See "
+        f"'the speedup did not actualize' regression."
+    )
+    print(f"[OK] {fn_name} normalizes condition before any stable_sha256 call")
+
 print("\nAll checks passed.")
