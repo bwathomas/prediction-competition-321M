@@ -696,6 +696,19 @@ USE_POOL_FEATURES = bool(ITEM_FEATURES_CFG.get("use_pool", True))
 USE_CLUSTER_FEATURES = bool(ITEM_FEATURES_CFG.get("use_clusters", True))
 POOL_FEATURE_DIM = int(ITEM_FEATURES_CFG.get("pool_feature_dim", len(POOL_FEATURE_NAMES)))
 CLUSTER_EMBED_DIM = int(ITEM_FEATURES_CFG.get("cluster_embed_dim", 16))
+# Guard against the contradictory `use_clusters=True, cluster_embed_dim=0`
+# state -- which would otherwise propagate into ModelConfig and silently
+# disable the cluster channel (has_cluster_embedding requires dim > 0)
+# while still printing `use_cluster_features: True, n_clusters: 64` in the
+# run banner. Coerce to the configs/default.yaml default so the channel
+# actually trains.
+if USE_CLUSTER_FEATURES and CLUSTER_EMBED_DIM <= 0:
+    print(
+        f"WARN: item_features.cluster_embed_dim={CLUSTER_EMBED_DIM} but "
+        "use_clusters=True; coercing CLUSTER_EMBED_DIM=16 so the cluster "
+        "channel is actually live."
+    )
+    CLUSTER_EMBED_DIM = 16
 POOL_FEATURES_DIR = ROOT / ITEM_FEATURES_CFG.get("cache_dir", "artifacts/item_features")
 POOL_FEATURES_PATH = POOL_FEATURES_DIR / "pool_features.parquet"
 POOL_STATS_PATH = POOL_FEATURES_DIR / "pool_features_stats.json"

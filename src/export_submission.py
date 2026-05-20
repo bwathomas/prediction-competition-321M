@@ -1348,6 +1348,27 @@ _ENCODER.eval().to(_DEVICE)
 
 _CKPT = torch.load(CKPT_PATH, map_location=_DEVICE)
 _MODEL_CFG: dict = dict(_CKPT["model_cfg"])
+
+# Repair the cluster-channel cfg shipped with older checkpoints: when
+# ``use_cluster_features=True`` and ``n_clusters > 0`` but the saved dict
+# is missing or has ``cluster_embed_dim<=0``, the trained channel would
+# silently no-op at runtime (``nn.Embedding`` is skipped, ids flow through
+# producing nothing). Coerce to the same default the trainer used so the
+# runtime matches the trained checkpoint.
+if (
+    _MODEL_CFG.get("use_cluster_features")
+    and int(_MODEL_CFG.get("n_clusters", 0) or 0) > 0
+    and int(_MODEL_CFG.get("cluster_embed_dim", 0) or 0) <= 0
+):
+    LOG.warning(
+        "checkpoint model_cfg has use_cluster_features=True, n_clusters=%d, "
+        "cluster_embed_dim=%r; coercing cluster_embed_dim=16 so the runtime "
+        "matches the trained channel.",
+        int(_MODEL_CFG.get("n_clusters", 0) or 0),
+        _MODEL_CFG.get("cluster_embed_dim"),
+    )
+    _MODEL_CFG["cluster_embed_dim"] = 16
+
 _INDEXER: dict = dict(_CKPT["indexer"])
 _MODEL_NAME: str = META["model_name"]
 _SUBJECT_TO_ID: dict = dict(_INDEXER["subject_to_id"])
@@ -1829,6 +1850,27 @@ def export_run(
             f"export_run: could not read checkpoint {ckpt_src} to verify model_cfg: {exc}"
         ) from exc
     ckpt_model_cfg = dict(_ckpt.get("model_cfg") or {})
+
+    # Cluster-channel sanity: the trainer's ``ModelConfig.__post_init__`` would
+    # have repaired this in-process, but checkpoints saved before that fix
+    # can still ship ``use_cluster_features=True`` with ``cluster_embed_dim=0``
+    # (a silent runtime no-op). Rewriting it here lets the rest of the
+    # export wire-up reason about the *trained* channel, not the broken dict.
+    if (
+        ckpt_model_cfg.get("use_cluster_features")
+        and int(ckpt_model_cfg.get("n_clusters", 0) or 0) > 0
+        and int(ckpt_model_cfg.get("cluster_embed_dim", 0) or 0) <= 0
+    ):
+        LOG.warning(
+            "export_run: checkpoint model_cfg has use_cluster_features=True, "
+            "n_clusters=%d, cluster_embed_dim=%r; coercing cluster_embed_dim=16 "
+            "to match configs/default.yaml so the runtime cluster channel is "
+            "actually live.",
+            int(ckpt_model_cfg.get("n_clusters", 0) or 0),
+            ckpt_model_cfg.get("cluster_embed_dim"),
+        )
+        ckpt_model_cfg["cluster_embed_dim"] = 16
+
     ckpt_uses_nn = bool(ckpt_model_cfg.get("use_nn_features", False))
     ckpt_uses_judge = bool(ckpt_model_cfg.get("use_judge_features", False))
     ckpt_nn_feature_dim = int(ckpt_model_cfg.get("nn_feature_dim", 0))

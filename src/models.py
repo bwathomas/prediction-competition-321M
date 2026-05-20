@@ -42,6 +42,7 @@ later LoRA-based encoder fine-tuning.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -49,6 +50,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# Default cluster-embedding width applied by ``ModelConfig.__post_init__``
+# when the cluster channel is enabled but the embedding dim is missing or
+# non-positive. Matches ``configs/default.yaml`` so checkpoints loaded with
+# the old (cluster_embed_dim=0) dataclass default no longer silently
+# degrade into a zero-width ``nn.Embedding(n_clusters, 0)`` no-op.
+DEFAULT_CLUSTER_EMBED_DIM: int = 16
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +116,34 @@ class ModelConfig:
     # the exact ordering.
     use_nn_features: bool = False
     nn_feature_dim: int = 8
+
+    def __post_init__(self) -> None:
+        # Repair the cluster channel when the caller (or an old checkpoint
+        # whose ``model_cfg`` dict predates the ``cluster_embed_dim`` field)
+        # left the dataclass in the contradictory ``use_cluster_features=True,
+        # n_clusters > 0, cluster_embed_dim == 0`` state.
+        #
+        # Without this, ``has_cluster_embedding`` evaluates to False, the
+        # cluster ``nn.Embedding`` is never built, and the cluster ids flow
+        # through forward() contributing nothing -- a silent no-op that
+        # shows up as ``cluster_embed_dim: 0`` in the printed config while
+        # ``use_cluster_features: True`` and ``n_clusters: 64``. We restore
+        # the configured default (matches ``configs/default.yaml``) and
+        # warn loudly so the run still trains a real cluster channel.
+        if (
+            self.use_cluster_features
+            and int(self.n_clusters) > 0
+            and int(self.cluster_embed_dim) <= 0
+        ):
+            warnings.warn(
+                "ModelConfig: use_cluster_features=True with n_clusters="
+                f"{int(self.n_clusters)} but cluster_embed_dim="
+                f"{int(self.cluster_embed_dim)}; coercing cluster_embed_dim "
+                f"to {DEFAULT_CLUSTER_EMBED_DIM} so the cluster channel is "
+                "actually live (was a silent no-op before).",
+                stacklevel=2,
+            )
+            self.cluster_embed_dim = int(DEFAULT_CLUSTER_EMBED_DIM)
 
     @property
     def use_subject_embed_features(self) -> bool:
