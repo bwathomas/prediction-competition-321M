@@ -327,6 +327,31 @@ def _cached_artifacts_match(
     return all(str(k) in assignments for k in item_keys)
 
 
+def try_load_cached_clusters(
+    *,
+    centroids_path: Path,
+    assignments_path: Path,
+    k: int,
+    d: int,
+    item_keys: Sequence[str],
+) -> tuple[np.ndarray, dict[str, int]] | None:
+    """Return ``(centroids, assignments)`` iff the on-disk cache is reusable.
+
+    Cheap counterpart to :func:`fit_and_assign` that lets callers (e.g. the
+    notebook) skip building the expensive ``[N, d]`` item-embedding matrix
+    whenever the cache is going to hit. Returns ``None`` when either
+    artifact is missing or its shape / key set drifted from this call's
+    parameters.
+    """
+    centroids = load_centroids(centroids_path)
+    assignments = load_assignments(assignments_path)
+    if _cached_artifacts_match(
+        centroids, assignments, k=int(k), d=int(d), item_keys=item_keys
+    ):
+        return centroids, assignments  # type: ignore[return-value]
+    return None
+
+
 # Convenience wrapper --------------------------------------------------------
 
 
@@ -452,4 +477,5 @@ __all__ = [
     "load_centroids",
     "save_assignments",
     "save_centroids",
+    "try_load_cached_clusters",
 ]

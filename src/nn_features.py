@@ -338,6 +338,25 @@ class TrainingNNIndex:
             return None
         return cls.load(out_dir, cfg)
 
+    @classmethod
+    def try_load_existing(
+        cls,
+        out_dir: Path,
+        cfg: NNFeaturesConfig,
+        item_keys: Sequence[str],
+    ) -> "TrainingNNIndex | None":
+        """Public cache-only loader. Returns ``None`` if no matching index.
+
+        Use this when the caller already has cached NN feature matrices on
+        disk and only needs the index for downstream sanity checks. Unlike
+        :meth:`build_from_lookup`, this never falls through to a rebuild --
+        it simply returns ``None`` if anything about the cached files does
+        not match (keys, similarity, missing files).
+        """
+        return cls._maybe_load_existing(
+            Path(out_dir), cfg, [str(k) for k in item_keys]
+        )
+
     # --------------------------------------------------------------- backend
 
     def _try_build_faiss(self, out_dir: Path) -> None:
