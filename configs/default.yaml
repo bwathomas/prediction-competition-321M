@@ -203,8 +203,95 @@ train:
   irt_reg:
     lambda_beta: 1.0e-4
     lambda_alpha: 1.0e-4
-  # Future hook: fine-tune the encoder with LoRA. Not implemented in v1.
-  enable_lora: false
+
+# ----------------------------------------------------------------------------
+# LoRA fine-tuning of the item-side encoder (optional, opt-in)
+#
+# When ``enabled: true`` the pipeline runs an overnight-safe second training
+# pass that unfreezes the encoder via PEFT LoRA adapters in the attention
+# projections, and trains them jointly with the existing head. The encoder
+# embedding cache is not used by this loop -- every step forwards raw item
+# tokens through the adapter-augmented encoder -- but the judge / NN /
+# cluster / pool features remain frozen inputs (they were computed against
+# the original frozen embeddings on purpose).
+#
+# Subjects stay cached lookups. We only LoRA-affect items.
+#
+# Step-level checkpointing to Drive: a Colab disconnect can cost at most
+# ``checkpoint_every_steps`` of work. Validate the first eval (step 1000 by
+# default) before trusting the run overnight -- if item-cold-start NLL has
+# regressed from the base checkpoint, kill and lower ``encoder_lr``.
+# ----------------------------------------------------------------------------
+lora:
+  enabled: false                       # master switch; false = current behavior
+  # Path to the head-only checkpoint to initialize from. ``null`` =
+  # auto-pick the best run by item-cold-start val log-loss from the current
+  # ``ALL_RUNS`` table (typically kfactor_irt_item_gated_mlp_k16_seed0_full).
+  base_checkpoint: null
+  # Adapter geometry. r=16 is the standard "moderate" rank; alpha/r=2 is the
+  # PEFT default scaling. Target the attention projections (q/k/v/o) which
+  # together carry the bulk of the encoder's expressive power.
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  # null = transform all layers; or e.g. [14,15,...,35] for late layers only.
+  # Restricting to late layers is a memory / overfitting escape valve.
+  layers_to_transform: null
+  gradient_checkpointing: true
+  # Two-group optimizer: encoder LR is ~100x smaller because the adapters
+  # are training from scratch but the head is already trained and should
+  # fine-tune gently around its optimum.
+  encoder_lr: 5.0e-6
+  head_lr: 5.0e-4
+  weight_decay_head: 0.01
+  epochs: 1
+  # Item-batch size at the *raw text* level. Effective item batch =
+  # batch_size_items * grad_accum_steps. Encoder fwd/bwd dominates GPU
+  # memory; halve and double respectively if it OOMs.
+  batch_size_items: 8
+  grad_accum_steps: 4
+  max_length: 1024
+  warmup_steps: 50
+  bf16: true
+  # Optional: cap optimizer state for the LoRA encoder via 8-bit AdamW
+  # (bitsandbytes). Default false; flip on if optimizer memory is tight.
+  use_8bit_optimizer: false
+  # ---- Overnight safety -------------------------------------------------
+  # Atomically save adapter + head + optimizer + RNG state to Drive every
+  # N steps. A Colab disconnect should cost no more than N steps of work.
+  checkpoint_every_steps: 200
+  # Run item-cold-start validation every N steps. Validation forwards val
+  # items through the CURRENT adapter state, not cached frozen embeddings.
+  eval_every_steps: 1000
+  drive_checkpoint_dir: "/content/drive/MyDrive/prediction-competition-321M/lora_ckpt"
+  keep_last_n_checkpoints: 3
+  resume: true                         # auto-resume from latest Drive checkpoint
+  # Hard runtime ceiling. We force a checkpoint and exit cleanly before
+  # exceeding this, so re-running the cell after a disconnect picks up
+  # where it left off. Set to 0 to disable the cap.
+  max_runtime_minutes: 600
+  # Verify step-0 val NLL matches the base checkpoint within ``init_check_tol``.
+  # Adapters initialize to zero contribution (PEFT default), so the assertion
+  # is a structural wiring check, not a tolerance knob you should loosen.
+  init_check_tol: 1.0e-3
+  # Per-step microbatch for the val pass. Smaller than the train item batch
+  # because val also forwards through the encoder (no cache).
+  val_batch_size_items: 16
+  # OOM-resilient fallback. If the train forward OOMs at the configured
+  # ``batch_size_items``, halve and double ``grad_accum_steps`` once
+  # automatically before giving up.
+  oom_fallback: true
+  # ---- Submission export ------------------------------------------------
+  # ``adapter_only`` (default): ship the tiny LoRA adapter inside the
+  #   submission ZIP and apply it to the stock encoder at runtime. Adds a
+  #   ``peft`` runtime dependency but the bundle stays self-contained.
+  # ``hf_upload``: merge adapter into a private HF repo and reference that
+  #   repo from ``models.txt``. Requires a writable HF token.
+  export_mode: "adapter_only"
+  # HF repo id to push the merged encoder to when ``export_mode = "hf_upload"``.
+  # Ignored otherwise. ``{user}`` is replaced with the resolved HF username.
+  hf_upload_repo: "{user}/qwen3-embedding-4b-lora-merged"
 
 # ----------------------------------------------------------------------------
 # LLM-as-judge (local HF model that scores P(correct) per (subject, item))

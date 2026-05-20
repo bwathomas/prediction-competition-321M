@@ -27,6 +27,15 @@ safetensors>=0.4
 sentencepiece>=0.2
 tokenizers>=0.19
 
+# Parameter-efficient fine-tuning (LoRA on the item-side encoder; optional)
+#
+# Only imported when `lora.enabled = true` in configs/default.yaml. The
+# frozen-encoder / head-only training path does not touch peft at all, so
+# pipelines that never run the LoRA cell will not pull a runtime cost from
+# this dependency. The submission runtime also imports peft only when an
+# adapter is bundled (`lora.export_mode = "adapter_only"`).
+peft>=0.10
+
 # NOTE on Flash Attention 2: do NOT list `flash-attn` here. The PyPI package
 # defaults to building from source via nvcc which takes 20-40 minutes on
 # Colab and frequently OOMs. Install it separately via the notebook's

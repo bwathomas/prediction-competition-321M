@@ -170,6 +170,87 @@ def main() -> int:
     judge_ship_at_runtime = bool(judge_block.get("ship_at_runtime", True))
     judge_id = str(judge_block.get("model_id", ""))
 
+    # --- LoRA bundle cross-check -----------------------------------------
+    # The submission declares its LoRA mode in runtime_meta.json under "lora".
+    # For ``adapter_only`` we must see a non-empty ``lora_adapter/`` dir AND a
+    # ``peft`` line in requirements.txt; for ``hf_upload`` the merged-encoder
+    # repo must be the first models.txt entry; for ``none``/missing the
+    # bundle must not ship an adapter dir at all (would silently change
+    # predictions on platforms that auto-install peft).
+    lora_block = dict(meta.get("lora") or {})
+    lora_mode = str(lora_block.get("mode", "none"))
+    lora_violations: list[str] = []
+    lora_note = "skipped (no lora block in runtime_meta)"
+    if lora_mode == "adapter_only":
+        adapter_dir = submission_dir / str(
+            lora_block.get("adapter_rel_path", "lora_adapter")
+        )
+        adapter_cfg = adapter_dir / "adapter_config.json"
+        adapter_weights_candidates = [
+            adapter_dir / "adapter_model.safetensors",
+            adapter_dir / "adapter_model.bin",
+        ]
+        if not adapter_dir.is_dir():
+            lora_violations.append(
+                f"lora.mode=adapter_only but {adapter_dir} is missing"
+            )
+        elif not adapter_cfg.exists():
+            lora_violations.append(
+                f"lora.mode=adapter_only but {adapter_cfg} is missing"
+            )
+        elif not any(p.exists() for p in adapter_weights_candidates):
+            lora_violations.append(
+                f"lora.mode=adapter_only but no adapter_model.{{safetensors,bin}} "
+                f"found under {adapter_dir}"
+            )
+        req = submission_dir / "requirements.txt"
+        req_txt = req.read_text(encoding="utf-8") if req.exists() else ""
+        if "peft" not in req_txt:
+            lora_violations.append(
+                "lora.mode=adapter_only but requirements.txt has no 'peft' line; "
+                "the runtime cannot merge the adapter and would silently fall "
+                "back to the base encoder."
+            )
+        adapter_size = (
+            sum(p.stat().st_size for p in adapter_dir.rglob("*") if p.is_file())
+            / (1024 * 1024)
+            if adapter_dir.is_dir()
+            else 0.0
+        )
+        lora_note = (
+            f"mode=adapter_only adapter_dir={adapter_dir.name} "
+            f"size={adapter_size:.2f}MB r={lora_block.get('r')} "
+            f"alpha={lora_block.get('alpha')}"
+        )
+    elif lora_mode == "hf_upload":
+        merged_repo = str(lora_block.get("merged_encoder_repo", ""))
+        if not merged_repo:
+            lora_violations.append(
+                "lora.mode=hf_upload but merged_encoder_repo is empty"
+            )
+        elif not declared or declared[0] != merged_repo:
+            lora_violations.append(
+                f"lora.mode=hf_upload but models.txt[0]={declared[:1]!r} "
+                f"!= merged_encoder_repo={merged_repo!r}"
+            )
+        if (submission_dir / "lora_adapter").exists():
+            lora_violations.append(
+                "lora.mode=hf_upload but a lora_adapter/ dir was bundled "
+                "anyway -- this is wasted space and confusing; drop one."
+            )
+        lora_note = f"mode=hf_upload merged_repo={merged_repo}"
+    elif lora_mode in ("none", ""):
+        # Defensive: a 'none' submission must not accidentally ship an adapter.
+        if (submission_dir / "lora_adapter").exists():
+            lora_violations.append(
+                "lora.mode=none but lora_adapter/ is present; either set the "
+                "export mode to adapter_only or drop the adapter from the "
+                "bundle."
+            )
+        lora_note = "mode=none"
+    else:
+        lora_violations.append(f"unknown lora.mode={lora_mode!r}")
+
     models_txt_violations: list[str] = []
     if encoder_id and encoder_id not in declared:
         models_txt_violations.append(
@@ -185,16 +266,39 @@ def main() -> int:
     print(f"judge.enabled       : {judge_enabled}")
     print(f"judge.ship_at_runtime: {judge_ship_at_runtime}")
     print(f"judge.model_id      : {judge_id}")
+    print(f"lora                : {lora_note}")
     for v in models_txt_violations:
         print(f"  models.txt FAIL   : {v}")
+    for v in lora_violations:
+        print(f"  lora FAIL         : {v}")
 
     captured = io.StringIO()
+    init_t0 = time.time()
     with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
         model_module = _load_submission_module(submission_dir)
+    init_secs = time.time() - init_t0
     init_log = captured.getvalue()
     print("--- module init log (first 600 chars) ---")
     print(init_log[:600])
     print("--- end module init log ---")
+    print(f"module import elapsed: {init_secs:.1f}s")
+
+    # If we bundled a LoRA adapter, the runtime model module is supposed to
+    # log a one-line "LoRA adapter merged" message during import. Surface
+    # that explicitly so a silent skip (peft missing, adapter dir wrong)
+    # cannot pass the smoke test unnoticed.
+    if lora_mode == "adapter_only":
+        merged_ok = "LoRA adapter merged" in init_log
+        if not merged_ok:
+            lora_violations.append(
+                "lora.mode=adapter_only but the runtime did NOT log "
+                "'LoRA adapter merged' during import -- the adapter was "
+                "almost certainly not applied. Predictions will reflect "
+                "the un-fine-tuned encoder."
+            )
+            print("  lora FAIL         : adapter merge log line not seen at import")
+        else:
+            print("  lora OK           : adapter merged at module import")
 
     if not hasattr(model_module, "predict"):
         print("FAIL: submission has no predict()")
@@ -391,6 +495,7 @@ def main() -> int:
         (not bad)
         and (not leak_flags)
         and (not models_txt_violations)
+        and (not lora_violations)
         and cache_check_ok
         and nn_ok
     )

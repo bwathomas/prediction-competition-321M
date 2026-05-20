@@ -82,6 +82,50 @@ CLUSTER_CENTROIDS_PATH = ARTIFACTS / "cluster_centroids.npy"
 TRAINING_CACHE_DIR = HERE / "cache"
 EPS = 1e-6
 
+# Stand-in for stdout logging when the platform doesn't surface it. Writes
+# a single JSON document to ``artifacts/runtime_progress.json`` that the
+# user can read via Codabench's output / artifact view after the round
+# finishes (or, if the platform surfaces in-flight artifacts, mid-run).
+# Every milestone overwrites the file atomically so the freshest state is
+# always available -- the document is small enough that this is cheap.
+RUNTIME_PROGRESS_PATH = ARTIFACTS / "runtime_progress.json"
+_PROGRESS_T0 = time.time()
+_PROGRESS_STATE: dict = {
+    "events": [],
+    "started_at": _PROGRESS_T0,
+}
+
+
+def _write_progress(stage: str, **info) -> None:
+    """Append a milestone to ``artifacts/runtime_progress.json``.
+
+    Safe to call repeatedly and from any code path. Never raises.
+    The file is rewritten atomically (write to a sibling then rename) so
+    a reader never sees a half-written JSON document.
+    """
+    try:
+        ev = {
+            "stage": stage,
+            "t_since_start_s": round(time.time() - _PROGRESS_T0, 3),
+            **info,
+        }
+        _PROGRESS_STATE["events"].append(ev)
+        _PROGRESS_STATE["latest"] = ev
+        # Also emit to stdout with flush so any platform that *does* surface
+        # stdout sees the same milestones in real time.
+        try:
+            print(f"[runtime] {stage} {info}", flush=True)
+        except Exception:
+            pass
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        tmp = RUNTIME_PROGRESS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(_PROGRESS_STATE, indent=2, default=str), encoding="utf-8"
+        )
+        tmp.replace(RUNTIME_PROGRESS_PATH)
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # Load runtime metadata (text template, encoder id, calibrator stub, etc.)
 # ---------------------------------------------------------------------------
@@ -143,14 +187,24 @@ JUDGE_NO_TOKENS: tuple = tuple(
     JUDGE_META.get("no_tokens", (" no", "no", " No", "No"))
 )
 JUDGE_SUFFIX_RESERVE_TOKENS: int = int(JUDGE_META.get("suffix_reserve_tokens", 256))
-# Per-round runtime batch sizes. Both default to 16 (safe on a 24 GB L4 with
-# two 4B-param bf16 models resident); raise via runtime_meta.json for bigger
-# tiers. Without batching the runtime takes ~5-10 hours on L4 for the active
-# 5,000-variant hidden sample -- the handbook explicitly recommends buffering
-# inputs on a module-level queue and flushing a batched forward pass.
-JUDGE_RUNTIME_BATCH_SIZE: int = int(JUDGE_META.get("runtime_batch_size", 16))
+# Per-round runtime batch sizes. The defaults assume the *encoder is evicted
+# from VRAM after the encoder phase of the flush*, freeing ~8 GB on L4 for
+# judge activations -- without that eviction the judge has to fit alongside
+# the encoder and is capped at bs=16 (a 2x slowdown on the dominant cost).
+# Override either knob via ``runtime_meta.json`` for larger/smaller tiers.
+JUDGE_RUNTIME_BATCH_SIZE: int = int(JUDGE_META.get("runtime_batch_size", 32))
 ENCODER_RUNTIME_BATCH_SIZE: int = int(
-    META.get("encoder_runtime_batch_size", 16)
+    META.get("encoder_runtime_batch_size", 32)
+)
+# Free the encoder model from GPU memory after the encoder phase of the
+# flush has populated _ITEM_EMB_CACHE / _SUBJECT_EMB_CACHE. The cache lives
+# on CPU as numpy arrays, so every subsequent predict() still hits it
+# without needing the encoder loaded. Disable via ``runtime_meta.json``
+# (``free_encoder_after_flush: false``) if a future runtime architecture
+# needs the encoder available beyond the flush (e.g. on-demand
+# embedding of items that weren't queued during acquisition).
+FREE_ENCODER_AFTER_FLUSH: bool = bool(
+    META.get("free_encoder_after_flush", True)
 )
 
 # NN feature schema. Must match src/nn_features.py exactly -- the runtime
@@ -166,6 +220,19 @@ NN_FALLBACK_VALUE: float = float(NN_META.get("fallback_value", 0.0))
 NN_TOP1_MISSING_SENTINEL: float = float(
     NN_META.get("top1_missing_sentinel", -1.0)
 )
+
+# LoRA adapter wiring. When ``LORA_META["mode"] == "adapter_only"`` we ship
+# the tiny PEFT adapter inside the bundle and merge it onto the stock
+# encoder at module import time. ``"hf_upload"`` mode ships nothing extra
+# here (the merged encoder is referenced from models.txt). ``"none"`` (or
+# missing) means the encoder is the stock frozen-cache encoder.
+#
+# We merge ONCE at import (``merge_and_unload``) so per-call ``predict()``
+# cost is identical to the non-LoRA submission.
+LORA_META: dict = dict(META.get("lora") or {})
+LORA_MODE: str = str(LORA_META.get("mode", "none"))
+LORA_ADAPTER_REL_PATH: str = str(LORA_META.get("adapter_rel_path", "lora_adapter"))
+LORA_ADAPTER_DIR: Path = HERE / LORA_ADAPTER_REL_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -1209,23 +1276,41 @@ class _LLMJudgeRuntime:
             if (_DEVICE == "cuda" and torch.cuda.is_bf16_supported() and JUDGE_BF16)
             else torch.float32
         )
-        attn_kwargs: dict = {}
+        # Explicit fallback chain: ``flash_attention_2`` (~ 2x faster on L4 at
+        # seq=512) -> ``sdpa`` (PyTorch >= 2.1 builtin, ~ 1.3x faster than
+        # eager) -> default (no kwarg, lets transformers pick eager). Each
+        # attempt records the impl that finally loaded into
+        # ``self.attn_impl`` so the runtime-progress file can surface it for
+        # the user even when logs aren't visible.
+        attn_candidates: list[str | None] = []
         if JUDGE_USE_FLASH_ATTENTION and _DEVICE == "cuda":
-            attn_kwargs["attn_implementation"] = "flash_attention_2"
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                cache_dir=_CACHE_DIR,
-                torch_dtype=dtype,
-                local_files_only=True,
-                **attn_kwargs,
-            )
-        except (ImportError, ValueError, RuntimeError):
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                cache_dir=_CACHE_DIR,
-                torch_dtype=dtype,
-                local_files_only=True,
+            attn_candidates.append("flash_attention_2")
+        if _DEVICE == "cuda":
+            attn_candidates.append("sdpa")
+        attn_candidates.append(None)
+        self.attn_impl = "unknown"
+        last_exc: Exception | None = None
+        for impl in attn_candidates:
+            try:
+                kwargs: dict = {}
+                if impl is not None:
+                    kwargs["attn_implementation"] = impl
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    cache_dir=_CACHE_DIR,
+                    torch_dtype=dtype,
+                    local_files_only=True,
+                    **kwargs,
+                )
+                self.attn_impl = impl or "eager"
+                break
+            except (ImportError, ValueError, RuntimeError) as exc:
+                last_exc = exc
+                continue
+        else:
+            raise RuntimeError(
+                f"Judge model load failed for every attention impl tried "
+                f"({attn_candidates}); last error: {last_exc!r}"
             )
         self.model.eval().to(_DEVICE)
 
@@ -1385,6 +1470,23 @@ if TRAINING_CACHE_DIR.exists() and (TRAINING_CACHE_DIR / "cache_meta.json").exis
 
 _t0 = time.time()
 LOG.info("Loading submission artifacts ...")
+_write_progress(
+    "module_init_start",
+    cuda_available=bool(torch.cuda.is_available()),
+    cuda_device_count=int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+    cuda_device_name=(
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    ),
+    cuda_total_vram_gb=(
+        round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 2)
+        if torch.cuda.is_available()
+        else 0.0
+    ),
+    judge_runtime_batch_size=int(JUDGE_RUNTIME_BATCH_SIZE),
+    encoder_runtime_batch_size=int(ENCODER_RUNTIME_BATCH_SIZE),
+    free_encoder_after_flush=bool(FREE_ENCODER_AFTER_FLUSH),
+    runtime_architecture=str(META.get("runtime_architecture", "(absent)")),
+)
 
 _CACHE_DIR = _resolve_cache_dir()
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1394,9 +1496,21 @@ if JUDGE_ENABLED and JUDGE_SHIP_AT_RUNTIME and JUDGE_MODEL_ID:
     try:
         JUDGE = _LLMJudgeRuntime(JUDGE_MODEL_ID)
         LOG.info("Loaded LLM-as-judge runtime: %s on %s", JUDGE_MODEL_ID, _DEVICE)
+        _write_progress(
+            "judge_loaded",
+            model_id=str(JUDGE_MODEL_ID),
+            device=_DEVICE,
+            attn_impl=getattr(JUDGE, "attn_impl", "unknown"),
+            dtype=str(next(JUDGE.model.parameters()).dtype),
+        )
     except Exception as exc:  # noqa: BLE001
         LOG.warning("Failed to load judge runtime (%s); falling back to zeros", exc)
         JUDGE = None
+        _write_progress(
+            "judge_load_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
 
 from transformers import AutoModel, AutoTokenizer
 
@@ -1415,6 +1529,57 @@ _ENCODER = AutoModel.from_pretrained(
     local_files_only=True,
 )
 _ENCODER.eval().to(_DEVICE)
+_write_progress(
+    "encoder_loaded",
+    model_id=str(ENCODER_ID),
+    device=_DEVICE,
+    dtype=str(_ENCODER_DTYPE),
+)
+
+# If the bundle includes a LoRA adapter, apply + merge it onto the stock
+# encoder ONCE at import time. After ``merge_and_unload`` the model has
+# the same shape and forward cost as the base encoder -- no per-call
+# slowdown vs. the non-LoRA submission. We never keep ``peft`` in
+# residence after the merge (it's unloaded with the adapter), so the
+# runtime memory profile is also unchanged.
+if LORA_MODE == "adapter_only" and LORA_ADAPTER_DIR.exists():
+    try:
+        from peft import PeftModel  # type: ignore
+
+        LOG.info(
+            "Applying LoRA adapter from %s and merging into base encoder",
+            LORA_ADAPTER_DIR,
+        )
+        _peft_encoder = PeftModel.from_pretrained(
+            _ENCODER,
+            str(LORA_ADAPTER_DIR),
+            is_trainable=False,
+        )
+        _ENCODER = _peft_encoder.merge_and_unload()
+        _ENCODER.eval().to(_DEVICE)
+        LOG.info("LoRA adapter merged into base encoder (merge_and_unload OK)")
+    except Exception as exc:  # noqa: BLE001
+        # Fail loud here: a silently-not-applied adapter would mean the
+        # runtime serves predictions from the un-fine-tuned encoder while
+        # the trained head expects fine-tuned features. Better to fail
+        # the entire submission than report wrong probabilities silently.
+        LOG.exception("LoRA adapter merge failed (%s)", exc)
+        raise RuntimeError(
+            f"LoRA adapter present at {LORA_ADAPTER_DIR} but merge failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+elif LORA_MODE == "adapter_only":
+    LOG.warning(
+        "runtime_meta.json declares lora.mode='adapter_only' but the "
+        "adapter dir %s is missing; serving the base encoder instead. "
+        "Predictions will be inconsistent with the trained head.",
+        LORA_ADAPTER_DIR,
+    )
+elif LORA_MODE == "hf_upload":
+    LOG.info(
+        "LoRA mode = hf_upload; expecting merged encoder under ENCODER_ID=%s",
+        ENCODER_ID,
+    )
 
 _CKPT = torch.load(CKPT_PATH, map_location=_DEVICE)
 _MODEL_CFG: dict = dict(_CKPT["model_cfg"])
@@ -1496,6 +1661,10 @@ _JUDGE_PENDING_KEYS: set[tuple[str, str]] = set()
 _FLUSHED: bool = True   # nothing pending at module init
 
 
+_FIRST_ACQ_LOGGED = False
+_ACQ_COUNT = 0
+
+
 def _enqueue_for_batch(
     *,
     benchmark: str,
@@ -1521,7 +1690,19 @@ def _enqueue_for_batch(
     ``"" -> "none"``, ``"nan" -> "none"``, ...); the others are passed
     through ``str(... or "")`` on both sides, which is idempotent.
     """
-    global _FLUSHED
+    global _FLUSHED, _FIRST_ACQ_LOGGED, _ACQ_COUNT
+    _ACQ_COUNT += 1
+    if not _FIRST_ACQ_LOGGED:
+        _FIRST_ACQ_LOGGED = True
+        _write_progress("acquisition_first_call")
+    elif _ACQ_COUNT % 5000 == 0:
+        _write_progress(
+            "acquisition_progress",
+            acq_count=int(_ACQ_COUNT),
+            items_pending=len(_ITEM_PENDING),
+            subjects_pending=len(_SUBJECT_PENDING),
+            judge_pending=len(_JUDGE_PENDING),
+        )
     benchmark = str(benchmark or "")
     condition = normalize_condition(condition)
     subject_content = str(subject_content or "")
@@ -1556,6 +1737,53 @@ def _enqueue_for_batch(
             _FLUSHED = False
 
 
+def _free_encoder_vram() -> None:
+    """Evict the encoder model from GPU memory.
+
+    Called once after the encoder phase of the flush has populated the
+    item / subject embedding caches. The caches live on CPU as numpy
+    arrays so every subsequent predict() still gets cache hits without
+    needing the encoder on-device. Freeing the encoder (~ 8 GB on a 4B
+    bf16 model) is the single biggest VRAM win available on L4 -- it
+    raises the judge's safe batch size from ~ 16 to ~ 32-48 because the
+    judge's activations no longer have to share VRAM with the encoder
+    weights, which roughly halves the judge phase wall time on a 50k+
+    candidate pool.
+    """
+    global _ENCODER, _TOKENIZER
+    try:
+        # Move to CPU first so the dispatch graph (if any) is torn down
+        # cleanly, then drop our references and ask CUDA to release the
+        # cached blocks.
+        if _ENCODER is not None:
+            try:
+                _ENCODER.to("cpu")
+            except Exception:
+                pass
+        _ENCODER = None  # type: ignore[assignment]
+        # Keep _TOKENIZER around: tiny, occasionally useful for diagnostics.
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        free_after_gb = (
+            round(torch.cuda.mem_get_info()[0] / (1024**3), 2)
+            if torch.cuda.is_available()
+            else None
+        )
+        _write_progress(
+            "encoder_evicted",
+            free_vram_gb_after=free_after_gb,
+        )
+    except Exception as exc:
+        _write_progress(
+            "encoder_evict_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+
+
 def _flush_pending_batches() -> None:
     """Drain all queued inputs into the per-content caches.
 
@@ -1563,13 +1791,33 @@ def _flush_pending_batches() -> None:
     expensive call is the very first ``predict()`` of the round, which
     absorbs the entire batched compute upfront so the remaining
     ``predict()`` calls are pure cache lookups.
+
+    Phases (each instrumented via ``_write_progress`` so the user can
+    see progress even when stdout is not surfaced by the platform):
+
+      1. encoder items   (batched encoder forward over unique items)
+      2. encoder subjects (only if ``use_subject_text_embedding=True``)
+      3. encoder eviction (free ~ 8 GB of L4 VRAM for judge activations)
+      4. judge pairs     (batched judge forward over unique pairs)
     """
     global _FLUSHED
     if _FLUSHED:
         return
-    t0 = time.time()
+    t_flush_start = time.time()
+    n_items_pending = len(_ITEM_PENDING)
+    n_subjects_pending = len(_SUBJECT_PENDING)
+    n_judge_pending = len(_JUDGE_PENDING)
+    _write_progress(
+        "flush_start",
+        n_items=n_items_pending,
+        n_subjects=n_subjects_pending,
+        n_judge_pairs=n_judge_pending,
+        encoder_batch=int(ENCODER_RUNTIME_BATCH_SIZE),
+        judge_batch=int(JUDGE_RUNTIME_BATCH_SIZE),
+    )
 
     if _ITEM_PENDING:
+        t = time.time()
         texts = [item_text_for(b, c, i) for (b, c, i) in _ITEM_PENDING]
         vecs = _embed_batch(texts)
         for (b, c, i), vec in zip(_ITEM_PENDING, vecs):
@@ -1577,10 +1825,17 @@ def _flush_pending_batches() -> None:
         n_items = len(_ITEM_PENDING)
         _ITEM_PENDING.clear()
         _ITEM_PENDING_KEYS.clear()
+        _write_progress(
+            "flush_items_done",
+            n_items=n_items,
+            phase_elapsed_s=round(time.time() - t, 3),
+            ms_per_item=round(1000.0 * (time.time() - t) / max(1, n_items), 2),
+        )
     else:
         n_items = 0
 
     if _SUBJECT_PENDING:
+        t = time.time()
         texts = [subject_text_for(s) for s in _SUBJECT_PENDING]
         vecs = _embed_batch(texts)
         for s, vec in zip(_SUBJECT_PENDING, vecs):
@@ -1588,10 +1843,25 @@ def _flush_pending_batches() -> None:
         n_subjects = len(_SUBJECT_PENDING)
         _SUBJECT_PENDING.clear()
         _SUBJECT_PENDING_KEYS.clear()
+        _write_progress(
+            "flush_subjects_done",
+            n_subjects=n_subjects,
+            phase_elapsed_s=round(time.time() - t, 3),
+        )
     else:
         n_subjects = 0
 
+    # Free the encoder before the judge phase so it can run with the full
+    # ~16 GB of L4 VRAM available for activations rather than the ~8 GB
+    # left over when both 4B-param models are co-resident. The encoder is
+    # never needed again within this round: every predict() lookup either
+    # cache-hits in ``_ITEM_EMB_CACHE`` (populated above) or, for a queue
+    # miss, falls back to ``DEFAULT_PROB`` via the existing try/except.
+    if FREE_ENCODER_AFTER_FLUSH:
+        _free_encoder_vram()
+
     if _JUDGE_PENDING and JUDGE is not None:
+        t = time.time()
         vecs = JUDGE.score_batch(_JUDGE_PENDING)
         for (b, c, s, i), vec in zip(_JUDGE_PENDING, vecs):
             key = (stable_sha256(s), stable_sha256(b, c, i))
@@ -1599,16 +1869,30 @@ def _flush_pending_batches() -> None:
         n_judge = len(_JUDGE_PENDING)
         _JUDGE_PENDING.clear()
         _JUDGE_PENDING_KEYS.clear()
+        _write_progress(
+            "flush_judge_done",
+            n_judge_pairs=n_judge,
+            phase_elapsed_s=round(time.time() - t, 3),
+            ms_per_pair=round(1000.0 * (time.time() - t) / max(1, n_judge), 2),
+        )
     else:
         n_judge = 0
 
     _FLUSHED = True
+    total_elapsed = time.time() - t_flush_start
     LOG.info(
         "Flushed batched queues: items=%d subjects=%d judge_pairs=%d in %.2fs",
         n_items,
         n_subjects,
         n_judge,
-        time.time() - t0,
+        total_elapsed,
+    )
+    _write_progress(
+        "flush_complete",
+        n_items=n_items,
+        n_subjects=n_subjects,
+        n_judge_pairs=n_judge,
+        total_elapsed_s=round(total_elapsed, 3),
     )
 
 
@@ -1620,6 +1904,17 @@ LOG.info(
     ENCODER_ID,
     _DEVICE,
     time.time() - _t0,
+)
+_write_progress(
+    "module_init_complete",
+    model_name=_MODEL_NAME,
+    n_subjects=len(_SUBJECT_TO_ID),
+    n_bc=len(_BC_TO_ID),
+    encoder=ENCODER_ID,
+    device=_DEVICE,
+    init_elapsed_s=round(time.time() - _t0, 3),
+    training_cache_loaded=bool(TRAINING_CACHE is not None),
+    judge_loaded=bool(JUDGE is not None),
 )
 
 
@@ -1643,6 +1938,17 @@ def _last_token_pool(last_hidden, attention_mask):
 
 
 def _embed_one(text: str) -> np.ndarray:
+    if _ENCODER is None:
+        # Encoder was freed after the batched-flush encoder phase (the
+        # ``FREE_ENCODER_AFTER_FLUSH`` path) and the caller is asking
+        # for an item that wasn't queued during acquisition. Return a
+        # zero vector with the expected dim; the residual was trained
+        # on real embeddings so this degrades quality, but it does not
+        # crash, and the trained IRT term still produces a usable
+        # prediction. The dim is read from _MODEL_CFG so we don't need
+        # the encoder loaded to know it.
+        dim = int(_MODEL_CFG.get("item_embed_dim", 0))
+        return np.zeros(dim, dtype=np.float32)
     enc = _TOKENIZER(
         [text],
         padding=True,
@@ -1677,6 +1983,12 @@ def _embed_batch(texts: list) -> list:
     """
     if not texts:
         return []
+    if _ENCODER is None:
+        # See ``_embed_one``: encoder was freed and the caller is asking
+        # for items not pre-queued during acquisition. Return zero
+        # vectors so the runtime stays alive.
+        dim = int(_MODEL_CFG.get("item_embed_dim", 0))
+        return [np.zeros(dim, dtype=np.float32) for _ in texts]
     out: list = [None] * len(texts)
     B = max(1, int(ENCODER_RUNTIME_BATCH_SIZE))
     for start in range(0, len(texts), B):
@@ -1935,14 +2247,30 @@ def _labeled_fingerprint(labeled: list[dict] | None) -> tuple:
     return tuple(sorted(out))
 
 
+_PREDICT_COUNT = 0
+_FIRST_PREDICT_LOGGED = False
+
+
 def predict(input: dict, labeled: list[dict] | None = None) -> float:
     """Return a native Python float in (0, 1)."""
     global _LAST_LABELED_FINGERPRINT, _CALIBRATOR
+    global _PREDICT_COUNT, _FIRST_PREDICT_LOGGED
     try:
         benchmark = str(input.get("benchmark", "") or "")
         condition = normalize_condition(input.get("condition", "none"))
         subject_content = str(input.get("subject_content", "") or "")
         item_content = str(input.get("item_content", "") or "")
+
+        if not _FIRST_PREDICT_LOGGED:
+            _FIRST_PREDICT_LOGGED = True
+            _write_progress(
+                "predict_first_call",
+                acq_total=int(_ACQ_COUNT),
+                items_queued=len(_ITEM_PENDING),
+                subjects_queued=len(_SUBJECT_PENDING),
+                judge_queued=len(_JUDGE_PENDING),
+                n_labeled=(len(labeled) if labeled else 0),
+            )
 
         # Lazy flush of anything queued by acquisition_function. The work
         # actually happens at most once per round -- on the very first
@@ -1956,6 +2284,10 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
                 _flush_pending_batches()
             except Exception:
                 LOG.exception("_flush_pending_batches failed; falling back to per-call inference")
+
+        _PREDICT_COUNT += 1
+        if _PREDICT_COUNT % 2000 == 0:
+            _write_progress("predict_progress", predict_count=int(_PREDICT_COUNT))
 
         cache_key = (
             stable_sha256(benchmark, condition, item_content),
@@ -2052,6 +2384,12 @@ faiss-cpu>=1.7.4
 """
 
 
+# When the bundle ships a LoRA adapter, the runtime needs `peft` to merge
+# it into the stock encoder at import time. We append this line to the
+# runtime requirements.txt only when ``lora.export_mode = "adapter_only"``.
+_RUNTIME_REQUIREMENTS_LORA_LINE = "peft>=0.10\n"
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -2071,6 +2409,9 @@ def export_run(
     training_cache_dir: str | os.PathLike[str] | None = None,
     judge_cfg: Mapping | None = None,
     nn_features_cfg: Mapping | None = None,
+    lora_cfg: Mapping | None = None,
+    lora_adapter_dir: str | os.PathLike[str] | None = None,
+    lora_head_checkpoint: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -2144,7 +2485,17 @@ def export_run(
         shutil.rmtree(sub)
     artifacts.mkdir(parents=True, exist_ok=True)
 
-    ckpt_src = Path(result.checkpoint_path)
+    # If the caller is exporting a LoRA run, ``lora_head_checkpoint`` is the
+    # head .pt the LoRA loop wrote (head + IRT + subject emb + feature
+    # consumer state dict) -- *not* the base head-only checkpoint. We need
+    # to ship THAT, not the pre-LoRA head, because the trained head was
+    # updated jointly with the adapter and the runtime must see the
+    # post-LoRA head weights to make consistent predictions.
+    ckpt_src = (
+        Path(lora_head_checkpoint)
+        if lora_head_checkpoint
+        else Path(result.checkpoint_path)
+    )
     if not ckpt_src.exists():
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_src}")
     shutil.copy2(ckpt_src, artifacts / "checkpoint.pt")
@@ -2279,12 +2630,20 @@ def export_run(
     # the *training-time* judge-scoring batch (default 256 on A100). The
     # *runtime* judge batch is a separate knob -- it gates the bs used
     # inside ``_LLMJudgeRuntime.score_batch`` at inference time on the
-    # platform's GPU, which is typically much smaller (L4: 24 GB). Default
-    # to 16 here and let callers override via ``judge_cfg["runtime_batch_size"]``.
+    # platform's GPU, which is typically much smaller (L4: 24 GB).
+    #
+    # The default of 32 assumes the runtime *evicts the encoder from VRAM
+    # after the encoder phase of the flush* (the
+    # ``FREE_ENCODER_AFTER_FLUSH`` path in the template), which frees the
+    # ~ 8 GB of weights the encoder was holding and leaves the judge with
+    # the full ~ 16 GB of L4 VRAM headroom for activations. With a
+    # co-resident encoder the safe ceiling is ~ 16, so override to 16
+    # via ``judge_cfg["runtime_batch_size"]`` if you disable encoder
+    # eviction in ``runtime_meta.json``.
     runtime_judge_bs = int(
         jcfg.get(
             "runtime_batch_size",
-            16 if int(jcfg.get("batch_size", 16) or 16) > 64 else jcfg.get("batch_size", 16),
+            32 if int(jcfg.get("batch_size", 32) or 32) > 64 else jcfg.get("batch_size", 32),
         )
     )
     judge_block = {
@@ -2324,29 +2683,147 @@ def export_run(
         "feature_in_residual": bool(jcfg.get("feature_in_residual", True)),
     }
 
+    # --- LoRA adapter / merged-encoder handling --------------------------
+    # Two supported export modes (set via ``lora_cfg.export_mode``):
+    #
+    # 1. ``adapter_only`` (default): copy the LoRA adapter dir into
+    #    ``submission/lora_adapter/`` and let the runtime apply +
+    #    merge_and_unload it onto the stock encoder at import. ``models.txt``
+    #    declares the stock encoder; ``requirements.txt`` declares ``peft``.
+    #    Net effect: tiny ZIP (~10-50 MB adapter), runtime is byte-equivalent
+    #    to having shipped the merged encoder. Self-contained, no HF auth.
+    #
+    # 2. ``hf_upload``: caller is responsible for uploading the merged
+    #    encoder to a private HF repo BEFORE running export_run; here we
+    #    just rewrite ENCODER_ID to point at that repo and leave the
+    #    runtime to load it like any other encoder. The bundle ships
+    #    nothing extra and ``peft`` is not required at runtime. Slightly
+    #    cleaner deployment but adds an external dependency (the repo).
+    lora_block: dict | None = None
+    lora_runtime_id_override: str | None = None
+    lora_extra_models: list[str] = []
+    lora_requirements_addendum = ""
+    if lora_cfg is not None:
+        mode = str(lora_cfg.get("export_mode", "adapter_only"))
+        if mode == "adapter_only":
+            if not lora_adapter_dir:
+                raise RuntimeError(
+                    "export_run: lora_cfg.export_mode='adapter_only' but no "
+                    "lora_adapter_dir was passed. Point it at the directory "
+                    "containing adapter_config.json + adapter weights "
+                    "(e.g. the LoRA run's `best/adapter/`)."
+                )
+            adapter_src = Path(lora_adapter_dir)
+            if not adapter_src.exists():
+                raise RuntimeError(
+                    f"export_run: lora_adapter_dir={adapter_src} does not exist"
+                )
+            adapter_dst = sub / "lora_adapter"
+            if adapter_dst.exists():
+                shutil.rmtree(adapter_dst)
+            shutil.copytree(adapter_src, adapter_dst)
+            adapter_size_mb = sum(
+                p.stat().st_size for p in adapter_dst.rglob("*") if p.is_file()
+            ) / (1024 * 1024)
+            LOG.info(
+                "Bundled LoRA adapter from %s -> %s (%.2f MB)",
+                adapter_src,
+                adapter_dst,
+                adapter_size_mb,
+            )
+            lora_block = {
+                "mode": "adapter_only",
+                "adapter_rel_path": "lora_adapter",
+                "adapter_size_mb": float(adapter_size_mb),
+                "base_encoder_model_id": str(encoder_cfg["model_id"]),
+                "r": int(lora_cfg.get("r", 16)),
+                "alpha": int(lora_cfg.get("alpha", 32)),
+                "target_modules": list(
+                    lora_cfg.get(
+                        "target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]
+                    )
+                ),
+                "layers_to_transform": (
+                    list(lora_cfg.get("layers_to_transform"))
+                    if lora_cfg.get("layers_to_transform")
+                    else None
+                ),
+            }
+            lora_requirements_addendum = _RUNTIME_REQUIREMENTS_LORA_LINE
+        elif mode == "hf_upload":
+            merged_repo = str(lora_cfg.get("hf_upload_repo") or "")
+            if not merged_repo or "{user}" in merged_repo:
+                raise RuntimeError(
+                    "export_run: lora_cfg.export_mode='hf_upload' requires "
+                    "lora_cfg.hf_upload_repo to be a resolved HF repo id "
+                    "(e.g. 'myuser/qwen3-embedding-4b-lora-merged'). The "
+                    "notebook is responsible for uploading the merged "
+                    "encoder to this repo BEFORE calling export_run."
+                )
+            lora_runtime_id_override = merged_repo
+            lora_extra_models = [merged_repo]
+            lora_block = {
+                "mode": "hf_upload",
+                "merged_encoder_repo": merged_repo,
+                "base_encoder_model_id": str(encoder_cfg["model_id"]),
+                "r": int(lora_cfg.get("r", 16)),
+                "alpha": int(lora_cfg.get("alpha", 32)),
+                "target_modules": list(
+                    lora_cfg.get(
+                        "target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]
+                    )
+                ),
+                "layers_to_transform": (
+                    list(lora_cfg.get("layers_to_transform"))
+                    if lora_cfg.get("layers_to_transform")
+                    else None
+                ),
+            }
+        elif mode in ("none", "disabled", ""):
+            lora_block = {"mode": "none"}
+        else:
+            raise ValueError(
+                f"export_run: unknown lora_cfg.export_mode={mode!r}; "
+                "expected 'adapter_only' | 'hf_upload' | 'none'."
+            )
+
     runtime_meta = {
         "run_id": result.run_id,
         "model_name": result.model_name,
         # Tag the shipped runtime architecture so future debug sessions can
         # tell at a glance which inference plumbing this bundle uses.
         "runtime_architecture": "batched_flush_v1",
-        "encoder_model_id": encoder_cfg["model_id"],
+        "encoder_model_id": (
+            lora_runtime_id_override or encoder_cfg["model_id"]
+        ),
         # The encoder side may have promoted max_length from config-null to a
         # data-driven cap. We persist the *effective* number so the runtime
         # tokenizes consistently with the offline cache.
         "max_length": int(encoder_cfg.get("max_length") or 512),
         # Per-batch size used by the runtime's ``_embed_batch`` flush path.
-        # Default 16 (safe on a 24 GB L4 with Qwen3-Embedding-4B bf16 + FA2
-        # while Qwen3-4B-Instruct is co-resident). Raise to 32+ on bigger
-        # tiers via ``encoder_cfg["runtime_batch_size"]`` or by editing the
-        # shipped runtime_meta.json before upload.
+        # Default 32 (safe on a 24 GB L4 with Qwen3-Embedding-4B bf16 + FA2
+        # because the encoder is the *only* model running during the
+        # encoder phase of the flush -- the judge's load hasn't yet
+        # produced any activations and the judge gets evicted/loaded
+        # transparently). Raise on bigger tiers via
+        # ``encoder_cfg["runtime_batch_size"]`` or by editing the
+        # shipped ``runtime_meta.json`` before upload.
         "encoder_runtime_batch_size": int(
             encoder_cfg.get(
                 "runtime_batch_size",
-                16
-                if int(encoder_cfg.get("batch_size", 16) or 16) > 64
-                else encoder_cfg.get("batch_size", 16),
+                32
+                if int(encoder_cfg.get("batch_size", 32) or 32) > 64
+                else encoder_cfg.get("batch_size", 32),
             )
+        ),
+        # Free the encoder model from VRAM after the encoder phase of
+        # the flush populates _ITEM_EMB_CACHE / _SUBJECT_EMB_CACHE.
+        # Frees ~ 8 GB on L4 so the judge phase can run at bs=32+ with
+        # comfortable activation headroom. Set to False only if the
+        # runtime architecture needs on-demand embedding inside predict()
+        # for items that weren't queued during acquisition.
+        "free_encoder_after_flush": bool(
+            encoder_cfg.get("free_encoder_after_flush", True)
         ),
         "pooling": encoder_cfg.get("pooling", "mean"),
         "use_contextual_item_text": bool(
@@ -2400,6 +2877,8 @@ def export_run(
             ),
         },
     }
+    if lora_block is not None:
+        runtime_meta["lora"] = lora_block
     (artifacts / "runtime_meta.json").write_text(
         json.dumps(runtime_meta, indent=2, default=str)
     )
@@ -2409,8 +2888,13 @@ def export_run(
         (sub / "labeling.py").write_text(_RUNTIME_LABELING_PY, encoding="utf-8")
 
     # models.txt: encoder first, then (optionally) the judge so the platform
-    # pre-fetches both. Caller-provided extras come last and are deduped.
-    declared = [encoder_cfg["model_id"]]
+    # pre-fetches both. ``hf_upload`` LoRA mode overrides the encoder id
+    # with the merged-encoder repo. Caller-provided extras come last and are
+    # deduped.
+    declared = [lora_runtime_id_override or encoder_cfg["model_id"]]
+    for m in lora_extra_models:
+        if m and m not in declared:
+            declared.append(m)
     if (
         judge_block["enabled"]
         and judge_block["ship_at_runtime"]
@@ -2423,7 +2907,9 @@ def export_run(
             if m and m not in declared:
                 declared.append(m)
     (sub / "models.txt").write_text("\n".join(declared) + "\n", encoding="utf-8")
-    (sub / "requirements.txt").write_text(_RUNTIME_REQUIREMENTS, encoding="utf-8")
+    (sub / "requirements.txt").write_text(
+        _RUNTIME_REQUIREMENTS + lora_requirements_addendum, encoding="utf-8"
+    )
 
     LOG.info(
         "Wrote submission to %s (declared models: %s)", sub.resolve(), declared

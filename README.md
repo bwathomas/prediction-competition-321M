@@ -1,43 +1,63 @@
-# A100 ablation pipeline -- Predictive AI Evaluation Challenge
+# Predictive AI Evaluation Challenge -- A100 pipeline
 
-A reproducible, A100-oriented training pipeline that compares three models on
-the [aims-foundations/measurement-db](https://huggingface.co/datasets/aims-foundations/measurement-db)
+A reproducible, A100-oriented training pipeline for the
+[aims-foundations/measurement-db](https://huggingface.co/datasets/aims-foundations/measurement-db)
 dataset under **item cold-start validation** -- the regime the hosted
-Codabench platform actually scores against:
+Codabench platform actually scores against.
 
-1. **K-factor / neural-IRT** (`kfactor`)
-2. **K-factor + ordinary MLP residual** (`kfactor_mlp`)
-3. **K-factor + gated MLP / SwiGLU residual** (`kfactor_gated_mlp`)
-4. **Item-IRT** (`kfactor_irt_item`) -- parallel 2PL Item-IRT channel:
-   `logit = alpha(item) * (theta_subj - beta(item)) + offsets`
-5. **Item-IRT + ordinary MLP residual** (`kfactor_irt_item_mlp`)
-6. **Item-IRT + gated MLP / SwiGLU residual** (`kfactor_irt_item_gated_mlp`)
+The current production model is `kfactor_irt_item_gated_mlp` (k=16) trained
+head-only on top of a frozen `Qwen/Qwen3-Embedding-4B` encoder, with
+LLM-as-judge features, k-nearest-neighbor passrate features, content-pool
+features, and a learned k-means cluster embedding feeding the gated MLP
+residual. It reaches ~0.444 item-cold-start val log-loss on the canonical
+split.
 
-The Item-IRT variants add an explicit multiplicative subject-item channel
-(`alpha(item) * (theta - beta(item))`) *outside* the residual MLP, plus two
-new channels that go *inside* the MLP: nine z-scored pool features
-(token length, has-latex, has-code, MC indicators, language, etc.) and a
-learned k-means cluster embedding fit on the cached item embeddings. The
-notebook's cell 14b emits a **feature-contribution + component-decomposition
-diagnostic** for the best run: Analysis A leaves out each channel in turn
-to attribute ΔNLL, and Analysis B decomposes the final logit into its
-additive components and reports each component's variance, Pearson
-correlation with the label, **Solo NLL** (fitted 2-param logistic on that
-component alone), and Solo AUC. CSVs and plots land in
-`artifacts/results/feature_ablation_{run_id}.csv` /
-`artifacts/results/component_decomp_{run_id}.csv` and the matching files
-under `artifacts/plots/`.
+Optionally, the same pipeline can fine-tune the encoder via **LoRA**
+adapters on the attention projections, trained jointly with the head. LoRA
+is overnight-safe (step-level Google Drive checkpointing, clean resume) and
+is shipped to the runtime either as a tiny in-bundle adapter that's merged
+into the stock encoder at import (`adapter_only`, default) or by uploading
+the merged 4B encoder to a private HF repo (`hf_upload`). See section
+**LoRA mode** below.
 
-The notebook downloads the dataset, embeds every unique item / subject text
-once with a heavy HF encoder (default: `intfloat/e5-mistral-7b-instruct`),
-trains all three model variants across multiple seeds and `k` values, builds
-a results table sorted by item-cold-start log-loss, and lets you pick
-which trained run to export into the required Codabench submission format.
+## Pipeline at a glance
+
+1. **Encoder + caches.** `Qwen/Qwen3-Embedding-4B` with `last_token`
+   pooling and the Qwen3 retrieval instruction. Item + subject embeddings
+   are computed once with content-hash-based caching, mirrored to Google
+   Drive for cross-Colab persistence.
+2. **Pool features (cell 8b).** Nine z-scored per-item scalars (token
+   length, has-latex, has-code, MC indicators, language, etc.) plus a
+   k-means cluster embedding fit on the cached item embeddings.
+3. **LLM-as-judge features (cell 8c).** A frozen 4B instruct judge scores
+   `(subject, item)` pairs with a yes/no token-margin trick. Four scalars
+   per pair are cached to Drive and fed into the head's residual MLP.
+4. **NN passrate features (cell 8d).** Sparse subject-by-item passrate
+   matrix + FAISS index over the cached item embeddings. For each
+   training/val row we compute eight aggregated scalars summarizing the
+   target subject's passrate on the test item's nearest training items.
+5. **Optional LoRA pre-tokenization (cell 8e).** When LoRA is enabled,
+   we pre-tokenize every unique item once with the same prefix +
+   contextual template the embedder uses, and cache the result to Drive.
+6. **Heads (cell 13).** K-factor + parallel Item-IRT (2PL) + gated MLP
+   residual that sees item embedding ⊕ pool features ⊕ cluster embedding
+   ⊕ judge features ⊕ NN passrate features. AdamW + bf16 + cosine
+   schedule + early stopping. Saves to `artifacts/checkpoints/`.
+7. **Optional LoRA fine-tuning (cell 13-LoRA).** Loads the best head-only
+   checkpoint, wraps the encoder in PEFT LoRA adapters, and jointly
+   trains the adapters + head against raw item tokens. See section below.
+8. **Evaluation (cells 14-17).** Item-cold-start NLL / Brier / AUC,
+   feature-ablation + component-decomposition diagnostic, slicewise
+   metrics, calibration plots.
+9. **Export (cell 19).** Bundles the chosen run as a Codabench submission
+   ZIP with a self-contained runtime, `models.txt`, `requirements.txt`,
+   trained head + (optionally) LoRA adapter, and a quantized
+   training-item cache for runtime NN lookup.
 
 > **Methodological rule (read this first):** primary model selection MUST
-> use the item-cold-start validation split. The notebook also reports a
-> leaky random-row split for sanity, and flags any residual model that
-> only improves random-row but not item-cold-start (which means it's
+> use the item-cold-start split. The notebook also reports a leaky
+> random-row split for sanity, and flags any residual model or LoRA run
+> that only improves random-row but not item-cold-start (i.e. is
 > overfitting to row-level leakage).
 
 ## Repository layout
@@ -51,58 +71,64 @@ which trained run to export into the required Codabench submission format.
 │   └── a100_ablation_notebook.ipynb  # generated from the .py
 ├── scripts/
 │   ├── build_ipynb_from_py.py        # zero-dep .py -> .ipynb converter
-│   └── smoke_test_submission.py      # offline submission smoke test
+│   └── smoke_test_submission.py      # offline submission smoke test (+ LoRA checks)
 ├── src/
 │   ├── data.py                       # HF download + join + keys + splits
-│   ├── embeddings.py                 # HF encoder + caching + token stats
-│   ├── models.py                     # KFactor + Item-IRT model variants
+│   ├── embeddings.py                 # HF encoder + caching + token stats + FA2
+│   ├── models.py                     # KFactor / Item-IRT / gated-MLP variants
 │   ├── item_features.py              # per-item pool features + z-score stats
 │   ├── clustering.py                 # k-means on cached item embeddings
-│   ├── train.py                      # AdamW + bf16 + cosine + early stop
+│   ├── judge.py                      # LLM-as-judge runtime + caching
+│   ├── nn_features.py                # sparse passrate + 8-scalar NN aggregator
+│   ├── tokenized_items.py            # pre-tokenized item cache (LoRA mode)
+│   ├── train.py                      # head-only AdamW + bf16 + cosine + early stop
+│   ├── lora_train.py                 # overnight-safe LoRA fine-tuning loop
+│   ├── drive_cache.py                # Google Drive cache resolution / upload
 │   ├── eval.py                       # metrics, ECE, slices, ablation diags
 │   ├── calibration.py                # temperature / intercept calibrator
-│   ├── sanity_checks.py              # data/embedding/model invariants
+│   ├── sanity_checks.py              # data / embedding / model invariants
 │   └── export_submission.py          # bundle to submission/ + submission.zip
 ├── requirements.txt
 └── README.md
 ```
 
-## Quick start: Google Colab
+## Quick start: Google Colab (A100)
 
-1. Open a new Colab notebook with an A100 runtime (Runtime → Change runtime type → A100 GPU).
+1. Open a new Colab notebook with an A100 runtime (Runtime → Change runtime
+   type → A100 GPU; an 80 GB A100 is comfortable, a 40 GB A100 works with
+   the OOM-fallback in cell 13-LoRA).
 2. In the first cell, paste:
+
    ```python
    !curl -sSL https://raw.githubusercontent.com/bwathomas/prediction-competition-321M/main/notebooks/a100_ablation_notebook.ipynb -o a100_ablation_notebook.ipynb
    ```
-   Then open `a100_ablation_notebook.ipynb` from the Colab file browser.
-   Alternatively just upload `notebooks/a100_ablation_notebook.ipynb` from this repo.
-3. Run the notebook. Cell 0 clones this repo into `/content/prediction-competition-321M/`,
-   cell 1 installs `requirements.txt`, cell 4 prompts for `HF_TOKEN` (or reads it
-   from the env var if you set one in Colab's secret manager / form widget first).
 
-## 1. Spin up a Vertex AI Workbench instance
+   Then open `a100_ablation_notebook.ipynb` from the Colab file browser.
+3. Run the notebook. Cell 0 clones this repo into
+   `/content/prediction-competition-321M/`, cell 1 installs
+   `requirements.txt`, cell 4 prompts for `HF_TOKEN` (or reads it from the
+   env var if you set one in Colab's secret manager first).
+4. Mount Google Drive when prompted (cells 8 / 8d / 8e / 13-LoRA): every
+   expensive artifact -- frozen embeddings, judge scores, NN passrate
+   tables, LoRA checkpoints -- is persisted there with content-hash
+   invalidation so a Colab restart does not redo work.
+
+## Vertex AI Workbench
 
 The pipeline assumes a single A100 (or, in a pinch, any GPU with bf16 +
 ~24 GB VRAM if you swap to a lighter encoder).
 
-1. Open Vertex AI Workbench in the Google Cloud Console.
-2. Create a new **User-managed notebook** with:
+1. Create a **User-managed notebook** with:
    - Environment: PyTorch 2.x (CUDA 12.x)
    - Machine type: `a2-highgpu-1g` (1 × A100 40 GB) or larger
-   - Optional: enable `bf16`-capable instance (A100 / H100)
-3. Once the notebook starts, open a terminal and clone this repo:
-   ```bash
-   git clone <this-repo> && cd <this-repo>
-   ```
-4. Install the runtime requirements:
-   ```bash
-   pip install -r requirements.txt
-   ```
+2. `git clone <this-repo> && cd <this-repo>`
+3. `pip install -r requirements.txt`
 
-## 2. Set the Hugging Face token
+## Hugging Face token
 
-The encoder defaults to `intfloat/e5-mistral-7b-instruct`, which is a gated
-repo. You need a Hugging Face token with read access.
+The encoder defaults to `Qwen/Qwen3-Embedding-4B` and the judge defaults to
+`Qwen/Qwen3-4B-Instruct-2507`; both are public, but a token still avoids
+rate-limited downloads.
 
 The pipeline resolves the token in this order, never logging or persisting
 it anywhere:
@@ -113,27 +139,9 @@ it anywhere:
    project is read from `GOOGLE_CLOUD_PROJECT` or `GCP_PROJECT`).
 3. Interactive `getpass.getpass` prompt at notebook runtime.
 
-Easiest path on Vertex AI:
+## Notebook cells
 
-```bash
-# Either set HF_TOKEN in the kernel environment ...
-export HF_TOKEN=...
-
-# ... or store it once in Secret Manager and let the notebook fetch it:
-echo -n "$HF_TOKEN" \
-  | gcloud secrets create HF_TOKEN --data-file=- --replication-policy=automatic
-gcloud secrets add-iam-policy-binding HF_TOKEN \
-  --member="serviceAccount:$(gcloud auth list --filter=status:ACTIVE --format='value(account)')" \
-  --role="roles/secretmanager.secretAccessor"
-```
-
-## 3. Run the notebook
-
-Open `notebooks/a100_ablation_notebook.ipynb` in JupyterLab and Run All.
-
-The notebook cells are intentionally numbered:
-
-0. Clone the project repo from GitHub (Colab / fresh Vertex AI instances).
+0. Clone the project repo (Colab / fresh Vertex AI instances).
 1. Install pinned requirements and import the stack.
 2. GPU banner -- fails loudly if no GPU (set `ALLOW_CPU=1` to override).
 3. Load configuration from `configs/default.yaml`.
@@ -141,18 +149,24 @@ The notebook cells are intentionally numbered:
 5. Download + join + key the dataset, print dataset statistics.
 6. Build the splits (item cold-start, optional benchmark heldout, random-row debug).
 7. Data sanity checks (leakage, key stability, missing values, ...).
-8. Build the HF encoder and embed unique items / subjects (cached).
+8. Build the encoder and embed unique items / subjects (Drive-cached).
+   8b. Pool features and k-means clustering on items.
+   8c. Score `(subject, item)` pairs with LLM-as-judge (Drive-cached).
+   8d. Build the training NN passrate index and compute NN features for train + val (Drive-cached).
+   8e. **(LoRA only)** Pre-tokenize unique items for the LoRA loop (Drive-cached).
 9. Embedding sanity checks (NaN/inf, zero-norm, truncation, determinism).
 10. Build the indexer and training matrices.
 11. Model sanity checks (forward pass, overfit a tiny batch, random labels).
 12. Baselines (global mean / subject shrinkage / bc shrinkage / logistic on embeddings).
-13. Train all three model variants across seeds and `k` values.
+13. Extended ablation grid: head-only training across model variants × `k` × seeds.
+    13-LoRA. **(LoRA only)** Joint LoRA + head fine-tuning with step-level Drive checkpointing.
 14. Evaluate each trained checkpoint on every split, build the results table.
+    14b. Feature contribution + component decomposition diagnostic for the best run.
 15. Random-row overfit flag (warns if a residual only helps the leaky split).
 16. Slicewise metrics (benchmark / condition / subject family / token length).
 17. Plots (val log-loss by model, calibration curves, by-benchmark deltas, ...).
 18. Choose a trained run to export (`ipywidgets` dropdown or `SELECTED_RUN_ID`).
-19. Export the selected run to `submission/` and `submission.zip`.
+19. Export the selected run to `submission/` and `submission.zip` (LoRA-aware).
 20. Run the in-notebook smoke test on 20 held-out validation rows.
 21. Optional GCS sync of `artifacts/` and `submission/`.
 
@@ -163,104 +177,213 @@ The paired `notebooks/a100_ablation_notebook.py` carries the same cells with
 py scripts/build_ipynb_from_py.py notebooks/a100_ablation_notebook.py
 ```
 
-## 4. Change the encoder model
+## LoRA mode (encoder fine-tuning)
 
-Edit `configs/default.yaml`:
+LoRA is **off by default**. With `lora.enabled: false` the entire pipeline
+behaves exactly as the head-only ablation pipeline; cells 8e and 13-LoRA
+print a "skipped" line and do nothing.
+
+### Why it's structurally different
+
+Head-only training consumes **cached** item embeddings -- the encoder is
+never invoked during the training loop. LoRA training cannot use the cache:
+every batch must forward raw item token IDs through the
+adapter-augmented encoder to get embeddings that reflect the current
+adapter weights. Concretely:
+
+- Step time goes from milliseconds to seconds.
+- A single epoch over ~300k unique items can be 1-3 hours on a single A100.
+- Encoder activations + gradients dominate GPU memory; gradient
+  checkpointing is mandatory.
+- The frozen-embedding cache is useless to LoRA (those embeddings are from
+  the pre-fine-tuning encoder) but stays valid for everything else: head
+  pretraining, the judge cache, NN features (computed offline against the
+  *original* frozen encoder), pool features, clusters.
+
+### Turning it on
+
+In `configs/default.yaml`:
+
+```yaml
+lora:
+  enabled: true
+  base_checkpoint: null              # null → best head-only run from cell 13
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  layers_to_transform: null          # null = all layers; or e.g. [14, ..., 35] for late-only
+  gradient_checkpointing: true
+  encoder_lr: 5.0e-6                 # ~100x smaller than head_lr (deliberately)
+  head_lr: 5.0e-4
+  weight_decay_head: 0.01
+  epochs: 1
+  batch_size_items: 8                # raw-text item batch
+  grad_accum_steps: 4                # effective item batch = 32
+  max_length: 1024
+  bf16: true
+  # Overnight safety
+  checkpoint_every_steps: 200
+  eval_every_steps: 1000
+  drive_checkpoint_dir: "/content/drive/MyDrive/prediction-competition-321M/lora_ckpt"
+  keep_last_n_checkpoints: 3
+  resume: true
+  max_runtime_minutes: 600
+  # Submission export
+  export_mode: "adapter_only"        # adapter_only | hf_upload
+  hf_upload_repo: ""                 # only required for hf_upload mode
+```
+
+Run cells 8e and 13-LoRA as part of Run All. They are idempotent: a Colab
+restart followed by re-running cell 13-LoRA resumes from the latest Drive
+checkpoint with optimizer, scheduler, RNG, and adapter state restored.
+
+### Overnight safety contract
+
+- **Step-level checkpoints**, not epoch-level. Default
+  `checkpoint_every_steps: 200`.
+- Checkpoints are atomic (`{dir}/step_{N}.tmp/` → `{dir}/step_{N}/`); the
+  Drive sync is non-atomic by itself.
+- The last `keep_last_n_checkpoints` checkpoints are kept, plus a
+  permanent `best/` dir (lowest val NLL so far).
+- `max_runtime_minutes` is a **hard stop**: the cell checkpoints and
+  exits 0 before the deadline. Re-run to continue.
+- `KeyboardInterrupt` and exceptions trigger an emergency final
+  checkpoint before re-raising.
+- The first eval (typically step 1000) prints a one-line sanity check
+  comparing step-0 val NLL against the base checkpoint's; LoRA adapters
+  initialize as no-ops, so any deviation > 1e-3 is a wiring bug and is
+  flagged loudly.
+
+### Submission export modes
+
+`lora.export_mode` controls how the LoRA-fine-tuned encoder ships:
+
+- **`adapter_only`** (default). The LoRA adapter directory (~10-50 MB) is
+  bundled into the submission ZIP at `submission/lora_adapter/`. The
+  shipped `submission/model.py` loads the stock `Qwen/Qwen3-Embedding-4B`
+  via `models.txt` and applies + merges the adapter once at module
+  import (`PeftModel.from_pretrained(...).merge_and_unload()`). Per-call
+  `predict()` cost is identical to the non-LoRA submission. Adds a single
+  `peft>=0.10` line to `requirements.txt`.
+- **`hf_upload`**. You upload the merged encoder (base + LoRA → ~8 GB) to
+  a private HF repo first, then set `lora.hf_upload_repo` to that repo
+  id. The exporter rewrites `models.txt` to reference the merged repo
+  directly; no `peft` runtime dependency. Useful if the competition
+  container forbids `peft`, otherwise prefer `adapter_only`.
+
+The smoke test (`scripts/smoke_test_submission.py`) verifies, for an
+`adapter_only` bundle, that the adapter dir exists, `requirements.txt`
+declares `peft`, and the runtime actually logs `"LoRA adapter merged"` at
+module import.
+
+### Honest expectations
+
+LoRA is the last untested lever and the most expensive one (a single
+overnight run on an 80 GB A100 takes ~6-8 hours).
+
+- Realistic upside: **0.02-0.05** lower item-cold-start NLL vs. the
+  head-only 0.444 baseline.
+- Real downside risk: the encoder can memorize the training-set item
+  distribution and **hurt** item-cold-start while improving the leaky
+  random-row split.
+- The step-level eval and the random-row-vs-cold-start divergence warning
+  in `lora_train` are there specifically to catch overfitting early. Check
+  the first eval before going to bed: **if cold-start NLL has gone up from
+  the head-only baseline, kill the run and lower `encoder_lr`** (e.g.
+  5e-6 → 2e-6).
+- Ship the head-only 0.444 submission to Codabench *before* the LoRA run,
+  so the leaderboard number is in hand for comparison the next morning.
+
+## Configuration
+
+`configs/default.yaml` is the single source of truth. Notable blocks:
 
 ```yaml
 encoder:
-  model_id: "intfloat/e5-mistral-7b-instruct"   # default heavy A100
-  # model_id: "sentence-transformers/all-mpnet-base-v2"   # ~110 MB
-  # model_id: "intfloat/e5-large-v2"                      # ~1.3 GB
-  # model_id: "BAAI/bge-large-en-v1.5"                    # ~1.3 GB
-```
+  model_id: "Qwen/Qwen3-Embedding-4B"
+  pooling: "last_token"
+  use_flash_attention: true
+  bf16: true
+  use_contextual_item_text: true
+  qwen3_instruction: "Given a web search query, retrieve relevant passages that answer the query"
 
-Lighter encoders run on T4 / L4. Heavy encoders need an A100 (and benefit
-from `bf16: true`).
-
-Some encoders need text prefixes (`query: ...`, `passage: ...`). Set
-`query_prefix` and `passage_prefix` in the same config block.
-
-## 5. Run ablations
-
-The notebook iterates over every combination in:
-
-```yaml
-train:
-  models:
-    - kfactor
-    - kfactor_mlp
-    - kfactor_gated_mlp
-    - kfactor_irt_item
-    - kfactor_irt_item_mlp
-    - kfactor_irt_item_gated_mlp
-  k_factors: [16, 32]
-  seeds: [0, 1, 2]
-  irt_reg:
-    lambda_beta: 1.0e-4
-    lambda_alpha: 1.0e-4
-```
-
-Per-channel knobs live in two new YAML blocks:
-
-```yaml
 item_features:
   enabled: true
-  use_pool: true                 # z-scored pool features (inside the MLP)
-  use_clusters: true             # learned cluster embedding (inside the MLP)
+  use_pool: true
+  use_clusters: true
   pool_feature_dim: 9
   cluster_embed_dim: 16
 
 clustering:
   k: 64
   seed: 0
+
+judge:
+  enabled: true
+  model_id: "Qwen/Qwen3-4B-Instruct-2507"
+  feature_in_residual: true
+  ship_at_runtime: true
+
+nn_features:
+  enabled: true
+  k: 16
+  runtime_k: 16
+  similarity: "cosine"
+  feature_dim: 8
+
+train:
+  models: [kfactor_irt_item_gated_mlp]   # current best variant
+  k_factors: [16]
+  seeds: [0, 1, 2]
+  learning_rate: 1.0e-3
+  batch_size: 65536
+  epochs: 6
+  irt_reg:
+    lambda_beta: 1.0e-4
+    lambda_alpha: 1.0e-4
+
+lora:
+  enabled: false                         # see "LoRA mode" above
 ```
 
-In cell 13 set ``RUN_FEATURE_TOGGLE_GRID = True`` to re-run the MLP /
-gated-MLP / Item-IRT-MLP / Item-IRT-gated-MLP variants with pool and
-cluster channels disabled. Cell 14b reads from whichever runs are
-present and writes ``artifacts/results/feature_ablation_{run_id}.csv`` and
-``artifacts/results/component_decomp_{run_id}.csv`` for the best run.
+To swap to a lighter encoder for fast iteration:
 
-Each `(model_name, k, seed)` becomes one checkpoint in
-`artifacts/checkpoints/{run_id}.pt` plus a sibling
-`{run_id}.json` with the full config + loss curve.
+```yaml
+encoder:
+  model_id: "intfloat/e5-large-v2"   # ~1.3 GB, fits a T4
+  pooling: "mean"
+  qwen3_instruction: ""              # only applies to Qwen3-Embedding-*
+```
 
-Results land in `artifacts/results/results.csv`, sorted by item-cold-start
-val log-loss (lower is better).
+Lighter encoders will also lower the head's ceiling; ~0.444 is specific to
+the Qwen3-Embedding-4B + judge + NN + IRT + gated-MLP stack.
 
-## 6. Pick which model to export
-
-By default the notebook picks the best run by item-cold-start val log-loss.
-
-To override:
-
-- **Interactive**: cell 18 builds an `ipywidgets.Dropdown` if `ipywidgets`
-  is installed. Pick a run and re-run the export cell.
-- **Manual**: set `SELECTED_RUN_ID = "kfactor_mlp_k16_seed0"` in cell 18.
-
-Cell 19 then exports the chosen run.
-
-## 7. Submission contract
+## Submission contract
 
 The exported `submission/model.py`:
 
 - Defines `predict(input: dict, labeled: list[dict] | None = None) -> float`.
-- Loads the encoder + checkpoint at **module scope** (no work inside `predict()`
-  except a single encoder forward and one sigmoid).
+- Loads the encoder + checkpoint + (optional) judge + (optional) LoRA
+  adapter at **module scope**. Per-call `predict()` cost is one encoder
+  forward + one judge forward (or two cache hits after the queue is
+  drained), one head forward, and one sigmoid.
 - Uses the **local HF cache only**: `local_files_only=True`. No outbound
   network calls.
-- Declares the encoder repo in `submission/models.txt` so the platform pre-fetches it.
+- Declares every required model id in `submission/models.txt` so the
+  platform pre-fetches them.
 - Returns a native Python float clipped to `[1e-6, 1 - 1e-6]`.
-- Handles unseen subjects / benchmark-conditions via UNK index 0 in each space.
+- Handles unseen subjects / benchmark-conditions via UNK index 0 in each
+  space.
 - Honors the four-field input contract exactly: `benchmark`, `condition`,
-  `subject_content`, `item_content`. Condition is re-normalized to the literal
-  `"none"` when missing/blank/null.
+  `subject_content`, `item_content`. Condition is re-normalized to the
+  literal `"none"` when missing/blank/null.
 
-The exported `submission/labeling.py` is an uncertainty-based acquisition
-function (`-abs(p - 0.5)`) that calls `model._predict_uncalibrated()` to
-score candidates. It returns 0.0 on any failure so the platform falls back
-to its random-K-per-category default cleanly.
+The exported `submission/labeling.py` enqueues every candidate the
+platform shows via `model._enqueue_for_batch(...)` (zero-cost ranking),
+then the first `predict()` call drains the queue through batched encoder
++ judge forwards (`batched_flush_v1` runtime architecture). Without this
+batched-flush path an L4 round takes ~5-10 hours on a ~50k-pair workload.
 
 If `labeled` is passed (the platform reveals K=5 labels per data category
 per round), the runtime fits a tiny calibrator on top of the base model:
@@ -271,7 +394,7 @@ per round), the runtime fits a tiny calibrator on top of the base model:
 
 The calibrator falls back to identity on any numerical failure.
 
-## 8. Smoke-test the submission
+## Smoke-test the submission
 
 In the notebook, cell 20 runs the in-notebook smoke test. From the command
 line:
@@ -286,15 +409,20 @@ py scripts/smoke_test_submission.py \
 The script:
 
 - Imports `submission/model.py`.
-- Calls `predict()` on 20 rows.
+- Calls `predict()` on N rows.
 - Verifies each output is a native `float`, finite, and in `[0, 1]`.
 - Captures stdout/stderr to check no `HF_TOKEN` value leaks to logs.
-- Verifies `models.txt` exists.
-- Re-zips `submission/` to `submission.zip`.
+- Verifies `models.txt` and `runtime_meta.json` are consistent
+  (encoder + judge + LoRA mode).
+- Verifies that the judge cache speedup actually fires
+  (second-call < first-call when a judge is present).
+- Verifies the NN-feature runtime path: shape, finiteness, range, and
+  top-1 self-similarity ≈ 1 for a training-item duplicate.
+- For LoRA `adapter_only` bundles: verifies the adapter dir + `peft`
+  requirement + the runtime's `"LoRA adapter merged"` log line at import.
+- Re-zips `submission/` to `submission.zip` if all checks pass.
 
-## 9. Optional: GCS artifact sync
-
-Set in `configs/default.yaml`:
+## Optional: GCS artifact sync
 
 ```yaml
 gcs:
@@ -307,16 +435,14 @@ Cell 21 uploads `artifacts/` and `submission/` to GCS via
 
 ## A100 / bf16 / determinism notes
 
-- `bf16: true` in the encoder block uses bf16 matmuls on A100 (and stays in
-  fp32 otherwise). It does NOT change the model's final precision because
-  the saved checkpoint is materialized in fp32.
+- `bf16: true` in the encoder block uses bf16 matmuls on A100 and stays in
+  fp32 otherwise. Head weights remain fp32; only encoder forward is bf16.
 - We set seeds for numpy / torch / Python, but with cudnn benchmark + bf16
   there is still small run-to-run nondeterminism; multiple seeds in the
-  training loop account for this.
-- We don't fine-tune the encoder. A TODO hook in `src/models.py` /
-  `src/embeddings.py` reserves space for LoRA, but v1 trains only the small
-  k-factor / residual heads on cached embeddings. That's why a single
-  A100 can finish the full ablation comfortably within an interactive session.
+  head-only ablation grid account for this.
+- LoRA training also seeds the length-bucket sampler per epoch from
+  `(seed + epoch)` and persists RNG state in every Drive checkpoint, so a
+  resumed run picks up the exact same shuffle order.
 
 ## Acknowledgements
 
