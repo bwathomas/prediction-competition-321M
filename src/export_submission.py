@@ -143,6 +143,15 @@ JUDGE_NO_TOKENS: tuple = tuple(
     JUDGE_META.get("no_tokens", (" no", "no", " No", "No"))
 )
 JUDGE_SUFFIX_RESERVE_TOKENS: int = int(JUDGE_META.get("suffix_reserve_tokens", 256))
+# Per-round runtime batch sizes. Both default to 16 (safe on a 24 GB L4 with
+# two 4B-param bf16 models resident); raise via runtime_meta.json for bigger
+# tiers. Without batching the runtime takes ~5-10 hours on L4 for the active
+# 5,000-variant hidden sample -- the handbook explicitly recommends buffering
+# inputs on a module-level queue and flushing a batched forward pass.
+JUDGE_RUNTIME_BATCH_SIZE: int = int(JUDGE_META.get("runtime_batch_size", 16))
+ENCODER_RUNTIME_BATCH_SIZE: int = int(
+    META.get("encoder_runtime_batch_size", 16)
+)
 
 # NN feature schema. Must match src/nn_features.py exactly -- the runtime
 # refuses to load the cache if its nn_features_config.json reports a
@@ -1287,6 +1296,67 @@ class _LLMJudgeRuntime:
         self.score_cache[key] = vec
         return vec
 
+    def score_batch(self, rows: list) -> list:
+        """Score many (benchmark, condition, subject_content, item_content) rows.
+
+        Returns one length-4 float32 vector per row, in the same order. Used
+        by the runtime's lazy-flush path: ``acquisition_function`` enqueues
+        every candidate the platform shows it, then the first ``predict()``
+        call drains the queue through this method in chunks of
+        ``JUDGE_RUNTIME_BATCH_SIZE``. The handbook (sec. 3.5) explicitly
+        recommends this architecture for any non-trivial local judge.
+        """
+        if not rows:
+            return []
+        B = max(1, int(JUDGE_RUNTIME_BATCH_SIZE))
+        out: list = [None] * len(rows)
+        for start in range(0, len(rows), B):
+            chunk = rows[start : start + B]
+            prompts = [
+                _judge_truncate(
+                    self.tokenizer,
+                    benchmark=str(b),
+                    condition=str(c),
+                    subject_content=str(s),
+                    item_content=str(i),
+                )
+                for (b, c, s, i) in chunk
+            ]
+            enc = self.tokenizer(
+                prompts,
+                padding="longest",
+                truncation=True,
+                max_length=JUDGE_MAX_PROMPT_TOKENS,
+                return_tensors="pt",
+            )
+            input_ids = enc["input_ids"].to(_DEVICE)
+            attn = enc["attention_mask"].to(_DEVICE)
+            with torch.inference_mode():
+                res = self.model(input_ids=input_ids, attention_mask=attn)
+            logits = res.logits
+            seq_lens = attn.sum(dim=1) - 1
+            seq_lens = seq_lens.clamp(min=0)
+            next_logits = logits[
+                torch.arange(logits.size(0), device=logits.device), seq_lens
+            ]
+            logprobs = torch.log_softmax(next_logits.float(), dim=-1)
+            yes_t = torch.tensor(self.yes_ids, dtype=torch.long, device=logprobs.device)
+            no_t = torch.tensor(self.no_ids, dtype=torch.long, device=logprobs.device)
+            lp_yes = torch.logsumexp(logprobs.index_select(1, yes_t), dim=-1)
+            lp_no = torch.logsumexp(logprobs.index_select(1, no_t), dim=-1)
+            lp_diff = lp_yes - lp_no
+            p_yes = torch.sigmoid(lp_diff)
+            ly = lp_yes.float().cpu().numpy()
+            ln = lp_no.float().cpu().numpy()
+            ld = lp_diff.float().cpu().numpy()
+            py = p_yes.float().cpu().numpy()
+            for j in range(len(chunk)):
+                out[start + j] = np.asarray(
+                    [float(ly[j]), float(ln[j]), float(ld[j]), float(py[j])],
+                    dtype=np.float32,
+                )
+        return out
+
 
 JUDGE: _LLMJudgeRuntime | None = None  # populated in the module-init section below
 
@@ -1402,6 +1472,122 @@ _PROB_CACHE: dict[tuple[str, str], float] = {}
 _CALIBRATOR = _Calibrator(META.get("default_calibrator"))
 _LAST_LABELED_FINGERPRINT: tuple | None = None
 
+# --- Batched-flush state (handbook sec. 3.5 architecture) ------------------
+# ``acquisition_function`` is called once per candidate in a strict single
+# pass *before* the platform invokes any ``predict()``. We use that window
+# to enqueue every (item, subject, judge) compute we'll need this round so
+# the very first ``predict()`` call can flush them through batched encoder
+# / judge forwards. Subsequent ``predict()`` calls then hit the cache and
+# spend ~5-10 ms each instead of ~400-600 ms doing a fresh bs=1 forward.
+_ITEM_PENDING: list[tuple[str, str, str]] = []         # (b, c, item_content)
+_SUBJECT_PENDING: list[str] = []                       # subject_content
+_JUDGE_PENDING: list[tuple[str, str, str, str]] = []   # (b, c, s, i)
+_ITEM_PENDING_KEYS: set[str] = set()
+_SUBJECT_PENDING_KEYS: set[str] = set()
+_JUDGE_PENDING_KEYS: set[tuple[str, str]] = set()
+_FLUSHED: bool = True   # nothing pending at module init
+
+
+def _enqueue_for_batch(
+    *,
+    benchmark: str,
+    condition: str,
+    subject_content: str,
+    item_content: str,
+) -> None:
+    """Queue the per-content compute for this candidate.
+
+    Called from ``acquisition_function`` for every candidate the platform
+    surfaces. Duplicate (item, subject, judge-pair) keys are deduped against
+    both the per-round queue *and* the persistent in-memory caches, so we
+    never enqueue work that's already done.
+    """
+    global _FLUSHED
+    item_key = stable_sha256(benchmark, condition, item_content)
+    if (
+        item_key not in _ITEM_PENDING_KEYS
+        and item_key not in _ITEM_EMB_CACHE
+    ):
+        _ITEM_PENDING_KEYS.add(item_key)
+        _ITEM_PENDING.append((benchmark, condition, item_content))
+        _FLUSHED = False
+
+    if _MODEL_CFG.get("use_subject_text_embedding"):
+        s_key = stable_sha256(subject_content)
+        if (
+            s_key not in _SUBJECT_PENDING_KEYS
+            and s_key not in _SUBJECT_EMB_CACHE
+        ):
+            _SUBJECT_PENDING_KEYS.add(s_key)
+            _SUBJECT_PENDING.append(subject_content)
+            _FLUSHED = False
+
+    if JUDGE is not None and _MODEL_CFG.get("use_judge_features"):
+        j_key = (stable_sha256(subject_content), item_key)
+        if (
+            j_key not in _JUDGE_PENDING_KEYS
+            and j_key not in JUDGE.score_cache
+        ):
+            _JUDGE_PENDING_KEYS.add(j_key)
+            _JUDGE_PENDING.append((benchmark, condition, subject_content, item_content))
+            _FLUSHED = False
+
+
+def _flush_pending_batches() -> None:
+    """Drain all queued inputs into the per-content caches.
+
+    Idempotent and safe to call when nothing is pending. The single
+    expensive call is the very first ``predict()`` of the round, which
+    absorbs the entire batched compute upfront so the remaining
+    ``predict()`` calls are pure cache lookups.
+    """
+    global _FLUSHED
+    if _FLUSHED:
+        return
+    t0 = time.time()
+
+    if _ITEM_PENDING:
+        texts = [item_text_for(b, c, i) for (b, c, i) in _ITEM_PENDING]
+        vecs = _embed_batch(texts)
+        for (b, c, i), vec in zip(_ITEM_PENDING, vecs):
+            _ITEM_EMB_CACHE[stable_sha256(b, c, i)] = vec
+        n_items = len(_ITEM_PENDING)
+        _ITEM_PENDING.clear()
+        _ITEM_PENDING_KEYS.clear()
+    else:
+        n_items = 0
+
+    if _SUBJECT_PENDING:
+        texts = [subject_text_for(s) for s in _SUBJECT_PENDING]
+        vecs = _embed_batch(texts)
+        for s, vec in zip(_SUBJECT_PENDING, vecs):
+            _SUBJECT_EMB_CACHE[stable_sha256(s)] = vec
+        n_subjects = len(_SUBJECT_PENDING)
+        _SUBJECT_PENDING.clear()
+        _SUBJECT_PENDING_KEYS.clear()
+    else:
+        n_subjects = 0
+
+    if _JUDGE_PENDING and JUDGE is not None:
+        vecs = JUDGE.score_batch(_JUDGE_PENDING)
+        for (b, c, s, i), vec in zip(_JUDGE_PENDING, vecs):
+            key = (stable_sha256(s), stable_sha256(b, c, i))
+            JUDGE.score_cache[key] = vec
+        n_judge = len(_JUDGE_PENDING)
+        _JUDGE_PENDING.clear()
+        _JUDGE_PENDING_KEYS.clear()
+    else:
+        n_judge = 0
+
+    _FLUSHED = True
+    LOG.info(
+        "Flushed batched queues: items=%d subjects=%d judge_pairs=%d in %.2fs",
+        n_items,
+        n_subjects,
+        n_judge,
+        time.time() - t0,
+    )
+
 
 LOG.info(
     "Submission ready: model=%s n_subjects=%d n_bc=%d encoder=%s device=%s in %.2fs",
@@ -1456,6 +1642,47 @@ def _embed_one(text: str) -> np.ndarray:
     if not np.all(np.isfinite(vec)):
         vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
     return vec.astype(np.float32, copy=False)
+
+
+def _embed_batch(texts: list) -> list:
+    """Encode many texts in chunks of ENCODER_RUNTIME_BATCH_SIZE.
+
+    Returns one float32 vector per input string, in the same order. Uses
+    ``padding="longest"`` within each chunk so wasted compute scales with
+    the per-chunk maximum length rather than the global one -- valuable
+    when item content has a heavy length tail.
+    """
+    if not texts:
+        return []
+    out: list = [None] * len(texts)
+    B = max(1, int(ENCODER_RUNTIME_BATCH_SIZE))
+    for start in range(0, len(texts), B):
+        chunk = texts[start : start + B]
+        enc = _TOKENIZER(
+            chunk,
+            padding="longest",
+            truncation=True,
+            max_length=MAX_LEN,
+            return_tensors="pt",
+        )
+        input_ids = enc["input_ids"].to(_DEVICE)
+        attn = enc["attention_mask"].to(_DEVICE)
+        with torch.inference_mode():
+            res = _ENCODER(input_ids=input_ids, attention_mask=attn)
+        last_hidden = res.last_hidden_state
+        if POOLING == "cls":
+            pooled = last_hidden[:, 0]
+        elif POOLING == "last_token":
+            pooled = _last_token_pool(last_hidden, attn)
+        else:
+            pooled = _mean_pool(last_hidden, attn)
+        vecs = pooled.float().cpu().numpy()
+        for i in range(vecs.shape[0]):
+            v = vecs[i]
+            if not np.all(np.isfinite(v)):
+                v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+            out[start + i] = v.astype(np.float32, copy=False)
+    return out
 
 
 def _get_item_embedding(benchmark: str, condition: str, item_content: str) -> np.ndarray:
@@ -1694,6 +1921,19 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
         subject_content = str(input.get("subject_content", "") or "")
         item_content = str(input.get("item_content", "") or "")
 
+        # Lazy flush of anything queued by acquisition_function. The work
+        # actually happens at most once per round -- on the very first
+        # predict() call -- and turns subsequent calls into pure cache
+        # lookups. If acquisition_function never queued anything (e.g. no
+        # labeling.py shipped, or platform fell back to random K labels
+        # before our queue was populated), this is a cheap no-op and the
+        # per-call path below falls back to the original bs=1 forward.
+        if not _FLUSHED:
+            try:
+                _flush_pending_batches()
+            except Exception:
+                LOG.exception("_flush_pending_batches failed; falling back to per-call inference")
+
         cache_key = (
             stable_sha256(benchmark, condition, item_content),
             stable_sha256(subject_content),
@@ -1722,42 +1962,51 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
 '''
 
 
-_RUNTIME_LABELING_PY = r'''"""Optional adaptive-labeling acquisition function.
+_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (batched-flush variant).
 
-The platform calls this before predict(). Higher score = "please label this
-pair". We score by uncertainty (1 - |p - 0.5|): a model that's right at 0.5
-benefits the most from a label, while we don't waste labels on already-confident
-predictions. Falls back to 0.0 if the module-level model wasn't loaded.
+The platform calls this once per candidate input in a strict single pass,
+before any predict() in the round. We use that window to enqueue every
+(item, subject, judge) compute we'll need this round on a module-level
+queue inside ``model.py``; the first ``predict()`` call then drains the
+queue through batched encoder + judge forwards and turns the remaining
+~50k ``predict()`` calls into ~5-10 ms cache lookups.
+
+This trades the smart-acquisition score (which would otherwise be
+~-|p - 0.5|, an uncertainty signal) for the platform's documented random
+top-K-per-category fallback. On the active configuration with K=5 labels
+revealed per data category, that's ~75 labels out of ~50k candidates --
+a typical 0.001-0.003 nat log-loss regression versus learned acquisition.
+We accept that hit because without batched judge inference the bundle
+takes ~5-10 hours per round on L4, well past any plausible per-round
+budget. The handbook (sec. 3.5) explicitly recommends this architecture.
+
+Returning a constant 0.0 makes every candidate tied at the top score, and
+the platform breaks ties uniformly at random per its spec.
 """
 
 from __future__ import annotations
 
-import math
-
 try:
-    from model import _predict_uncalibrated  # type: ignore
+    from model import _enqueue_for_batch  # type: ignore
 except Exception:  # noqa: BLE001
-    _predict_uncalibrated = None  # type: ignore
+    _enqueue_for_batch = None  # type: ignore
 
 
 def acquisition_function(input: dict) -> float:
-    if _predict_uncalibrated is None:
-        return 0.0
-    try:
-        p = _predict_uncalibrated(
-            str(input.get("benchmark", "")),
-            str(input.get("condition", "none")),
-            str(input.get("subject_content", "")),
-            str(input.get("item_content", "")),
-        )
-        if not math.isfinite(p):
-            return 0.0
-        score = -abs(p - 0.5)
-        if not math.isfinite(score):
-            return 0.0
-        return float(score)
-    except Exception:
-        return 0.0
+    if _enqueue_for_batch is not None:
+        try:
+            _enqueue_for_batch(
+                benchmark=str(input.get("benchmark", "") or ""),
+                condition=str(input.get("condition", "none") or "none"),
+                subject_content=str(input.get("subject_content", "") or ""),
+                item_content=str(input.get("item_content", "") or ""),
+            )
+        except Exception:  # noqa: BLE001
+            # Never let a queueing error escape; the platform falls back
+            # to random K-per-category labels if any acquisition call
+            # raises, and we don't want to lose the entire labeling pass.
+            pass
+    return 0.0
 '''
 
 
