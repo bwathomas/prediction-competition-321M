@@ -41,11 +41,14 @@ m = es._RUNTIME_MODEL_PY
 must_have_model = [
     "_RIDGE_LAMBDA_GLOBAL",
     "_RIDGE_LAMBDA_BC",
+    "_RIDGE_LAMBDA_TYPE",
     "def _fit_intercept_ridge",
     "target_b",
     "class _Calibrator",
     "self.per_bc: dict[str, float]",
     "self.b_global",
+    "self.delta_type",
+    "is_new_list",
     "def apply(self, p: float, bc_key: str = \"\")",
     "_bc_key_for_apply = \"{0}::{1}\"",
     "p = _CALIBRATOR.apply(p, _bc_key_for_apply)",
@@ -210,6 +213,51 @@ print("    apply(0.85, '')             = {:.4f}".format(p_cal_global))
 # Both apply paths should pull p down (per_bc[known::none] is shrunk
 # toward b_global by ridge, but still in the same direction).
 assert p_cal_global < p_orig, "global apply path should also pull down"
-print("[7/7] OK runtime _Calibrator behaves correctly")
+
+# Behavioral check for delta_type: bias new-bc rows down so the calibrator
+# should pull POSITIVE delta_type to correct them.
+sandbox2 = dict(sandbox)
+sandbox2["_BC_TO_ID"] = {"known::none": 1}  # 'new::none' is NOT in here
+def _predict_with_new_bias(b, c, s, i):
+    return 0.35 if b == "new" else 0.65  # both underconfident in different directions
+sandbox2["_predict_uncalibrated"] = _predict_with_new_bias
+exec(compile(cal_block, "<runtime_calibrator>", "exec"), sandbox2)
+CalibratorTyped = sandbox2["_Calibrator"]
+cal_typed = CalibratorTyped()
+labels_mixed = []
+# Heavy oversample of new-bc rows (mimicking dual-pool acquisition).
+for i in range(30):
+    labels_mixed.append({
+        "label": 1.0, "benchmark": "new", "condition": "none",
+        "subject_content": "s", "item_content": "i{}".format(i),
+    })
+for i in range(5):
+    labels_mixed.append({
+        "label": 0.0, "benchmark": "known", "condition": "none",
+        "subject_content": "s", "item_content": "k{}".format(i),
+    })
+cal_typed.fit_from_labeled(labels_mixed)
+print(
+    "    delta_type fit: b_global={:+.4f}, delta_type={:+.4f}".format(
+        cal_typed.b_global, cal_typed.delta_type
+    )
+)
+assert cal_typed.delta_type > 0.30, (
+    "delta_type should pull POSITIVE when new-bc predictions are underconfident; got "
+    + str(cal_typed.delta_type)
+)
+# Unseen-this-round bc: 'unseen_new::none' is not in _BC_TO_ID -> apply uses
+# b_global + delta_type.  'unseen_known' is in _BC_TO_ID but no labels.
+sandbox2["_BC_TO_ID"]["unseen_known::none"] = 99
+p_new_unseen = cal_typed.apply(0.5, "totally_unseen_new::none")
+p_known_unseen = cal_typed.apply(0.5, "unseen_known::none")
+print("    apply(0.5, new-unseen) = {:.4f}; apply(0.5, known-unseen) = {:.4f}".format(
+    p_new_unseen, p_known_unseen
+))
+assert p_new_unseen > p_known_unseen, (
+    "unseen new-bc apply should shift UP relative to unseen known-bc apply; got "
+    "new={}, known={}".format(p_new_unseen, p_known_unseen)
+)
+print("[7/7] OK runtime _Calibrator behaves correctly (incl. delta_type)")
 
 print("\n[OK] all export_submission smoke tests pass")

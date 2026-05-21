@@ -54,9 +54,12 @@ def _verify_one(m: str, labeling_py: str, meta: str) -> None:
     assert "def _fit_beta_calibration" not in m
     assert "_RIDGE_LAMBDA_GLOBAL" in m, "must use new PP_CONSERVATIVE ridge"
     assert "_RIDGE_LAMBDA_BC" in m, "must use new PP_CONSERVATIVE ridge"
+    assert "_RIDGE_LAMBDA_TYPE" in m, "must declare TYPE-conditional ridge"
     assert "self.per_bc" in m
     assert "self.per_bc: dict[str, float]" in m, "per_bc values must now be floats, not state dicts"
     assert "self.b_global" in m
+    assert "self.delta_type" in m, "calibrator must expose delta_type field"
+    assert "is_new_list" in m, "calibrator fit must compute is_new_list"
     assert "target_b" in m
     # Gated-fit machinery should be GONE now.
     assert "def _gated_fit" not in m, "gated_fit replaced by partial pooling"

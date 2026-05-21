@@ -1,5 +1,19 @@
 # Cold-start calibration: literature review and candidate ideas
 
+> **Update 2026-05-21 — sim results landed.**
+> Tier-1 ideas were all simulated in `scripts/_sim_tier1_candidates.py`
+> and `scripts/_sim_type_sweep.py`.  Verdicts:
+>
+> | Idea | Sim result | Decision |
+> |------|------------|----------|
+> | A. Importance-weighted | Loses every regime when bc-bias is zero-mean (variance penalty dominates); +0.011 nats only when there is a real systematic mean shift (F1/F2 regimes). Bias-variance trade-off is unfavorable for our typical case. | **DO NOT SHIP as written.** |
+> | B. IRT anchor-item | Deferred. Requires building a true IRT-structured sim world; the structural-propagation mechanism overlaps heavily with the already-rejected per-subject channel (`docs/redteam_findings.md`).  Marked as a separate research line. | **DEFER.** |
+> | C. Embedding-as-covariate | Wins +0.0001 nats across all honest *and* adversarial regimes — but the attribution test (`JOINT` candidate with w=0) shows the gain is **entirely** from the joint coordinate-descent fit, not from the embedding itself.  Embedding contributes zero useful information; shipping it would add implementation surface for nothing. | **DO NOT SHIP.** |
+> | D. Mix-n-Match (Platt + isotonic) | Isotonic step overfits at N=75 even with 3-fold CV gating (-0.0056 nats when it triggers).  Safer settings just make it a no-op.  Trades safety for risk. | **DO NOT SHIP.** |
+> | **NEW: A′ — Type-conditional intercept** (1-parameter `delta_type` shrunk to 0 with ridge=10) | Wins every honest regime (+0.0016–0.0036 nats), wins biggest adversarial regimes (+0.0021–0.0052 nats), and worst loss is **-0.00015 nats** (within noise floor).  On systematic-mean-shift regimes it matches IW's best case (+0.012 nats) without IW's catastrophic adversarial failures.  Mechanism: the dual-pool 95/5 acquisition puts 70/75 labels on new-bc rows, so `b_global` absorbs the sample-level mean of those rows and mis-applies to the 80% of test rows that are known-bc.  A single ridge-shrunk `delta_type` separates the new-bc shift from the global shift. | **SHIP.** Already implemented in `_perbc_cal_sources.NEW_CALIBRATOR_BLOCK` and `src/export_submission._RUNTIME_MODEL_PY`. |
+>
+> So idea A morphed into a much safer parametric variant (A′) that captures the same signal IW was trying to estimate, but without the per-row weight variance.  Ideas C and D are dead.  Idea B remains an open research line.
+
 After the per-subject and kNN-neighbor channels failed red-teaming
 (see `docs/redteam_findings.md`), I went back to the literature on
 calibration in settings that match ours:

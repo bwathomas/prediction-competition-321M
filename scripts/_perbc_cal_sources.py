@@ -36,48 +36,58 @@ import re
 # ---------------------------------------------------------------------------
 
 NEW_CALIBRATOR_BLOCK = '''# ---------------------------------------------------------------------------
-# Calibrator (per-benchmark partial-pool intercept; ridge-shrunk to global)
+# Calibrator (per-benchmark partial-pool intercept + new-bc type shift)
 # ---------------------------------------------------------------------------
 #
 # Design notes:
 #
-#   * One-parameter calibrator per benchmark: an intercept ``b`` on the
-#     logit scale.  ``logit(p_cal) = logit(p) + b``.  With N <= 75 labels
-#     per round (~5 per benchmark on average) anything richer overfits.
+#   * One-parameter intercept per benchmark plus ONE extra parameter
+#     ``delta_type`` that captures a systematic shift between new-bc
+#     rows (benchmarks not in _BC_TO_ID) and known-bc rows.  This is
+#     the type-conditional intercept that survived red-team in
+#     ``scripts/_sim_tier1_candidates.py`` and
+#     ``scripts/_sim_type_sweep.py`` -- mean NLL gain ranges from
+#     +0.0016 nats on honest baselines to +0.0117 nats on systematic
+#     mean-shift adversarial regimes, with worst-case adversarial loss
+#     of -0.00015 nats (effectively zero, well below the 0.001 nat
+#     leaderboard noise floor).
 #
-#   * PARTIAL POOLING instead of an accept-or-reject gate.  We fit:
+#   * Why this beats the previous b_global+delta_bc-only calibrator:
+#     with the dual-pool 95/5 acquisition, 70 of the 75 labels come
+#     from new-bc rows.  The b_global fit absorbs the SAMPLE-LEVEL
+#     mean shift of those new-bc rows even when the population means
+#     are balanced.  That shift then mis-applies to the 80% of test
+#     rows that are known-bc.  delta_type separates the new-bc
+#     sample-mean from the global mean in 1 ridge-regularized
+#     parameter; bc_keys that are not in _BC_TO_ID inherit
+#     b_global + delta_type at apply time, while known-bc rows inherit
+#     just b_global.
 #
-#       b_global  = argmin_b sum_all BCE(logit(p)+b, y)
-#                              + RIDGE_LAMBDA_GLOBAL * b**2
+#   * The fit is a 4-stage coordinate descent:
 #
-#       b_bc[k]   = argmin_b sum_bc=k BCE(logit(p)+b, y)
-#                              + RIDGE_LAMBDA_BC * (b - b_global)**2
+#       stage 1: b_global = argmin_b sum_all BCE(logit(p)+b, y) + tau_g * b^2
+#       stage 2: delta_type = argmin_d sum_{is_new} BCE(logit(p)+b_global+d, y)
+#                              + tau_type * d^2     (only fit on new-bc rows)
+#       stage 3: re-fit b_global with delta_type * is_new_i as per-row offset
+#       stage 4: per_bc[k] = argmin_b sum_{bc=k} BCE(logit(p)+b, y)
+#                              + tau_bc * (b - (b_global + delta_type * is_new_k))^2
 #
-#     The ridge toward ``b_global`` gives continuous shrinkage:
-#     benchmarks with many labels move toward their own ``b``;
-#     benchmarks with few labels inherit ``b_global``; benchmarks with
-#     zero labels just use ``b_global`` at apply time.  No discrete gate
-#     to flip; the noise floor that used to push a gated fit back to
-#     identity is replaced by a smooth Bayesian-style shrinkage.
+#   * tau_type = 10 was picked from the tau sweep in
+#     scripts/_sim_type_sweep.py over {3, 5, 10, 20, 50, 100} on six
+#     regimes.  Lower tau wins bigger on real shifts but loses on
+#     no-shift; higher tau is too conservative.  At tau=10, worst
+#     adversarial loss is -0.00015 nats; best gain is +0.012 nats on
+#     systematic mean-shift; honest baselines gain +0.0016-0.0036
+#     nats.
 #
-#   * RIDGE_LAMBDA = 20 was picked from a 50-trial simulation sweep
-#     over {2, 5, 10, 15, 20, 25, 30, 40, 60, 80} on the realistic-head
-#     regime (sigma_new = 1.0, sigma_known = 0.2).  Lambda in [15, 25]
-#     are tied for lowest mean NLL; 20 also has lowest variance, so we
-#     pick the safer end of the plateau.  Interpretation: lambda = 20
-#     is ~equivalent to twenty fake observations pinned at the prior,
-#     which is the right strength when typical per-bc N is in the
-#     single digits.
-#
-#   * Per-bc routing uses the raw ``bc_key`` string
-#     ("benchmark::condition") -- NOT the embedding table's bc_id,
-#     which would collapse every unseen benchmark to 0 and merge them
-#     all into a single bucket (the opposite of what we want for
-#     new-benchmark calibration).
+#   * RIDGE_LAMBDA = 20 (global + per-bc) was carried over from the
+#     previous PP_CONSERVATIVE refactor; the sweep showed lambda in
+#     [15, 25] tied for lowest mean NLL.
 
 
 _RIDGE_LAMBDA_GLOBAL = 20.0
 _RIDGE_LAMBDA_BC = 20.0
+_RIDGE_LAMBDA_TYPE = 10.0
 
 
 def _sigmoid(x: float) -> float:
@@ -128,10 +138,23 @@ def _fit_intercept_ridge(
 
 
 class _Calibrator:
-    """Hierarchical per-benchmark intercept with continuous ridge shrinkage.
+    """Type-conditional partial-pool intercept calibrator.
+
+    State:
+      * ``b_global``     -- global intercept shift (applied to every row).
+      * ``delta_type``   -- additional shift applied to NEW-bc rows only
+                            (bc_key not in _BC_TO_ID at fit time).
+      * ``per_bc``       -- per-benchmark full intercept (already
+                            includes b_global + delta_type * is_new_for_bc).
 
     Routing at apply time:
-        ``per_bc[bc_key]`` if present, else ``b_global``.
+        - ``per_bc[bc_key]`` if present (covers benchmarks seen in this
+          round's labeled set);
+        - else ``b_global + delta_type`` if bc_key is NOT in _BC_TO_ID
+          (i.e. a benchmark that did not appear in training data);
+        - else ``b_global`` (a training benchmark we just didn't see
+          labels for this round).
+
     ``bc_key`` is the raw "benchmark::condition" string so each unseen
     benchmark gets its own slot (we never collapse new benchmarks to a
     shared bucket).
@@ -142,6 +165,7 @@ class _Calibrator:
             self.b_global: float = float(state.get("b", 0.0))
         else:
             self.b_global = 0.0
+        self.delta_type: float = 0.0
         self.per_bc: dict[str, float] = {}
 
     def fit_from_labeled(self, labeled_list) -> None:
@@ -150,6 +174,7 @@ class _Calibrator:
         ps: list[float] = []
         ys: list[float] = []
         bcs: list[str] = []
+        is_new_list: list[float] = []
         for ex in labeled_list:
             try:
                 lbl = ex.get("label")
@@ -176,30 +201,59 @@ class _Calibrator:
             ps.append(float(p_base))
             ys.append(min(max(y, 0.0), 1.0))
             bcs.append(bc_key)
+            is_new_list.append(0.0 if bc_key in _BC_TO_ID else 1.0)
         if not ps:
             return
+        # Stage 1: initial b_global on raw ps.
         self.b_global = _fit_intercept_ridge(
             ps, ys, target_b=0.0, ridge=_RIDGE_LAMBDA_GLOBAL
         )
-        bc_to_pairs: dict[str, tuple[list[float], list[float]]] = {}
-        for p, y, bc in zip(ps, ys, bcs):
-            bucket = bc_to_pairs.setdefault(bc, ([], []))
+        # Stage 2: fit delta_type from new-bc rows only, with b_global as
+        # fixed offset.  We pre-shift the ps by b_global so the existing
+        # _fit_intercept_ridge can be reused without a new helper.
+        new_ps = []
+        new_ys = []
+        for i, flag in enumerate(is_new_list):
+            if flag > 0.5:
+                new_ps.append(_sigmoid(_logit(ps[i]) + self.b_global))
+                new_ys.append(ys[i])
+        if new_ps:
+            self.delta_type = _fit_intercept_ridge(
+                new_ps, new_ys, target_b=0.0, ridge=_RIDGE_LAMBDA_TYPE
+            )
+        else:
+            self.delta_type = 0.0
+        # Stage 3: re-fit b_global with delta_type * is_new as per-row
+        # offset.  Same pre-shift trick.
+        shifted_ps = [
+            _sigmoid(_logit(ps[i]) + self.delta_type * is_new_list[i])
+            for i in range(len(ps))
+        ]
+        self.b_global = _fit_intercept_ridge(
+            shifted_ps, ys, target_b=0.0, ridge=_RIDGE_LAMBDA_GLOBAL
+        )
+        # Stage 4: per-bc deltas, with target = b_global + delta_type * is_new_for_bc.
+        bc_to_pairs: dict[str, tuple[list[float], list[float], float]] = {}
+        for p, y, bc, flag in zip(ps, ys, bcs, is_new_list):
+            bucket = bc_to_pairs.setdefault(bc, ([], [], flag))
             bucket[0].append(p)
             bucket[1].append(y)
         self.per_bc = {}
-        for bc_key, (lp, ly) in bc_to_pairs.items():
+        for bc_key, (lp, ly, flag) in bc_to_pairs.items():
+            target = self.b_global + self.delta_type * flag
             b_bc = _fit_intercept_ridge(
-                lp, ly, target_b=self.b_global, ridge=_RIDGE_LAMBDA_BC
+                lp, ly, target_b=target, ridge=_RIDGE_LAMBDA_BC
             )
             self.per_bc[bc_key] = float(b_bc)
         try:
             n_new_benchmarks = sum(
-                1 for k in self.per_bc if _BC_TO_ID.get(k, 0) == 0
+                1 for k in self.per_bc if k not in _BC_TO_ID
             )
             LOG.info(
-                "Calibrator fit: N=%d, b_global=%+.4f, per_bc=%d (of which %d are NEW benchmarks)",
+                "Calibrator fit: N=%d, b_global=%+.4f, delta_type=%+.4f, per_bc=%d (of which %d are NEW benchmarks)",
                 len(ps),
                 self.b_global,
+                self.delta_type,
                 len(self.per_bc),
                 n_new_benchmarks,
             )
@@ -212,7 +266,9 @@ class _Calibrator:
         if isinstance(bc_key, str) and bc_key in self.per_bc:
             b = float(self.per_bc[bc_key])
         else:
-            b = float(self.b_global)
+            # Unseen-this-round bc: fall back to global + type shift.
+            is_new = 0.0 if (isinstance(bc_key, str) and bc_key in _BC_TO_ID) else 1.0
+            b = float(self.b_global) + float(self.delta_type) * is_new
         try:
             z = _logit(p) + b
             q = _sigmoid(z)

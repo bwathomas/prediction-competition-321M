@@ -247,6 +247,83 @@ def main() -> int:
     assert cal_nll < id_nll, "should still beat identity overall"
     print("           PASS\n")
 
+    # Test 5: NEW-bc systematic shift -> delta_type pulls in corrective
+    # direction; b_global stays small.  Only alpha and beta are in
+    # _BC_TO_ID (training); gamma and delta are "new".  We bias only the
+    # new-bc rows uniformly negative (sigmoid output too low).
+    def _predict_with_new_bc_bias(benchmark, condition, subject, item):
+        p_true = _true_probability(benchmark, condition, subject, item)
+        z = math.log(max(1e-9, p_true) / max(1e-9, 1.0 - p_true))
+        if benchmark in ("gamma", "delta"):
+            z -= 1.5  # new-bc predictions too low
+        return 1.0 / (1.0 + math.exp(-z))
+
+    train_only = {"alpha::none": 1, "beta::none": 2}  # gamma/delta are new
+    ns5 = {
+        "math": math, "EPS": 1e-6, "DEFAULT_PROB": 0.5, "LOG": _LogStub(),
+        "normalize_condition": normalize_condition,
+        "_BC_TO_ID": train_only,
+        "_predict_uncalibrated": _predict_with_new_bc_bias,
+    }
+    exec(src, ns5)
+    cal5 = ns5["_Calibrator"]()
+    labels5 = []
+    rng5 = random.Random(0xFEEDFACE)
+    # Heavy oversample of new bcs (mimicking dual-pool acquisition).
+    counts = {"alpha": 3, "beta": 3, "gamma": 30, "delta": 30}
+    for bench, n in counts.items():
+        for i in range(n):
+            subject_content = "subj-" + str(i)
+            item_content = "item-" + str(i)
+            p_pred = _predict_with_new_bc_bias(bench, "none", subject_content, item_content)
+            p_truth = _true_probability(bench, "none", subject_content, item_content)
+            y = 1 if rng5.random() < p_truth else 0
+            labels5.append({
+                "benchmark": bench, "condition": "none",
+                "subject_content": subject_content, "item_content": item_content,
+                "label": y,
+            })
+    rng5.shuffle(labels5)
+    cal5.fit_from_labeled(labels5)
+    print(
+        "[TEST 5 new-bc shift] b_global = {:+.4f}, delta_type = {:+.4f}".format(
+            cal5.b_global, cal5.delta_type
+        )
+    )
+    print(
+        "           per_bc shifts: " + str({
+            k: round(v - cal5.b_global, 3) for k, v in cal5.per_bc.items()
+        })
+    )
+    assert cal5.delta_type > 0.30, (
+        "delta_type must pull POSITIVE (since new-bc predictions are too low); "
+        "got " + str(cal5.delta_type)
+    )
+    assert abs(cal5.b_global) < 0.5, (
+        "b_global should stay modest once delta_type absorbs the new-bc shift; got "
+        + str(cal5.b_global)
+    )
+    # At apply time: unseen new-bc gets b_global + delta_type;
+    # unseen training-bc gets just b_global.
+    p_test = 0.30  # an underconfident-low prediction
+    # 'epsilon::none' is unseen and NOT in _BC_TO_ID -> treated as new.
+    p_new = cal5.apply(p_test, "epsilon::none")
+    p_train = cal5.apply(p_test, "alpha::none" if "alpha::none" not in cal5.per_bc else "zeta::none")
+    # Actually alpha::none IS in cal.per_bc (we saw 3 alpha labels), so use a
+    # different known-bc that's in _BC_TO_ID but unseen in labels:
+    train_only["theta::none"] = 99  # add a training bc we didn't label
+    p_train_unseen = cal5.apply(p_test, "theta::none")
+    print(
+        "           apply(0.30, new) = {:.4f}; apply(0.30, train-unseen) = {:.4f}".format(
+            p_new, p_train_unseen
+        )
+    )
+    assert p_new > p_train_unseen, (
+        "new-bc apply must shift UP (delta_type correction) more than "
+        "training-bc apply; got new={}, train={}".format(p_new, p_train_unseen)
+    )
+    print("           PASS\n")
+
     return 0
 
 
