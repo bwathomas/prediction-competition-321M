@@ -9,6 +9,7 @@ __all__ = [
     "lora_train",
     "models",
     "sanity_checks",
+    "semantic_categories",
     "submission_import",
     "tokenized_items",
     "train",

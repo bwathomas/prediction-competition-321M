@@ -244,28 +244,36 @@ def _move_batch(batch, device: str):
 
 
 def _unpack_batch(batch, device: str):
-    """Unpack the 9-tuple yielded by ``LookupDataset`` onto ``device``.
+    """Unpack the 10-tuple yielded by ``LookupDataset`` onto ``device``.
 
     Returns ``(s, bc, ie, se_or_none, pf_or_none, ci_or_none, jf_or_none,
-    nf_or_none, y)``. Empty optional channels are returned as ``None`` so
-    the model can fast-path around them. The judge-features tensor ``jf``
-    has ``shape[-1] == 0`` when judge scoring is disabled or no scores
-    were attached; ``nf`` (nearest-neighbor features) follows the same
-    convention.
+    nf_or_none, y, w)``. Empty optional channels are returned as ``None``
+    so the model can fast-path around them. The judge-features tensor
+    ``jf`` has ``shape[-1] == 0`` when judge scoring is disabled or no
+    scores were attached; ``nf`` (nearest-neighbor features) follows the
+    same convention. ``w`` is the per-row sample weight; for unweighted
+    behavior ``LookupDataset`` fills it with ``1.0``.
 
     Note: we deliberately name the NN-features tensor ``nf`` rather than
     ``nn`` -- the latter would shadow the ``torch.nn`` module imported at
     the top of this file, which is a subtle footgun for anyone reading or
-    modifying the trainer.
+    modifying the trainer. The same goes for the sample-weight tensor
+    ``w`` (not ``weights``) since the latter would also be ambiguous in
+    several existing call sites.
     """
     moved = _move_batch(batch, device)
-    s, bc, ie, se, pf, ci, jf, nf, y = moved
+    if len(moved) == 10:
+        s, bc, ie, se, pf, ci, jf, nf, y, w = moved
+    else:
+        # Back-compat: pre-weights LookupDataset emitted a 9-tuple.
+        s, bc, ie, se, pf, ci, jf, nf, y = moved
+        w = torch.ones_like(y, dtype=torch.float32)
     se_use = se if se.shape[-1] > 0 else None
     pf_use = pf if pf.shape[-1] > 0 else None
     ci_use = ci if (ci.numel() > 0 and ci.dim() >= 1) else None
     jf_use = jf if jf.shape[-1] > 0 else None
     nf_use = nf if nf.shape[-1] > 0 else None
-    return s, bc, ie, se_use, pf_use, ci_use, jf_use, nf_use, y
+    return s, bc, ie, se_use, pf_use, ci_use, jf_use, nf_use, y, w
 
 
 def _forward_model(model, s, bc, ie, se, pf, ci, jf=None, nf=None):
@@ -345,7 +353,9 @@ def evaluate_model(
     with torch.inference_mode():
         with autocast_ctx:
             for batch_idx, batch in enumerate(iterator, start=1):
-                s, bc, ie, se, pf, ci, jf, nf, y = _unpack_batch(batch, device)
+                # Validation/eval ignores sample weights: the competition
+                # is scored against the raw per-row metric.
+                s, bc, ie, se, pf, ci, jf, nf, y, _w = _unpack_batch(batch, device)
                 logits = _forward_model(model, s, bc, ie, se, pf, ci, jf, nf)
                 p = torch.sigmoid(logits).float().cpu().numpy()
 
@@ -458,7 +468,11 @@ def train_one(
         opt, total_steps, train_cfg.warmup_steps, train_cfg.scheduler
     )
 
-    loss_fn = nn.BCEWithLogitsLoss()
+    # We use the per-row loss directly so we can apply the optional
+    # sample-weight channel ``w`` from ``LookupDataset``. When weights are
+    # all 1.0 (the unweighted default), the result is identical to
+    # ``BCEWithLogitsLoss()(logits, y)`` to within float precision.
+    bce_per_row = nn.BCEWithLogitsLoss(reduction="none")
 
     bf16 = train_cfg.bf16 and device.startswith("cuda") and torch.cuda.is_bf16_supported()
 
@@ -549,13 +563,16 @@ def train_one(
         )
 
         for batch_idx, batch in enumerate(iterator, start=1):
-            s, bc, ie, se, pf, ci, jf, nf, y = _unpack_batch(batch, device)
+            s, bc, ie, se, pf, ci, jf, nf, y, w = _unpack_batch(batch, device)
 
             opt.zero_grad(set_to_none=True)
 
             with autocast_ctx_factory():
                 logits = _forward_model(model, s, bc, ie, se, pf, ci, jf, nf)
-                loss = loss_fn(logits, y)
+                per_row = bce_per_row(logits, y)
+                w = w.to(per_row.dtype)
+                w_sum = w.sum().clamp_min(1e-8)
+                loss = (per_row * w).sum() / w_sum
                 # Soft IRT regularization: keep beta from exploding and
                 # log(alpha) close to 0 so the IRT head and the residual MLP
                 # don't collude in degenerate ways.

@@ -1061,11 +1061,14 @@ class Indexer:
 
 class LookupDataset(torch.utils.data.Dataset):
     """Yields ``(subject_id, bc_id, item_emb, subject_emb, pool_feats,
-    cluster_id, judge_feats, nn_feats, label)`` per row.
+    cluster_id, judge_feats, nn_feats, label, sample_weight)`` per row.
 
     Pool features, cluster ids, judge features, and NN features are
-    optional: if missing, zero-sized tensors are returned. The trainer +
-    eval code unpacks the 9-tuple; downstream models silently ignore
+    optional: if missing, zero-sized tensors are returned. ``sample_weight``
+    is always present and defaults to a per-row scalar of ``1.0`` when the
+    caller does not supply weights, so existing unweighted training is
+    bit-for-bit equivalent to the pre-weights behavior. The trainer +
+    eval code unpacks the 10-tuple; downstream models silently ignore
     zero-sized channels.
 
     The training and val datasets each receive their own ``nn`` matrix
@@ -1085,6 +1088,7 @@ class LookupDataset(torch.utils.data.Dataset):
         cluster_ids: np.ndarray | None = None,
         judge_feats: np.ndarray | None = None,
         nn_feats: np.ndarray | None = None,
+        sample_weights: np.ndarray | None = None,
     ):
         self.subject_ids = torch.from_numpy(np.asarray(subject_ids, dtype=np.int64))
         self.bc_ids = torch.from_numpy(np.asarray(bc_ids, dtype=np.int64))
@@ -1120,6 +1124,16 @@ class LookupDataset(torch.utils.data.Dataset):
             self.nn_feats = torch.from_numpy(
                 np.asarray(nn_feats, dtype=np.float32)
             )
+        if sample_weights is None:
+            self.sample_weights = torch.ones(len(labels), dtype=torch.float32)
+        else:
+            sw = np.asarray(sample_weights, dtype=np.float32)
+            if sw.shape[0] != len(labels):
+                raise ValueError(
+                    f"sample_weights length {sw.shape[0]} != labels length "
+                    f"{len(labels)}"
+                )
+            self.sample_weights = torch.from_numpy(sw)
 
     def __len__(self) -> int:
         return self.labels.shape[0]
@@ -1135,6 +1149,7 @@ class LookupDataset(torch.utils.data.Dataset):
             self.judge_feats[idx],
             self.nn_feats[idx],
             self.labels[idx],
+            self.sample_weights[idx],
         )
 
 

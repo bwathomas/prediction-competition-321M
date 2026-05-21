@@ -203,6 +203,24 @@ train:
   irt_reg:
     lambda_beta: 1.0e-4
     lambda_alpha: 1.0e-4
+  # ---- Sample weighting (semantic-category stratification) ---------------
+  # When enabled, every training row gets a weight
+  #     w(i, s) = (1 / n_i) * ( |I| / (15 * |I_{c(i)}|) ) ** lambda
+  # where ``i`` is the item-variant of the row, ``c(i)`` is its semantic
+  # category (see ``src/semantic_categories.py`` for the 15-category
+  # taxonomy), ``n_i`` is the number of training rows for that item, and
+  # |I_c| / |I| are item-variant counts. The BCE is then reduced as a
+  # weighted mean instead of a plain mean. ``lambda = 0`` reduces to
+  # item-uniform weighting; ``lambda = 1`` (default) gives every semantic
+  # category the same total training weight regardless of size. Disabling
+  # this flag recovers the prior unweighted behavior bit-for-bit.
+  sample_weighting:
+    enabled: true
+    scheme: "semantic_category_item_uniform"
+    lambda: 1.0
+    normalize: true
+    item_col: "item_key"
+    log_report: true
 
 # ----------------------------------------------------------------------------
 # LoRA fine-tuning of the item-side encoder (optional, opt-in)

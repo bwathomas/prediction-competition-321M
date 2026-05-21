@@ -1274,6 +1274,7 @@ def _build_arrays(
     judge_lookup=None,
     nn_train: np.ndarray | None = None,
     nn_val: np.ndarray | None = None,
+    sample_weighting_cfg: dict | None = None,
 ):
     train = split_art.train
     val = split_art.val
@@ -1312,10 +1313,30 @@ def _build_arrays(
         )
     y_train = train["label"].astype(float).to_numpy()
     y_val = val["label"].astype(float).to_numpy()
+
+    # Optional semantic-category training weights. Validation is always
+    # unweighted: the leaderboard metric is the raw per-row mean.
+    sw_train: np.ndarray | None = None
+    if sample_weighting_cfg and bool(sample_weighting_cfg.get("enabled", False)):
+        from src.semantic_categories import (
+            compute_semantic_sample_weights,
+            format_semantic_category_report,
+        )
+
+        weights, report = compute_semantic_sample_weights(
+            train,
+            lambda_=float(sample_weighting_cfg.get("lambda", 1.0)),
+            item_col=str(sample_weighting_cfg.get("item_col", "item_key")),
+            normalize=bool(sample_weighting_cfg.get("normalize", True)),
+            return_report=True,
+        )
+        sw_train = np.asarray(weights, dtype=np.float32)
+        if bool(sample_weighting_cfg.get("log_report", True)):
+            print(format_semantic_category_report(report))
     return (
         LookupDataset(
             s_train, bc_train, ie_train, y_train, se_train, pf_train,
-            ci_train, jf_train, nn_train_arr,
+            ci_train, jf_train, nn_train_arr, sw_train,
         ),
         LookupDataset(
             s_val, bc_val, ie_val, y_val, se_val, pf_val,
@@ -1359,6 +1380,8 @@ USE_NN_FEATURES = bool(
     USE_NN_FEATURES and nn_train_matrix is not None and nn_val_matrix is not None
 )
 
+SAMPLE_WEIGHTING_CFG = (CFG.get("train", {}) or {}).get("sample_weighting", {}) or {}
+
 train_ds, val_ds = _build_arrays(
     primary,
     indexer,
@@ -1370,6 +1393,7 @@ train_ds, val_ds = _build_arrays(
     judge_lookup=judge_features_lookup if USE_JUDGE_FEATURES else None,
     nn_train=nn_train_matrix if USE_NN_FEATURES else None,
     nn_val=nn_val_matrix if USE_NN_FEATURES else None,
+    sample_weighting_cfg=SAMPLE_WEIGHTING_CFG,
 )
 print(
     f"train rows: {len(train_ds)} | val rows: {len(val_ds)} | "
