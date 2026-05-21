@@ -121,7 +121,7 @@ submission_cache:
 # residual MLP alongside pool, cluster, and judge channels.
 # ----------------------------------------------------------------------------
 nn_features:
-  enabled: true
+  enabled: false
   k: 16
   similarity: "cosine"
   exclude_self_in_training: true
@@ -138,7 +138,7 @@ nn_features:
 item_features:
   enabled: true
   use_pool: true                 # concat z-scored pool features into MLP input
-  use_clusters: true             # concat learned cluster embedding into MLP input
+  use_clusters: false            # concat learned cluster embedding into MLP input
   pool_feature_dim: 9            # update if the pool-feature list changes
   cluster_embed_dim: 16
   cache_dir: "artifacts/item_features"
@@ -241,7 +241,7 @@ train:
 # regressed from the base checkpoint, kill and lower ``encoder_lr``.
 # ----------------------------------------------------------------------------
 lora:
-  enabled: false                       # master switch; false = current behavior
+  enabled: true                        # master switch; false skips the LoRA pass
   # Path to the head-only checkpoint to initialize from. ``null`` =
   # auto-pick the best run by item-cold-start val log-loss from the current
   # ``ALL_RUNS`` table (typically kfactor_irt_item_gated_mlp_k16_seed0_full).
@@ -271,6 +271,17 @@ lora:
   grad_accum_steps: 4
   max_length: 1024
   warmup_steps: 50
+  # Optional explicit step budget. ``0`` schedules over the full epoch (the
+  # historical behavior). ``>0`` schedules over the planned short-run budget
+  # which is required for cosine/linear decays to actually decay during a
+  # 1k-10k step LoRA pass instead of being effectively constant-LR.
+  max_train_steps: 0
+  # Cosine | linear | constant. Applied AFTER the warmup ramp.
+  scheduler: "cosine"
+  # If >0, overrides ``warmup_steps`` as a fraction of ``max_train_steps``.
+  warmup_ratio: 0.0
+  # Floor on the decayed LR as a fraction of the peak (peak * min_lr_ratio).
+  min_lr_ratio: 0.05
   bf16: true
   # Optional: cap optimizer state for the LoRA encoder via 8-bit AdamW
   # (bitsandbytes). Default false; flip on if optimizer memory is tight.
@@ -296,6 +307,14 @@ lora:
   # Per-step microbatch for the val pass. Smaller than the train item batch
   # because val also forwards through the encoder (no cache).
   val_batch_size_items: 16
+  # Cap the periodic / final / init val pass to this many batches. ``0`` =
+  # full validation; ``>0`` evaluates a deterministic random subset of
+  # ``val_eval_max_batches * val_batch_size_items`` rows. Capping is the
+  # difference between a 30s eval and a 15min eval on a 1M-row val split.
+  val_eval_max_batches: 0
+  # Seed for the random validation subset. Fixed across resume so the
+  # capped val metric is comparable step-to-step.
+  val_eval_seed: 12345
   # OOM-resilient fallback. If the train forward OOMs at the configured
   # ``batch_size_items``, halve and double ``grad_accum_steps`` once
   # automatically before giving up.
@@ -321,7 +340,7 @@ lora:
 # template + token list, model_id covers tokenizer + weights).
 # ----------------------------------------------------------------------------
 judge:
-  enabled: true
+  enabled: false
   model_id: "Qwen/Qwen3-4B-Instruct-2507"
   # Default tuned for a single A100 (40/80 GB) with Qwen3-4B in bf16 + FA2
   # at max_prompt_tokens=1024. Drop to 16 on T4 / smaller GPUs. The forward
@@ -392,7 +411,20 @@ eval:
   plots_dir: "artifacts/plots"
   checkpoints_dir: "artifacts/checkpoints"
   ece_bins: 10
-  primary_metric: "log_loss"     # lower is better; selection done on item cold-start
+  # Item cold-start validation metric used for model selection / early
+  # stopping. Two options:
+  #   "log_loss"        - per-row mean BCE (the metric the public
+  #                       harness computes today, treats every row
+  #                       equally).
+  #   "log_loss_macro"  - mean of per-row BCE across the 15 semantic
+  #                       categories from src/semantic_categories.py.
+  #                       Use this when training is category-weighted so
+  #                       selection sees the same objective. It is also
+  #                       closer to the leaderboard's hidden stratified
+  #                       sampling (see validation_harness/harness/sampling.py).
+  primary_metric: "log_loss_macro"
+  # Set to true to print the per-category breakdown each epoch.
+  log_per_category: true
 
 # ----------------------------------------------------------------------------
 # Submission export

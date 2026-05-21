@@ -36,7 +36,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from tqdm.auto import tqdm
+
+from .colab_tqdm import get_tqdm
+
+tqdm = get_tqdm()
 
 from .models import (
     Indexer,
@@ -85,6 +88,23 @@ class TrainConfig:
     early_stopping_patience: int = 5
     bf16: bool = True
     num_workers: int = 0
+
+    # Validation-metric used for early stopping + best-checkpoint selection.
+    # "log_loss"        -> per-row mean (the public-harness metric today)
+    # "log_loss_macro"  -> mean over semantic categories (matches our
+    #                      category-stratified training objective and the
+    #                      platform's stratified hidden-sample sampling
+    #                      described in validation_harness/harness/sampling.py)
+    # When "log_loss_macro" is requested but ``val_category_ids`` is not
+    # supplied to ``train_one``, we silently fall back to "log_loss" and
+    # log a warning so a misconfigured run still trains.
+    selection_metric: str = "log_loss"
+
+    # If true and val_category_ids was supplied, print the per-category
+    # validation breakdown each time the selection metric improves. Helps
+    # spot regressions hiding in small categories (e.g. cybench) that the
+    # per-row mean would average away.
+    log_per_category: bool = True
 
     # Progress / diagnostics.
     progress: bool = True
@@ -288,6 +308,59 @@ def _forward_model(model, s, bc, ie, se, pf, ci, jf=None, nf=None):
     return model(s, bc, ie, se, pf, ci, jf, nf)
 
 
+@dataclass
+class EvalMetrics:
+    """Validation metrics with both per-row and per-category aggregations.
+
+    The five primary fields are kept as positional attributes so callers
+    can still unpack with ``ll, brier, auc, p, y = evaluate_model(...)``
+    via :py:meth:`__iter__`. The macro and per-category fields are
+    populated when ``evaluate_model`` is given ``val_category_ids``.
+
+    ``log_loss`` / ``brier`` / ``auc`` always refer to the per-row mean
+    (the metric the public harness uses today). The matching
+    ``log_loss_macro`` / ``brier_macro`` / ``auc_macro`` average over the
+    semantic categories actually present in the validation pool. Use the
+    macro flavor when the training loss is also category-stratified so
+    selection and reporting see the same objective.
+    """
+
+    log_loss: float
+    brier: float
+    auc: float | None
+    p: np.ndarray
+    y: np.ndarray
+    log_loss_macro: float | None = None
+    brier_macro: float | None = None
+    auc_macro: float | None = None
+    n_categories_present: int = 0
+    per_category: dict[str, dict[str, Any]] | None = None
+
+    def __iter__(self):
+        # Backward-compat: ``ll, brier, auc, p, y = evaluate_model(...)``
+        yield self.log_loss
+        yield self.brier
+        yield self.auc
+        yield self.p
+        yield self.y
+
+    def to_log_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "val_log_loss": float(self.log_loss),
+            "val_brier": float(self.brier),
+            "val_auc": float(self.auc) if self.auc is not None else None,
+        }
+        if self.log_loss_macro is not None:
+            out["val_log_loss_macro"] = float(self.log_loss_macro)
+        if self.brier_macro is not None:
+            out["val_brier_macro"] = float(self.brier_macro)
+        if self.auc_macro is not None:
+            out["val_auc_macro"] = float(self.auc_macro)
+        if self.n_categories_present:
+            out["n_categories_present"] = int(self.n_categories_present)
+        return out
+
+
 def evaluate_model(
     model: nn.Module,
     val_ds: LookupDataset,
@@ -302,8 +375,17 @@ def evaluate_model(
     run_id: str = "",
     epoch: int | None = None,
     epochs: int | None = None,
-) -> tuple[float, float, float | None, np.ndarray, np.ndarray]:
-    """Run val_ds through model and return (log_loss, brier, auc, p, y)."""
+    val_category_ids: np.ndarray | None = None,
+) -> EvalMetrics:
+    """Run val_ds through model and return per-row + per-category metrics.
+
+    Backwards-compatible: the returned :class:`EvalMetrics` supports tuple
+    unpacking as ``ll, brier, auc, p, y = evaluate_model(...)``. When
+    ``val_category_ids`` is supplied (an ``int64`` array aligned with the
+    val rows, e.g. from ``assign_semantic_categories_df`` over the
+    validation dataframe), the result is enriched with macro-averages and
+    a per-category breakdown.
+    """
     model.eval()
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
@@ -400,6 +482,37 @@ def evaluate_model(
     val_brier = _brier(y, p)
     val_auc = _auc(y, p)
 
+    metrics = EvalMetrics(
+        log_loss=val_ll, brier=val_brier, auc=val_auc, p=p, y=y,
+    )
+
+    if val_category_ids is not None and len(p) == len(val_category_ids):
+        from .semantic_categories import stratified_eval_metrics  # local import
+
+        strat = stratified_eval_metrics(
+            y_true=y, p=p, category_ids=np.asarray(val_category_ids, dtype=np.int64),
+        )
+        metrics.log_loss_macro = (
+            None
+            if np.isnan(strat["log_loss_macro"])
+            else float(strat["log_loss_macro"])
+        )
+        metrics.brier_macro = (
+            None
+            if np.isnan(strat["brier_macro"])
+            else float(strat["brier_macro"])
+        )
+        metrics.auc_macro = strat["auc_macro"]
+        metrics.n_categories_present = int(strat["n_categories_present"])
+        metrics.per_category = strat["per_category"]
+    elif val_category_ids is not None:
+        LOG.warning(
+            "evaluate_model: val_category_ids length=%d != predictions length=%d; "
+            "skipping macro metrics",
+            len(val_category_ids),
+            len(p),
+        )
+
     _write_progress_file(
         progress_file,
         {
@@ -412,11 +525,15 @@ def evaluate_model(
             "val_log_loss": float(val_ll),
             "val_brier": float(val_brier),
             "val_auc": float(val_auc) if val_auc is not None else None,
+            "val_log_loss_macro": metrics.log_loss_macro,
+            "val_brier_macro": metrics.brier_macro,
+            "val_auc_macro": metrics.auc_macro,
+            "n_categories_present": int(metrics.n_categories_present),
             **_gpu_mem_dict(),
         },
     )
 
-    return val_ll, val_brier, val_auc, p, y
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -437,8 +554,17 @@ def train_one(
     checkpoint_dir: str | os.PathLike[str],
     device: str | None = None,
     extra_metadata: Mapping[str, Any] | None = None,
+    val_category_ids: np.ndarray | None = None,
 ) -> TrainResult:
-    """Train a single (model_name, seed) configuration."""
+    """Train a single (model_name, seed) configuration.
+
+    When ``val_category_ids`` is supplied (an int64 array aligned with the
+    rows of ``val_ds``), the trainer additionally computes category-macro
+    log-loss / Brier / AUC and -- if ``train_cfg.selection_metric`` is
+    ``"log_loss_macro"`` -- uses the macro variant for early stopping and
+    best-checkpoint selection. Either way both flavors are logged in the
+    history and progress file.
+    """
     set_seed(seed)
 
     if torch.cuda.is_available():
@@ -647,7 +773,7 @@ def train_one(
         train_elapsed = time.time() - epoch_t0
 
         val_t0 = time.time()
-        val_ll, val_brier, val_auc, _val_p, _val_y = evaluate_model(
+        val_metrics = evaluate_model(
             model,
             val_ds,
             device=device,
@@ -660,8 +786,40 @@ def train_one(
             run_id=run_id,
             epoch=epoch,
             epochs=train_cfg.epochs,
+            val_category_ids=val_category_ids,
         )
         val_elapsed = time.time() - val_t0
+
+        val_ll = val_metrics.log_loss
+        val_brier = val_metrics.brier
+        val_auc = val_metrics.auc
+        val_ll_macro = val_metrics.log_loss_macro
+        val_brier_macro = val_metrics.brier_macro
+        val_auc_macro = val_metrics.auc_macro
+
+        # Pick which scalar drives early stopping + best-checkpoint
+        # selection. Default behavior is "log_loss" (the per-row mean)
+        # which matches the prior behavior bit-for-bit. "log_loss_macro"
+        # selects the category-stratified scalar -- recommended when the
+        # training loss is also category-stratified (the default) since
+        # the two objectives are then in agreement. We never let the
+        # selection silently fall back to the micro metric without
+        # logging it: a misconfigured run should still train but should
+        # be loud about which metric is actually being optimized.
+        selection_metric = (
+            getattr(train_cfg, "selection_metric", "log_loss") or "log_loss"
+        ).lower()
+        if selection_metric == "log_loss_macro" and val_ll_macro is None:
+            if epoch == 1:
+                LOG.warning(
+                    "train_cfg.selection_metric='log_loss_macro' but no "
+                    "val_category_ids supplied; falling back to log_loss "
+                    "(micro) for early stopping."
+                )
+            selection_metric = "log_loss"
+        score_for_selection = (
+            val_ll_macro if selection_metric == "log_loss_macro" else val_ll
+        )
 
         history.append(
             {
@@ -670,6 +828,11 @@ def train_one(
                 "val_log_loss": val_ll,
                 "val_brier": val_brier,
                 "val_auc": val_auc,
+                "val_log_loss_macro": val_ll_macro,
+                "val_brier_macro": val_brier_macro,
+                "val_auc_macro": val_auc_macro,
+                "val_n_categories_present": val_metrics.n_categories_present,
+                "selection_metric": selection_metric,
                 "lr": opt.param_groups[0]["lr"],
                 "train_elapsed_seconds": train_elapsed,
                 "val_elapsed_seconds": val_elapsed,
@@ -677,15 +840,40 @@ def train_one(
             }
         )
 
-        improved = val_ll < best_ll - 1e-6
+        improved = (
+            score_for_selection is not None
+            and score_for_selection < best_ll - 1e-6
+        )
 
         if improved:
-            best_ll = val_ll
-            best_brier = val_brier
-            best_auc = val_auc
+            best_ll = float(score_for_selection)
+            best_brier = val_brier_macro if selection_metric == "log_loss_macro" else val_brier
+            best_auc = val_auc_macro if selection_metric == "log_loss_macro" else val_auc
             best_epoch = epoch
             patience = 0
             _save_checkpoint(model, model_cfg, train_cfg, indexer, ckpt_path)
+            if (
+                getattr(train_cfg, "log_per_category", False)
+                and val_metrics.per_category is not None
+            ):
+                from .semantic_categories import format_stratified_eval_report
+
+                LOG.info(
+                    "best-epoch per-category breakdown:\n%s",
+                    format_stratified_eval_report(
+                        {
+                            "log_loss_micro": val_metrics.log_loss,
+                            "brier_micro": val_metrics.brier,
+                            "auc_micro": val_metrics.auc,
+                            "log_loss_macro": val_metrics.log_loss_macro,
+                            "brier_macro": val_metrics.brier_macro,
+                            "auc_macro": val_metrics.auc_macro,
+                            "n_categories_present": val_metrics.n_categories_present,
+                            "per_category": val_metrics.per_category,
+                        },
+                        desc=f"{run_id} epoch {epoch} val",
+                    ),
+                )
         else:
             patience += 1
 
@@ -701,6 +889,13 @@ def train_one(
                 "val_log_loss": float(val_ll),
                 "val_brier": float(val_brier),
                 "val_auc": float(val_auc) if val_auc is not None else None,
+                "val_log_loss_macro": val_ll_macro,
+                "val_brier_macro": val_brier_macro,
+                "val_auc_macro": val_auc_macro,
+                "val_n_categories_present": int(
+                    val_metrics.n_categories_present
+                ),
+                "selection_metric": selection_metric,
                 "best_val_log_loss": float(best_ll),
                 "best_epoch": int(best_epoch),
                 "improved": bool(improved),
@@ -716,13 +911,18 @@ def train_one(
 
         LOG.info(
             "epoch %d/%d train=%.5f val_ll=%.5f val_brier=%.5f val_auc=%s "
-            "lr=%.5g train_time=%s val_time=%s gpu_mem=%s %s",
+            "val_ll_macro=%s val_brier_macro=%s val_auc_macro=%s "
+            "select=%s lr=%.5g train_time=%s val_time=%s gpu_mem=%s %s",
             epoch,
             train_cfg.epochs,
             train_loss,
             val_ll,
             val_brier,
             f"{val_auc:.4f}" if val_auc is not None else "n/a",
+            f"{val_ll_macro:.5f}" if val_ll_macro is not None else "n/a",
+            f"{val_brier_macro:.5f}" if val_brier_macro is not None else "n/a",
+            f"{val_auc_macro:.4f}" if val_auc_macro is not None else "n/a",
+            selection_metric,
             opt.param_groups[0]["lr"],
             _fmt_seconds(train_elapsed),
             _fmt_seconds(val_elapsed),
@@ -858,8 +1058,13 @@ def train_many(
     run_id_prefix: str = "",
     device: str | None = None,
     extra_metadata: Mapping[str, Any] | None = None,
+    val_category_ids: np.ndarray | None = None,
 ) -> list[TrainResult]:
-    """Run `train_one` across multiple seeds. Returns a list of TrainResults."""
+    """Run `train_one` across multiple seeds. Returns a list of TrainResults.
+
+    ``val_category_ids`` is forwarded as-is to :func:`train_one`; see that
+    function's docstring for the macro-metric behavior.
+    """
     out: list[TrainResult] = []
 
     for seed_idx, seed in enumerate(seeds, start=1):
@@ -891,6 +1096,7 @@ def train_many(
             checkpoint_dir=checkpoint_dir,
             device=device,
             extra_metadata=extra_metadata,
+            val_category_ids=val_category_ids,
         )
 
         out.append(res)
@@ -914,6 +1120,7 @@ def train_many(
 
 
 __all__ = [
+    "EvalMetrics",
     "TrainConfig",
     "TrainResult",
     "evaluate_model",

@@ -663,6 +663,177 @@ def format_semantic_category_report(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Category-stratified validation metrics
+#
+# When the training loss is category-stratified, a plain per-row validation
+# metric over-counts large categories (e.g. ultrafeedback in our corpus is
+# ~60% of items) and under-counts small ones (cybench, androidworld). The
+# hidden platform draws N=5000 hidden items stratified across data
+# categories per the public harness, which makes the leaderboard score
+# closer to a *macro-average across categories* than to a per-row micro
+# average. We therefore report both flavors and let the trainer select on
+# whichever the user configures as primary.
+# ---------------------------------------------------------------------------
+
+
+def _log_loss(y: np.ndarray, p: np.ndarray, eps: float = 1e-7) -> float:
+    if y.size == 0:
+        return float("nan")
+    yy = np.clip(y.astype(np.float64), 0.0, 1.0)
+    pp = np.clip(p.astype(np.float64), eps, 1.0 - eps)
+    return float(-(yy * np.log(pp) + (1.0 - yy) * np.log(1.0 - pp)).mean())
+
+
+def _brier(y: np.ndarray, p: np.ndarray) -> float:
+    if y.size == 0:
+        return float("nan")
+    return float(np.mean((y.astype(np.float64) - p.astype(np.float64)) ** 2))
+
+
+def _auc(y: np.ndarray, p: np.ndarray) -> float | None:
+    if y.size == 0:
+        return None
+    yb = (y >= 0.5).astype(int)
+    pos_n = int(yb.sum())
+    neg_n = int((1 - yb).sum())
+    if pos_n == 0 or neg_n == 0:
+        return None
+    if not np.allclose(y, yb, atol=1e-6):
+        return None
+    order = np.argsort(p, kind="mergesort")
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(p) + 1)
+    return float(
+        (ranks[yb == 1].sum() - pos_n * (pos_n + 1) / 2.0) / (pos_n * neg_n)
+    )
+
+
+def stratified_eval_metrics(
+    y_true: np.ndarray,
+    p: np.ndarray,
+    category_ids: np.ndarray,
+    *,
+    eps: float = 1e-7,
+) -> dict[str, Any]:
+    """Compute per-category + macro-average log_loss / brier / AUC.
+
+    Parameters
+    ----------
+    y_true : (N,) float -- labels in [0, 1].
+    p : (N,) float -- predicted probabilities.
+    category_ids : (N,) int -- semantic category id in ``[0, 15)``. Rows
+        with id outside that range are silently dropped from the macro
+        average; this lets callers tag "unknown" rows with -1.
+
+    Returns
+    -------
+    dict with keys::
+
+        log_loss_micro, brier_micro, auc_micro,        # per-row mean
+        log_loss_macro, brier_macro, auc_macro,        # mean over present categories
+        n_categories_present,                          # how many cats had >= 1 row
+        per_category: {name: {n_rows, log_loss, brier, auc}}
+
+    AUC at the macro level averages only categories where AUC is defined
+    (both pos and neg present with hard-binarized labels). Categories with
+    undefined AUC are reported as ``None`` in ``per_category`` and skipped
+    from the macro mean.
+    """
+    y = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    pp = np.asarray(p, dtype=np.float64).reshape(-1)
+    cats = np.asarray(category_ids, dtype=np.int64).reshape(-1)
+    if y.shape != pp.shape or y.shape != cats.shape:
+        raise ValueError(
+            f"shape mismatch: y={y.shape} p={pp.shape} cats={cats.shape}"
+        )
+
+    out: dict[str, Any] = {
+        "log_loss_micro": _log_loss(y, pp, eps=eps),
+        "brier_micro": _brier(y, pp),
+        "auc_micro": _auc(y, pp),
+        "log_loss_macro": float("nan"),
+        "brier_macro": float("nan"),
+        "auc_macro": None,
+        "n_categories_present": 0,
+        "per_category": {},
+    }
+
+    per_cat: dict[str, dict[str, Any]] = {}
+    macro_ll: list[float] = []
+    macro_br: list[float] = []
+    macro_auc: list[float] = []
+
+    for cid in range(N_CATEGORIES):
+        mask = cats == cid
+        n = int(mask.sum())
+        if n == 0:
+            per_cat[CATEGORY_NAMES[cid]] = {
+                "n_rows": 0,
+                "log_loss": None,
+                "brier": None,
+                "auc": None,
+            }
+            continue
+        ll = _log_loss(y[mask], pp[mask], eps=eps)
+        br = _brier(y[mask], pp[mask])
+        a = _auc(y[mask], pp[mask])
+        per_cat[CATEGORY_NAMES[cid]] = {
+            "n_rows": n,
+            "log_loss": ll,
+            "brier": br,
+            "auc": a,
+        }
+        macro_ll.append(ll)
+        macro_br.append(br)
+        if a is not None:
+            macro_auc.append(a)
+
+    out["per_category"] = per_cat
+    out["n_categories_present"] = len(macro_ll)
+    if macro_ll:
+        out["log_loss_macro"] = float(np.mean(macro_ll))
+    if macro_br:
+        out["brier_macro"] = float(np.mean(macro_br))
+    if macro_auc:
+        out["auc_macro"] = float(np.mean(macro_auc))
+    return out
+
+
+def format_stratified_eval_report(stats: Mapping[str, Any], *, desc: str = "val") -> str:
+    """Pretty-print stratified eval stats as a multi-line table for logs."""
+    def _fmt(x: Any) -> str:
+        if x is None:
+            return "  n/a"
+        if isinstance(x, float):
+            if x != x:  # NaN
+                return "  n/a"
+            return f"{x:.5f}"
+        return str(x)
+
+    lines = [
+        f"[{desc}] micro: ll={_fmt(stats.get('log_loss_micro'))}  "
+        f"brier={_fmt(stats.get('brier_micro'))}  "
+        f"auc={_fmt(stats.get('auc_micro'))}",
+        f"[{desc}] macro: ll={_fmt(stats.get('log_loss_macro'))}  "
+        f"brier={_fmt(stats.get('brier_macro'))}  "
+        f"auc={_fmt(stats.get('auc_macro'))}  "
+        f"(n_cats={stats.get('n_categories_present', 0)})",
+        f"  {'category':40s} {'n_rows':>10s} {'ll':>10s} {'brier':>10s} {'auc':>10s}",
+    ]
+    per_cat = stats.get("per_category", {}) or {}
+    for name in CATEGORY_NAMES:
+        row = per_cat.get(name, {})
+        lines.append(
+            f"  {name:40s} "
+            f"{int(row.get('n_rows', 0)):>10d} "
+            f"{_fmt(row.get('log_loss')):>10s} "
+            f"{_fmt(row.get('brier')):>10s} "
+            f"{_fmt(row.get('auc')):>10s}"
+        )
+    return "\n".join(lines)
+
+
 __all__ = [
     "CATEGORY_NAMES",
     "CATEGORY_TO_ID",
@@ -672,5 +843,7 @@ __all__ = [
     "assign_semantic_category_id",
     "compute_semantic_sample_weights",
     "format_semantic_category_report",
+    "format_stratified_eval_report",
     "semantic_category_report",
+    "stratified_eval_metrics",
 ]

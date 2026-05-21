@@ -1314,23 +1314,32 @@ def _build_arrays(
     y_train = train["label"].astype(float).to_numpy()
     y_val = val["label"].astype(float).to_numpy()
 
-    # Optional semantic-category training weights. Validation is always
-    # unweighted: the leaderboard metric is the raw per-row mean.
+    # Optional semantic-category training weights. Validation rows do NOT
+    # carry weights -- the validation metric is computed per-row -- but we
+    # *do* compute the same semantic-category id for every val row so the
+    # trainer can also report a category-macro log-loss (closer to the
+    # leaderboard's stratified sampling than the raw per-row mean).
     sw_train: np.ndarray | None = None
-    if sample_weighting_cfg and bool(sample_weighting_cfg.get("enabled", False)):
+    val_category_ids: np.ndarray | None = None
+
+    sw_enabled = bool(sample_weighting_cfg and sample_weighting_cfg.get("enabled", False))
+    if sw_enabled:
         from src.semantic_categories import (
+            assign_semantic_categories_df,
             compute_semantic_sample_weights,
             format_semantic_category_report,
         )
 
+        item_col = str(sample_weighting_cfg.get("item_col", "item_key"))
         weights, report = compute_semantic_sample_weights(
             train,
             lambda_=float(sample_weighting_cfg.get("lambda", 1.0)),
-            item_col=str(sample_weighting_cfg.get("item_col", "item_key")),
+            item_col=item_col,
             normalize=bool(sample_weighting_cfg.get("normalize", True)),
             return_report=True,
         )
         sw_train = np.asarray(weights, dtype=np.float32)
+        val_category_ids = assign_semantic_categories_df(val, item_col=item_col)
         if bool(sample_weighting_cfg.get("log_report", True)):
             print(format_semantic_category_report(report))
     return (
@@ -1342,6 +1351,7 @@ def _build_arrays(
             s_val, bc_val, ie_val, y_val, se_val, pf_val,
             ci_val, jf_val, nn_val_arr,
         ),
+        val_category_ids,
     )
 
 
@@ -1381,8 +1391,9 @@ USE_NN_FEATURES = bool(
 )
 
 SAMPLE_WEIGHTING_CFG = (CFG.get("train", {}) or {}).get("sample_weighting", {}) or {}
+EVAL_PRIMARY_METRIC = (CFG.get("eval", {}) or {}).get("primary_metric", "log_loss")
 
-train_ds, val_ds = _build_arrays(
+train_ds, val_ds, val_category_ids = _build_arrays(
     primary,
     indexer,
     item_emb_lookup,
@@ -1636,6 +1647,11 @@ train_cfg = TrainConfig(
     early_stopping_patience=int(CFG["train"]["early_stopping_patience"]),
     bf16=bool(CFG["encoder"]["bf16"]),
     num_workers=int(CFG["train"].get("num_workers", 0)),
+    # When ``eval.primary_metric`` in the config is "log_loss_macro" we
+    # pass it through as the trainer's selection_metric so early stopping
+    # + best-checkpoint use the category-stratified validation log-loss
+    # (apples-to-apples with the category-weighted training objective).
+    selection_metric=str(EVAL_PRIMARY_METRIC),
     progress=True,
     log_every_batches=1,
     progress_file=str(PROGRESS_FILE),
@@ -1736,7 +1752,9 @@ for job_idx, (model_name, k, seed, tag, up, uc) in enumerate(pbar, start=1):
             "use_pool_features": bool(model_cfg.use_pool_features),
             "use_cluster_features": bool(model_cfg.use_cluster_features),
             "feature_tag": tag,
+            "eval_primary_metric": EVAL_PRIMARY_METRIC,
         },
+        val_category_ids=val_category_ids,
     )
 
     job_elapsed = time.time() - job_t0
