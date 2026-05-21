@@ -854,8 +854,37 @@ _REGISTRY = {
 
 
 # ---------------------------------------------------------------------------
-# Calibrator (intercept-only / temperature-intercept / identity)
+# Calibrator (per-benchmark held-out-gated intercept w/ ridge + identity)
 # ---------------------------------------------------------------------------
+#
+# Design notes:
+#
+#   * Only one fitted tier -- ridge-regularized intercept-only -- because
+#     N<=75 (75 total per round, ~5 per benchmark on average) is way below
+#     what is needed to fit a second free parameter reliably.  An earlier
+#     experiment with a temp+intercept tier turned out to overfit so hard
+#     that CV with random shuffles flipped between accept and reject (T
+#     fits ranged from 0.6 to 0.85 on data that was actually well
+#     calibrated).
+#
+#   * Held-out gate uses REPEATED 5-fold CV (5 shuffles) so the gate
+#     decision does not depend on the caller's input order, plus an
+#     AIC-style complexity margin (4 nats per param per repeat) AND a
+#     per-repeat majority gate (calibrator must beat baseline in at least
+#     ceil(n_repeats / 2) of the individual shuffles).
+#
+#   * The fit itself adds an L2 ridge ``lambda * b**2`` so even when
+#     accepted, the intercept gets pulled toward zero.  lambda = 1.0,
+#     equivalent to one fake observation pinned at b = 0.
+#
+#   * Per-bc routing uses the raw ``bc_key`` string
+#     (``"benchmark::condition"``) -- NOT the embedding table's bc_id,
+#     which would collapse every unseen benchmark to 0 and merge them
+#     all into a single bucket (the opposite of what we want for
+#     new-benchmark calibration).
+
+
+_RIDGE_LAMBDA = 1.0
 
 
 def _sigmoid(x: float) -> float:
@@ -871,206 +900,223 @@ def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
 
 
-class _Calibrator:
-    """Identity by default; replaced in-place by fit_from_labeled().
+def _fit_intercept_ridge(ps, ys, ridge: float = _RIDGE_LAMBDA):
+    """Fit logit(p') = logit(p) + b by 1D Newton on BCE + ridge * b**2."""
+    if not ps:
+        return {"kind": "identity"}
+    zs = [_logit(p) for p in ps]
+    b = 0.0
+    for _ in range(80):
+        g = 2.0 * ridge * b
+        h = 2.0 * ridge
+        for z, y in zip(zs, ys):
+            q = _sigmoid(z + b)
+            g += q - y
+            h += q * (1.0 - q)
+        if h < 1e-9:
+            break
+        step = g / h
+        new_b = b - step
+        if not math.isfinite(new_b):
+            break
+        if abs(new_b - b) < 1e-8:
+            b = new_b
+            break
+        b = new_b
+    if not math.isfinite(b):
+        return {"kind": "identity"}
+    b = max(-5.0, min(5.0, float(b)))
+    return {"kind": "intercept", "b": b}
 
-    Tier order matches ``src.calibration.best_effort_fit``:
-      - N >= 60  -> 3-param beta calibration (Kull/Filho/Flach 2017)
-      - N >= 30  -> 2-param temperature + intercept (Platt)
-      - N >= 5   -> 1-param intercept-only logit shift
-      - otherwise -> identity (the default ``state``).
+
+def _apply_state(p: float, state: dict) -> float:
+    if not math.isfinite(p):
+        return DEFAULT_PROB
+    kind = state.get("kind", "identity")
+    if kind == "intercept":
+        z = _logit(p) + float(state.get("b", 0.0))
+        return _sigmoid(z)
+    return p
+
+
+def _stable_shuffle_order(ps, ys) -> list:
+    """Deterministic permutation invariant to input order."""
+    keyed = [(float(p), float(y), j) for j, (p, y) in enumerate(zip(ps, ys))]
+    keyed.sort()
+    return [k[2] for k in keyed]
+
+
+def _kfold_indices(perm: list, k: int, seed: int):
+    """Apply seed-controlled rotation on ``perm`` then stripe into k folds."""
+    n = len(perm)
+    if n == 0 or k <= 0:
+        return [perm]
+    rotated = list(perm)
+    rng = __import__("random").Random(seed)
+    rng.shuffle(rotated)
+    return [rotated[i::k] for i in range(k)]
+
+
+def _cv_nll_pair(ps, ys, fitter, baseline_state, folds):
+    """Return (cal_total_nll, base_total_nll, counted) over `folds`."""
+    n = len(ps)
+    cal_total = 0.0
+    base_total = 0.0
+    counted = 0
+    for test in folds:
+        if not test:
+            continue
+        train_set = set(test)
+        train_p = [ps[j] for j in range(n) if j not in train_set]
+        train_y = [ys[j] for j in range(n) if j not in train_set]
+        try:
+            cal_state = fitter(train_p, train_y)
+        except Exception:
+            cal_state = {"kind": "identity"}
+        for j in test:
+            p_cal = _apply_state(ps[j], cal_state)
+            p_base = _apply_state(ps[j], baseline_state)
+            p_cal = min(max(p_cal, EPS), 1.0 - EPS)
+            p_base = min(max(p_base, EPS), 1.0 - EPS)
+            y = ys[j]
+            cal_total -= y * math.log(p_cal) + (1.0 - y) * math.log(1.0 - p_cal)
+            base_total -= y * math.log(p_base) + (1.0 - y) * math.log(1.0 - p_base)
+            counted += 1
+    return cal_total, base_total, counted
+
+
+def _gated_fit(
+    ps,
+    ys,
+    baseline_state,
+    *,
+    min_total: int = 5,
+    n_repeats: int = 5,
+    margin_nats_per_param: float = 4.0,
+    require_majority_repeat_wins: bool = True,
+):
+    """Return a ridge-fit intercept state if it convincingly beats baseline,
+    else return ``baseline_state`` unchanged.
+    """
+    n = len(ps)
+    if n < min_total:
+        return baseline_state
+    fitter = _fit_intercept_ridge
+    k_params = 1
+    k = 5 if n >= 10 else n
+    perm = _stable_shuffle_order(ps, ys)
+    cal_total = 0.0
+    base_total = 0.0
+    counted = 0
+    repeat_wins = 0
+    for rep in range(n_repeats):
+        folds = _kfold_indices(perm, k, seed=0xC0FFEE + rep * 7919)
+        c, b_, n_eval = _cv_nll_pair(ps, ys, fitter, baseline_state, folds)
+        cal_total += c
+        base_total += b_
+        counted += n_eval
+        if c < b_:
+            repeat_wins += 1
+    margin = margin_nats_per_param * k_params * n_repeats
+    if counted == 0:
+        return baseline_state
+    if cal_total >= base_total - margin:
+        return baseline_state
+    if require_majority_repeat_wins and repeat_wins < (n_repeats + 1) // 2:
+        return baseline_state
+    try:
+        return fitter(ps, ys)
+    except Exception:
+        return baseline_state
+
+
+class _Calibrator:
+    """Hierarchical per-benchmark calibrator with held-out NLL gating.
+
+    Routing path at apply time:
+        local[bc_key] (if accepted) -> global -> identity
+    where bc_key is the raw "benchmark::condition" string so each new
+    benchmark gets its own slot (and unseen benchmarks do NOT collapse to
+    a shared bc_id=0 bucket).
     """
 
-    def __init__(self, state: dict | None = None):
-        self.state: dict = dict(state or {"kind": "identity"})
+    def __init__(self, state: dict | None = None) -> None:
+        self.state: dict = dict(state) if isinstance(state, dict) else {"kind": "identity"}
+        self.per_bc: dict[str, dict] = {}
 
-    def apply(self, p: float) -> float:
-        if not math.isfinite(p):
-            return DEFAULT_PROB
-        kind = self.state.get("kind", "identity")
-        if kind == "intercept":
-            z = _logit(p) + float(self.state.get("b", 0.0))
-            return min(max(_sigmoid(z), EPS), 1.0 - EPS)
-        if kind == "temp_intercept":
-            T = max(0.1, float(self.state.get("T", 1.0)))
-            b = float(self.state.get("b", 0.0))
-            z = _logit(p) / T + b
-            return min(max(_sigmoid(z), EPS), 1.0 - EPS)
-        if kind == "beta":
-            a = max(0.01, float(self.state.get("a", 1.0)))
-            b = max(0.01, float(self.state.get("b", 1.0)))
-            c = float(self.state.get("c", 0.0))
-            p_safe = min(max(float(p), EPS), 1.0 - EPS)
-            z = a * math.log(p_safe) - b * math.log(1.0 - p_safe) + c
-            return min(max(_sigmoid(z), EPS), 1.0 - EPS)
-        return min(max(p, EPS), 1.0 - EPS)
-
-    def fit_from_labeled(self, labeled_list: list[dict]) -> None:
+    def fit_from_labeled(self, labeled_list) -> None:
         if not labeled_list:
             return
         ps: list[float] = []
         ys: list[float] = []
+        bcs: list[str] = []
         for ex in labeled_list:
             try:
-                y = float(ex.get("label"))
+                lbl = ex.get("label")
+                if lbl is None:
+                    continue
+                y = float(lbl)
             except (TypeError, ValueError):
                 continue
-            p_base = _predict_uncalibrated(
-                ex.get("benchmark", ""),
-                ex.get("condition", "none"),
-                ex.get("subject_content", ""),
-                ex.get("item_content", ""),
-            )
-            if math.isfinite(y) and math.isfinite(p_base):
-                ys.append(min(max(y, 0.0), 1.0))
-                ps.append(p_base)
+            if not math.isfinite(y):
+                continue
+            benchmark = str(ex.get("benchmark", "") or "")
+            condition = normalize_condition(ex.get("condition", "none"))
+            subject_content = str(ex.get("subject_content", "") or "")
+            item_content = str(ex.get("item_content", "") or "")
+            try:
+                p_base = _predict_uncalibrated(
+                    benchmark, condition, subject_content, item_content
+                )
+            except Exception:
+                continue
+            if not math.isfinite(p_base):
+                continue
+            bc_key = "{0}::{1}".format(benchmark, condition)
+            ps.append(float(p_base))
+            ys.append(min(max(y, 0.0), 1.0))
+            bcs.append(bc_key)
         if not ps:
             return
-        yb = [1 if v >= 0.5 else 0 for v in ys]
-        if sum(yb) == 0 or sum(yb) == len(yb):
-            return  # degenerate: identity is safer
-        if len(ps) >= 60:
-            self.state = _fit_beta_calibration(ps, ys)
-            # Sanity-check the fit; fall back to temp_intercept if any output
-            # is non-finite (a runaway Newton step we didn't catch otherwise).
-            try:
-                out = [self.apply(float(x)) for x in ps]
-                if not all(math.isfinite(v) for v in out):
-                    self.state = _fit_temp_intercept(ps, ys)
-            except Exception:  # noqa: BLE001
-                self.state = _fit_temp_intercept(ps, ys)
-        elif len(ps) >= 30:
-            self.state = _fit_temp_intercept(ps, ys)
-        elif len(ps) >= 5:
-            self.state = _fit_intercept_only(ps, ys)
-
-
-def _fit_intercept_only(ps: list[float], ys: list[float]) -> dict:
-    z = np.log(np.clip(ps, EPS, 1 - EPS)) - np.log(np.clip([1 - p for p in ps], EPS, 1 - EPS))
-    y = np.asarray(ys, dtype=float)
-    b = 0.0
-    for _ in range(50):
-        pred = 1.0 / (1.0 + np.exp(-(z + b)))
-        grad = float((pred - y).mean())
-        hess = float((pred * (1.0 - pred)).mean()) + 1e-6
-        step = grad / hess
-        b -= step
-        if abs(step) < 1e-6:
-            break
-    if not math.isfinite(b):
-        return {"kind": "identity"}
-    return {"kind": "intercept", "b": float(b)}
-
-
-def _fit_temp_intercept(ps: list[float], ys: list[float]) -> dict:
-    z = np.log(np.clip(ps, EPS, 1 - EPS)) - np.log(np.clip([1 - p for p in ps], EPS, 1 - EPS))
-    y = np.asarray(ys, dtype=float)
-    T, b = 1.0, 0.0
-    for _ in range(100):
-        zt = z / T + b
-        pred = 1.0 / (1.0 + np.exp(-zt))
-        err = pred - y
-        d_b = float(err.mean())
-        d_a = float((err * z).mean())
-        h_b = float((pred * (1 - pred)).mean()) + 1e-6
-        h_a = float((pred * (1 - pred) * z * z).mean()) + 1e-6
-        new_b = b - d_b / h_b
-        new_a = (1.0 / T) - d_a / h_a
-        new_T = 1.0 / max(0.1, new_a)
-        if not (math.isfinite(new_b) and math.isfinite(new_T)):
-            return {"kind": "identity"}
-        if abs(new_b - b) + abs(new_T - T) < 1e-6:
-            T, b = new_T, new_b
-            break
-        T, b = new_T, new_b
-    return {"kind": "temp_intercept", "T": float(T), "b": float(b)}
-
-
-def _beta_calibration_loss(
-    a: float,
-    b: float,
-    c: float,
-    lp: "np.ndarray",
-    lq: "np.ndarray",
-    y: "np.ndarray",
-) -> float:
-    z = a * lp - b * lq + c
-    log_p = -np.logaddexp(0.0, -z)
-    log_q = -np.logaddexp(0.0, z)
-    return float(-(y * log_p + (1.0 - y) * log_q).mean())
-
-
-def _fit_beta_calibration(ps: list[float], ys: list[float]) -> dict:
-    """Fit Kull/Filho/Flach 2017 beta calibration on (p_uncal, y).
-
-    Mirror of ``src.calibration.fit_beta`` -- 3-param Newton with the full
-    3x3 Hessian (the diagonal approximation that works for the simpler
-    fits diverges here because the (a, b) cross-derivative is non-trivial),
-    a small ridge, and backtracking line search to guarantee BCE never
-    increases. ``a, b`` are clamped to ``[0.01, 100]`` so the calibrator
-    stays monotone increasing; ``c`` is clamped to ``[-20, 20]``.
-    """
-    ps_arr = np.asarray(ps, dtype=float)
-    y = np.asarray(ys, dtype=float)
-    if ps_arr.size < 60 or ps_arr.size != y.size:
-        return {"kind": "identity"}
-    p_safe = np.clip(ps_arr, EPS, 1.0 - EPS)
-    lp = np.log(p_safe)
-    lq = np.log(1.0 - p_safe)
-    a, b, c = 1.0, 1.0, 0.0
-    loss = _beta_calibration_loss(a, b, c, lp, lq, y)
-    for _ in range(100):
-        z = a * lp - b * lq + c
-        pred = 1.0 / (1.0 + np.exp(-z))
-        err = pred - y
-        h = pred * (1.0 - pred)
-        g = np.array(
-            [
-                float((err * lp).mean()),
-                float((-err * lq).mean()),
-                float(err.mean()),
-            ],
-            dtype=np.float64,
-        )
-        H = np.empty((3, 3), dtype=np.float64)
-        H[0, 0] = float((h * lp * lp).mean())
-        H[1, 1] = float((h * lq * lq).mean())
-        H[2, 2] = float(h.mean())
-        H[0, 1] = H[1, 0] = float((h * lp * (-lq)).mean())
-        H[0, 2] = H[2, 0] = float((h * lp).mean())
-        H[1, 2] = H[2, 1] = float((h * (-lq)).mean())
-        H += 1e-6 * np.eye(3)
-        try:
-            delta = np.linalg.solve(H, g)
-        except np.linalg.LinAlgError:
-            break
-        if not np.all(np.isfinite(delta)):
-            break
-        step = 1.0
-        accepted = False
-        for _bt in range(7):
-            new_a = min(100.0, max(0.01, a - step * float(delta[0])))
-            new_b = min(100.0, max(0.01, b - step * float(delta[1])))
-            new_c = min(20.0, max(-20.0, c - step * float(delta[2])))
-            if not (
-                math.isfinite(new_a) and math.isfinite(new_b) and math.isfinite(new_c)
-            ):
-                step *= 0.5
+        global_state = _gated_fit(ps, ys, baseline_state={"kind": "identity"})
+        self.state = global_state
+        bc_to_pairs: dict[str, tuple[list[float], list[float]]] = {}
+        for p, y, bc in zip(ps, ys, bcs):
+            bucket = bc_to_pairs.setdefault(bc, ([], []))
+            bucket[0].append(p)
+            bucket[1].append(y)
+        local: dict[str, dict] = {}
+        for bc_key, (lp, ly) in bc_to_pairs.items():
+            if len(lp) < 5:
                 continue
-            new_loss = _beta_calibration_loss(new_a, new_b, new_c, lp, lq, y)
-            if math.isfinite(new_loss) and new_loss <= loss + 1e-12:
-                accepted = True
-                break
-            step *= 0.5
-        if not accepted:
-            break
-        if abs(new_a - a) + abs(new_b - b) + abs(new_c - c) < 1e-7:
-            a, b, c, loss = new_a, new_b, new_c, new_loss
-            break
-        a, b, c, loss = new_a, new_b, new_c, new_loss
-    if not (math.isfinite(a) and math.isfinite(b) and math.isfinite(c)):
-        return {"kind": "identity"}
-    return {"kind": "beta", "a": float(a), "b": float(b), "c": float(c)}
+            cand = _gated_fit(lp, ly, baseline_state=global_state, min_total=5)
+            if cand is not global_state and cand.get("kind", "identity") != "identity":
+                local[bc_key] = cand
+        self.per_bc = local
+        try:
+            n_new_benchmarks = sum(
+                1 for k in self.per_bc if _BC_TO_ID.get(k, 0) == 0
+            )
+            LOG.info(
+                "Calibrator fit: N=%d, global=%s, per_bc=%d (of which %d are NEW benchmarks)",
+                len(ps),
+                self.state.get("kind", "identity"),
+                len(self.per_bc),
+                n_new_benchmarks,
+            )
+        except Exception:
+            pass
+
+    def apply(self, p: float, bc_key: str = "") -> float:
+        if not math.isfinite(p):
+            return DEFAULT_PROB
+        if isinstance(bc_key, str) and bc_key in self.per_bc:
+            q = _apply_state(p, self.per_bc[bc_key])
+        else:
+            q = _apply_state(p, self.state)
+        if not math.isfinite(q):
+            return DEFAULT_PROB
+        return float(min(max(q, EPS), 1.0 - EPS))
 
 
 # ---------------------------------------------------------------------------
@@ -1768,6 +1814,16 @@ _MODEL_NAME: str = META["model_name"]
 _SUBJECT_TO_ID: dict = dict(_INDEXER["subject_to_id"])
 _BC_TO_ID: dict = dict(_INDEXER["bc_to_id"])
 
+# Per-(subject, bc) training row counts, used by labeling.py for graded
+# novelty + graded anchoring acquisition.  Optional: present only when
+# ``export_run`` was called with ``train_counts={...}`` -- otherwise these
+# stay empty and labeling.py falls back to binary novelty + anchoring
+# (which still preserves the priority ordering, just without the
+# continuous gradient within each tier).
+_TRAIN_COUNTS_RAW: dict = dict(META.get("train_counts") or {})
+_N_TRAIN_PER_SUBJECT: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_subject") or {})
+_N_TRAIN_PER_BC: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_bc") or {})
+
 _MODEL = _REGISTRY[_MODEL_NAME](_MODEL_CFG)
 _MODEL.load_state_dict(_CKPT["model_state"], strict=False)
 _MODEL.eval().to(_DEVICE)
@@ -2396,7 +2452,8 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
             return float(cached)
 
         p = _predict_uncalibrated(benchmark, condition, subject_content, item_content)
-        p = _CALIBRATOR.apply(p)
+        _bc_key_for_apply = "{0}::{1}".format(benchmark, condition)
+        p = _CALIBRATOR.apply(p, _bc_key_for_apply)
         p = float(min(max(p, EPS), 1.0 - EPS))
         _PROB_CACHE[cache_key] = p
         return p
@@ -2406,7 +2463,7 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
 '''
 
 
-_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (streamed-flush + uncertainty).
+_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (benchmark-novelty + anchor-model).
 
 The Codabench runner calls ``acquisition_function`` once per hidden
 (subject, item) pair BEFORE any ``predict()`` call.  Each call here does
@@ -2414,75 +2471,138 @@ two things:
 
   1. Forward the input to ``model._enqueue_for_batch`` so the streamed-
      flush architecture can start populating encoder + judge caches in
-     the background. This is what keeps every per-call wall time bounded
-     and the eventual ``predict()`` calls under the 10s timeout.
+     the background.
 
-  2. Return a *real* acquisition score derived from the cheap baseline
-     logit (subject intercept + benchmark-condition intercept + mu)
-     looked up directly from the trained head's embedding tables -- NO
-     encoder forward, NO judge forward. The score is
-     ``-|sigmoid(baseline_logit) - 0.5|``, the canonical binary-uncertainty
-     signal (Lewis & Gale 1994): higher = closer to 0.5 = the head is
-     less sure. The platform sorts top-K-per-category by this score so
-     the 75 revealed labels concentrate on (subject, bc) combinations
-     where the head's a priori uncertainty is highest -- exactly where
-     a small Platt / beta calibrator fitted on those labels has the
-     largest leverage on the post-calibration log-loss.
+  2. Return an ACQUISITION SCORE biased toward new benchmarks observed
+     with well-anchored models. The score has three layers:
 
-The signal is *item-agnostic* (the cheap baseline doesn't look at
-``item_content``), so candidates that share a (subject, bc) tie at the
-same score; the platform's documented random tiebreak then picks among
-them, which gives a stratified-by-(subject, bc) random sample of items
-from the most-uncertain combos. If the baseline lookup fails for any
-reason we silently fall back to 0.0 (the previous behavior), which the
-platform handles as a uniform random fallback per its spec.
+       score = 1000 * novelty(B) + 10 * anchoring(M) + tiebreak
+
+     where the SHAPE of novelty/anchoring depends on what the runtime
+     model.py exposes:
+
+       GRADED mode (preferred; requires model._N_TRAIN_PER_BC and
+       model._N_TRAIN_PER_SUBJECT to be present at module scope):
+
+         novelty(B)   = 1 / sqrt(1 + n_train_per_bc[bc_key])
+                        -- 1.0 for an unseen benchmark, decaying smoothly
+                           as the benchmark's training-row count grows.
+         anchoring(M) = log1p(n_train_per_subject[sha256(subject)]) / LN
+                        -- 0.0 for an unseen model, log-scaled toward 1.0
+                           as the subject's training-row count grows.
+                           LN = log1p(max(_N_TRAIN_PER_SUBJECT.values())).
+
+       BINARY fallback (when the runtime bundle does not ship counts --
+       e.g. bundles patched in-place by the surgical pack scripts):
+
+         novelty(B)   = 1 if bc_id == 0 else 0
+         anchoring(M) = 1 if s_id  != 0 else 0
+
+     Both modes preserve the same priority ordering -- novelty (max +1000)
+     dominates anchoring (max +10) dominates tiebreak (~+/-0.5) -- so the
+     platform's top-K-per-category sampler will reliably pick new-benchmark
+     anchor-model rows over alternatives.
+
+If any of the model.py lookups fail (corrupt bundle, missing symbol) we
+silently fall back to 0.0 -- the platform handles that as uniform random
+within the category.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
+
+
+def _stable_tiebreak(*parts: str) -> float:
+    """Return a deterministic float in [-0.5, +0.5] derived from inputs."""
+    h = hashlib.blake2b(("\x00".join(parts)).encode("utf-8"), digest_size=8).digest()
+    n = int.from_bytes(h, "little")
+    return (n / 2 ** 64) - 0.5
+
+
+def _graded_novelty(bc_key: str, n_train_per_bc) -> float:
+    n = float(n_train_per_bc.get(bc_key, 0))
+    return 1.0 / math.sqrt(1.0 + n)
+
+
+def _graded_anchoring(subject_key: str, n_train_per_subject, log_max_plus_one: float) -> float:
+    if log_max_plus_one <= 0.0:
+        return 0.0
+    n = float(n_train_per_subject.get(subject_key, 0))
+    return math.log1p(n) / log_max_plus_one
 
 
 def acquisition_function(input: dict) -> float:  # noqa: A002
     benchmark = str(input.get("benchmark", "") or "")
-    condition = str(input.get("condition", "none") or "none")
+    condition_raw = str(input.get("condition", "none") or "none")
     subject_content = str(input.get("subject_content", "") or "")
     item_content = str(input.get("item_content", "") or "")
+
     try:
         from model import _enqueue_for_batch  # type: ignore
     except Exception:  # noqa: BLE001
         _enqueue_for_batch = None  # type: ignore
     try:
-        from model import _baseline_logit  # type: ignore
+        from model import (  # type: ignore
+            _BC_TO_ID,
+            _SUBJECT_TO_ID,
+            normalize_condition,
+            stable_sha256,
+        )
     except Exception:  # noqa: BLE001
-        _baseline_logit = None  # type: ignore
+        _BC_TO_ID = None  # type: ignore
+        _SUBJECT_TO_ID = None  # type: ignore
+        normalize_condition = None  # type: ignore
+        stable_sha256 = None  # type: ignore
+
+    # Optional graded-mode lookups; absence is fine -> binary fallback.
+    try:
+        from model import _N_TRAIN_PER_BC, _N_TRAIN_PER_SUBJECT  # type: ignore
+    except Exception:  # noqa: BLE001
+        _N_TRAIN_PER_BC = None  # type: ignore
+        _N_TRAIN_PER_SUBJECT = None  # type: ignore
+
     if _enqueue_for_batch is not None:
         try:
             _enqueue_for_batch(
                 benchmark=benchmark,
-                condition=condition,
+                condition=condition_raw,
                 subject_content=subject_content,
                 item_content=item_content,
             )
         except Exception:  # noqa: BLE001
-            # Never let a queueing error escape; the platform falls back
-            # to random K-per-category labels if any acquisition call
-            # raises, and we don't want to lose the entire labeling pass.
             pass
-    if _baseline_logit is None:
+
+    if (
+        _BC_TO_ID is None
+        or _SUBJECT_TO_ID is None
+        or normalize_condition is None
+        or stable_sha256 is None
+    ):
         return 0.0
+
     try:
-        z = float(_baseline_logit(subject_content, benchmark, condition))
-        if not math.isfinite(z):
-            return 0.0
-        # Stable sigmoid.
-        if z >= 0.0:
-            p = 1.0 / (1.0 + math.exp(-z))
+        condition = normalize_condition(condition_raw)
+        bc_key = "{0}::{1}".format(benchmark, condition)
+        bc_id = int(_BC_TO_ID.get(bc_key, 0))
+        subject_key = stable_sha256(subject_content)
+        s_id = int(_SUBJECT_TO_ID.get(subject_key, 0))
+
+        if isinstance(_N_TRAIN_PER_BC, dict) and isinstance(_N_TRAIN_PER_SUBJECT, dict):
+            try:
+                max_n_subj = max(_N_TRAIN_PER_SUBJECT.values()) if _N_TRAIN_PER_SUBJECT else 0
+                log_max_plus_one = math.log1p(float(max_n_subj))
+            except Exception:  # noqa: BLE001
+                log_max_plus_one = 0.0
+            novelty = _graded_novelty(bc_key, _N_TRAIN_PER_BC)
+            anchoring = _graded_anchoring(subject_key, _N_TRAIN_PER_SUBJECT, log_max_plus_one)
         else:
-            ez = math.exp(z)
-            p = ez / (1.0 + ez)
-        # Higher score == closer to 0.5 == more uncertain.
-        return -abs(p - 0.5)
+            novelty = 1.0 if bc_id == 0 else 0.0
+            anchoring = 1.0 if s_id != 0 else 0.0
+
+        tb = _stable_tiebreak(benchmark, condition, subject_content, item_content)
+        return 1000.0 * novelty + 10.0 * anchoring + tb
     except Exception:  # noqa: BLE001
         return 0.0
 '''
@@ -2518,6 +2638,48 @@ _RUNTIME_REQUIREMENTS_LORA_LINE = "peft>=0.10\n"
 # ---------------------------------------------------------------------------
 
 
+def compute_train_counts(train_df) -> dict:
+    """Compute per-subject and per-bc training-row counts from a dataframe.
+
+    Returns a dict with two sub-dicts:
+      * ``n_per_subject``: keyed by ``sha256(subject_content)`` -> count.
+        We hash the subject so the runtime's lookup matches predict()'s
+        own ``stable_sha256(subject_content)`` keying scheme.
+      * ``n_per_bc``: keyed by ``"benchmark::condition"`` -> count.
+
+    The dataframe MUST contain ``subject_content``, ``benchmark``, and
+    ``condition`` columns; missing columns raise.  Pass this to
+    ``export_run(..., train_counts=compute_train_counts(train_df))`` so
+    the shipped runtime can use graded (rather than binary) novelty +
+    anchoring acquisition.
+    """
+    import hashlib as _hashlib
+
+    required = {"subject_content", "benchmark", "condition"}
+    missing = required - set(train_df.columns)
+    if missing:
+        raise ValueError(
+            "compute_train_counts: dataframe missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    def _sha256(s) -> str:
+        return _hashlib.sha256(str(s or "").encode("utf-8")).hexdigest()
+
+    n_per_subject: dict[str, int] = {}
+    n_per_bc: dict[str, int] = {}
+    for subj, bench, cond in zip(
+        train_df["subject_content"].tolist(),
+        train_df["benchmark"].tolist(),
+        train_df["condition"].tolist(),
+    ):
+        sk = _sha256(subj)
+        bc = "{0}::{1}".format(str(bench or ""), str(cond or "none"))
+        n_per_subject[sk] = n_per_subject.get(sk, 0) + 1
+        n_per_bc[bc] = n_per_bc.get(bc, 0) + 1
+    return {"n_per_subject": n_per_subject, "n_per_bc": n_per_bc}
+
+
 def export_run(
     *,
     result: TrainResult,
@@ -2537,6 +2699,7 @@ def export_run(
     lora_head_checkpoint: str | os.PathLike[str] | None = None,
     ship_training_cache: bool = False,
     ship_requirements_txt: bool = False,
+    train_counts: Mapping | None = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -3023,6 +3186,32 @@ def export_run(
     }
     if lora_block is not None:
         runtime_meta["lora"] = lora_block
+    if train_counts:
+        # Embed per-subject and per-bc training row counts so the runtime
+        # labeling.py can switch from BINARY -> GRADED novelty + anchoring
+        # acquisition.  Shape: {"n_per_subject": {sha256(subj): N},
+        # "n_per_bc": {"benchmark::condition": N}}.
+        if not isinstance(train_counts, Mapping):
+            raise TypeError(
+                "export_run: train_counts must be a mapping with "
+                "'n_per_subject' and 'n_per_bc' sub-dicts"
+            )
+        n_per_subject = train_counts.get("n_per_subject") or {}
+        n_per_bc = train_counts.get("n_per_bc") or {}
+        if not isinstance(n_per_subject, Mapping) or not isinstance(n_per_bc, Mapping):
+            raise TypeError(
+                "export_run: train_counts['n_per_subject'] and "
+                "train_counts['n_per_bc'] must both be mappings"
+            )
+        runtime_meta["train_counts"] = {
+            "n_per_subject": {str(k): int(v) for k, v in n_per_subject.items()},
+            "n_per_bc": {str(k): int(v) for k, v in n_per_bc.items()},
+        }
+        LOG.info(
+            "Embedding train_counts: %d subjects, %d (benchmark, condition) pairs",
+            len(runtime_meta["train_counts"]["n_per_subject"]),
+            len(runtime_meta["train_counts"]["n_per_bc"]),
+        )
     (artifacts / "runtime_meta.json").write_text(
         json.dumps(runtime_meta, indent=2, default=str)
     )

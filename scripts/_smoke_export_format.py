@@ -55,30 +55,72 @@ for stale in (
     )
 print("[OK] obsolete batched-flush plumbing fully removed from model.py")
 
-# 2c. Runtime model.py exposes the cheap baseline-logit helper +
-#     beta-calibration fitter that labeling.py / _Calibrator depend on.
+# 2c. Runtime model.py exposes the cheap baseline-logit helper (kept as
+#     a useful API even though labeling.py no longer consumes it), the
+#     new per-benchmark held-out-gated calibrator, and the train-count
+#     lookup tables that labeling.py uses for graded acquisition.
 for needle in (
     "def _baseline_logit",
     "_BASELINE_MU",
     "_SUBJECT_BASELINE",
     "_BC_BASELINE",
-    "def _fit_beta_calibration",
-    "def _beta_calibration_loss",
-    '"kind": "beta"',
+    "_RIDGE_LAMBDA",
+    "def _fit_intercept_ridge",
+    "def _gated_fit",
+    "class _Calibrator",
+    "self.per_bc: dict[str, dict]",
+    'def apply(self, p: float, bc_key: str = "")',
+    '_bc_key_for_apply = "{0}::{1}"',
+    "p = _CALIBRATOR.apply(p, _bc_key_for_apply)",
+    "_N_TRAIN_PER_SUBJECT",
+    "_N_TRAIN_PER_BC",
 ):
     assert needle in ES._RUNTIME_MODEL_PY, f"missing in model.py template: {needle!r}"
     print(f"[OK] runtime model.py declares: {needle}")
 
-# 3. labeling.py drives the streamed flush AND returns a real uncertainty
-#    score from the cheap (subject, bc) baseline -- no encoder/judge forward.
+# 2d. Old single-tier fitters and the beta tier must be gone.
+for stale in (
+    "def _fit_intercept_only",
+    "def _fit_temp_intercept",
+    "def _fit_beta_calibration",
+    "def _beta_calibration_loss",
+    '"kind": "beta"',
+    '"kind": "temp_intercept"',
+):
+    assert stale not in ES._RUNTIME_MODEL_PY, (
+        f"stale legacy calibrator symbol still present: {stale!r}"
+    )
+print("[OK] obsolete legacy calibrator tiers fully removed")
+
+# 3. labeling.py drives the streamed flush AND returns a benchmark-novelty
+#    + anchor-model acquisition score (graded if model.py exposes
+#    _N_TRAIN_PER_* dicts, binary fallback otherwise).
 for needle in (
     "_enqueue_for_batch",
-    "_baseline_logit",
-    "-abs(p - 0.5)",
-    "return 0.0",  # still the documented fallback when the baseline lookup fails
+    "_BC_TO_ID",
+    "_SUBJECT_TO_ID",
+    "_N_TRAIN_PER_BC",
+    "_N_TRAIN_PER_SUBJECT",
+    "_graded_novelty",
+    "_graded_anchoring",
+    "_stable_tiebreak",
+    "1000.0 * novelty",
+    "10.0 * anchoring",
+    "return 0.0",  # still the documented fallback when the model import fails
 ):
     assert needle in ES._RUNTIME_LABELING_PY, f"missing in labeling.py: {needle!r}"
-print("[OK] runtime labeling.py streams flush + returns -|p-0.5| from baseline")
+print("[OK] runtime labeling.py streams flush + returns novelty/anchoring score")
+
+# 3b. The old uncertainty path must be gone from labeling.py.
+for stale in (
+    "from model import _baseline_logit",
+    "-abs(p - 0.5)",
+    "Lewis & Gale",
+):
+    assert stale not in ES._RUNTIME_LABELING_PY, (
+        f"stale uncertainty-acquisition symbol still in labeling.py: {stale!r}"
+    )
+print("[OK] obsolete uncertainty-acquisition path removed from labeling.py")
 
 # 4. export_run writes the right fields and the broken repair is gone.
 src = inspect.getsource(ES.export_run)
