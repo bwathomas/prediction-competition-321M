@@ -1,10 +1,16 @@
-"""Pack a streamed-encoder + NN bundle with the tiered beta-calibration model.
+"""Pack a streamed-encoder + NN bundle with tiered beta calibration + smart labeling.
 
-Starts from ``submission_streamed_encoder_nn.zip`` and replaces ONLY the
-``_Calibrator`` block in ``model.py`` with the tiered version shipped in
-``submission_k_factor.zip``.  Everything else (HF offline env vars,
-streamed-flush plumbing, NN cache directory, checkpoint, labeling.py,
-runtime_meta.json) is copied verbatim.
+Starts from ``submission_streamed_encoder_nn.zip`` and patches two things
+from ``submission_k_factor.zip``:
+
+  1. ``model.py`` -- swap in the tiered ``_Calibrator`` block (beta /
+     Platt / intercept) AND graft the ``_baseline_logit`` fast-path so
+     ``labeling.py`` can return a real uncertainty score.
+  2. ``labeling.py`` -- replace the enqueue-only constant-0.0 variant with
+     the streamed-flush + uncertainty version (enqueue + ``-|p-0.5|``).
+
+Everything else (HF offline env vars, streamed-flush plumbing, NN cache,
+checkpoint, runtime_meta.json) is copied verbatim from the base bundle.
 
 The tiered calibrator selects automatically by the number ``N`` of
 revealed labels passed in ``predict(input, labeled)``:
@@ -26,9 +32,8 @@ Source bundle:
     model.py's calibrator block)
 
 Donor bundle:
-  - submission_k_factor.zip             (source of the new
-    _Calibrator class, _fit_intercept_only, _fit_temp_intercept,
-    _fit_beta_calibration, and _beta_calibration_loss)
+  - submission_k_factor.zip             (source of the tiered calibrator,
+    _baseline_logit fast-path, and uncertainty labeling.py)
 """
 
 from __future__ import annotations
@@ -120,6 +125,60 @@ def _patch_calibrator(base_model_py: str, donor_model_py: str) -> str:
     return patched
 
 
+BASELINE_START = "# --- Fast-path baseline logits for acquisition_function"
+BASELINE_END_MARKER = '\n\nLOG.info(\n    "Submission ready:'
+
+
+def _extract_baseline_block(model_py: str, *, label: str) -> str:
+    start = model_py.find(BASELINE_START)
+    if start < 0:
+        raise RuntimeError(f"{label}: could not find baseline-logit banner")
+    end = model_py.find(BASELINE_END_MARKER, start)
+    if end < 0:
+        raise RuntimeError(f"{label}: could not find end marker after baseline block")
+    block = model_py[start:end]
+    if "def _baseline_logit" not in block:
+        raise RuntimeError(f"{label}: baseline block missing _baseline_logit")
+    return block
+
+
+def _patch_baseline_logits(model_py: str, donor_model_py: str) -> str:
+    if "def _baseline_logit" in model_py:
+        print("[INFO] model.py already has _baseline_logit; skipping graft")
+        return model_py
+    block = _extract_baseline_block(donor_model_py, label="donor")
+    anchor = "_LAST_LABELED_FINGERPRINT: tuple | None = None\n\n\nLOG.info("
+    if anchor not in model_py:
+        raise RuntimeError(
+            "base model.py: could not find insertion anchor for baseline logits "
+            "(expected _LAST_LABELED_FINGERPRINT followed by LOG.info Submission ready)"
+        )
+    patched = model_py.replace(
+        anchor,
+        "_LAST_LABELED_FINGERPRINT: tuple | None = None\n\n\n" + block + "\n\nLOG.info(",
+        1,
+    )
+    for needle in ("_BASELINE_MU", "_SUBJECT_BASELINE", "_BC_BASELINE", "def _baseline_logit"):
+        if needle not in patched:
+            raise RuntimeError(f"patched model.py is missing {needle!r}")
+    return patched
+
+
+def _labeling_from_donor(donor_labeling_py: str) -> str:
+    """Return k-factor labeling.py with a one-line context tweak for encoder+NN."""
+    if "_baseline_logit" not in donor_labeling_py:
+        raise RuntimeError("donor labeling.py does not import _baseline_logit")
+    if "_enqueue_for_batch" not in donor_labeling_py:
+        raise RuntimeError("donor labeling.py does not call _enqueue_for_batch")
+    # Keep donor logic verbatim; only adjust the module docstring opener so
+    # the shipped bundle is self-describing.
+    return donor_labeling_py.replace(
+        "(streamed-flush + uncertainty).",
+        "(streamed-encoder + NN + uncertainty).",
+        1,
+    )
+
+
 def main() -> int:
     if not BASE_ZIP.exists():
         print(f"ERROR: base bundle not found: {BASE_ZIP}", file=sys.stderr)
@@ -135,8 +194,12 @@ def main() -> int:
     with zipfile.ZipFile(DONOR_ZIP, "r") as donor_zf:
         with donor_zf.open("model.py", "r") as fh:
             donor_model_py = fh.read().decode("utf-8")
+        with donor_zf.open("labeling.py", "r") as fh:
+            donor_labeling_py = fh.read().decode("utf-8")
 
     patched = _patch_calibrator(base_model_py, donor_model_py)
+    patched = _patch_baseline_logits(patched, donor_model_py)
+    labeling_py = _labeling_from_donor(donor_labeling_py)
 
     # Show a one-line diff summary so the user can confirm the size delta.
     delta = len(patched) - len(base_model_py)
@@ -144,12 +207,14 @@ def main() -> int:
         f"[INFO] model.py: base={len(base_model_py):,} bytes, "
         f"patched={len(patched):,} bytes, delta={delta:+,} bytes"
     )
+    print(f"[INFO] labeling.py: {len(labeling_py):,} bytes (uncertainty + enqueue)")
 
     # Compile-check the patched source so we never ship a syntax error.
     import ast
 
     ast.parse(patched)
-    print("[INFO] patched model.py parses as valid Python")
+    ast.parse(labeling_py)
+    print("[INFO] patched model.py and labeling.py parse as valid Python")
 
     if OUT_ZIP.exists():
         OUT_ZIP.unlink()
@@ -165,6 +230,11 @@ def main() -> int:
                 new_info.compress_type = zipfile.ZIP_DEFLATED
                 new_info.external_attr = info.external_attr
                 dst_zf.writestr(new_info, patched.encode("utf-8"))
+            elif name == "labeling.py":
+                new_info = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+                new_info.compress_type = zipfile.ZIP_DEFLATED
+                new_info.external_attr = info.external_attr
+                dst_zf.writestr(new_info, labeling_py.encode("utf-8"))
             else:
                 with src_zf.open(name, "r") as fh:
                     payload = fh.read()
