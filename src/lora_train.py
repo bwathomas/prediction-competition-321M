@@ -44,11 +44,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-try:
-    from tqdm.auto import tqdm
-except Exception:  # pragma: no cover - tqdm is optional
-    def tqdm(x, *args, **kwargs):
-        return x
+from .colab_tqdm import get_tqdm
+
+tqdm = get_tqdm()
 
 from .embeddings import (
     EncoderConfig,
@@ -101,6 +99,14 @@ class LoRATrainConfig:
     grad_accum_steps: int = 4
     max_length: int = 1024
     warmup_steps: int = 50
+    # Planned-budget scheduler knobs. ``max_train_steps = 0`` recovers the
+    # full-epoch schedule; ``> 0`` schedules over the planned short-run
+    # budget so a cosine/linear decay actually decays during a 1k-10k
+    # LoRA pass instead of being effectively constant-LR.
+    scheduler: str = "cosine"
+    max_train_steps: int = 0
+    warmup_ratio: float = 0.0
+    min_lr_ratio: float = 0.05
     bf16: bool = True
     use_8bit_optimizer: bool = False
 
@@ -112,6 +118,11 @@ class LoRATrainConfig:
     max_runtime_minutes: int = 600
     init_check_tol: float = 1.0e-3
     val_batch_size_items: int = 16
+    # Cap on val batches used by the periodic / final / init eval pass.
+    # 0 = full val; > 0 = a deterministic random subset of
+    # ``val_eval_max_batches * val_batch_size_items`` rows.
+    val_eval_max_batches: int = 0
+    val_eval_seed: int = 12345
     oom_fallback: bool = True
 
     export_mode: str = "adapter_only"
@@ -148,6 +159,10 @@ class LoRATrainConfig:
             grad_accum_steps=int(d.get("grad_accum_steps", 4)),
             max_length=int(d.get("max_length", 1024)),
             warmup_steps=int(d.get("warmup_steps", 50)),
+            scheduler=str(d.get("scheduler", "cosine")),
+            max_train_steps=int(d.get("max_train_steps", 0)),
+            warmup_ratio=float(d.get("warmup_ratio", 0.0)),
+            min_lr_ratio=float(d.get("min_lr_ratio", 0.05)),
             bf16=bool(d.get("bf16", True)),
             use_8bit_optimizer=bool(d.get("use_8bit_optimizer", False)),
             checkpoint_every_steps=int(d.get("checkpoint_every_steps", 200)),
@@ -158,6 +173,8 @@ class LoRATrainConfig:
             max_runtime_minutes=int(d.get("max_runtime_minutes", 600)),
             init_check_tol=float(d.get("init_check_tol", 1.0e-3)),
             val_batch_size_items=int(d.get("val_batch_size_items", 16)),
+            val_eval_max_batches=int(d.get("val_eval_max_batches", 0)),
+            val_eval_seed=int(d.get("val_eval_seed", 12345)),
             oom_fallback=bool(d.get("oom_fallback", True)),
             export_mode=str(d.get("export_mode", "adapter_only")),
             hf_upload_repo=str(d.get("hf_upload_repo", "")),
@@ -321,6 +338,26 @@ def _make_collator(
     return _collate
 
 
+def _fixed_random_subset_indices(n: int, m: int, *, seed: int) -> np.ndarray:
+    """Return a deterministic random subset of row indices.
+
+    The returned indices are sorted after sampling so DataLoader order is
+    deterministic and stable across resumes, but the subset itself is a
+    random sample of the full set rather than the first ``m`` rows. This
+    is how the capped validation pass picks which rows it evaluates: if
+    the val frame is sorted in any meaningful way (subject, length,
+    benchmark), evaluating the first N rows would bias the cap.
+    """
+    n = int(n)
+    m = int(min(max(0, m), n))
+    if m <= 0 or m >= n:
+        return np.arange(n, dtype=np.int64)
+    rng = np.random.default_rng(int(seed))
+    idx = rng.choice(n, size=m, replace=False)
+    idx.sort()
+    return idx.astype(np.int64, copy=False)
+
+
 # ---------------------------------------------------------------------------
 # Length-bucketed BatchSampler. Shuffles bucket order but keeps in-batch
 # token lengths close so padding waste is bounded.
@@ -359,24 +396,34 @@ class LengthBucketBatchSampler(torch.utils.data.Sampler):
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self._epoch)
-        # Build per-bucket index lists (in the *original* index space).
+
+        # Build per-bucket index lists in the original dataset index space.
         buckets: list[list[int]] = [[] for _ in range(self.n_buckets)]
         for sorted_pos, idx in enumerate(self._sorted):
             buckets[int(self._bucket_ids[sorted_pos])].append(int(idx))
+
         if self.shuffle:
             for b in buckets:
                 rng.shuffle(b)
-        # Concatenate buckets in shuffled bucket-order so adjacent batches
-        # come from nearby length regimes -- pad waste stays bounded but
-        # the loader still mixes across the full corpus.
-        order = list(range(self.n_buckets))
+
+        # Form batches within each length bucket so in-batch padding remains
+        # bounded. Then shuffle the completed batches globally so training
+        # does not spend thousands of consecutive microbatches in one
+        # token-length regime -- previously the loop concatenated entire
+        # buckets back-to-back, which produced long runs of one length
+        # regime and surfaced as degenerate per-batch loss spikes.
+        batches: list[list[int]] = []
+        for b in buckets:
+            for start in range(0, len(b), self.batch_size):
+                batch = b[start : start + self.batch_size]
+                if batch:
+                    batches.append(batch)
+
         if self.shuffle:
-            rng.shuffle(order)
-        flat: list[int] = []
-        for bi in order:
-            flat.extend(buckets[bi])
-        for start in range(0, len(flat), self.batch_size):
-            yield flat[start : start + self.batch_size]
+            rng.shuffle(batches)
+
+        for batch in batches:
+            yield batch
 
     def __len__(self) -> int:
         return math.ceil(self._n / self.batch_size)
@@ -401,6 +448,70 @@ def _pool(
 # ---------------------------------------------------------------------------
 # Encoder wrapping
 # ---------------------------------------------------------------------------
+
+
+def _force_disable_gradient_checkpointing(encoder, base_encoder=None) -> None:
+    """Force-disable HF/PEFT gradient checkpointing on every nested module.
+
+    Some HF/PEFT versions retain checkpointing state even after the
+    user-level config says ``gradient_checkpointing=False`` -- notably
+    after ``get_peft_model(...)`` wraps a base encoder that was loaded
+    while a prior session left checkpointing enabled. The downstream
+    symptom is "RuntimeError: Checkpointing requires checkpoint_fn..." or
+    silent zero adapter gradients depending on the PEFT version.
+
+    To make ``cfg.gradient_checkpointing = False`` actually mean what it
+    says, we walk every submodule of the wrapper, the underlying base
+    model, and the original ``base_encoder`` reference, and clear the
+    flag everywhere. We also turn off ``use_cache`` on configs that have
+    it (it interacts badly with checkpointing).
+    """
+    modules = [encoder]
+    if base_encoder is not None:
+        modules.append(base_encoder)
+
+    try:
+        if hasattr(encoder, "get_base_model"):
+            modules.append(encoder.get_base_model())
+    except Exception:
+        pass
+
+    for module in modules:
+        if module is None:
+            continue
+
+        try:
+            if hasattr(module, "gradient_checkpointing_disable"):
+                module.gradient_checkpointing_disable()
+        except Exception:
+            LOG.warning("gradient_checkpointing_disable failed", exc_info=True)
+
+        try:
+            if hasattr(module, "disable_input_require_grads"):
+                module.disable_input_require_grads()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(module, "config") and hasattr(module.config, "use_cache"):
+                module.config.use_cache = False
+        except Exception:
+            pass
+
+        try:
+            for sub in module.modules():
+                if hasattr(sub, "gradient_checkpointing"):
+                    try:
+                        sub.gradient_checkpointing = False
+                    except Exception:
+                        pass
+                if hasattr(sub, "config") and hasattr(sub.config, "use_cache"):
+                    try:
+                        sub.config.use_cache = False
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 def _wrap_encoder_with_lora(
@@ -437,6 +548,11 @@ def _wrap_encoder_with_lora(
         **layer_kwargs,
     )
     encoder = get_peft_model(base_encoder, lora_cfg)
+
+    if not cfg.gradient_checkpointing:
+        LOG.info("Force-disabling gradient checkpointing after PEFT wrapping")
+        _force_disable_gradient_checkpointing(encoder, base_encoder=base_encoder)
+
     if cfg.gradient_checkpointing:
         # Order matters: the input-require-grads hook must be installed
         # BEFORE the first forward, and AFTER gradient checkpointing is
@@ -719,16 +835,61 @@ def _json_default(obj):
 # ---------------------------------------------------------------------------
 
 
-def _make_scheduler(opt, total_steps: int, warmup: int):
-    warmup = max(0, int(warmup))
+def _make_scheduler(
+    opt,
+    total_steps: int,
+    warmup: int,
+    *,
+    scheduler: str = "cosine",
+    min_lr_ratio: float = 0.05,
+):
+    """Warmup + decay scheduler over the planned training budget.
+
+    The learning rates in the optimizer are interpreted as PEAK learning
+    rates. The scheduler then:
+      1. linearly warms from 0 to peak LR over ``warmup`` steps;
+      2. decays from peak LR to ``peak_lr * min_lr_ratio`` over the
+         remaining ``total_steps - warmup`` steps.
+
+    Using ``total_steps`` derived from the planned ``max_train_steps``
+    instead of the full 150k-step epoch matters a lot for short LoRA
+    runs: scheduling cosine decay over a full epoch turns a 1k-5k-step
+    run into an effectively constant-LR / warmup-only schedule, which
+    defeats the point of choosing cosine or linear.
+    """
     total_steps = max(1, int(total_steps))
+    warmup = max(0, int(warmup))
+    if total_steps <= 1:
+        warmup = 0
+    else:
+        warmup = min(warmup, total_steps - 1)
+
+    min_lr_ratio = float(min(max(float(min_lr_ratio), 0.0), 1.0))
+    sched = str(scheduler or "cosine").lower().strip()
 
     def lr_lambda(step: int) -> float:
+        step = int(step)
+
         if warmup > 0 and step < warmup:
             return float(step + 1) / float(max(1, warmup))
+
+        if sched in {"constant", "constant_with_warmup"}:
+            return 1.0
+
         progress = (step - warmup) / max(1, total_steps - warmup)
         progress = float(min(max(progress, 0.0), 1.0))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        if sched in {"linear", "linear_decay"}:
+            decay = 1.0 - progress
+        elif sched in {"cosine", "cosine_decay"}:
+            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            raise ValueError(
+                f"Unknown LoRA scheduler={scheduler!r}; "
+                "use cosine, linear, or constant"
+            )
+
+        return min_lr_ratio + (1.0 - min_lr_ratio) * decay
 
     return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
@@ -801,8 +962,20 @@ def _evaluate_lora(
     pooling: str,
     bf16: bool,
     desc: str = "lora-val",
+    max_batches: int | None = None,
+    log_every: int = 100,
 ) -> dict:
-    """Run a single eval pass through the (adapter-augmented) encoder."""
+    """Run a single eval pass through the (adapter-augmented) encoder.
+
+    Args:
+        max_batches: optional cap on the number of validation batches to
+            consume. ``None`` or ``<= 0`` evaluates every batch yielded by
+            ``val_loader``. Used by the periodic in-loop eval so a single
+            eval pass stays bounded even when the val split is large.
+        log_every: emit a per-batch progress log every N batches. ``0``
+            disables progress logging; the default is friendly to runs
+            that hide tqdm output (Colab background tabs, CI).
+    """
     encoder.eval()
     head_model.eval()
     preds: list[np.ndarray] = []
@@ -821,8 +994,20 @@ def _evaluate_lora(
         dynamic_ncols=True,
         total=len(val_loader),
     )
+    eval_t0 = time.time()
+    seen_rows = 0
     with autocast_ctx:
-        for batch in pbar:
+        for batch_i, batch in enumerate(pbar, start=1):
+            if max_batches is not None and max_batches > 0 and batch_i > max_batches:
+                LOG.info(
+                    "%s stopping early after %d batches / %d rows because max_batches=%d",
+                    desc,
+                    batch_i - 1,
+                    seen_rows,
+                    max_batches,
+                )
+                break
+
             batch = _move_batch(batch, device)
             item_emb = _encoder_embed(
                 encoder,
@@ -837,6 +1022,20 @@ def _evaluate_lora(
             p = torch.sigmoid(logits.float()).cpu().numpy()
             preds.append(p)
             targets.append(batch["label"].float().cpu().numpy())
+
+            seen_rows += int(batch["label"].shape[0])
+            if log_every and batch_i % int(log_every) == 0:
+                elapsed = time.time() - eval_t0
+                LOG.info(
+                    "%s progress: batch %d/%d rows=%d elapsed=%.1f min rate=%.1f rows/s",
+                    desc,
+                    batch_i,
+                    len(val_loader),
+                    seen_rows,
+                    elapsed / 60.0,
+                    seen_rows / max(elapsed, 1e-6),
+                )
+
     p = np.concatenate(preds) if preds else np.zeros(0, dtype=np.float32)
     y = np.concatenate(targets) if targets else np.zeros(0, dtype=np.float32)
     return {
@@ -1003,6 +1202,10 @@ def run(
         )
     encoder = _wrap_encoder_with_lora(base_encoder, cfg=cfg).to(device)
 
+    if not cfg.gradient_checkpointing:
+        LOG.info("Force-disabling gradient checkpointing after encoder.to(device)")
+        _force_disable_gradient_checkpointing(encoder, base_encoder=base_encoder)
+
     # ---- Tokenizer for pad token ------------------------------------------
     embedder._load()  # noqa: SLF001
     tokenizer = embedder._tok  # noqa: SLF001
@@ -1030,11 +1233,71 @@ def run(
         num_workers=0,
         pin_memory=device.startswith("cuda"),
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds,
+
+    # Validation loader. If ``val_eval_max_batches > 0``, evaluate a fixed
+    # deterministic random subset instead of the first N validation rows
+    # -- ordering matters because the val frame is sorted by subject /
+    # benchmark and the first-N slice was systematically biased.
+    val_eval_ds: torch.utils.data.Dataset = val_ds
+    requested_val_rows = (
+        int(cfg.val_eval_max_batches) * int(cfg.val_batch_size_items)
+        if int(getattr(cfg, "val_eval_max_batches", 0)) > 0
+        else 0
+    )
+    if requested_val_rows > 0 and requested_val_rows < len(val_ds):
+        val_eval_seed = int(getattr(cfg, "val_eval_seed", 12345))
+        val_subset_idx = _fixed_random_subset_indices(
+            len(val_ds),
+            requested_val_rows,
+            seed=val_eval_seed,
+        )
+        val_eval_ds = torch.utils.data.Subset(val_ds, val_subset_idx.tolist())
+        LOG.info(
+            "Using fixed random validation subset: rows=%d/%d seed=%d "
+            "batch_size=%d batches=%d",
+            len(val_eval_ds),
+            len(val_ds),
+            val_eval_seed,
+            cfg.val_batch_size_items,
+            math.ceil(len(val_eval_ds) / max(1, cfg.val_batch_size_items)),
+        )
+    else:
+        LOG.info(
+            "Using full validation set: rows=%d batch_size=%d batches=%d",
+            len(val_ds),
+            cfg.val_batch_size_items,
+            math.ceil(len(val_ds) / max(1, cfg.val_batch_size_items)),
+        )
+
+    # Length-bucketed batch sampler with shuffle=True so validation batches
+    # are not consumed in subject-sorted order. The aggregate val log-loss
+    # is invariant to batch order, but tqdm/progress logs and any future
+    # streaming consumer benefit from the shuffled order, and (more
+    # importantly) it parallels the training-side shuffle so debugging
+    # batch-level behavior reflects the same regime.
+    val_token_lens_for_sampler = (
+        np.asarray(
+            [
+                token_cache.token_lens[int(val_ds.item_token_idx[i])]
+                for i in val_eval_ds.indices
+            ],
+            dtype=np.int32,
+        )
+        if isinstance(val_eval_ds, torch.utils.data.Subset)
+        else np.asarray(
+            [token_cache.token_lens[int(i)] for i in val_ds.item_token_idx],
+            dtype=np.int32,
+        )
+    )
+    val_sampler = LengthBucketBatchSampler(
+        token_lens=val_token_lens_for_sampler,
         batch_size=cfg.val_batch_size_items,
-        shuffle=False,
-        drop_last=False,
+        shuffle=True,
+        seed=int(getattr(cfg, "val_eval_seed", 12345)),
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_eval_ds,
+        batch_sampler=val_sampler,
         collate_fn=collate,
         num_workers=0,
         pin_memory=device.startswith("cuda"),
@@ -1081,8 +1344,46 @@ def run(
     )
 
     total_steps_per_epoch = math.ceil(len(train_loader) / max(1, cfg.grad_accum_steps))
-    total_steps = max(1, int(total_steps_per_epoch * cfg.epochs))
-    scheduler = _make_scheduler(optimizer, total_steps, cfg.warmup_steps)
+    epoch_total_steps = max(1, int(total_steps_per_epoch * cfg.epochs))
+
+    # If ``max_train_steps`` is set, schedule over the intended short-run
+    # budget, not over the full epoch. This is critical for cosine/linear
+    # decays to actually fire during a 1k-10k LoRA pass.
+    total_steps = (
+        int(cfg.max_train_steps)
+        if int(getattr(cfg, "max_train_steps", 0)) > 0
+        else epoch_total_steps
+    )
+    total_steps = max(1, int(total_steps))
+
+    if float(getattr(cfg, "warmup_ratio", 0.0)) > 0:
+        warmup_steps = int(round(total_steps * float(cfg.warmup_ratio)))
+    else:
+        warmup_steps = int(cfg.warmup_steps)
+
+    warmup_steps = max(0, min(warmup_steps, max(0, total_steps - 1)))
+
+    LOG.info(
+        "LoRA LR schedule: scheduler=%s planned_steps=%d epoch_total_steps=%d "
+        "warmup_steps=%d warmup_ratio=%.4f min_lr_ratio=%.4f "
+        "peak_encoder_lr=%.3g peak_head_lr=%.3g",
+        getattr(cfg, "scheduler", "cosine"),
+        total_steps,
+        epoch_total_steps,
+        warmup_steps,
+        float(getattr(cfg, "warmup_ratio", 0.0)),
+        float(getattr(cfg, "min_lr_ratio", 0.05)),
+        float(cfg.encoder_lr),
+        float(cfg.head_lr),
+    )
+
+    scheduler = _make_scheduler(
+        optimizer,
+        total_steps,
+        warmup_steps,
+        scheduler=getattr(cfg, "scheduler", "cosine"),
+        min_lr_ratio=float(getattr(cfg, "min_lr_ratio", 0.05)),
+    )
 
     # ---- Resume? -----------------------------------------------------------
     resumed = False
@@ -1116,6 +1417,11 @@ def run(
                         str(adapter_dir), adapter_name="default", is_trainable=True
                     )
                     LOG.info("Reloaded adapter weights from %s", adapter_dir)
+                    if not cfg.gradient_checkpointing:
+                        LOG.info(
+                            "Force-disabling gradient checkpointing after adapter reload"
+                        )
+                        _force_disable_gradient_checkpointing(encoder)
                 else:
                     LOG.warning("Adapter dir missing at %s; using fresh PEFT init", adapter_dir)
                 _ = PeftModel  # silence unused-import lint
@@ -1142,7 +1448,22 @@ def run(
             resumed = True
 
     # ---- Step-0 init sanity check ----------------------------------------
-    LOG.info("Computing base + step-0 val NLL for init sanity check...")
+    # The init eval defaults to ``cfg.val_eval_max_batches`` so an init
+    # check on a 1M-row val split does not stall a 15-min LoRA experiment
+    # for 30 minutes. ``LORA_INIT_EVAL_BATCHES`` and ``LORA_EVAL_LOG_EVERY``
+    # env vars override the per-cfg defaults without re-editing the config.
+    init_eval_batches = int(
+        os.environ.get(
+            "LORA_INIT_EVAL_BATCHES",
+            str(int(getattr(cfg, "val_eval_max_batches", 0) or 0)),
+        )
+    )
+    eval_log_every = int(os.environ.get("LORA_EVAL_LOG_EVERY", "25"))
+    LOG.info(
+        "Computing base + step-0 val NLL for init sanity check on first %d val batches "
+        "(set LORA_INIT_EVAL_BATCHES=0 for full init eval).",
+        init_eval_batches,
+    )
     base_val = _evaluate_lora(
         encoder=encoder,
         head_model=head_model,
@@ -1151,6 +1472,8 @@ def run(
         pooling=pooling,
         bf16=bf16,
         desc="lora-val (init)",
+        max_batches=init_eval_batches if init_eval_batches > 0 else None,
+        log_every=eval_log_every,
     )
     init_check_passed = True
     if not resumed:
@@ -1226,7 +1549,7 @@ def run(
         "weight_decay": float(cfg.weight_decay_head),
         "batch_size": int(cfg.batch_size_items * cfg.grad_accum_steps),
         "epochs": int(cfg.epochs),
-        "scheduler": "cosine",
+        "scheduler": str(getattr(cfg, "scheduler", "cosine")),
         "grad_clip": 1.0,
         "bf16": bool(bf16),
         "_provenance": "lora_train.run",
@@ -1403,6 +1726,14 @@ def run(
                             pooling=pooling,
                             bf16=bf16,
                             desc=f"lora-val step={global_step}",
+                            max_batches=(
+                                int(cfg.val_eval_max_batches)
+                                if int(getattr(cfg, "val_eval_max_batches", 0)) > 0
+                                else None
+                            ),
+                            log_every=int(
+                                os.environ.get("LORA_EVAL_LOG_EVERY", "100")
+                            ),
                         )
                         encoder.train()
                         head_model.train()
@@ -1475,6 +1806,85 @@ def run(
                         }
                     )
 
+                    # ---- clean stop at max_train_steps ----------------
+                    # This avoids relying on manual interrupt or
+                    # ``max_runtime_minutes`` to stop a short, scheduled
+                    # LoRA run -- when ``max_train_steps`` is set the
+                    # schedule has already decayed all the way down to
+                    # ``min_lr_ratio * peak_lr`` so continuing past it
+                    # only burns compute.
+                    if (
+                        int(getattr(cfg, "max_train_steps", 0)) > 0
+                        and global_step >= int(cfg.max_train_steps)
+                    ):
+                        LOG.info(
+                            "max_train_steps=%d hit at global_step=%d; "
+                            "checkpointing and exiting",
+                            int(cfg.max_train_steps),
+                            global_step,
+                        )
+
+                        if not (
+                            cfg.eval_every_steps > 0
+                            and global_step % cfg.eval_every_steps == 0
+                        ):
+                            metrics = _evaluate_lora(
+                                encoder=encoder,
+                                head_model=head_model,
+                                val_loader=val_loader,
+                                device=device,
+                                pooling=pooling,
+                                bf16=bf16,
+                                desc=f"lora-val step={global_step} final-budget",
+                                max_batches=(
+                                    int(cfg.val_eval_max_batches)
+                                    if int(getattr(cfg, "val_eval_max_batches", 0)) > 0
+                                    else None
+                                ),
+                                log_every=int(
+                                    os.environ.get("LORA_EVAL_LOG_EVERY", "100")
+                                ),
+                            )
+                            encoder.train()
+                            head_model.train()
+                            improved = metrics["log_loss"] < best_val_ll - 1e-6
+                            if improved:
+                                best_val_ll = float(metrics["log_loss"])
+                                best_val_brier = float(metrics["brier"])
+                                best_step = int(global_step)
+                            LOG.info(
+                                "step=%d val_ll=%.5f val_brier=%.5f best=%.5f@step%d%s",
+                                global_step,
+                                metrics["log_loss"],
+                                metrics["brier"],
+                                best_val_ll,
+                                best_step,
+                                " (improved)" if improved else "",
+                            )
+
+                        _save_current(
+                            step=global_step,
+                            epoch=epoch,
+                            reason="max_train_steps",
+                            is_best=False,
+                        )
+                        return _build_result(
+                            cfg=cfg,
+                            base_checkpoint=str(base_path),
+                            n_train=len(train_ds),
+                            n_val=len(val_ds),
+                            global_step=global_step,
+                            best_step=best_step,
+                            best_val_ll=best_val_ll,
+                            best_val_brier=best_val_brier,
+                            base_val=base_val,
+                            init_check_passed=init_check_passed,
+                            drive_root=drive_root,
+                            elapsed=time.time() - start + elapsed_prior,
+                            reason=f"hit max_train_steps={int(cfg.max_train_steps)}",
+                            completed=True,
+                        )
+
     except KeyboardInterrupt:
         LOG.warning("LoRA training interrupted by KeyboardInterrupt")
         try:
@@ -1509,6 +1919,12 @@ def run(
         pooling=pooling,
         bf16=bf16,
         desc="lora-val final",
+        max_batches=(
+            int(cfg.val_eval_max_batches)
+            if int(getattr(cfg, "val_eval_max_batches", 0)) > 0
+            else None
+        ),
+        log_every=int(os.environ.get("LORA_EVAL_LOG_EVERY", "100")),
     )
     improved = metrics["log_loss"] < best_val_ll - 1e-6
     if improved:

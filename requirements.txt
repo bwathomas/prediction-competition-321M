@@ -35,6 +35,12 @@ tokenizers>=0.19
 # this dependency. The submission runtime also imports peft only when an
 # adapter is bundled (`lora.export_mode = "adapter_only"`).
 peft>=0.10
+# Recent peft versions (>=0.13) import ``torchao`` at import time; older
+# torchao wheels are missing symbols peft expects and the import then
+# fails with "cannot import name 'TorchAOConfig' from 'torchao.quantization'".
+# Pin torchao to a version that satisfies the peft import gate so a fresh
+# environment install does not need a follow-up `pip install -U torchao`.
+torchao>=0.16
 
 # NOTE on Flash Attention 2: do NOT list `flash-attn` here. The PyPI package
 # defaults to building from source via nvcc which takes 20-40 minutes on

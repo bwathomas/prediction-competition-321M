@@ -45,11 +45,9 @@ from typing import Iterable, Mapping
 import numpy as np
 import pandas as pd
 
-try:
-    from tqdm.auto import tqdm
-except Exception:  # pragma: no cover - tqdm is optional
-    def tqdm(x, *args, **kwargs):
-        return x
+from .colab_tqdm import get_tqdm
+
+tqdm = get_tqdm()
 
 from .embeddings import (
     EncoderConfig,
@@ -235,29 +233,53 @@ def build_tokenized_item_cache(
         )
 
     tokenizer_kind = type(tokenizer).__name__
-    is_fast = "Fast" in tokenizer_kind
+    # ``"Fast" in tokenizer_kind`` used to be the detection rule, but newer
+    # Hugging Face tokenizers (notably ``Qwen2Tokenizer`` in recent
+    # Transformers) are backed by the Rust ``tokenizers`` library yet do
+    # not carry "Fast" in their class name. The class-name check then
+    # incorrectly took the slow Python fallback path -- a 5-10x slowdown
+    # on the ~300k unique item corpus. Use attribute / backend detection
+    # instead, which is what HF's own utilities do internally.
+    is_fast = bool(
+        getattr(tokenizer, "is_fast", False)
+        or getattr(tokenizer, "backend", None) == "tokenizers"
+        or hasattr(tokenizer, "backend_tokenizer")
+    )
     LOG.info(
-        "Tokenizing %d unique items (max_length=%d, tokenizer=%s, fast=%s)",
+        "Tokenizing %d unique items (max_length=%d, tokenizer=%s, fast=%s, backend=%s)",
         len(keys),
         eff_max_length,
         tokenizer_kind,
         is_fast,
+        getattr(tokenizer, "backend", None),
     )
 
     t0 = time.time()
     if is_fast:
         # Fast tokenizers release the GIL and parallelize across Rust
-        # threads; one batched call is the fastest path.
-        enc = tokenizer(
-            texts,
-            add_special_tokens=True,
-            truncation=True,
-            max_length=eff_max_length,
-            padding=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        )
-        ids_lists = enc["input_ids"]
+        # threads. We chunk into batches of ``TOKENIZE_BATCH_SIZE`` (env
+        # override) instead of one enormous batched call so we never
+        # materialize a single ``BatchEncoding`` of all ~300k items at
+        # once and the progress bar updates several times per second.
+        ids_lists = []
+        batch_size = int(os.environ.get("TOKENIZE_BATCH_SIZE", "4096"))
+        for start in tqdm(
+            range(0, len(texts), batch_size),
+            desc="tokenize item batches",
+            unit="batch",
+            dynamic_ncols=True,
+        ):
+            chunk = texts[start : start + batch_size]
+            enc = tokenizer(
+                chunk,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=eff_max_length,
+                padding=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            ids_lists.extend(enc["input_ids"])
     else:
         ids_lists = []
         for t in tqdm(
