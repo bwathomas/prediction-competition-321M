@@ -72,7 +72,7 @@ m = re.search(
     r'JUDGE_RUNTIME_BATCH_SIZE: int = int\(JUDGE_META\.get\("runtime_batch_size", (\d+)\)\)',
     ES._RUNTIME_MODEL_PY,
 )
-assert m and int(m.group(1)) == 16, "judge runtime batch default not 16"
+assert m and int(m.group(1)) == 32, "judge runtime batch default not 32"
 print(f"[OK] JUDGE_RUNTIME_BATCH_SIZE defaults to {m.group(1)}")
 
 m = re.search(

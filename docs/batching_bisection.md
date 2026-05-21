@@ -1,5 +1,52 @@
 # Batching bisection — failure modes and isolation under pass/fail-only
 
+## UPDATE 2026-05-20: root cause is most likely bundle SIZE / shipped `cache/`
+
+The user reported that **the last bundle that worked on Codabench was
+`submission_judge_slim.zip` (15 MB, no `cache/`, no `requirements.txt`,
+`nn_features.enabled = false`)**, and that *every* 114 MB bundle we've
+shipped since — batched and non-batched, judge-enabled and judge-disabled,
+with and without SDPA, with and without encoder eviction — has failed
+within 1–5 minutes with the opaque `PAIEC-UNKNOWN-001`.
+
+That single observation invalidates most of the table below. The
+batched-flush code is almost certainly not the regression; the failure
+correlates with the 100 MB `cache/` directory + `requirements.txt`,
+not with anything in `model.py`. Hypothesised mechanisms (any/all):
+
+1. The platform's effective bundle-size ceiling is below 114 MB and our
+   `default.yaml` `submission.max_zip_size_mb = 70` was correct all along;
+   the platform is killing the container at extraction / disk-quota time.
+2. The platform tries `pip install -r requirements.txt`, the
+   `faiss-cpu>=1.7.4` wheel fails to install (no internet / no wheel for
+   the runner's Python), and the container is killed.
+3. Loading the 80 MB `embeddings_int8.npy` + 21 MB `item_keys.parquet`
+   at module init exceeds the runner's CPU RAM budget, the container is
+   OOM-killed before `predict()` is called.
+
+Any of (1)–(3) explains: PAIEC-UNKNOWN-001, no log output, "ran for
+1–5 minutes before failing", and the fact that the slim 15 MB bundle was
+the only one that ever worked.
+
+Diagnostic bundle: **`submission_cacheless.zip`** (built by
+`scripts/pack_cacheless.py`) — strips the `cache/` directory and
+`requirements.txt` from the current `submission_turbo_judge.zip` source,
+flips `nn_features.enabled` to `false` in `runtime_meta.json` so the
+runtime's graceful fallback (`return np.zeros(dim)` when
+`TRAINING_CACHE is None`, line 1436 of the runtime `model.py`) is the
+only NN code path that executes. Final size: ~14.7 MB, within the 70 MB
+ceiling and structurally close to the working slim bundle.
+
+If `submission_cacheless.zip` PASSES, the regression is confirmed to be
+in the shipped `cache/` directory and/or `requirements.txt`. Future
+bundles must skip both by default; `src/export_submission.py` and
+`configs/default.yaml` need a `submission.ship_training_cache: false`
+default to enforce this.
+
+If `submission_cacheless.zip` FAILS the same way, the regression lives
+in our `model.py` template itself; the next bisection step is to swap
+the cache-less bundle's `model.py` for slim's `model.py` and re-export.
+
 ## Platform constraint
 
 The platform surfaces **only one bit per submission**: pass / fail

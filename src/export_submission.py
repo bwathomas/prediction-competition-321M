@@ -2416,6 +2416,8 @@ def export_run(
     lora_cfg: Mapping | None = None,
     lora_adapter_dir: str | os.PathLike[str] | None = None,
     lora_head_checkpoint: str | os.PathLike[str] | None = None,
+    ship_training_cache: bool = False,
+    ship_requirements_txt: bool = False,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -2609,7 +2611,27 @@ def export_run(
 
     # Optional training-item cache (quantized + PCA + FAISS). Copied to
     # ``submission/cache/`` so the runtime can mmap it for NN lookup.
-    if training_cache_dir is not None:
+    #
+    # Default is OFF (``ship_training_cache=False``). Every 114 MB bundle
+    # that shipped the cache directory has failed PAIEC-UNKNOWN-001 on
+    # Codabench within 1-5 minutes; the 15 MB slim bundle (no cache) was
+    # the only one that ever completed. The runtime ``_get_nn_features``
+    # falls back to ``np.zeros(dim)`` when ``TRAINING_CACHE is None`` so
+    # skipping the cache costs the NN feature signal but keeps the
+    # bundle inside the platform's operational envelope. Flip the
+    # ``ship_training_cache`` flag on (or set
+    # ``submission.ship_training_cache: true`` in ``configs/default.yaml``)
+    # only after verifying the platform accepts the larger bundle.
+    if not ship_training_cache:
+        if training_cache_dir is not None:
+            LOG.info(
+                "Skipping training-cache bundling (ship_training_cache=False). "
+                "training_cache_dir=%s is available locally for evaluation "
+                "but will NOT be copied into submission/cache/. The runtime "
+                "will fall back to zero NN features.",
+                training_cache_dir,
+            )
+    elif training_cache_dir is not None:
         src_cache = Path(training_cache_dir)
         if src_cache.exists():
             dst_cache = sub / "cache"
@@ -2910,9 +2932,25 @@ def export_run(
             if m and m not in declared:
                 declared.append(m)
     (sub / "models.txt").write_text("\n".join(declared) + "\n", encoding="utf-8")
-    (sub / "requirements.txt").write_text(
-        _RUNTIME_REQUIREMENTS + lora_requirements_addendum, encoding="utf-8"
-    )
+
+    # ``requirements.txt`` is OPTIONAL on Codabench. The working slim
+    # bundle did not ship one and ran cleanly; every recent bundle that
+    # included one (with the optional ``faiss-cpu`` line) failed
+    # PAIEC-UNKNOWN-001. The platform pre-installs torch, numpy,
+    # transformers, safetensors, tokenizers, etc., so we only ship a
+    # requirements.txt when the caller explicitly opts in OR when the
+    # LoRA adapter export mode actually needs ``peft``.
+    needs_lora_reqs = bool(lora_requirements_addendum.strip())
+    if ship_requirements_txt or needs_lora_reqs:
+        (sub / "requirements.txt").write_text(
+            _RUNTIME_REQUIREMENTS + lora_requirements_addendum, encoding="utf-8"
+        )
+    else:
+        LOG.info(
+            "Skipping requirements.txt (ship_requirements_txt=False, "
+            "no LoRA requirements). Codabench will use its pre-installed "
+            "torch / transformers / numpy stack."
+        )
 
     LOG.info(
         "Wrote submission to %s (declared models: %s)", sub.resolve(), declared

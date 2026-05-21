@@ -381,6 +381,26 @@ submission:
   # widget. ``make_submission_zip`` deletes the over-cap zip and raises so
   # we never silently ship an un-uploadable bundle.
   max_zip_size_mb: 70
+  # Ship the quantized training-item ``cache/`` (FAISS index, item
+  # embeddings, subject pass-rate sparse matrices) inside the submission
+  # zip. Default is FALSE because every 114 MB bundle we shipped with
+  # cache/ failed PAIEC-UNKNOWN-001 within 1-5 minutes on Codabench
+  # while the 15 MB slim bundle (no cache/) was the only one that ever
+  # ran to completion. The runtime ``model.py`` gracefully falls back to
+  # zero-valued NN features when the cache is absent
+  # (``_get_nn_features`` returns ``np.zeros(dim)`` when
+  # ``TRAINING_CACHE is None``), so flipping this off costs us the NN
+  # feature signal but keeps the bundle inside the platform's
+  # operational envelope. Flip to true ONLY after verifying the platform
+  # accepts the larger bundle.
+  ship_training_cache: false
+  # Ship ``requirements.txt`` inside the submission zip. Default is
+  # FALSE because the working slim bundle did not have one, and we
+  # suspect the platform's ``pip install -r requirements.txt`` step
+  # (specifically the optional ``faiss-cpu`` wheel) was the killer for
+  # every bundle that included it. The platform pre-installs torch /
+  # numpy / transformers / etc., so a missing requirements.txt is fine.
+  ship_requirements_txt: false
 
 # ----------------------------------------------------------------------------
 # Optional GCS sync
