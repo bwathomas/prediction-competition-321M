@@ -1,20 +1,24 @@
-"""Behavioral smoke test for the new benchmark-novelty labeling.py.
+"""Behavioral smoke test for the dual-pool stratified labeling.py.
 
 Extracts labeling.py from the shipped bundle and stubs the model.py
 imports it depends on (_enqueue_for_batch, _BC_TO_ID, _SUBJECT_TO_ID,
 normalize_condition, stable_sha256).  Verifies:
 
-  1. Acquisition score for a known benchmark + known subject is LOW.
-  2. Acquisition score for a NEW benchmark + known subject is HIGH (>1000).
-  3. Acquisition score for a NEW benchmark + UNKNOWN subject is MEDIUM
-     (>1000 but < the known-subject case).
-  4. Acquisition score for a known benchmark + unknown subject is LOW.
-  5. _enqueue_for_batch is invoked exactly once per call (the streamed-
-     encoder pipeline depends on this).
-  6. If model.py imports fail, the score gracefully falls back to 0.0.
-  7. Score difference between top and bottom is large enough that the
-     platform's top-K-per-category sampler will reliably pick the
-     new-benchmark + anchor-model candidates.
+  1. Each item is deterministically routed to either POOL A (new-bc
+     prioritized) or POOL B (known-bc prioritized) via a stable hash
+     of ``item_content``.
+  2. In POOL A: a new-bc candidate scores HIGH (>=1000); a known-bc
+     candidate scores LOW (<100).
+  3. In POOL B: a known-bc candidate scores HIGH (>=1000); a new-bc
+     candidate scores LOW (<100).
+  4. Within a pool, anchoring + tiebreak order subjects (anchored
+     subjects beat unknown ones).
+  5. Across many random items, the empirical fraction routed to
+     POOL A matches ``_FRACTION_NEW_POOL`` (0.95) within tolerance.
+  6. ``_enqueue_for_batch`` fires exactly once per call.
+  7. If model.py imports fail, score gracefully falls back to 0.0.
+  8. Both BINARY (no train counts) and GRADED (with counts) paths
+     route correctly.
 """
 
 from __future__ import annotations
@@ -73,7 +77,6 @@ def _stub_module(
 def _load_labeling_with_stub(model_stub):
     """Extract labeling.py from the bundle, register model_stub, import."""
     sys.modules["model"] = model_stub
-    # Use a temp dir so we can import labeling.py as a real module.
     with zipfile.ZipFile(OUT_ZIP, "r") as zf:
         src = zf.read("labeling.py").decode("utf-8")
     with tempfile.TemporaryDirectory() as td:
@@ -87,19 +90,39 @@ def _load_labeling_with_stub(model_stub):
         return mod
 
 
+def _find_item_in_pool(labeling, target_new_pool: bool, *, prefix: str) -> str:
+    """Return an item_content string that the labeling module routes to
+    ``new_pool == target_new_pool``.  Just enumerates suffixes until a
+    match is found (the hash is uniform, so this terminates fast)."""
+    for i in range(10_000):
+        candidate = "{}-{}".format(prefix, i)
+        if labeling._item_in_new_pool(candidate) == target_new_pool:
+            return candidate
+    raise RuntimeError("could not find a suitable item; hash is degenerate?")
+
+
 def main() -> int:
     known_bc = ["mmlu::none", "gsm8k::none", "humaneval::cot"]
     known_subjects = ["gpt-4", "llama-3-70b", "claude-3-opus", "mistral-7b"]
-    new_bc = "secret_benchmark_v2::none"
-    new_subject = "unknown_local_llm"
 
-    # -------- BINARY mode (no counts shipped) --------
+    # ---------------------------------------------------------------------
+    # BINARY mode (no train counts shipped)
+    # ---------------------------------------------------------------------
     print("=" * 60)
-    print("BINARY mode (legacy bundles without train counts)")
+    print("BINARY mode (bundles without train counts)")
     print("=" * 60)
     enqueue_log = []
     stub = _stub_module(known_bc, known_subjects, enqueue_log)
     labeling = _load_labeling_with_stub(stub)
+
+    assert hasattr(labeling, "_FRACTION_NEW_POOL"), "labeling.py must expose _FRACTION_NEW_POOL"
+    assert hasattr(labeling, "_item_in_new_pool"), "labeling.py must expose _item_in_new_pool"
+    assert abs(labeling._FRACTION_NEW_POOL - 0.95) < 1e-9, (
+        "tuned fraction must be 0.95, got " + str(labeling._FRACTION_NEW_POOL)
+    )
+
+    item_in_A = _find_item_in_pool(labeling, target_new_pool=True, prefix="poolA")
+    item_in_B = _find_item_in_pool(labeling, target_new_pool=False, prefix="poolB")
 
     def score(benchmark, condition, subject, item, ll=labeling):
         return ll.acquisition_function({
@@ -109,48 +132,68 @@ def main() -> int:
             "item_content": item,
         })
 
-    s_known_known = score("mmlu", "none", "gpt-4", "what is 2+2?")
-    s_new_known = score("secret_benchmark_v2", "none", "gpt-4", "what is 2+2?")
-    s_new_unknown = score("secret_benchmark_v2", "none", "unknown_local_llm", "what is 2+2?")
-    s_known_unknown = score("mmlu", "none", "unknown_local_llm", "what is 2+2?")
+    # Pool A behavior: new bcs win, known bcs lose.
+    s_A_new_known_subj = score("secret_new_bench", "none", "gpt-4", item_in_A)
+    s_A_new_unknown_subj = score("secret_new_bench", "none", "unknown_llm", item_in_A)
+    s_A_known_known_subj = score("mmlu", "none", "gpt-4", item_in_A)
+    # Pool B behavior: known bcs win, new bcs lose.
+    s_B_known_known_subj = score("mmlu", "none", "gpt-4", item_in_B)
+    s_B_new_known_subj = score("secret_new_bench", "none", "gpt-4", item_in_B)
 
-    print(
-        "[scores]"
-        + "\n  known_bc + known_subj   = {:+10.4f}".format(s_known_known)
-        + "\n  NEW_bc   + known_subj   = {:+10.4f}".format(s_new_known)
-        + "\n  NEW_bc   + UNKNOWN_subj = {:+10.4f}".format(s_new_unknown)
-        + "\n  known_bc + UNKNOWN_subj = {:+10.4f}".format(s_known_unknown)
+    print("[POOL A (new-prioritized)]")
+    print("  new_bc   + known_subj   = {:+10.4f}".format(s_A_new_known_subj))
+    print("  new_bc   + UNKNOWN_subj = {:+10.4f}".format(s_A_new_unknown_subj))
+    print("  known_bc + known_subj   = {:+10.4f}".format(s_A_known_known_subj))
+    print("[POOL B (known-prioritized)]")
+    print("  known_bc + known_subj   = {:+10.4f}".format(s_B_known_known_subj))
+    print("  new_bc   + known_subj   = {:+10.4f}".format(s_B_new_known_subj))
+
+    assert s_A_new_known_subj >= 1000.0, "POOL A new-bc must score >=1000"
+    assert s_A_new_known_subj > s_A_new_unknown_subj, (
+        "anchor strength must order within POOL A new-bc tier"
     )
+    assert s_A_known_known_subj < 100.0, "POOL A known-bc must score <100 (deprioritized)"
+    assert s_B_known_known_subj >= 1000.0, "POOL B known-bc must score >=1000"
+    assert s_B_new_known_subj < 100.0, "POOL B new-bc must score <100 (deprioritized)"
 
-    assert s_new_known > 1000.0, "new bc + anchor model should be > 1000"
-    assert s_new_unknown > 1000.0, "new bc alone should still be > 1000"
-    assert s_new_known > s_new_unknown, "anchor model should outrank unknown model within new bc"
-    assert s_known_known < 100.0, "known bc + anchor model should be small"
-    assert s_known_known > s_known_unknown, "anchor model should outrank unknown model within known bc"
-    assert s_new_unknown - s_known_known > 900.0, "novelty band gap should be large"
-    assert len(enqueue_log) == 4, "expected 4 enqueue calls, got " + str(len(enqueue_log))
-    print("[OK] BINARY mode passes\n")
+    # _enqueue_for_batch should have fired on each scoring call.
+    assert len(enqueue_log) == 5, (
+        "expected 5 enqueue calls, got " + str(len(enqueue_log))
+    )
+    print("[OK] BINARY mode pool routing correct\n")
 
-    # -------- GRADED mode (counts shipped) --------
+    # ---------------------------------------------------------------------
+    # Empirical pool fraction across 5000 random items
+    # ---------------------------------------------------------------------
+    n_in_A = 0
+    N = 5000
+    for i in range(N):
+        if labeling._item_in_new_pool("random-item-{}".format(i)):
+            n_in_A += 1
+    frac = n_in_A / N
+    print("[empirical pool fraction] N={}, in POOL A = {} ({:.2%})".format(N, n_in_A, frac))
+    assert abs(frac - 0.95) < 0.02, (
+        "empirical fraction must match _FRACTION_NEW_POOL=0.95 within 0.02; got {}".format(frac)
+    )
+    print("[OK] pool fraction matches target\n")
+
+    # ---------------------------------------------------------------------
+    # GRADED mode (train counts shipped)
+    # ---------------------------------------------------------------------
     print("=" * 60)
-    print("GRADED mode (re-exported bundles WITH train counts)")
+    print("GRADED mode (bundles WITH train counts)")
     print("=" * 60)
-    # 4 known benchmarks with very different training intensities; one
-    # is very rare so it should still score nearly as high as a truly
-    # unseen benchmark.
     bc_counts = {
-        "mmlu::none": 5000,        # very popular -> low novelty
-        "gsm8k::none": 500,        # medium
-        "humaneval::cot": 50,      # rare
-        "very_rare_bench::none": 1,  # extremely rare -> high novelty
+        "mmlu::none": 5000,
+        "gsm8k::none": 500,
+        "humaneval::cot": 50,
     }
     subj_counts = {
-        "gpt-4": 4000,             # max anchoring
-        "llama-3-70b": 800,        # high
-        "claude-3-opus": 400,      # medium
-        "mistral-7b": 20,          # low but known
+        "gpt-4": 4000,
+        "llama-3-70b": 800,
+        "claude-3-opus": 400,
+        "mistral-7b": 20,
     }
-    # Provide _BC_TO_ID for the rare bench so it counts as "known" with low count.
     known_bc_graded = list(bc_counts.keys())
     enqueue_log2 = []
     stub_g = _stub_module(
@@ -162,46 +205,51 @@ def main() -> int:
     )
     labeling_g = _load_labeling_with_stub(stub_g)
 
+    g_item_A = _find_item_in_pool(labeling_g, target_new_pool=True, prefix="gA")
+    g_item_B = _find_item_in_pool(labeling_g, target_new_pool=False, prefix="gB")
+
     def score_g(b, c, s, it, ll=labeling_g):
         return ll.acquisition_function({
             "benchmark": b, "condition": c,
             "subject_content": s, "item_content": it,
         })
 
-    g_popular_top = score_g("mmlu", "none", "gpt-4", "Q1")
-    g_popular_low = score_g("mmlu", "none", "mistral-7b", "Q1")
-    g_rare_top = score_g("very_rare_bench", "none", "gpt-4", "Q1")
-    g_unseen_top = score_g("totally_unseen_bench", "none", "gpt-4", "Q1")
-    g_unseen_unknown = score_g("totally_unseen_bench", "none", "unknown_llm", "Q1")
-    g_medium_medium = score_g("gsm8k", "none", "claude-3-opus", "Q1")
+    # In POOL A: an unseen benchmark scores HIGH; a known-but-rare scores LOW.
+    g_A_unseen_top = score_g("totally_unseen_bench", "none", "gpt-4", g_item_A)
+    g_A_rare_known = score_g("humaneval", "cot", "gpt-4", g_item_A)
+    g_A_popular_known = score_g("mmlu", "none", "gpt-4", g_item_A)
+    # In POOL B: a known benchmark scores HIGH; an unseen scores LOW.
+    g_B_unseen = score_g("totally_unseen_bench", "none", "gpt-4", g_item_B)
+    g_B_rare_known = score_g("humaneval", "cot", "gpt-4", g_item_B)
+    g_B_popular_known = score_g("mmlu", "none", "gpt-4", g_item_B)
+    # Anchor strength within tier:
+    g_A_unseen_low_anchor = score_g("totally_unseen_bench", "none", "mistral-7b", g_item_A)
 
-    print(
-        "[graded scores]"
-        + "\n  popular bc  + top model     = {:+10.4f}".format(g_popular_top)
-        + "\n  popular bc  + low-anchor    = {:+10.4f}".format(g_popular_low)
-        + "\n  very rare   + top model     = {:+10.4f}".format(g_rare_top)
-        + "\n  UNSEEN bc   + top model     = {:+10.4f}".format(g_unseen_top)
-        + "\n  UNSEEN bc   + UNKNOWN model = {:+10.4f}".format(g_unseen_unknown)
-        + "\n  medium bc   + medium model  = {:+10.4f}".format(g_medium_medium)
+    print("[GRADED POOL A]")
+    print("  unseen_bc  + top model = {:+10.4f}".format(g_A_unseen_top))
+    print("  rare_known + top model = {:+10.4f}".format(g_A_rare_known))
+    print("  popular_kn + top model = {:+10.4f}".format(g_A_popular_known))
+    print("[GRADED POOL B]")
+    print("  unseen_bc  + top model = {:+10.4f}".format(g_B_unseen))
+    print("  rare_known + top model = {:+10.4f}".format(g_B_rare_known))
+    print("  popular_kn + top model = {:+10.4f}".format(g_B_popular_known))
+    print("[anchor ordering in pool A]")
+    print("  unseen_bc  + low model = {:+10.4f}".format(g_A_unseen_low_anchor))
+
+    assert g_A_unseen_top >= 1000.0, "POOL A unseen-bc must score >=1000"
+    assert g_A_rare_known < 100.0, "POOL A known-bc (rare or not) must score <100"
+    assert g_A_popular_known < 100.0, "POOL A popular-known must score <100"
+    assert g_B_rare_known >= 1000.0, "POOL B rare-known must score >=1000"
+    assert g_B_popular_known >= 1000.0, "POOL B popular-known must score >=1000"
+    assert g_B_unseen < 100.0, "POOL B unseen-bc must score <100"
+    assert g_A_unseen_top > g_A_unseen_low_anchor, (
+        "anchor strength must order within POOL A unseen tier"
     )
+    print("[OK] GRADED mode pool routing correct\n")
 
-    # Graded ordering:
-    # (a) UNSEEN benchmark (novelty=1) should outrank a known-but-rare benchmark.
-    assert g_unseen_top > g_rare_top, "unseen bc must outrank rare-known bc"
-    # (b) Rare-known should outrank popular.
-    assert g_rare_top > g_popular_top, "rare-known bc should beat popular bc"
-    # (c) Anchor strength matters within a tier (popular bc).
-    assert g_popular_top > g_popular_low, "anchor strength must order within tier"
-    # (d) Anchor strength still matters in the unseen tier.
-    assert g_unseen_top > g_unseen_unknown, "anchor model must outrank unknown in unseen tier"
-    # (e) The popular tier should be substantially lower than the unseen tier
-    #     so the platform's top-K-per-category will reliably pick unseen rows.
-    assert g_unseen_unknown - g_popular_top > 100.0, (
-        "novelty band gap should still dominate (>100) even in graded mode"
-    )
-    print("[OK] GRADED mode passes\n")
-
-    # Fallback path: when model.py fails to import, score should be 0.0.
+    # ---------------------------------------------------------------------
+    # Fallback: when model.py fails to import, score should be 0.0.
+    # ---------------------------------------------------------------------
     sys.modules.pop("model", None)
     sys.modules.pop("labeling", None)
 

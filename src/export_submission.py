@@ -854,37 +854,48 @@ _REGISTRY = {
 
 
 # ---------------------------------------------------------------------------
-# Calibrator (per-benchmark held-out-gated intercept w/ ridge + identity)
+# Calibrator (per-benchmark partial-pool intercept; ridge-shrunk to global)
 # ---------------------------------------------------------------------------
 #
 # Design notes:
 #
-#   * Only one fitted tier -- ridge-regularized intercept-only -- because
-#     N<=75 (75 total per round, ~5 per benchmark on average) is way below
-#     what is needed to fit a second free parameter reliably.  An earlier
-#     experiment with a temp+intercept tier turned out to overfit so hard
-#     that CV with random shuffles flipped between accept and reject (T
-#     fits ranged from 0.6 to 0.85 on data that was actually well
-#     calibrated).
+#   * One-parameter calibrator per benchmark: an intercept ``b`` on the
+#     logit scale.  ``logit(p_cal) = logit(p) + b``.  With N <= 75 labels
+#     per round (~5 per benchmark on average) anything richer overfits.
 #
-#   * Held-out gate uses REPEATED 5-fold CV (5 shuffles) so the gate
-#     decision does not depend on the caller's input order, plus an
-#     AIC-style complexity margin (4 nats per param per repeat) AND a
-#     per-repeat majority gate (calibrator must beat baseline in at least
-#     ceil(n_repeats / 2) of the individual shuffles).
+#   * PARTIAL POOLING instead of an accept-or-reject gate.  We fit:
 #
-#   * The fit itself adds an L2 ridge ``lambda * b**2`` so even when
-#     accepted, the intercept gets pulled toward zero.  lambda = 1.0,
-#     equivalent to one fake observation pinned at b = 0.
+#       b_global  = argmin_b sum_all BCE(logit(p)+b, y)
+#                              + RIDGE_LAMBDA_GLOBAL * b**2
+#
+#       b_bc[k]   = argmin_b sum_bc=k BCE(logit(p)+b, y)
+#                              + RIDGE_LAMBDA_BC * (b - b_global)**2
+#
+#     The ridge toward ``b_global`` gives continuous shrinkage:
+#     benchmarks with many labels move toward their own ``b``;
+#     benchmarks with few labels inherit ``b_global``; benchmarks with
+#     zero labels just use ``b_global`` at apply time.  No discrete gate
+#     to flip; the noise floor that used to push a gated fit back to
+#     identity is replaced by a smooth Bayesian-style shrinkage.
+#
+#   * RIDGE_LAMBDA = 20 was picked from a 50-trial simulation sweep
+#     over {2, 5, 10, 15, 20, 25, 30, 40, 60, 80} on the realistic-head
+#     regime (sigma_new = 1.0, sigma_known = 0.2).  Lambda in [15, 25]
+#     are tied for lowest mean NLL; 20 also has lowest variance, so we
+#     pick the safer end of the plateau.  Interpretation: lambda = 20
+#     is ~equivalent to twenty fake observations pinned at the prior,
+#     which is the right strength when typical per-bc N is in the
+#     single digits.
 #
 #   * Per-bc routing uses the raw ``bc_key`` string
-#     (``"benchmark::condition"``) -- NOT the embedding table's bc_id,
+#     ("benchmark::condition") -- NOT the embedding table's bc_id,
 #     which would collapse every unseen benchmark to 0 and merge them
 #     all into a single bucket (the opposite of what we want for
 #     new-benchmark calibration).
 
 
-_RIDGE_LAMBDA = 1.0
+_RIDGE_LAMBDA_GLOBAL = 20.0
+_RIDGE_LAMBDA_BC = 20.0
 
 
 def _sigmoid(x: float) -> float:
@@ -900,14 +911,20 @@ def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
 
 
-def _fit_intercept_ridge(ps, ys, ridge: float = _RIDGE_LAMBDA):
-    """Fit logit(p') = logit(p) + b by 1D Newton on BCE + ridge * b**2."""
+def _fit_intercept_ridge(
+    ps,
+    ys,
+    *,
+    target_b: float = 0.0,
+    ridge: float = _RIDGE_LAMBDA_GLOBAL,
+) -> float:
+    """Return ``b`` minimizing sum BCE(logit(p)+b, y) + ridge * (b - target_b)**2."""
     if not ps:
-        return {"kind": "identity"}
+        return float(target_b)
     zs = [_logit(p) for p in ps]
-    b = 0.0
+    b = float(target_b)
     for _ in range(80):
-        g = 2.0 * ridge * b
+        g = 2.0 * ridge * (b - target_b)
         h = 2.0 * ridge
         for z, y in zip(zs, ys):
             q = _sigmoid(z + b)
@@ -924,125 +941,26 @@ def _fit_intercept_ridge(ps, ys, ridge: float = _RIDGE_LAMBDA):
             break
         b = new_b
     if not math.isfinite(b):
-        return {"kind": "identity"}
-    b = max(-5.0, min(5.0, float(b)))
-    return {"kind": "intercept", "b": b}
-
-
-def _apply_state(p: float, state: dict) -> float:
-    if not math.isfinite(p):
-        return DEFAULT_PROB
-    kind = state.get("kind", "identity")
-    if kind == "intercept":
-        z = _logit(p) + float(state.get("b", 0.0))
-        return _sigmoid(z)
-    return p
-
-
-def _stable_shuffle_order(ps, ys) -> list:
-    """Deterministic permutation invariant to input order."""
-    keyed = [(float(p), float(y), j) for j, (p, y) in enumerate(zip(ps, ys))]
-    keyed.sort()
-    return [k[2] for k in keyed]
-
-
-def _kfold_indices(perm: list, k: int, seed: int):
-    """Apply seed-controlled rotation on ``perm`` then stripe into k folds."""
-    n = len(perm)
-    if n == 0 or k <= 0:
-        return [perm]
-    rotated = list(perm)
-    rng = __import__("random").Random(seed)
-    rng.shuffle(rotated)
-    return [rotated[i::k] for i in range(k)]
-
-
-def _cv_nll_pair(ps, ys, fitter, baseline_state, folds):
-    """Return (cal_total_nll, base_total_nll, counted) over `folds`."""
-    n = len(ps)
-    cal_total = 0.0
-    base_total = 0.0
-    counted = 0
-    for test in folds:
-        if not test:
-            continue
-        train_set = set(test)
-        train_p = [ps[j] for j in range(n) if j not in train_set]
-        train_y = [ys[j] for j in range(n) if j not in train_set]
-        try:
-            cal_state = fitter(train_p, train_y)
-        except Exception:
-            cal_state = {"kind": "identity"}
-        for j in test:
-            p_cal = _apply_state(ps[j], cal_state)
-            p_base = _apply_state(ps[j], baseline_state)
-            p_cal = min(max(p_cal, EPS), 1.0 - EPS)
-            p_base = min(max(p_base, EPS), 1.0 - EPS)
-            y = ys[j]
-            cal_total -= y * math.log(p_cal) + (1.0 - y) * math.log(1.0 - p_cal)
-            base_total -= y * math.log(p_base) + (1.0 - y) * math.log(1.0 - p_base)
-            counted += 1
-    return cal_total, base_total, counted
-
-
-def _gated_fit(
-    ps,
-    ys,
-    baseline_state,
-    *,
-    min_total: int = 5,
-    n_repeats: int = 5,
-    margin_nats_per_param: float = 4.0,
-    require_majority_repeat_wins: bool = True,
-):
-    """Return a ridge-fit intercept state if it convincingly beats baseline,
-    else return ``baseline_state`` unchanged.
-    """
-    n = len(ps)
-    if n < min_total:
-        return baseline_state
-    fitter = _fit_intercept_ridge
-    k_params = 1
-    k = 5 if n >= 10 else n
-    perm = _stable_shuffle_order(ps, ys)
-    cal_total = 0.0
-    base_total = 0.0
-    counted = 0
-    repeat_wins = 0
-    for rep in range(n_repeats):
-        folds = _kfold_indices(perm, k, seed=0xC0FFEE + rep * 7919)
-        c, b_, n_eval = _cv_nll_pair(ps, ys, fitter, baseline_state, folds)
-        cal_total += c
-        base_total += b_
-        counted += n_eval
-        if c < b_:
-            repeat_wins += 1
-    margin = margin_nats_per_param * k_params * n_repeats
-    if counted == 0:
-        return baseline_state
-    if cal_total >= base_total - margin:
-        return baseline_state
-    if require_majority_repeat_wins and repeat_wins < (n_repeats + 1) // 2:
-        return baseline_state
-    try:
-        return fitter(ps, ys)
-    except Exception:
-        return baseline_state
+        return float(target_b)
+    return max(-5.0, min(5.0, float(b)))
 
 
 class _Calibrator:
-    """Hierarchical per-benchmark calibrator with held-out NLL gating.
+    """Hierarchical per-benchmark intercept with continuous ridge shrinkage.
 
-    Routing path at apply time:
-        local[bc_key] (if accepted) -> global -> identity
-    where bc_key is the raw "benchmark::condition" string so each new
-    benchmark gets its own slot (and unseen benchmarks do NOT collapse to
-    a shared bc_id=0 bucket).
+    Routing at apply time:
+        ``per_bc[bc_key]`` if present, else ``b_global``.
+    ``bc_key`` is the raw "benchmark::condition" string so each unseen
+    benchmark gets its own slot (we never collapse new benchmarks to a
+    shared bucket).
     """
 
     def __init__(self, state: dict | None = None) -> None:
-        self.state: dict = dict(state) if isinstance(state, dict) else {"kind": "identity"}
-        self.per_bc: dict[str, dict] = {}
+        if isinstance(state, dict) and state.get("kind") == "intercept":
+            self.b_global: float = float(state.get("b", 0.0))
+        else:
+            self.b_global = 0.0
+        self.per_bc: dict[str, float] = {}
 
     def fit_from_labeled(self, labeled_list) -> None:
         if not labeled_list:
@@ -1078,29 +996,28 @@ class _Calibrator:
             bcs.append(bc_key)
         if not ps:
             return
-        global_state = _gated_fit(ps, ys, baseline_state={"kind": "identity"})
-        self.state = global_state
+        self.b_global = _fit_intercept_ridge(
+            ps, ys, target_b=0.0, ridge=_RIDGE_LAMBDA_GLOBAL
+        )
         bc_to_pairs: dict[str, tuple[list[float], list[float]]] = {}
         for p, y, bc in zip(ps, ys, bcs):
             bucket = bc_to_pairs.setdefault(bc, ([], []))
             bucket[0].append(p)
             bucket[1].append(y)
-        local: dict[str, dict] = {}
+        self.per_bc = {}
         for bc_key, (lp, ly) in bc_to_pairs.items():
-            if len(lp) < 5:
-                continue
-            cand = _gated_fit(lp, ly, baseline_state=global_state, min_total=5)
-            if cand is not global_state and cand.get("kind", "identity") != "identity":
-                local[bc_key] = cand
-        self.per_bc = local
+            b_bc = _fit_intercept_ridge(
+                lp, ly, target_b=self.b_global, ridge=_RIDGE_LAMBDA_BC
+            )
+            self.per_bc[bc_key] = float(b_bc)
         try:
             n_new_benchmarks = sum(
                 1 for k in self.per_bc if _BC_TO_ID.get(k, 0) == 0
             )
             LOG.info(
-                "Calibrator fit: N=%d, global=%s, per_bc=%d (of which %d are NEW benchmarks)",
+                "Calibrator fit: N=%d, b_global=%+.4f, per_bc=%d (of which %d are NEW benchmarks)",
                 len(ps),
-                self.state.get("kind", "identity"),
+                self.b_global,
                 len(self.per_bc),
                 n_new_benchmarks,
             )
@@ -1111,9 +1028,14 @@ class _Calibrator:
         if not math.isfinite(p):
             return DEFAULT_PROB
         if isinstance(bc_key, str) and bc_key in self.per_bc:
-            q = _apply_state(p, self.per_bc[bc_key])
+            b = float(self.per_bc[bc_key])
         else:
-            q = _apply_state(p, self.state)
+            b = float(self.b_global)
+        try:
+            z = _logit(p) + b
+            q = _sigmoid(z)
+        except Exception:
+            return DEFAULT_PROB
         if not math.isfinite(q):
             return DEFAULT_PROB
         return float(min(max(q, EPS), 1.0 - EPS))
@@ -2463,49 +2385,94 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
 '''
 
 
-_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (benchmark-novelty + anchor-model).
+_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (dual-pool stratification).
 
 The Codabench runner calls ``acquisition_function`` once per hidden
-(subject, item) pair BEFORE any ``predict()`` call.  Each call here does
-two things:
+(subject, item) pair BEFORE any ``predict()`` call.  Each call here
+does two things:
 
   1. Forward the input to ``model._enqueue_for_batch`` so the streamed-
      flush architecture can start populating encoder + judge caches in
      the background.
 
-  2. Return an ACQUISITION SCORE biased toward new benchmarks observed
-     with well-anchored models. The score has three layers:
+  2. Return an ACQUISITION SCORE designed to give the per-bc calibrator
+     a useful mix of labels.
 
-       score = 1000 * novelty(B) + 10 * anchoring(M) + tiebreak
+ACQUISITION DESIGN -- dual-pool stratification
+==============================================
 
-     where the SHAPE of novelty/anchoring depends on what the runtime
-     model.py exposes:
+The platform stratifies its ~256k acquisition calls into K=15 data
+categories (a hash of ``item_variant_id``) and reveals the top-K=5
+highest-scoring rows per category (75 labels total per round).
 
-       GRADED mode (preferred; requires model._N_TRAIN_PER_BC and
-       model._N_TRAIN_PER_SUBJECT to be present at module scope):
+A naive ``score = 1000 * novelty(bc)`` puts 100% of those 75 labels on
+new benchmarks, which under-uses the calibrator's per-bc structure and
+leaves the global intercept contaminated by trial-specific new-bc
+biases.  But a simple "novelty * smaller_weight" doesn't work either:
+because top-K-per-category is an extreme-value selection, any weight
+above a tiny threshold collapses to 100% new -- and below it, to
+~20% new (the population fraction).  There is no in-between via a
+single multiplier.
 
-         novelty(B)   = 1 / sqrt(1 + n_train_per_bc[bc_key])
-                        -- 1.0 for an unseen benchmark, decaying smoothly
-                           as the benchmark's training-row count grows.
-         anchoring(M) = log1p(n_train_per_subject[sha256(subject)]) / LN
-                        -- 0.0 for an unseen model, log-scaled toward 1.0
-                           as the subject's training-row count grows.
-                           LN = log1p(max(_N_TRAIN_PER_SUBJECT.values())).
+To get a tunable mix we instead split candidates into two pools and
+score each pool independently:
 
-       BINARY fallback (when the runtime bundle does not ship counts --
-       e.g. bundles patched in-place by the surgical pack scripts):
+  * Hash ``item_content`` to a uniform u in [0, 1).
+  * If u < FRACTION_NEW_POOL: this row is in POOL A (new-bc only).
+    A new-bc candidate gets +1000; a known-bc candidate gets +0.
+  * Else: row is in POOL B (known-bc only).
+    A known-bc candidate gets +1000; a new-bc candidate gets +0.
 
-         novelty(B)   = 1 if bc_id == 0 else 0
-         anchoring(M) = 1 if s_id  != 0 else 0
+Top-K-per-category then picks 5 rows out of ~17k candidates per
+category, of which only ~23% are "eligible" (new-bc-in-A or
+known-bc-in-B); the rest score 0+anchor and lose.
 
-     Both modes preserve the same priority ordering -- novelty (max +1000)
-     dominates anchoring (max +10) dominates tiebreak (~+/-0.5) -- so the
-     platform's top-K-per-category sampler will reliably pick new-benchmark
-     anchor-model rows over alternatives.
+Fraction-of-labels math
+-----------------------
 
-If any of the model.py lookups fail (corrupt bundle, missing symbol) we
-silently fall back to 0.0 -- the platform handles that as uniform random
-within the category.
+  P(eligible & new) = P(A) * P(new) = FRACTION_NEW_POOL * P(new|cat)
+  P(eligible & known) = P(B) * P(known) = (1 - FRACTION_NEW_POOL) * P(known|cat)
+
+For our setup P(new|cat) ~= 3/15 = 0.20 and P(known|cat) = 0.80.  With
+FRACTION_NEW_POOL = 0.95 the expected fraction of NEW in the final
+labels is
+
+    0.95 * 0.20 / (0.95 * 0.20 + 0.05 * 0.80) ~= 0.826
+
+A 50-trial simulation over the realistic-head regime
+(sigma_new=1.0, sigma_known=0.2) confirms 82-85% is the optimum:
+
+    new_frac    NLL_all (mean +- std)
+    ----------------------------------
+    1.2%        0.6049 +- 0.0058    (almost-all-known)
+    18.7%       0.6038 +- 0.0057    (uniform random)
+    49.3%       0.6019 +- 0.0052    (perfectly balanced)
+    82.5%       0.6011 +- 0.0050    <- empirical optimum
+    100.0%      0.6012 +- 0.0050    (old production)
+
+Within each pool the anchor + tiebreak terms decide which subjects/items
+win the top-5 slots:
+
+    score = bc_bonus + 10 * anchoring(subject) + tiebreak
+
+where ``anchoring`` and the boolean ``is_new_bc`` decision use:
+
+  GRADED mode (preferred; requires ``model._N_TRAIN_PER_BC`` and
+  ``model._N_TRAIN_PER_SUBJECT`` at module scope):
+
+    is_new_bc    = (n_train_per_bc[bc_key] == 0)
+    anchoring    = log1p(n_train_per_subject[sha256(subject)]) / LN
+                   (LN = log1p(max(_N_TRAIN_PER_SUBJECT.values())))
+
+  BINARY fallback (when the bundle does NOT ship train_counts -- e.g.
+  bundles patched in-place by surgical pack scripts):
+
+    is_new_bc    = (bc_id == 0)
+    anchoring    = 1 if s_id != 0 else 0
+
+If any of the model.py lookups fail (corrupt bundle, missing symbol)
+we silently fall back to 0.0 -- the platform handles that as uniform
+random within the category.
 """
 
 from __future__ import annotations
@@ -2514,16 +2481,24 @@ import hashlib
 import math
 
 
+# Fraction of items routed to the "new-prioritized" pool.  See module
+# docstring above for the simulation sweep that picked this value
+# (50 trials over the realistic-head regime, optimum in [0.85, 0.95]).
+_FRACTION_NEW_POOL = 0.95
+
+
+def _item_in_new_pool(item_content: str) -> bool:
+    """Deterministic per-item assignment to POOL A (new) vs POOL B (known)."""
+    h = hashlib.blake2b(item_content.encode("utf-8"), digest_size=8).digest()
+    n = int.from_bytes(h, "little")
+    return (n / float(2 ** 64)) < _FRACTION_NEW_POOL
+
+
 def _stable_tiebreak(*parts: str) -> float:
     """Return a deterministic float in [-0.5, +0.5] derived from inputs."""
     h = hashlib.blake2b(("\x00".join(parts)).encode("utf-8"), digest_size=8).digest()
     n = int.from_bytes(h, "little")
     return (n / 2 ** 64) - 0.5
-
-
-def _graded_novelty(bc_key: str, n_train_per_bc) -> float:
-    n = float(n_train_per_bc.get(bc_key, 0))
-    return 1.0 / math.sqrt(1.0 + n)
 
 
 def _graded_anchoring(subject_key: str, n_train_per_subject, log_max_plus_one: float) -> float:
@@ -2595,14 +2570,19 @@ def acquisition_function(input: dict) -> float:  # noqa: A002
                 log_max_plus_one = math.log1p(float(max_n_subj))
             except Exception:  # noqa: BLE001
                 log_max_plus_one = 0.0
-            novelty = _graded_novelty(bc_key, _N_TRAIN_PER_BC)
+            n_train_bc = float(_N_TRAIN_PER_BC.get(bc_key, 0))
+            is_new_bc = (n_train_bc <= 0.0)
             anchoring = _graded_anchoring(subject_key, _N_TRAIN_PER_SUBJECT, log_max_plus_one)
         else:
-            novelty = 1.0 if bc_id == 0 else 0.0
+            is_new_bc = (bc_id == 0)
             anchoring = 1.0 if s_id != 0 else 0.0
 
+        in_new_pool = _item_in_new_pool(item_content)
+        eligible = (in_new_pool == is_new_bc)
+        bc_bonus = 1000.0 if eligible else 0.0
+
         tb = _stable_tiebreak(benchmark, condition, subject_content, item_content)
-        return 1000.0 * novelty + 10.0 * anchoring + tb
+        return bc_bonus + 10.0 * anchoring + tb
     except Exception:  # noqa: BLE001
         return 0.0
 '''

@@ -39,14 +39,13 @@ print("[3/7] OK _RUNTIME_LABELING_PY parses ({:,} bytes)".format(len(es._RUNTIME
 # 4) Required markers in the runtime model.py.
 m = es._RUNTIME_MODEL_PY
 must_have_model = [
-    "_RIDGE_LAMBDA",
+    "_RIDGE_LAMBDA_GLOBAL",
+    "_RIDGE_LAMBDA_BC",
     "def _fit_intercept_ridge",
-    "def _gated_fit",
-    "def _stable_shuffle_order",
-    "def _kfold_indices",
-    "def _cv_nll_pair",
+    "target_b",
     "class _Calibrator",
-    "self.per_bc: dict[str, dict]",
+    "self.per_bc: dict[str, float]",
+    "self.b_global",
     "def apply(self, p: float, bc_key: str = \"\")",
     "_bc_key_for_apply = \"{0}::{1}\"",
     "p = _CALIBRATOR.apply(p, _bc_key_for_apply)",
@@ -54,9 +53,6 @@ must_have_model = [
     "_N_TRAIN_PER_BC",
     "_TRAIN_COUNTS_RAW",
     "META.get(\"train_counts\")",
-    "n_repeats",
-    "margin_nats_per_param",
-    "require_majority_repeat_wins",
     "n_new_benchmarks",
 ]
 for needle in must_have_model:
@@ -69,6 +65,13 @@ forbidden_model = [
     "def _beta_calibration_loss",
     '"kind": "beta"',
     '"kind": "temp_intercept"',
+    # Gate machinery replaced by partial pooling.
+    "def _gated_fit",
+    "def _cv_nll_pair",
+    "def _kfold_indices",
+    "def _stable_shuffle_order",
+    "margin_nats_per_param",
+    "require_majority_repeat_wins",
 ]
 for needle in forbidden_model:
     if needle in m:
@@ -82,12 +85,14 @@ must_have_labeling = [
     "_SUBJECT_TO_ID",
     "_N_TRAIN_PER_BC",
     "_N_TRAIN_PER_SUBJECT",
-    "novelty",
+    "_FRACTION_NEW_POOL = 0.95",
+    "_item_in_new_pool",
+    "is_new_bc",
+    "in_new_pool",
+    "eligible",
     "anchoring",
     "_enqueue_for_batch",
-    "1000.0 * novelty",
     "10.0 * anchoring",
-    "_graded_novelty",
     "_graded_anchoring",
     "_stable_tiebreak",
 ]
@@ -97,6 +102,8 @@ for needle in must_have_labeling:
 forbidden_labeling = [
     "from model import _baseline_logit",
     "Lewis & Gale",  # the old uncertainty doc-string callout
+    "1000.0 * novelty",
+    "def _graded_novelty",
 ]
 for needle in forbidden_labeling:
     if needle in lp:
@@ -167,7 +174,7 @@ sandbox["_predict_uncalibrated"] = _predict_uncal
 # Extract just the calibrator class + helpers from the runtime template.
 # Easiest is to exec the entire calibrator block.  We isolate it by
 # splitting on the next module-level banner.
-cal_start = m.find("_RIDGE_LAMBDA = 1.0")
+cal_start = m.find("_RIDGE_LAMBDA_GLOBAL = 20.0")
 cal_end = m.find("# ---------------------------------------------------------------------------\n# Training-item cache")
 assert cal_start > 0 and cal_end > cal_start, (cal_start, cal_end)
 cal_block = m[cal_start:cal_end]
@@ -176,7 +183,7 @@ exec(compile(cal_block, "<runtime_calibrator>", "exec"), sandbox)
 Calibrator = sandbox["_Calibrator"]
 cal = Calibrator()
 # 30 labels all with y=0 but predict_uncal returning 0.85
-# -> the calibrator should accept a negative intercept.
+# -> the calibrator should fit a negative b_global (partial pooling).
 labels = [
     {
         "label": 0.0,
@@ -188,18 +195,21 @@ labels = [
     for i in range(30)
 ]
 cal.fit_from_labeled(labels)
-print("    fit yielded state.kind={}, per_bc size={}".format(
-    cal.state.get("kind"), len(cal.per_bc)
+print("    fit yielded b_global={:+.4f}, per_bc size={}".format(
+    cal.b_global, len(cal.per_bc)
 ))
-assert cal.state.get("kind") == "intercept", "expected a global intercept fit"
+assert cal.b_global < -0.05, "b_global must pull negative on a too-high predictor"
 # Apply on a fresh p=0.85 should pull below 0.85.
 p_orig = 0.85
 p_cal = cal.apply(p_orig, "known::none")
 print("    apply(0.85, 'known::none') = {:.4f} (was {:.4f})".format(p_cal, p_orig))
 assert p_cal < p_orig, "calibrator should pull down a too-high prediction"
-# Apply with empty bc_key falls back to global.
+# Apply with empty bc_key falls back to b_global (no per-bc routing).
 p_cal_global = cal.apply(p_orig, "")
-assert abs(p_cal_global - p_cal) > -1e-9  # global == per_bc when per_bc empty, basically same
+print("    apply(0.85, '')             = {:.4f}".format(p_cal_global))
+# Both apply paths should pull p down (per_bc[known::none] is shrunk
+# toward b_global by ridge, but still in the same direction).
+assert p_cal_global < p_orig, "global apply path should also pull down"
 print("[7/7] OK runtime _Calibrator behaves correctly")
 
 print("\n[OK] all export_submission smoke tests pass")

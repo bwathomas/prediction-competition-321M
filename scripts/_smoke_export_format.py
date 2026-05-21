@@ -57,18 +57,20 @@ print("[OK] obsolete batched-flush plumbing fully removed from model.py")
 
 # 2c. Runtime model.py exposes the cheap baseline-logit helper (kept as
 #     a useful API even though labeling.py no longer consumes it), the
-#     new per-benchmark held-out-gated calibrator, and the train-count
+#     new per-benchmark partial-pool calibrator, and the train-count
 #     lookup tables that labeling.py uses for graded acquisition.
 for needle in (
     "def _baseline_logit",
     "_BASELINE_MU",
     "_SUBJECT_BASELINE",
     "_BC_BASELINE",
-    "_RIDGE_LAMBDA",
+    "_RIDGE_LAMBDA_GLOBAL",
+    "_RIDGE_LAMBDA_BC",
     "def _fit_intercept_ridge",
-    "def _gated_fit",
+    "target_b",
     "class _Calibrator",
-    "self.per_bc: dict[str, dict]",
+    "self.per_bc: dict[str, float]",
+    "self.b_global",
     'def apply(self, p: float, bc_key: str = "")',
     '_bc_key_for_apply = "{0}::{1}"',
     "p = _CALIBRATOR.apply(p, _bc_key_for_apply)",
@@ -78,7 +80,8 @@ for needle in (
     assert needle in ES._RUNTIME_MODEL_PY, f"missing in model.py template: {needle!r}"
     print(f"[OK] runtime model.py declares: {needle}")
 
-# 2d. Old single-tier fitters and the beta tier must be gone.
+# 2d. Old single-tier fitters, beta tier, AND the gated-fit machinery
+#     must all be gone (partial pooling replaced the gate).
 for stale in (
     "def _fit_intercept_only",
     "def _fit_temp_intercept",
@@ -86,14 +89,19 @@ for stale in (
     "def _beta_calibration_loss",
     '"kind": "beta"',
     '"kind": "temp_intercept"',
+    "def _gated_fit",
+    "def _cv_nll_pair",
+    "def _kfold_indices",
+    "margin_nats_per_param",
+    "require_majority_repeat_wins",
 ):
     assert stale not in ES._RUNTIME_MODEL_PY, (
         f"stale legacy calibrator symbol still present: {stale!r}"
     )
-print("[OK] obsolete legacy calibrator tiers fully removed")
+print("[OK] obsolete legacy calibrator tiers + gate machinery fully removed")
 
-# 3. labeling.py drives the streamed flush AND returns a benchmark-novelty
-#    + anchor-model acquisition score (graded if model.py exposes
+# 3. labeling.py drives the streamed flush AND returns a dual-pool
+#    stratified acquisition score (graded if model.py exposes
 #    _N_TRAIN_PER_* dicts, binary fallback otherwise).
 for needle in (
     "_enqueue_for_batch",
@@ -101,26 +109,39 @@ for needle in (
     "_SUBJECT_TO_ID",
     "_N_TRAIN_PER_BC",
     "_N_TRAIN_PER_SUBJECT",
-    "_graded_novelty",
+    "_FRACTION_NEW_POOL",
+    "_item_in_new_pool",
     "_graded_anchoring",
     "_stable_tiebreak",
-    "1000.0 * novelty",
+    "is_new_bc",
+    "in_new_pool",
+    "eligible",
     "10.0 * anchoring",
     "return 0.0",  # still the documented fallback when the model import fails
 ):
     assert needle in ES._RUNTIME_LABELING_PY, f"missing in labeling.py: {needle!r}"
-print("[OK] runtime labeling.py streams flush + returns novelty/anchoring score")
+print("[OK] runtime labeling.py uses dual-pool stratified acquisition")
 
-# 3b. The old uncertainty path must be gone from labeling.py.
+# 3b. The old uncertainty path AND the obsolete single-multiplier
+#     novelty scoring must be gone from labeling.py.
 for stale in (
     "from model import _baseline_logit",
     "-abs(p - 0.5)",
     "Lewis & Gale",
+    "1000.0 * novelty",
+    "def _graded_novelty",  # the single-multiplier graded novelty is gone
 ):
     assert stale not in ES._RUNTIME_LABELING_PY, (
-        f"stale uncertainty-acquisition symbol still in labeling.py: {stale!r}"
+        f"stale labeling-template symbol still in labeling.py: {stale!r}"
     )
-print("[OK] obsolete uncertainty-acquisition path removed from labeling.py")
+print("[OK] obsolete single-multiplier acquisition path removed from labeling.py")
+
+# 3c. _FRACTION_NEW_POOL must be tuned to 0.95 (50-trial sim sweep).
+assert "_FRACTION_NEW_POOL = 0.95" in ES._RUNTIME_LABELING_PY, (
+    "_FRACTION_NEW_POOL must equal 0.95 (the tuned optimum from "
+    "scripts/_sim_acquisition_tuning.py)"
+)
+print("[OK] _FRACTION_NEW_POOL pinned to tuned 0.95")
 
 # 4. export_run writes the right fields and the broken repair is gone.
 src = inspect.getsource(ES.export_run)
