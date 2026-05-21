@@ -1,4 +1,4 @@
-"""Smoke-check that export_run produces the batched-flush format end to end."""
+"""Smoke-check that export_run produces the streamed-flush format end to end."""
 
 from __future__ import annotations
 
@@ -26,11 +26,34 @@ for needle in (
     "ENCODER_RUNTIME_BATCH_SIZE",
     "def _enqueue_for_batch",
     "def _flush_pending_batches",
+    "def _flush_one_item_batch",
+    "def _flush_one_subject_batch",
+    "def _flush_one_judge_batch",
     "def score_batch",
     "def _embed_batch",
+    # Offline mode must be forced before the transformers import; without
+    # it, PAIEC-NETWORK-001 kills the submission even with a fully cached
+    # ``from_pretrained(..., local_files_only=True)`` call.
+    'HF_HUB_OFFLINE',
+    'TRANSFORMERS_OFFLINE',
+    'HF_DATASETS_OFFLINE',
 ):
     assert needle in ES._RUNTIME_MODEL_PY, f"missing in model.py template: {needle!r}"
     print(f"[OK] runtime model.py reads/declares: {needle}")
+
+# 2b. The obsolete batched-flush plumbing must be gone -- it tripped the
+#     10 s per-call predict() timeout on the documented ~256 k workload.
+for stale in (
+    "_write_progress",
+    "_free_encoder_vram",
+    "FREE_ENCODER_AFTER_FLUSH",
+    "RUNTIME_PROGRESS_PATH",
+    "_PROGRESS_T0",
+):
+    assert stale not in ES._RUNTIME_MODEL_PY, (
+        f"stale obsolete-arch symbol still in model.py template: {stale!r}"
+    )
+print("[OK] obsolete batched-flush plumbing fully removed from model.py")
 
 # 3. labeling.py is the enqueue-only variant.
 for needle in ("_enqueue_for_batch", "return 0.0"):
@@ -42,12 +65,17 @@ src = inspect.getsource(ES.export_run)
 for needle in (
     '"encoder_runtime_batch_size":',
     '"runtime_batch_size": runtime_judge_bs',
-    '"runtime_architecture": "batched_flush_v1"',
+    '"runtime_architecture": "streamed_flush_v1"',
 ):
     assert needle in src, f"missing in export_run: {needle!r}"
     print(f"[OK] export_run writes: {needle}")
 assert "coercing cluster_embed_dim=16" not in src, "broken repair STILL in export_run"
 print("[OK] broken cluster repair removed from export_run")
+# The obsolete batched-flush tag must not leak through any other code path.
+assert '"runtime_architecture": "batched_flush_v1"' not in src, (
+    "export_run still tags bundles as batched_flush_v1"
+)
+print("[OK] export_run no longer emits the obsolete batched_flush_v1 tag")
 
 # 5. include_labeling=False warning is wired up.
 assert "if not include_labeling:" in src and "LOG.warning(" in src, (
@@ -55,24 +83,29 @@ assert "if not include_labeling:" in src and "LOG.warning(" in src, (
 )
 print("[OK] include_labeling=False emits a runtime warning")
 
-# 6. configs/default.yaml has both runtime batch size knobs.
+# 6. configs/default.yaml has the correct streamed-flush runtime batch
+#    sizes for both encoder (bs=16) and judge (bs=8).
 cfg_yaml = (ROOT / "configs" / "default.yaml").read_text(encoding="utf-8")
-for needle in (
-    "runtime_batch_size: 16",  # appears twice (encoder + judge sections)
-):
-    n = cfg_yaml.count(needle)
-    assert n >= 2, f"expected 2x {needle!r} in default.yaml, got {n}"
-    print(f"[OK] default.yaml has {n} occurrences of {needle!r} (encoder + judge)")
+assert cfg_yaml.count("runtime_batch_size: 16") >= 1, (
+    "default.yaml is missing 'runtime_batch_size: 16' (encoder)"
+)
+print("[OK] default.yaml has encoder.runtime_batch_size: 16")
+assert cfg_yaml.count("runtime_batch_size: 8") >= 1, (
+    "default.yaml is missing 'runtime_batch_size: 8' (judge -- streamed-flush "
+    "co-resident default; raise only after verifying no OOM on target tier)"
+)
+print("[OK] default.yaml has judge.runtime_batch_size: 8")
 
 # 7. Quick check that the runtime template handles missing fields gracefully.
-#    (It should default to 16, not crash.)
+#    Defaults are sized for an L4 with the encoder + judge co-resident in
+#    the streamed-flush architecture: encoder bs=16, judge bs=8.
 import re
 
 m = re.search(
     r'JUDGE_RUNTIME_BATCH_SIZE: int = int\(JUDGE_META\.get\("runtime_batch_size", (\d+)\)\)',
     ES._RUNTIME_MODEL_PY,
 )
-assert m and int(m.group(1)) == 32, "judge runtime batch default not 32"
+assert m and int(m.group(1)) == 8, "judge runtime batch default not 8"
 print(f"[OK] JUDGE_RUNTIME_BATCH_SIZE defaults to {m.group(1)}")
 
 m = re.search(

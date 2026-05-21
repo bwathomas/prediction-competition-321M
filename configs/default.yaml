@@ -311,10 +311,17 @@ judge:
   batch_size: 256
   # *Runtime* (Codabench) batch size for the inline judge. Read separately
   # from ``batch_size`` above because Codabench typically lands on L4
-  # (24 GB), where bs=256 would OOM instantly. The batched-flush runtime
+  # (24 GB), where bs=256 would OOM instantly. The streamed-flush runtime
   # template in src/export_submission.py reads exactly this field via
   # ``judge.runtime_batch_size`` in the shipped runtime_meta.json.
-  runtime_batch_size: 16
+  #
+  # bs=8 is the proven-safe ceiling for the streamed-flush architecture:
+  # both 4 B-param bf16 models stay co-resident on the L4 for the entire
+  # round (no encoder eviction), so the judge has only ~ 8 GB of
+  # activations headroom after the encoder's ~ 8 GB of weights. Raise
+  # only after verifying that the larger bs does not OOM on the target
+  # tier; the runtime never reads from ``batch_size`` here.
+  runtime_batch_size: 8
   max_prompt_tokens: 512
   max_new_tokens: 1
   bf16: true

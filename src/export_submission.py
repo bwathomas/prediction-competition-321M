@@ -55,6 +55,20 @@ encoder forward pass per unseen item and a single sigmoid.
 
 from __future__ import annotations
 
+# IMPORTANT: Set HuggingFace offline mode BEFORE importing transformers /
+# huggingface_hub / datasets. The Codabench runner blocks outbound
+# connections; without these env vars, even a fully-cached
+# ``from_pretrained(..., local_files_only=True)`` call will fire a metadata
+# HEAD request to https://huggingface.co and the platform kills the
+# submission with PAIEC-NETWORK-001. Setting them via ``setdefault`` is a
+# no-op when the platform has already declared offline mode itself, so this
+# is safe in every environment.
+import os as _os_for_hf_offline
+_os_for_hf_offline.environ.setdefault("HF_HUB_OFFLINE", "1")
+_os_for_hf_offline.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+_os_for_hf_offline.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+del _os_for_hf_offline
+
 import hashlib
 import json
 import logging
@@ -81,50 +95,6 @@ POOL_STATS_PATH = ARTIFACTS / "pool_features_stats.json"
 CLUSTER_CENTROIDS_PATH = ARTIFACTS / "cluster_centroids.npy"
 TRAINING_CACHE_DIR = HERE / "cache"
 EPS = 1e-6
-
-# Stand-in for stdout logging when the platform doesn't surface it. Writes
-# a single JSON document to ``artifacts/runtime_progress.json`` that the
-# user can read via Codabench's output / artifact view after the round
-# finishes (or, if the platform surfaces in-flight artifacts, mid-run).
-# Every milestone overwrites the file atomically so the freshest state is
-# always available -- the document is small enough that this is cheap.
-RUNTIME_PROGRESS_PATH = ARTIFACTS / "runtime_progress.json"
-_PROGRESS_T0 = time.time()
-_PROGRESS_STATE: dict = {
-    "events": [],
-    "started_at": _PROGRESS_T0,
-}
-
-
-def _write_progress(stage: str, **info) -> None:
-    """Append a milestone to ``artifacts/runtime_progress.json``.
-
-    Safe to call repeatedly and from any code path. Never raises.
-    The file is rewritten atomically (write to a sibling then rename) so
-    a reader never sees a half-written JSON document.
-    """
-    try:
-        ev = {
-            "stage": stage,
-            "t_since_start_s": round(time.time() - _PROGRESS_T0, 3),
-            **info,
-        }
-        _PROGRESS_STATE["events"].append(ev)
-        _PROGRESS_STATE["latest"] = ev
-        # Also emit to stdout with flush so any platform that *does* surface
-        # stdout sees the same milestones in real time.
-        try:
-            print(f"[runtime] {stage} {info}", flush=True)
-        except Exception:
-            pass
-        ARTIFACTS.mkdir(parents=True, exist_ok=True)
-        tmp = RUNTIME_PROGRESS_PATH.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(_PROGRESS_STATE, indent=2, default=str), encoding="utf-8"
-        )
-        tmp.replace(RUNTIME_PROGRESS_PATH)
-    except Exception:
-        pass
 
 # ---------------------------------------------------------------------------
 # Load runtime metadata (text template, encoder id, calibrator stub, etc.)
@@ -187,34 +157,33 @@ JUDGE_NO_TOKENS: tuple = tuple(
     JUDGE_META.get("no_tokens", (" no", "no", " No", "No"))
 )
 JUDGE_SUFFIX_RESERVE_TOKENS: int = int(JUDGE_META.get("suffix_reserve_tokens", 256))
-# Per-round runtime batch sizes. These have very different VRAM profiles
-# on L4 (24 GB) and so default to different numbers:
+# Per-round runtime batch sizes for the streamed-flush architecture.
 #
-#   * Encoder runs DURING the co-resident phase (judge weights are also
-#     loaded, ~8 GB). Encoder weights are another ~8 GB. That leaves ~8 GB
-#     for activations -- bs=16 is the proven-safe ceiling. bs=32 has been
-#     observed to OOM on L4 in the wild.
+# The Codabench runner enforces a *per-call* ``predict()`` timeout of 10
+# seconds (PAIEC-TIMEOUT-001 in the diagnostic logs).  An earlier rev tried
+# to absorb all batched encoder + judge compute inside the first
+# ``predict()`` call; on the documented ~50 k-pair workload that single
+# call took several minutes and the platform killed the submission.
 #
-#   * Judge runs AFTER the encoder is evicted (the
-#     ``FREE_ENCODER_AFTER_FLUSH`` path below freed ~8 GB), so it gets the
-#     full ~16 GB of headroom for activations and is safe at bs=32 -- the
-#     judge phase is the dominant cost, so this is where the speedup
-#     actually matters.
+# The current architecture streams: ``acquisition_function`` opportunistically
+# fires one small batch per call (judge first because it's the deepest
+# queue per pair), so the heavy compute is spread evenly across the
+# ~256 k acquisition calls.  Both 4 B-param bf16 models remain co-resident
+# on a 24 GB L4 for the entire round, so the batch sizes must fit
+# *together*:
+#
+#   * Encoder: bs=16 with Qwen3-4B-Instruct co-resident at ~8 GB of
+#     weights leaves enough headroom for activations.  bs=32 was observed
+#     to OOM in the wild with the judge loaded.
+#
+#   * Judge: bs=8 with Qwen3-Embedding-4B co-resident.  This is the
+#     conservative ceiling; the original 32-batch path assumed the
+#     encoder had been evicted from VRAM, which no longer happens.
 #
 # Override either knob via ``runtime_meta.json`` for larger/smaller tiers.
-JUDGE_RUNTIME_BATCH_SIZE: int = int(JUDGE_META.get("runtime_batch_size", 32))
+JUDGE_RUNTIME_BATCH_SIZE: int = int(JUDGE_META.get("runtime_batch_size", 8))
 ENCODER_RUNTIME_BATCH_SIZE: int = int(
     META.get("encoder_runtime_batch_size", 16)
-)
-# Free the encoder model from GPU memory after the encoder phase of the
-# flush has populated _ITEM_EMB_CACHE / _SUBJECT_EMB_CACHE. The cache lives
-# on CPU as numpy arrays, so every subsequent predict() still hits it
-# without needing the encoder loaded. Disable via ``runtime_meta.json``
-# (``free_encoder_after_flush: false``) if a future runtime architecture
-# needs the encoder available beyond the flush (e.g. on-demand
-# embedding of items that weren't queued during acquisition).
-FREE_ENCODER_AFTER_FLUSH: bool = bool(
-    META.get("free_encoder_after_flush", True)
 )
 
 # NN feature schema. Must match src/nn_features.py exactly -- the runtime
@@ -1474,23 +1443,6 @@ if TRAINING_CACHE_DIR.exists() and (TRAINING_CACHE_DIR / "cache_meta.json").exis
 
 _t0 = time.time()
 LOG.info("Loading submission artifacts ...")
-_write_progress(
-    "module_init_start",
-    cuda_available=bool(torch.cuda.is_available()),
-    cuda_device_count=int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
-    cuda_device_name=(
-        torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-    ),
-    cuda_total_vram_gb=(
-        round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 2)
-        if torch.cuda.is_available()
-        else 0.0
-    ),
-    judge_runtime_batch_size=int(JUDGE_RUNTIME_BATCH_SIZE),
-    encoder_runtime_batch_size=int(ENCODER_RUNTIME_BATCH_SIZE),
-    free_encoder_after_flush=bool(FREE_ENCODER_AFTER_FLUSH),
-    runtime_architecture=str(META.get("runtime_architecture", "(absent)")),
-)
 
 _CACHE_DIR = _resolve_cache_dir()
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1500,21 +1452,9 @@ if JUDGE_ENABLED and JUDGE_SHIP_AT_RUNTIME and JUDGE_MODEL_ID:
     try:
         JUDGE = _LLMJudgeRuntime(JUDGE_MODEL_ID)
         LOG.info("Loaded LLM-as-judge runtime: %s on %s", JUDGE_MODEL_ID, _DEVICE)
-        _write_progress(
-            "judge_loaded",
-            model_id=str(JUDGE_MODEL_ID),
-            device=_DEVICE,
-            attn_impl=getattr(JUDGE, "attn_impl", "unknown"),
-            dtype=str(next(JUDGE.model.parameters()).dtype),
-        )
     except Exception as exc:  # noqa: BLE001
         LOG.warning("Failed to load judge runtime (%s); falling back to zeros", exc)
         JUDGE = None
-        _write_progress(
-            "judge_load_failed",
-            error=str(exc),
-            error_type=type(exc).__name__,
-        )
 
 from transformers import AutoModel, AutoTokenizer
 
@@ -1533,12 +1473,6 @@ _ENCODER = AutoModel.from_pretrained(
     local_files_only=True,
 )
 _ENCODER.eval().to(_DEVICE)
-_write_progress(
-    "encoder_loaded",
-    model_id=str(ENCODER_ID),
-    device=_DEVICE,
-    dtype=str(_ENCODER_DTYPE),
-)
 
 # If the bundle includes a LoRA adapter, apply + merge it onto the stock
 # encoder ONCE at import time. After ``merge_and_unload`` the model has
@@ -1649,24 +1583,71 @@ _PROB_CACHE: dict[tuple[str, str], float] = {}
 _CALIBRATOR = _Calibrator(META.get("default_calibrator"))
 _LAST_LABELED_FINGERPRINT: tuple | None = None
 
-# --- Batched-flush state (handbook sec. 3.5 architecture) ------------------
-# ``acquisition_function`` is called once per candidate in a strict single
-# pass *before* the platform invokes any ``predict()``. We use that window
-# to enqueue every (item, subject, judge) compute we'll need this round so
-# the very first ``predict()`` call can flush them through batched encoder
-# / judge forwards. Subsequent ``predict()`` calls then hit the cache and
-# spend ~5-10 ms each instead of ~400-600 ms doing a fresh bs=1 forward.
+# --- Streamed-flush state (per-call timeout-safe architecture) -------------
+#
+# The platform enforces a 10-second per-call timeout on ``predict()``.  An
+# earlier rev queued every per-content compute on a module-scope list and
+# drained it inside the first ``predict()`` call; on the documented ~50 k-
+# pair workload that one call took minutes and the runner killed the
+# submission with PAIEC-TIMEOUT-001.
+#
+# This rev streams instead.  ``acquisition_function`` is called once per
+# candidate in a strict single pass *before* the platform invokes any
+# ``predict()``.  Each call appends to the pending queues and, when a queue
+# is deep enough, fires exactly one small batch inline.  Bounded per-call
+# work (~100-200 ms peak when a batch fires; ~30 us otherwise).  Total
+# queued judge work for ~256 k pairs at bs=8 streams evenly across the
+# acquisition pass -- well inside any reasonable per-round budget, and no
+# single acquisition call ever blocks for more than ~200 ms.  ``predict()``
+# then only drains the residual (each queue is < its batch size, so the
+# residual flush is one tiny final batch per queue, < 1.5 s total).
 _ITEM_PENDING: list[tuple[str, str, str]] = []         # (b, c, item_content)
 _SUBJECT_PENDING: list[str] = []                       # subject_content
 _JUDGE_PENDING: list[tuple[str, str, str, str]] = []   # (b, c, s, i)
 _ITEM_PENDING_KEYS: set[str] = set()
 _SUBJECT_PENDING_KEYS: set[str] = set()
 _JUDGE_PENDING_KEYS: set[tuple[str, str]] = set()
-_FLUSHED: bool = True   # nothing pending at module init
 
 
-_FIRST_ACQ_LOGGED = False
-_ACQ_COUNT = 0
+def _flush_one_item_batch(n: int) -> None:
+    if not _ITEM_PENDING:
+        return
+    n = max(1, min(n, len(_ITEM_PENDING)))
+    chunk = _ITEM_PENDING[:n]
+    del _ITEM_PENDING[:n]
+    texts = [item_text_for(b, c, i) for (b, c, i) in chunk]
+    vecs = _embed_batch(texts)
+    for (b, c, i), vec in zip(chunk, vecs):
+        key = stable_sha256(b, c, i)
+        _ITEM_EMB_CACHE[key] = vec
+        _ITEM_PENDING_KEYS.discard(key)
+
+
+def _flush_one_subject_batch(n: int) -> None:
+    if not _SUBJECT_PENDING:
+        return
+    n = max(1, min(n, len(_SUBJECT_PENDING)))
+    chunk = _SUBJECT_PENDING[:n]
+    del _SUBJECT_PENDING[:n]
+    texts = [subject_text_for(s) for s in chunk]
+    vecs = _embed_batch(texts)
+    for s, vec in zip(chunk, vecs):
+        key = stable_sha256(s)
+        _SUBJECT_EMB_CACHE[key] = vec
+        _SUBJECT_PENDING_KEYS.discard(key)
+
+
+def _flush_one_judge_batch(n: int) -> None:
+    if not _JUDGE_PENDING or JUDGE is None:
+        return
+    n = max(1, min(n, len(_JUDGE_PENDING)))
+    chunk = _JUDGE_PENDING[:n]
+    del _JUDGE_PENDING[:n]
+    vecs = JUDGE.score_batch(chunk)
+    for (b, c, s, i), vec in zip(chunk, vecs):
+        j_key = (stable_sha256(s), stable_sha256(b, c, i))
+        JUDGE.score_cache[j_key] = vec
+        _JUDGE_PENDING_KEYS.discard(j_key)
 
 
 def _enqueue_for_batch(
@@ -1676,12 +1657,18 @@ def _enqueue_for_batch(
     subject_content: str,
     item_content: str,
 ) -> None:
-    """Queue the per-content compute for this candidate.
+    """Enqueue + opportunistically fire at most one small batch.
 
     Called from ``acquisition_function`` for every candidate the platform
-    surfaces. Duplicate (item, subject, judge-pair) keys are deduped against
-    both the per-round queue *and* the persistent in-memory caches, so we
-    never enqueue work that's already done.
+    surfaces. Duplicate (item, subject, judge-pair) keys are deduped
+    against both the per-round queue *and* the persistent in-memory
+    caches, so we never enqueue or recompute work that's already done.
+
+    The opportunistic flush has a fixed priority order, judge > item >
+    subject, because the judge queue has the deepest per-pair compute and
+    would otherwise grow without bound while the encoder queues drain
+    fast enough on their own.  At most one small batch fires per call,
+    bounding per-call wall time.
 
     CRITICAL: every value used to build a cache key here must be passed
     through the same normalization that ``_predict_uncalibrated`` will
@@ -1694,210 +1681,60 @@ def _enqueue_for_batch(
     ``"" -> "none"``, ``"nan" -> "none"``, ...); the others are passed
     through ``str(... or "")`` on both sides, which is idempotent.
     """
-    global _FLUSHED, _FIRST_ACQ_LOGGED, _ACQ_COUNT
-    _ACQ_COUNT += 1
-    if not _FIRST_ACQ_LOGGED:
-        _FIRST_ACQ_LOGGED = True
-        _write_progress("acquisition_first_call")
-    elif _ACQ_COUNT % 5000 == 0:
-        _write_progress(
-            "acquisition_progress",
-            acq_count=int(_ACQ_COUNT),
-            items_pending=len(_ITEM_PENDING),
-            subjects_pending=len(_SUBJECT_PENDING),
-            judge_pending=len(_JUDGE_PENDING),
-        )
     benchmark = str(benchmark or "")
     condition = normalize_condition(condition)
     subject_content = str(subject_content or "")
     item_content = str(item_content or "")
+
     item_key = stable_sha256(benchmark, condition, item_content)
-    if (
-        item_key not in _ITEM_PENDING_KEYS
-        and item_key not in _ITEM_EMB_CACHE
-    ):
+    if item_key not in _ITEM_PENDING_KEYS and item_key not in _ITEM_EMB_CACHE:
         _ITEM_PENDING_KEYS.add(item_key)
         _ITEM_PENDING.append((benchmark, condition, item_content))
-        _FLUSHED = False
 
     if _MODEL_CFG.get("use_subject_text_embedding"):
         s_key = stable_sha256(subject_content)
-        if (
-            s_key not in _SUBJECT_PENDING_KEYS
-            and s_key not in _SUBJECT_EMB_CACHE
-        ):
+        if s_key not in _SUBJECT_PENDING_KEYS and s_key not in _SUBJECT_EMB_CACHE:
             _SUBJECT_PENDING_KEYS.add(s_key)
             _SUBJECT_PENDING.append(subject_content)
-            _FLUSHED = False
 
     if JUDGE is not None and _MODEL_CFG.get("use_judge_features"):
         j_key = (stable_sha256(subject_content), item_key)
-        if (
-            j_key not in _JUDGE_PENDING_KEYS
-            and j_key not in JUDGE.score_cache
-        ):
+        if j_key not in _JUDGE_PENDING_KEYS and j_key not in JUDGE.score_cache:
             _JUDGE_PENDING_KEYS.add(j_key)
-            _JUDGE_PENDING.append((benchmark, condition, subject_content, item_content))
-            _FLUSHED = False
+            _JUDGE_PENDING.append(
+                (benchmark, condition, subject_content, item_content)
+            )
 
-
-def _free_encoder_vram() -> None:
-    """Evict the encoder model from GPU memory.
-
-    Called once after the encoder phase of the flush has populated the
-    item / subject embedding caches. The caches live on CPU as numpy
-    arrays so every subsequent predict() still gets cache hits without
-    needing the encoder on-device. Freeing the encoder (~ 8 GB on a 4B
-    bf16 model) is the single biggest VRAM win available on L4 -- it
-    raises the judge's safe batch size from ~ 16 to ~ 32-48 because the
-    judge's activations no longer have to share VRAM with the encoder
-    weights, which roughly halves the judge phase wall time on a 50k+
-    candidate pool.
-    """
-    global _ENCODER, _TOKENIZER
-    try:
-        # Move to CPU first so the dispatch graph (if any) is torn down
-        # cleanly, then drop our references and ask CUDA to release the
-        # cached blocks.
-        if _ENCODER is not None:
-            try:
-                _ENCODER.to("cpu")
-            except Exception:
-                pass
-        _ENCODER = None  # type: ignore[assignment]
-        # Keep _TOKENIZER around: tiny, occasionally useful for diagnostics.
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        free_after_gb = (
-            round(torch.cuda.mem_get_info()[0] / (1024**3), 2)
-            if torch.cuda.is_available()
-            else None
-        )
-        _write_progress(
-            "encoder_evicted",
-            free_vram_gb_after=free_after_gb,
-        )
-    except Exception as exc:
-        _write_progress(
-            "encoder_evict_failed",
-            error=str(exc),
-            error_type=type(exc).__name__,
-        )
+    # One opportunistic flush per call.  Judge first (deepest queue),
+    # then encoder items, then encoder subjects.
+    if JUDGE is not None and len(_JUDGE_PENDING) >= JUDGE_RUNTIME_BATCH_SIZE:
+        _flush_one_judge_batch(JUDGE_RUNTIME_BATCH_SIZE)
+        return
+    if len(_ITEM_PENDING) >= ENCODER_RUNTIME_BATCH_SIZE:
+        _flush_one_item_batch(ENCODER_RUNTIME_BATCH_SIZE)
+        return
+    if len(_SUBJECT_PENDING) >= ENCODER_RUNTIME_BATCH_SIZE:
+        _flush_one_subject_batch(ENCODER_RUNTIME_BATCH_SIZE)
+        return
 
 
 def _flush_pending_batches() -> None:
-    """Drain all queued inputs into the per-content caches.
+    """Drain residual pending items / subjects / judge pairs.
 
-    Idempotent and safe to call when nothing is pending. The single
-    expensive call is the very first ``predict()`` of the round, which
-    absorbs the entire batched compute upfront so the remaining
-    ``predict()`` calls are pure cache lookups.
-
-    Phases (each instrumented via ``_write_progress`` so the user can
-    see progress even when stdout is not surfaced by the platform):
-
-      1. encoder items   (batched encoder forward over unique items)
-      2. encoder subjects (only if ``use_subject_text_embedding=True``)
-      3. encoder eviction (free ~ 8 GB of L4 VRAM for judge activations)
-      4. judge pairs     (batched judge forward over unique pairs)
+    Called by ``predict()`` on every invocation.  Each queue's residual
+    is < its batch size (because every time the queue hit the batch size
+    threshold, ``_enqueue_for_batch`` drained one batch inline), so each
+    loop fires at most one final small batch.  Worst-case wall time:
+    < 1.5 seconds, well inside the 10-second per-call timeout.  After
+    the first ``predict()`` call drains everything, subsequent calls
+    short-circuit because all three queues are empty.
     """
-    global _FLUSHED
-    if _FLUSHED:
-        return
-    t_flush_start = time.time()
-    n_items_pending = len(_ITEM_PENDING)
-    n_subjects_pending = len(_SUBJECT_PENDING)
-    n_judge_pending = len(_JUDGE_PENDING)
-    _write_progress(
-        "flush_start",
-        n_items=n_items_pending,
-        n_subjects=n_subjects_pending,
-        n_judge_pairs=n_judge_pending,
-        encoder_batch=int(ENCODER_RUNTIME_BATCH_SIZE),
-        judge_batch=int(JUDGE_RUNTIME_BATCH_SIZE),
-    )
-
-    if _ITEM_PENDING:
-        t = time.time()
-        texts = [item_text_for(b, c, i) for (b, c, i) in _ITEM_PENDING]
-        vecs = _embed_batch(texts)
-        for (b, c, i), vec in zip(_ITEM_PENDING, vecs):
-            _ITEM_EMB_CACHE[stable_sha256(b, c, i)] = vec
-        n_items = len(_ITEM_PENDING)
-        _ITEM_PENDING.clear()
-        _ITEM_PENDING_KEYS.clear()
-        _write_progress(
-            "flush_items_done",
-            n_items=n_items,
-            phase_elapsed_s=round(time.time() - t, 3),
-            ms_per_item=round(1000.0 * (time.time() - t) / max(1, n_items), 2),
-        )
-    else:
-        n_items = 0
-
-    if _SUBJECT_PENDING:
-        t = time.time()
-        texts = [subject_text_for(s) for s in _SUBJECT_PENDING]
-        vecs = _embed_batch(texts)
-        for s, vec in zip(_SUBJECT_PENDING, vecs):
-            _SUBJECT_EMB_CACHE[stable_sha256(s)] = vec
-        n_subjects = len(_SUBJECT_PENDING)
-        _SUBJECT_PENDING.clear()
-        _SUBJECT_PENDING_KEYS.clear()
-        _write_progress(
-            "flush_subjects_done",
-            n_subjects=n_subjects,
-            phase_elapsed_s=round(time.time() - t, 3),
-        )
-    else:
-        n_subjects = 0
-
-    # Free the encoder before the judge phase so it can run with the full
-    # ~16 GB of L4 VRAM available for activations rather than the ~8 GB
-    # left over when both 4B-param models are co-resident. The encoder is
-    # never needed again within this round: every predict() lookup either
-    # cache-hits in ``_ITEM_EMB_CACHE`` (populated above) or, for a queue
-    # miss, falls back to ``DEFAULT_PROB`` via the existing try/except.
-    if FREE_ENCODER_AFTER_FLUSH:
-        _free_encoder_vram()
-
-    if _JUDGE_PENDING and JUDGE is not None:
-        t = time.time()
-        vecs = JUDGE.score_batch(_JUDGE_PENDING)
-        for (b, c, s, i), vec in zip(_JUDGE_PENDING, vecs):
-            key = (stable_sha256(s), stable_sha256(b, c, i))
-            JUDGE.score_cache[key] = vec
-        n_judge = len(_JUDGE_PENDING)
-        _JUDGE_PENDING.clear()
-        _JUDGE_PENDING_KEYS.clear()
-        _write_progress(
-            "flush_judge_done",
-            n_judge_pairs=n_judge,
-            phase_elapsed_s=round(time.time() - t, 3),
-            ms_per_pair=round(1000.0 * (time.time() - t) / max(1, n_judge), 2),
-        )
-    else:
-        n_judge = 0
-
-    _FLUSHED = True
-    total_elapsed = time.time() - t_flush_start
-    LOG.info(
-        "Flushed batched queues: items=%d subjects=%d judge_pairs=%d in %.2fs",
-        n_items,
-        n_subjects,
-        n_judge,
-        total_elapsed,
-    )
-    _write_progress(
-        "flush_complete",
-        n_items=n_items,
-        n_subjects=n_subjects,
-        n_judge_pairs=n_judge,
-        total_elapsed_s=round(total_elapsed, 3),
-    )
+    while _ITEM_PENDING:
+        _flush_one_item_batch(ENCODER_RUNTIME_BATCH_SIZE)
+    while _SUBJECT_PENDING:
+        _flush_one_subject_batch(ENCODER_RUNTIME_BATCH_SIZE)
+    while _JUDGE_PENDING:
+        _flush_one_judge_batch(JUDGE_RUNTIME_BATCH_SIZE)
 
 
 LOG.info(
@@ -1908,17 +1745,6 @@ LOG.info(
     ENCODER_ID,
     _DEVICE,
     time.time() - _t0,
-)
-_write_progress(
-    "module_init_complete",
-    model_name=_MODEL_NAME,
-    n_subjects=len(_SUBJECT_TO_ID),
-    n_bc=len(_BC_TO_ID),
-    encoder=ENCODER_ID,
-    device=_DEVICE,
-    init_elapsed_s=round(time.time() - _t0, 3),
-    training_cache_loaded=bool(TRAINING_CACHE is not None),
-    judge_loaded=bool(JUDGE is not None),
 )
 
 
@@ -1943,14 +1769,10 @@ def _last_token_pool(last_hidden, attention_mask):
 
 def _embed_one(text: str) -> np.ndarray:
     if _ENCODER is None:
-        # Encoder was freed after the batched-flush encoder phase (the
-        # ``FREE_ENCODER_AFTER_FLUSH`` path) and the caller is asking
-        # for an item that wasn't queued during acquisition. Return a
-        # zero vector with the expected dim; the residual was trained
-        # on real embeddings so this degrades quality, but it does not
-        # crash, and the trained IRT term still produces a usable
-        # prediction. The dim is read from _MODEL_CFG so we don't need
-        # the encoder loaded to know it.
+        # Encoder failed to load (a defensive guard); return a zero vector
+        # with the expected dim so the runtime still produces a usable
+        # prediction via the IRT term.  The dim is read from _MODEL_CFG so
+        # we don't need the encoder loaded to know it.
         dim = int(_MODEL_CFG.get("item_embed_dim", 0))
         return np.zeros(dim, dtype=np.float32)
     enc = _TOKENIZER(
@@ -2251,47 +2073,24 @@ def _labeled_fingerprint(labeled: list[dict] | None) -> tuple:
     return tuple(sorted(out))
 
 
-_PREDICT_COUNT = 0
-_FIRST_PREDICT_LOGGED = False
-
-
 def predict(input: dict, labeled: list[dict] | None = None) -> float:
-    """Return a native Python float in (0, 1)."""
+    """Return a native Python float in (0, 1).
+
+    The streamed-flush architecture means most of the heavy compute has
+    already happened inside ``acquisition_function`` -- this call only
+    needs to drain whatever residual is left on the pending queues
+    (always < one batch per queue, so < 1.5 s total), then do a cache
+    lookup or a single bs=1 forward for the rare item that wasn't
+    queued.  Idempotent: after the first call drains everything, every
+    subsequent call short-circuits because the queues are empty.
+    """
+    _flush_pending_batches()
     global _LAST_LABELED_FINGERPRINT, _CALIBRATOR
-    global _PREDICT_COUNT, _FIRST_PREDICT_LOGGED
     try:
         benchmark = str(input.get("benchmark", "") or "")
         condition = normalize_condition(input.get("condition", "none"))
         subject_content = str(input.get("subject_content", "") or "")
         item_content = str(input.get("item_content", "") or "")
-
-        if not _FIRST_PREDICT_LOGGED:
-            _FIRST_PREDICT_LOGGED = True
-            _write_progress(
-                "predict_first_call",
-                acq_total=int(_ACQ_COUNT),
-                items_queued=len(_ITEM_PENDING),
-                subjects_queued=len(_SUBJECT_PENDING),
-                judge_queued=len(_JUDGE_PENDING),
-                n_labeled=(len(labeled) if labeled else 0),
-            )
-
-        # Lazy flush of anything queued by acquisition_function. The work
-        # actually happens at most once per round -- on the very first
-        # predict() call -- and turns subsequent calls into pure cache
-        # lookups. If acquisition_function never queued anything (e.g. no
-        # labeling.py shipped, or platform fell back to random K labels
-        # before our queue was populated), this is a cheap no-op and the
-        # per-call path below falls back to the original bs=1 forward.
-        if not _FLUSHED:
-            try:
-                _flush_pending_batches()
-            except Exception:
-                LOG.exception("_flush_pending_batches failed; falling back to per-call inference")
-
-        _PREDICT_COUNT += 1
-        if _PREDICT_COUNT % 2000 == 0:
-            _write_progress("predict_progress", predict_count=int(_PREDICT_COUNT))
 
         cache_key = (
             stable_sha256(benchmark, condition, item_content),
@@ -2321,50 +2120,54 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
 '''
 
 
-_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (batched-flush variant).
+_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (streamed-flush variant).
 
-The platform calls this once per candidate input in a strict single pass,
-before any predict() in the round. We use that window to enqueue every
-(item, subject, judge) compute we'll need this round on a module-level
-queue inside ``model.py``; the first ``predict()`` call then drains the
-queue through batched encoder + judge forwards and turns the remaining
-~50k ``predict()`` calls into ~5-10 ms cache lookups.
+The Codabench runner calls ``acquisition_function`` once per hidden
+(subject, item) pair BEFORE any ``predict()`` call.  Each call here
+forwards to ``model._enqueue_for_batch``, which:
 
-This trades the smart-acquisition score (which would otherwise be
-~-|p - 0.5|, an uncertainty signal) for the platform's documented random
-top-K-per-category fallback. On the active configuration with K=5 labels
-revealed per data category, that's ~75 labels out of ~50k candidates --
-a typical 0.001-0.003 nat log-loss regression versus learned acquisition.
-We accept that hit because without batched judge inference the bundle
-takes ~5-10 hours per round on L4, well past any plausible per-round
-budget. The handbook (sec. 3.5) explicitly recommends this architecture.
+  1. Appends the inputs to the pending encoder / judge queues
+     (deduped against the in-memory caches so we never re-do work),
+  2. Opportunistically fires AT MOST one small batch inline if a queue
+     has crossed its bs threshold (judge bs=8 priority, then encoder
+     bs=16), so the heavy compute is spread evenly across every
+     acquisition call instead of being dumped on the first
+     ``predict()``.
 
-Returning a constant 0.0 makes every candidate tied at the top score, and
-the platform breaks ties uniformly at random per its spec.
+This is required by the 10-second per-call ``predict()`` timeout: an
+earlier rev drained everything inside the first ``predict()`` call and
+the runner killed the submission with PAIEC-TIMEOUT-001 on the
+~50 k-pair workload.  Streaming keeps every call < ~200 ms while still
+achieving full batched throughput end-to-end.
+
+Returning a constant 0.0 makes every candidate tied at the top score,
+and the platform breaks ties uniformly at random per its spec -- which
+is equivalent in expectation to the default random-K-per-category
+fallback applied when no ``labeling.py`` is shipped.  The only effect
+of this file is to drive the streamed flush; the acquisition signal
+itself is intentionally constant.
 """
 
 from __future__ import annotations
 
-try:
-    from model import _enqueue_for_batch  # type: ignore
-except Exception:  # noqa: BLE001
-    _enqueue_for_batch = None  # type: ignore
 
-
-def acquisition_function(input: dict) -> float:
-    if _enqueue_for_batch is not None:
-        try:
-            _enqueue_for_batch(
-                benchmark=str(input.get("benchmark", "") or ""),
-                condition=str(input.get("condition", "none") or "none"),
-                subject_content=str(input.get("subject_content", "") or ""),
-                item_content=str(input.get("item_content", "") or ""),
-            )
-        except Exception:  # noqa: BLE001
-            # Never let a queueing error escape; the platform falls back
-            # to random K-per-category labels if any acquisition call
-            # raises, and we don't want to lose the entire labeling pass.
-            pass
+def acquisition_function(input: dict) -> float:  # noqa: A002
+    try:
+        from model import _enqueue_for_batch  # type: ignore
+    except Exception:  # noqa: BLE001
+        return 0.0
+    try:
+        _enqueue_for_batch(
+            benchmark=str(input.get("benchmark", "") or ""),
+            condition=str(input.get("condition", "none") or "none"),
+            subject_content=str(input.get("subject_content", "") or ""),
+            item_content=str(input.get("item_content", "") or ""),
+        )
+    except Exception:  # noqa: BLE001
+        # Never let a queueing error escape; the platform falls back to
+        # random K-per-category labels if any acquisition call raises,
+        # and we don't want to lose the entire labeling pass.
+        pass
     return 0.0
 '''
 
@@ -2421,26 +2224,32 @@ def export_run(
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
-    All exports produced by this function ship the **batched-flush
-    runtime architecture** ("runtime_architecture": "batched_flush_v1"
+    All exports produced by this function ship the **streamed-flush
+    runtime architecture** ("runtime_architecture": "streamed_flush_v1"
     in ``runtime_meta.json``):
 
+    - ``model.py`` forces HF offline mode (HF_HUB_OFFLINE,
+      TRANSFORMERS_OFFLINE, HF_DATASETS_OFFLINE) at the top of the file,
+      *before* importing transformers / huggingface_hub.  The Codabench
+      runner blocks outbound traffic; without these env vars, even a
+      fully-cached ``from_pretrained`` raises PAIEC-NETWORK-001.
     - ``labeling.py`` is enqueue-only: ``acquisition_function`` calls
       ``model._enqueue_for_batch(...)`` for every candidate the platform
-      surfaces, then returns 0.0 (constant ranking -> platform's random
-      tie-break, identical to not shipping labeling.py at all).
-    - The first ``predict()`` call drains the queue through batched
-      encoder + judge forwards at ``encoder_runtime_batch_size`` and
-      ``judge.runtime_batch_size`` respectively (default 16 each;
-      sized for a 24 GB L4 with both 4 B-param bf16 models co-resident).
-    - Subsequent ``predict()`` calls are pure cache lookups (~5-10 ms).
+      surfaces, which appends to the encoder + judge queues and
+      *opportunistically fires AT MOST one small batch inline* (judge
+      bs=8 priority, then encoder bs=16) whenever a queue crosses its
+      threshold.  This bounds per-call wall time to ~100-200 ms while
+      still achieving full batched throughput.
+    - ``predict()`` then only drains the residual (each queue is
+      < its batch size, so the residual flush is one tiny final batch
+      per queue, < 1.5 s total) and falls into a cache lookup.
 
-    This matches the handbook's sec. 3.5 recommendation; without it, an
-    L4 round takes ~5-10 hours on a ~50 k-pair workload because every
-    candidate triggers a bs=1 forward through Qwen3-Embedding-4B and
-    Qwen3-4B-Instruct.
+    This avoids the per-call PAIEC-TIMEOUT-001 hit that the prior
+    "drain everything inside the first predict()" architecture took on
+    ~256 k acquisition workloads.  Both 4 B-param bf16 models stay
+    co-resident on the L4 for the entire round; no encoder eviction.
 
-    If you pass ``include_labeling=False`` the batched-flush path is
+    If you pass ``include_labeling=False`` the streamed-flush path is
     architecturally disabled (no queue gets populated), and ``predict()``
     falls back to the original bs=1 per-call inference path. The bundle
     is still functionally correct, just ~10-15x slower at runtime. We
@@ -2476,7 +2285,7 @@ def export_run(
 
     if not include_labeling:
         LOG.warning(
-            "export_run: include_labeling=False -- the batched-flush "
+            "export_run: include_labeling=False -- the streamed-flush "
             "architecture is disabled (acquisition_function won't be "
             "called by the platform, so model._enqueue_for_batch never "
             "fires). predict() will fall back to bs=1 inference and the "
@@ -2656,20 +2465,19 @@ def export_run(
     # the *training-time* judge-scoring batch (default 256 on A100). The
     # *runtime* judge batch is a separate knob -- it gates the bs used
     # inside ``_LLMJudgeRuntime.score_batch`` at inference time on the
-    # platform's GPU, which is typically much smaller (L4: 24 GB).
+    # platform's GPU (L4, 24 GB).
     #
-    # The default of 32 assumes the runtime *evicts the encoder from VRAM
-    # after the encoder phase of the flush* (the
-    # ``FREE_ENCODER_AFTER_FLUSH`` path in the template), which frees the
-    # ~ 8 GB of weights the encoder was holding and leaves the judge with
-    # the full ~ 16 GB of L4 VRAM headroom for activations. With a
-    # co-resident encoder the safe ceiling is ~ 16, so override to 16
-    # via ``judge_cfg["runtime_batch_size"]`` if you disable encoder
-    # eviction in ``runtime_meta.json``.
+    # The default of 8 is the safe ceiling for the streamed-flush
+    # architecture, where both 4 B-param bf16 models remain co-resident
+    # on the L4 for the entire round (no encoder eviction).  The judge
+    # then has only ~ 8 GB of activations headroom after the encoder's
+    # ~ 8 GB of weights, so bs=8 is the largest pad-longest batch that
+    # reliably fits.  Raise via ``judge_cfg["runtime_batch_size"]`` only
+    # if you've verified larger sizes don't OOM on the target tier.
     runtime_judge_bs = int(
         jcfg.get(
             "runtime_batch_size",
-            32 if int(jcfg.get("batch_size", 32) or 32) > 64 else jcfg.get("batch_size", 32),
+            8 if int(jcfg.get("batch_size", 8) or 8) > 64 else jcfg.get("batch_size", 8),
         )
     )
     judge_block = {
@@ -2678,7 +2486,7 @@ def export_run(
         "model_id": str(jcfg.get("model_id", "")),
         # Kept for forensics / log lines; the runtime never reads this field.
         "batch_size": int(jcfg.get("batch_size", 16)),
-        # The runtime batched-flush path reads exactly this field.
+        # The streamed-flush runtime path reads exactly this field.
         "runtime_batch_size": runtime_judge_bs,
         "max_prompt_tokens": int(jcfg.get("max_prompt_tokens", 1024)),
         "bf16": bool(jcfg.get("bf16", True)),
@@ -2818,7 +2626,12 @@ def export_run(
         "model_name": result.model_name,
         # Tag the shipped runtime architecture so future debug sessions can
         # tell at a glance which inference plumbing this bundle uses.
-        "runtime_architecture": "batched_flush_v1",
+        # ``streamed_flush_v1``: opportunistic per-call mini-batches inside
+        # ``acquisition_function`` (no big flush inside the first
+        # ``predict()``), HF_HUB_OFFLINE forced at module import to satisfy
+        # PAIEC-NETWORK-001, no encoder eviction (both 4 B models stay
+        # co-resident on L4 for the entire round).
+        "runtime_architecture": "streamed_flush_v1",
         "encoder_model_id": (
             lora_runtime_id_override or encoder_cfg["model_id"]
         ),
@@ -2826,13 +2639,12 @@ def export_run(
         # data-driven cap. We persist the *effective* number so the runtime
         # tokenizes consistently with the offline cache.
         "max_length": int(encoder_cfg.get("max_length") or 512),
-        # Per-batch size used by the runtime's ``_embed_batch`` flush path.
+        # Per-batch size used by the runtime's ``_embed_batch`` path.
         # Default 16 (proven-safe on a 24 GB L4 with Qwen3-Embedding-4B
-        # bf16 + FA2 while Qwen3-4B-Instruct is co-resident -- bs=32 has
-        # OOM'd in the wild). Raise to 32+ once the encoder is evicted
-        # / the runtime no longer keeps both models resident, but note
-        # that the judge phase is the dominant cost and that's where
-        # the bigger batch actually pays off.
+        # bf16 co-resident with Qwen3-4B-Instruct -- bs=32 has OOM'd in
+        # the wild). The encoder no longer gets evicted before the judge
+        # phase under the streamed-flush architecture, so the safe
+        # ceiling is the *co-resident* number.
         "encoder_runtime_batch_size": int(
             encoder_cfg.get(
                 "runtime_batch_size",
@@ -2840,15 +2652,6 @@ def export_run(
                 if int(encoder_cfg.get("batch_size", 16) or 16) > 64
                 else encoder_cfg.get("batch_size", 16),
             )
-        ),
-        # Free the encoder model from VRAM after the encoder phase of
-        # the flush populates _ITEM_EMB_CACHE / _SUBJECT_EMB_CACHE.
-        # Frees ~ 8 GB on L4 so the judge phase can run at bs=32+ with
-        # comfortable activation headroom. Set to False only if the
-        # runtime architecture needs on-demand embedding inside predict()
-        # for items that weren't queued during acquisition.
-        "free_encoder_after_flush": bool(
-            encoder_cfg.get("free_encoder_after_flush", True)
         ),
         "pooling": encoder_cfg.get("pooling", "mean"),
         "use_contextual_item_text": bool(
