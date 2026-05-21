@@ -55,10 +55,30 @@ for stale in (
     )
 print("[OK] obsolete batched-flush plumbing fully removed from model.py")
 
-# 3. labeling.py is the enqueue-only variant.
-for needle in ("_enqueue_for_batch", "return 0.0"):
+# 2c. Runtime model.py exposes the cheap baseline-logit helper +
+#     beta-calibration fitter that labeling.py / _Calibrator depend on.
+for needle in (
+    "def _baseline_logit",
+    "_BASELINE_MU",
+    "_SUBJECT_BASELINE",
+    "_BC_BASELINE",
+    "def _fit_beta_calibration",
+    "def _beta_calibration_loss",
+    '"kind": "beta"',
+):
+    assert needle in ES._RUNTIME_MODEL_PY, f"missing in model.py template: {needle!r}"
+    print(f"[OK] runtime model.py declares: {needle}")
+
+# 3. labeling.py drives the streamed flush AND returns a real uncertainty
+#    score from the cheap (subject, bc) baseline -- no encoder/judge forward.
+for needle in (
+    "_enqueue_for_batch",
+    "_baseline_logit",
+    "-abs(p - 0.5)",
+    "return 0.0",  # still the documented fallback when the baseline lookup fails
+):
     assert needle in ES._RUNTIME_LABELING_PY, f"missing in labeling.py: {needle!r}"
-print("[OK] runtime labeling.py is enqueue-only")
+print("[OK] runtime labeling.py streams flush + returns -|p-0.5| from baseline")
 
 # 4. export_run writes the right fields and the broken repair is gone.
 src = inspect.getsource(ES.export_run)

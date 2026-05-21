@@ -770,7 +770,14 @@ def _logit(p: float) -> float:
 
 
 class _Calibrator:
-    """Identity by default; replaced in-place by fit_from_labeled()."""
+    """Identity by default; replaced in-place by fit_from_labeled().
+
+    Tier order matches ``src.calibration.best_effort_fit``:
+      - N >= 60  -> 3-param beta calibration (Kull/Filho/Flach 2017)
+      - N >= 30  -> 2-param temperature + intercept (Platt)
+      - N >= 5   -> 1-param intercept-only logit shift
+      - otherwise -> identity (the default ``state``).
+    """
 
     def __init__(self, state: dict | None = None):
         self.state: dict = dict(state or {"kind": "identity"})
@@ -786,6 +793,13 @@ class _Calibrator:
             T = max(0.1, float(self.state.get("T", 1.0)))
             b = float(self.state.get("b", 0.0))
             z = _logit(p) / T + b
+            return min(max(_sigmoid(z), EPS), 1.0 - EPS)
+        if kind == "beta":
+            a = max(0.01, float(self.state.get("a", 1.0)))
+            b = max(0.01, float(self.state.get("b", 1.0)))
+            c = float(self.state.get("c", 0.0))
+            p_safe = min(max(float(p), EPS), 1.0 - EPS)
+            z = a * math.log(p_safe) - b * math.log(1.0 - p_safe) + c
             return min(max(_sigmoid(z), EPS), 1.0 - EPS)
         return min(max(p, EPS), 1.0 - EPS)
 
@@ -813,7 +827,17 @@ class _Calibrator:
         yb = [1 if v >= 0.5 else 0 for v in ys]
         if sum(yb) == 0 or sum(yb) == len(yb):
             return  # degenerate: identity is safer
-        if len(ps) >= 30:
+        if len(ps) >= 60:
+            self.state = _fit_beta_calibration(ps, ys)
+            # Sanity-check the fit; fall back to temp_intercept if any output
+            # is non-finite (a runaway Newton step we didn't catch otherwise).
+            try:
+                out = [self.apply(float(x)) for x in ps]
+                if not all(math.isfinite(v) for v in out):
+                    self.state = _fit_temp_intercept(ps, ys)
+            except Exception:  # noqa: BLE001
+                self.state = _fit_temp_intercept(ps, ys)
+        elif len(ps) >= 30:
             self.state = _fit_temp_intercept(ps, ys)
         elif len(ps) >= 5:
             self.state = _fit_intercept_only(ps, ys)
@@ -858,6 +882,93 @@ def _fit_temp_intercept(ps: list[float], ys: list[float]) -> dict:
             break
         T, b = new_T, new_b
     return {"kind": "temp_intercept", "T": float(T), "b": float(b)}
+
+
+def _beta_calibration_loss(
+    a: float,
+    b: float,
+    c: float,
+    lp: "np.ndarray",
+    lq: "np.ndarray",
+    y: "np.ndarray",
+) -> float:
+    z = a * lp - b * lq + c
+    log_p = -np.logaddexp(0.0, -z)
+    log_q = -np.logaddexp(0.0, z)
+    return float(-(y * log_p + (1.0 - y) * log_q).mean())
+
+
+def _fit_beta_calibration(ps: list[float], ys: list[float]) -> dict:
+    """Fit Kull/Filho/Flach 2017 beta calibration on (p_uncal, y).
+
+    Mirror of ``src.calibration.fit_beta`` -- 3-param Newton with the full
+    3x3 Hessian (the diagonal approximation that works for the simpler
+    fits diverges here because the (a, b) cross-derivative is non-trivial),
+    a small ridge, and backtracking line search to guarantee BCE never
+    increases. ``a, b`` are clamped to ``[0.01, 100]`` so the calibrator
+    stays monotone increasing; ``c`` is clamped to ``[-20, 20]``.
+    """
+    ps_arr = np.asarray(ps, dtype=float)
+    y = np.asarray(ys, dtype=float)
+    if ps_arr.size < 60 or ps_arr.size != y.size:
+        return {"kind": "identity"}
+    p_safe = np.clip(ps_arr, EPS, 1.0 - EPS)
+    lp = np.log(p_safe)
+    lq = np.log(1.0 - p_safe)
+    a, b, c = 1.0, 1.0, 0.0
+    loss = _beta_calibration_loss(a, b, c, lp, lq, y)
+    for _ in range(100):
+        z = a * lp - b * lq + c
+        pred = 1.0 / (1.0 + np.exp(-z))
+        err = pred - y
+        h = pred * (1.0 - pred)
+        g = np.array(
+            [
+                float((err * lp).mean()),
+                float((-err * lq).mean()),
+                float(err.mean()),
+            ],
+            dtype=np.float64,
+        )
+        H = np.empty((3, 3), dtype=np.float64)
+        H[0, 0] = float((h * lp * lp).mean())
+        H[1, 1] = float((h * lq * lq).mean())
+        H[2, 2] = float(h.mean())
+        H[0, 1] = H[1, 0] = float((h * lp * (-lq)).mean())
+        H[0, 2] = H[2, 0] = float((h * lp).mean())
+        H[1, 2] = H[2, 1] = float((h * (-lq)).mean())
+        H += 1e-6 * np.eye(3)
+        try:
+            delta = np.linalg.solve(H, g)
+        except np.linalg.LinAlgError:
+            break
+        if not np.all(np.isfinite(delta)):
+            break
+        step = 1.0
+        accepted = False
+        for _bt in range(7):
+            new_a = min(100.0, max(0.01, a - step * float(delta[0])))
+            new_b = min(100.0, max(0.01, b - step * float(delta[1])))
+            new_c = min(20.0, max(-20.0, c - step * float(delta[2])))
+            if not (
+                math.isfinite(new_a) and math.isfinite(new_b) and math.isfinite(new_c)
+            ):
+                step *= 0.5
+                continue
+            new_loss = _beta_calibration_loss(new_a, new_b, new_c, lp, lq, y)
+            if math.isfinite(new_loss) and new_loss <= loss + 1e-12:
+                accepted = True
+                break
+            step *= 0.5
+        if not accepted:
+            break
+        if abs(new_a - a) + abs(new_b - b) + abs(new_c - c) < 1e-7:
+            a, b, c, loss = new_a, new_b, new_c, new_loss
+            break
+        a, b, c, loss = new_a, new_b, new_c, new_loss
+    if not (math.isfinite(a) and math.isfinite(b) and math.isfinite(c)):
+        return {"kind": "identity"}
+    return {"kind": "beta", "a": float(a), "b": float(b), "c": float(c)}
 
 
 # ---------------------------------------------------------------------------
@@ -1737,6 +1848,79 @@ def _flush_pending_batches() -> None:
         _flush_one_judge_batch(JUDGE_RUNTIME_BATCH_SIZE)
 
 
+# --- Fast-path baseline logits for acquisition_function ---------------------
+#
+# ``acquisition_function`` is called once per (subject, item) candidate in a
+# strict single pass before any ``predict()``. We cannot afford an encoder
+# (or judge) forward there -- that's what the streamed-flush queue is for --
+# so we expose a cheap proxy: the subject + benchmark-condition intercept
+# read directly from the trained head's embedding tables. For an IRT-family
+# head that's ``mu + theta_s + beta_bc``; for the k-factor family it's
+# ``mu + alpha_s + beta_bc``. The item-side contribution and the residual
+# MLP are dropped because both require the encoder forward we're trying to
+# skip. The signal is *coarse* (it's constant across items at the same
+# (subject, bc)), but strictly more informative than a constant 0.0 score:
+# it lets ``labeling.py`` return an uncertainty signal ``-|sigmoid(z) - 0.5|``
+# so the platform's top-K-per-category picker biases revealed labels toward
+# (subject, bc) combos where the head is most uncertain.
+_BASELINE_MU: float = 0.0
+_SUBJECT_BASELINE: np.ndarray = np.zeros(max(1, len(_SUBJECT_TO_ID)), dtype=np.float32)
+_BC_BASELINE: np.ndarray = np.zeros(max(1, len(_BC_TO_ID)), dtype=np.float32)
+try:
+    with torch.inference_mode():
+        if hasattr(_MODEL, "mu"):
+            _BASELINE_MU = float(_MODEL.mu.detach().float().cpu().item())
+        # IRT-family heads use ``theta``; k-factor-family heads use ``alpha``.
+        if hasattr(_MODEL, "theta"):
+            _SUBJECT_BASELINE = (
+                _MODEL.theta.weight.detach().float().cpu().numpy().squeeze(-1)
+                .astype(np.float32, copy=False)
+            )
+        elif hasattr(_MODEL, "alpha"):
+            _SUBJECT_BASELINE = (
+                _MODEL.alpha.weight.detach().float().cpu().numpy().squeeze(-1)
+                .astype(np.float32, copy=False)
+            )
+        if hasattr(_MODEL, "beta"):
+            _BC_BASELINE = (
+                _MODEL.beta.weight.detach().float().cpu().numpy().squeeze(-1)
+                .astype(np.float32, copy=False)
+            )
+except Exception:  # noqa: BLE001
+    # Never break module import on a baseline-extraction edge case. The
+    # acquisition path falls back to a constant 0.0 score automatically.
+    LOG.exception("Could not extract baseline logits; acquisition_function will use a constant score.")
+
+
+def _baseline_logit(
+    subject_content: str, benchmark: str, condition: str
+) -> float:
+    """Cheap item-agnostic logit proxy for ``acquisition_function``.
+
+    Returns ``mu + subject_baseline[s_id] + bc_baseline[bc_id]`` using the
+    same normalization + indexer lookup ``_predict_uncalibrated`` uses, so
+    the proxy ranks (subject, bc) combos consistently with the full model.
+    No encoder, no judge, no head forward -- a pure embedding-table lookup,
+    safe to call from ``labeling.py`` 256k times per round.
+    """
+    try:
+        benchmark = str(benchmark or "")
+        condition = normalize_condition(condition)
+        subject_content = str(subject_content or "")
+        subject_key = stable_sha256(subject_content)
+        bc_key = f"{benchmark}::{condition}"
+        s_id = _SUBJECT_TO_ID.get(subject_key, 0)
+        bc_id = _BC_TO_ID.get(bc_key, 0)
+        s = float(_SUBJECT_BASELINE[s_id]) if 0 <= s_id < len(_SUBJECT_BASELINE) else 0.0
+        b = float(_BC_BASELINE[bc_id]) if 0 <= bc_id < len(_BC_BASELINE) else 0.0
+        z = _BASELINE_MU + s + b
+        if not math.isfinite(z):
+            return 0.0
+        return float(z)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 LOG.info(
     "Submission ready: model=%s n_subjects=%d n_bc=%d encoder=%s device=%s in %.2fs",
     _MODEL_NAME,
@@ -2120,55 +2304,85 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
 '''
 
 
-_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (streamed-flush variant).
+_RUNTIME_LABELING_PY = r'''"""Adaptive-labeling acquisition function (streamed-flush + uncertainty).
 
 The Codabench runner calls ``acquisition_function`` once per hidden
-(subject, item) pair BEFORE any ``predict()`` call.  Each call here
-forwards to ``model._enqueue_for_batch``, which:
+(subject, item) pair BEFORE any ``predict()`` call.  Each call here does
+two things:
 
-  1. Appends the inputs to the pending encoder / judge queues
-     (deduped against the in-memory caches so we never re-do work),
-  2. Opportunistically fires AT MOST one small batch inline if a queue
-     has crossed its bs threshold (judge bs=8 priority, then encoder
-     bs=16), so the heavy compute is spread evenly across every
-     acquisition call instead of being dumped on the first
-     ``predict()``.
+  1. Forward the input to ``model._enqueue_for_batch`` so the streamed-
+     flush architecture can start populating encoder + judge caches in
+     the background. This is what keeps every per-call wall time bounded
+     and the eventual ``predict()`` calls under the 10s timeout.
 
-This is required by the 10-second per-call ``predict()`` timeout: an
-earlier rev drained everything inside the first ``predict()`` call and
-the runner killed the submission with PAIEC-TIMEOUT-001 on the
-~50 k-pair workload.  Streaming keeps every call < ~200 ms while still
-achieving full batched throughput end-to-end.
+  2. Return a *real* acquisition score derived from the cheap baseline
+     logit (subject intercept + benchmark-condition intercept + mu)
+     looked up directly from the trained head's embedding tables -- NO
+     encoder forward, NO judge forward. The score is
+     ``-|sigmoid(baseline_logit) - 0.5|``, the canonical binary-uncertainty
+     signal (Lewis & Gale 1994): higher = closer to 0.5 = the head is
+     less sure. The platform sorts top-K-per-category by this score so
+     the 75 revealed labels concentrate on (subject, bc) combinations
+     where the head's a priori uncertainty is highest -- exactly where
+     a small Platt / beta calibrator fitted on those labels has the
+     largest leverage on the post-calibration log-loss.
 
-Returning a constant 0.0 makes every candidate tied at the top score,
-and the platform breaks ties uniformly at random per its spec -- which
-is equivalent in expectation to the default random-K-per-category
-fallback applied when no ``labeling.py`` is shipped.  The only effect
-of this file is to drive the streamed flush; the acquisition signal
-itself is intentionally constant.
+The signal is *item-agnostic* (the cheap baseline doesn't look at
+``item_content``), so candidates that share a (subject, bc) tie at the
+same score; the platform's documented random tiebreak then picks among
+them, which gives a stratified-by-(subject, bc) random sample of items
+from the most-uncertain combos. If the baseline lookup fails for any
+reason we silently fall back to 0.0 (the previous behavior), which the
+platform handles as a uniform random fallback per its spec.
 """
 
 from __future__ import annotations
 
+import math
+
 
 def acquisition_function(input: dict) -> float:  # noqa: A002
+    benchmark = str(input.get("benchmark", "") or "")
+    condition = str(input.get("condition", "none") or "none")
+    subject_content = str(input.get("subject_content", "") or "")
+    item_content = str(input.get("item_content", "") or "")
     try:
         from model import _enqueue_for_batch  # type: ignore
     except Exception:  # noqa: BLE001
+        _enqueue_for_batch = None  # type: ignore
+    try:
+        from model import _baseline_logit  # type: ignore
+    except Exception:  # noqa: BLE001
+        _baseline_logit = None  # type: ignore
+    if _enqueue_for_batch is not None:
+        try:
+            _enqueue_for_batch(
+                benchmark=benchmark,
+                condition=condition,
+                subject_content=subject_content,
+                item_content=item_content,
+            )
+        except Exception:  # noqa: BLE001
+            # Never let a queueing error escape; the platform falls back
+            # to random K-per-category labels if any acquisition call
+            # raises, and we don't want to lose the entire labeling pass.
+            pass
+    if _baseline_logit is None:
         return 0.0
     try:
-        _enqueue_for_batch(
-            benchmark=str(input.get("benchmark", "") or ""),
-            condition=str(input.get("condition", "none") or "none"),
-            subject_content=str(input.get("subject_content", "") or ""),
-            item_content=str(input.get("item_content", "") or ""),
-        )
+        z = float(_baseline_logit(subject_content, benchmark, condition))
+        if not math.isfinite(z):
+            return 0.0
+        # Stable sigmoid.
+        if z >= 0.0:
+            p = 1.0 / (1.0 + math.exp(-z))
+        else:
+            ez = math.exp(z)
+            p = ez / (1.0 + ez)
+        # Higher score == closer to 0.5 == more uncertain.
+        return -abs(p - 0.5)
     except Exception:  # noqa: BLE001
-        # Never let a queueing error escape; the platform falls back to
-        # random K-per-category labels if any acquisition call raises,
-        # and we don't want to lose the entire labeling pass.
-        pass
-    return 0.0
+        return 0.0
 '''
 
 
