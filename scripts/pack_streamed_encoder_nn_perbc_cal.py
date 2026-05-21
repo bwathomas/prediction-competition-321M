@@ -62,6 +62,11 @@ def main() -> int:
                 ni.compress_type = zipfile.ZIP_DEFLATED
                 ni.external_attr = info.external_attr
                 dst_zf.writestr(ni, src.NEW_LABELING_PY.encode("utf-8"))
+            elif name == "artifacts/runtime_meta.json":
+                ni = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+                ni.compress_type = zipfile.ZIP_DEFLATED
+                ni.external_attr = info.external_attr
+                dst_zf.writestr(ni, src.clear_calibration_disabled_in_meta(src_zf.read(name)))
             else:
                 if info.is_dir():
                     dst_zf.writestr(info, b"")

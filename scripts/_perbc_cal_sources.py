@@ -616,6 +616,23 @@ def sanity_check_labeling_py(labeling_py: str) -> None:
         )
 
 
+def clear_calibration_disabled_in_meta(meta_json_bytes: bytes) -> bytes:
+    """If artifacts/runtime_meta.json has ``calibration_disabled: True``,
+    flip it to False.  We are re-enabling calibration in the patched
+    bundle, so leaving the flag stale produces the meta/runtime mismatch
+    that the audit harness flags.
+    """
+    import json
+    meta = json.loads(meta_json_bytes.decode("utf-8"))
+    if meta.get("calibration_disabled") is True:
+        meta["calibration_disabled"] = False
+        # Also nudge the architecture tag if it has the +nocal suffix.
+        arch = meta.get("runtime_architecture", "")
+        if isinstance(arch, str) and arch.endswith("+nocal"):
+            meta["runtime_architecture"] = arch[: -len("+nocal")] + "+perbc_cal"
+    return json.dumps(meta, indent=2).encode("utf-8")
+
+
 def required_model_py_prereqs(model_py: str) -> None:
     """Validate the SOURCE model.py exposes the symbols labeling.py needs."""
     must_have_pre_predict = ["_BC_TO_ID:", "_SUBJECT_TO_ID:", "def normalize_condition", "def stable_sha256"]
