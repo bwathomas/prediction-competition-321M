@@ -741,6 +741,107 @@ class _IRTItemKFactorGatedMLP(_ResidualIRTItem):
     residual_cls = _GatedResidual
 
 
+def _residual_input_dim_hybrid_irt_kfactor(cfg: dict) -> int:
+    base = cfg["item_embed_dim"] + 3 + cfg["k"] * 3 + 1
+    if cfg.get("use_subject_text_embedding"):
+        base += int(cfg.get("subject_embed_dim", 0))
+    if cfg.get("use_pool_features"):
+        base += int(cfg.get("pool_feature_dim", 0))
+    if cfg.get("use_cluster_features") and cfg.get("n_clusters", 0) > 0:
+        base += int(cfg.get("cluster_embed_dim", 0))
+    if cfg.get("use_judge_features"):
+        base += int(cfg.get("judge_feature_dim", 0))
+    if cfg.get("use_nn_features"):
+        base += int(cfg.get("nn_feature_dim", 0))
+    return base
+
+
+def _residual_features_hybrid_irt_kfactor(
+    cfg, comps, u_s, v_i, raw_factor, ie, se, pool_feats, cluster_emb, judge_feats, nn_feats
+):
+    parts = [
+        ie,
+        comps["theta"].unsqueeze(-1),
+        comps["beta_i"].unsqueeze(-1),
+        comps["alpha_i"].unsqueeze(-1),
+        u_s,
+        v_i,
+        u_s * v_i,
+        raw_factor.unsqueeze(-1),
+    ]
+    if cfg.get("use_subject_text_embedding") and se is not None and se.shape[-1] > 0:
+        parts.append(se)
+    if cfg.get("use_pool_features") and pool_feats is not None and pool_feats.shape[-1] > 0:
+        parts.append(pool_feats)
+    if (
+        cfg.get("use_cluster_features")
+        and cluster_emb is not None
+        and cluster_emb.shape[-1] > 0
+    ):
+        parts.append(cluster_emb)
+    if (
+        cfg.get("use_judge_features")
+        and judge_feats is not None
+        and judge_feats.shape[-1] > 0
+    ):
+        parts.append(judge_feats)
+    if (
+        cfg.get("use_nn_features")
+        and nn_feats is not None
+        and nn_feats.shape[-1] > 0
+    ):
+        parts.append(nn_feats)
+    return torch.cat(parts, dim=-1)
+
+
+class _HybridIRTItemKFactorGatedMLP(_IRTItemBase):
+    """Runtime mirror of ``HybridIRTItemKFactorGatedMLP`` in ``src/models.py``.
+
+    Adds the multidimensional k-factor branch and gated residual on top of
+    the IRT base. The state-dict layout must match the training-time class
+    exactly so checkpoints load cleanly.
+    """
+
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        self.u = nn.Embedding(cfg["n_subjects"], cfg["k"])
+        self.item_map = _ItemParameterMap(
+            item_embed_dim=cfg["item_embed_dim"],
+            k=cfg["k"],
+            hidden=cfg["item_map_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+        self.rho_factor = nn.Parameter(torch.tensor(0.1))
+        in_dim = _residual_input_dim_hybrid_irt_kfactor(cfg)
+        self.residual = _GatedResidual(
+            in_dim=in_dim,
+            hidden=cfg["residual_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+        self.lambda_resid = nn.Parameter(
+            torch.tensor(float(cfg.get("lambda_resid_init", 0.1))),
+            requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
+        )
+
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None, nn_feats=None):
+        comps = self._irt_components(s, bc, ie)
+        u_s = self.u(s)
+        v_i, _unused_d_i = self.item_map(ie)
+        k = max(1, self.cfg["k"])
+        raw_factor = (u_s * v_i).sum(dim=-1) / math.sqrt(k)
+        c_factor = self.rho_factor * raw_factor
+        cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
+        x = _residual_features_hybrid_irt_kfactor(
+            self.cfg, comps, u_s, v_i, raw_factor, ie, se, pool_feats, cluster_emb, judge_feats, nn_feats
+        )
+        return (
+            comps["irt"]
+            + comps["offset"]
+            + c_factor
+            + self.lambda_resid * self.residual(x)
+        )
+
+
 _REGISTRY = {
     "kfactor": _KFactor,
     "kfactor_mlp": _MLPResidual,
@@ -748,6 +849,7 @@ _REGISTRY = {
     "kfactor_irt_item": _IRTItemKFactor,
     "kfactor_irt_item_mlp": _IRTItemKFactorMLP,
     "kfactor_irt_item_gated_mlp": _IRTItemKFactorGatedMLP,
+    "hybrid_irt_kfactor_gated_mlp": _HybridIRTItemKFactorGatedMLP,
 }
 
 

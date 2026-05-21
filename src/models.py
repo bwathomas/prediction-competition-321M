@@ -388,6 +388,74 @@ def _build_residual_features_irt(
     return torch.cat(parts, dim=-1)
 
 
+def _residual_feature_dim_hybrid_irt_kfactor(cfg: ModelConfig) -> int:
+    """Width of the residual-MLP input for the hybrid IRT + k-factor variant.
+
+    The hybrid variant exposes the IRT scalars (theta, beta_i, alpha_i) AND
+    the multidimensional kfactor components (u_s, v_i, u_s * v_i) plus a
+    scalar for the raw u_s . v_i interaction. This is a superset of both
+    the IRT-only and kfactor-only residual inputs.
+    """
+    base = (
+        cfg.item_embed_dim
+        + 3                              # theta, beta_i, alpha_i scalars
+        + cfg.k                          # u_s
+        + cfg.k                          # v_i
+        + cfg.k                          # u_s * v_i
+        + 1                              # raw factor interaction scalar
+    )
+    if cfg.use_subject_embed_features:
+        base += cfg.subject_embed_dim
+    if cfg.use_pool_features:
+        base += cfg.effective_pool_dim
+    if cfg.has_cluster_embedding:
+        base += cfg.cluster_embed_dim
+    if cfg.use_judge_features:
+        base += cfg.effective_judge_dim
+    if cfg.use_nn_features:
+        base += cfg.effective_nn_dim
+    return base
+
+
+def _build_residual_features_hybrid_irt_kfactor(
+    cfg: ModelConfig,
+    *,
+    theta: torch.Tensor,
+    beta_i: torch.Tensor,
+    alpha_i: torch.Tensor,
+    u_s: torch.Tensor,
+    v_i: torch.Tensor,
+    raw_factor: torch.Tensor,
+    item_emb: torch.Tensor,
+    subject_emb: torch.Tensor | None,
+    pool_z: torch.Tensor | None,
+    cluster_emb: torch.Tensor | None,
+    judge_feats: torch.Tensor | None = None,
+    nn_feats: torch.Tensor | None = None,
+) -> torch.Tensor:
+    parts = [
+        item_emb,
+        theta.unsqueeze(-1),
+        beta_i.unsqueeze(-1),
+        alpha_i.unsqueeze(-1),
+        u_s,
+        v_i,
+        u_s * v_i,
+        raw_factor.unsqueeze(-1),
+    ]
+    if cfg.use_subject_embed_features and subject_emb is not None:
+        parts.append(subject_emb)
+    _maybe_append(
+        parts,
+        cfg,
+        pool_z=pool_z,
+        cluster_emb=cluster_emb,
+        judge_feats=judge_feats,
+        nn_feats=nn_feats,
+    )
+    return torch.cat(parts, dim=-1)
+
+
 def _maybe_zero_judge(
     cfg: ModelConfig,
     judge_feats: torch.Tensor | None,
@@ -943,6 +1011,221 @@ class IRTItemKFactorGatedMLP(_ResidualIRTItem):
 
 
 # ---------------------------------------------------------------------------
+# Hybrid IRT + k-factor + gated residual MLP (new)
+# ---------------------------------------------------------------------------
+
+
+class HybridIRTItemKFactorGatedMLP(nn.Module):
+    """Hybrid Item-IRT + multidimensional k-factor + gated residual MLP.
+
+    The final logit is:
+
+        logit = mu
+              + beta_bc
+              + alpha_i * (theta_s - beta_i)
+              + rho_factor * ((u_s . v_i) / sqrt(k))
+              + lambda_resid * gated_residual(F)
+
+    where:
+      - ``theta_s`` is a learned per-subject scalar ability (IRT),
+      - ``beta_i, alpha_i`` come from the item-IRT heads (IRT difficulty /
+        discrimination predicted from the item embedding),
+      - ``u_s`` is a learned ``k``-dim subject vector,
+      - ``v_i`` is a ``k``-dim item factor predicted from the item embedding,
+      - ``rho_factor`` is a trainable scalar mixing the k-factor channel.
+
+    This deliberately does *not* re-use the full ``KFactorModel`` logit,
+    because that would double-count the global ``mu``, the benchmark-condition
+    offset ``beta_bc``, and would introduce a second scalar item difficulty
+    (``-d_i`` from ``ItemParameterMap``). The IRT ``beta_i`` is already the
+    scalar item difficulty; the only thing missing from the IRT channel is
+    the multidimensional subject-item interaction ``u_s . v_i / sqrt(k)``,
+    which is precisely what the factor branch contributes here.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.mu = nn.Parameter(torch.zeros(1))
+        self.theta = nn.Embedding(cfg.n_subjects, 1)          # subject ability
+        self.beta = nn.Embedding(cfg.n_benchmark_conditions, 1)
+        nn.init.zeros_(self.theta.weight)
+        nn.init.zeros_(self.beta.weight)
+
+        self.irt_heads = ItemIRTHeads(
+            item_dim=cfg.item_embed_dim,
+            hidden=cfg.item_map_hidden_dim,
+            dropout=cfg.dropout,
+        )
+
+        self.u = nn.Embedding(cfg.n_subjects, cfg.k)
+        nn.init.normal_(self.u.weight, std=0.05)
+
+        self.item_map = ItemParameterMap(
+            item_embed_dim=cfg.item_embed_dim,
+            k=cfg.k,
+            hidden=cfg.item_map_hidden_dim,
+            dropout=cfg.dropout,
+        )
+
+        self.rho_factor = nn.Parameter(torch.tensor(0.1))
+
+        in_dim = _residual_feature_dim_hybrid_irt_kfactor(cfg)
+        self.residual = GatedSwiGLUResidual(
+            in_dim=in_dim,
+            hidden=cfg.residual_hidden_dim,
+            dropout=cfg.dropout,
+        )
+        self.lambda_resid = nn.Parameter(
+            torch.tensor(float(cfg.lambda_resid_init)),
+            requires_grad=bool(cfg.lambda_resid_trainable),
+        )
+
+        self.cluster_embedding: nn.Embedding | None = None
+        if cfg.has_cluster_embedding:
+            self.cluster_embedding = nn.Embedding(
+                cfg.n_clusters + 1, cfg.cluster_embed_dim, padding_idx=0
+            )
+            nn.init.normal_(self.cluster_embedding.weight, std=0.05)
+
+    @property
+    def has_residual(self) -> bool:
+        return True
+
+    @property
+    def has_irt_heads(self) -> bool:
+        return True
+
+    @property
+    def has_judge_features(self) -> bool:
+        return bool(self.cfg.use_judge_features and self.cfg.effective_judge_dim > 0)
+
+    @property
+    def has_nn_features(self) -> bool:
+        return bool(self.cfg.use_nn_features and self.cfg.effective_nn_dim > 0)
+
+    def _cluster_emb(self, cluster_ids: torch.Tensor | None) -> torch.Tensor | None:
+        if self.cluster_embedding is None or cluster_ids is None:
+            return None
+        if cluster_ids.numel() == 0 or cluster_ids.dim() < 1:
+            return None
+        return self.cluster_embedding(cluster_ids.long())
+
+    def _components(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        theta = self.theta(subject_idx).squeeze(-1)
+        bc_off = self.beta(bc_idx).squeeze(-1)
+        beta_i, alpha_i = self.irt_heads(item_emb)
+        u_s = self.u(subject_idx)
+        v_i, _unused_d_i = self.item_map(item_emb)
+        k = max(1, self.cfg.k)
+        raw_factor = (u_s * v_i).sum(dim=-1) / math.sqrt(k)
+        c_irt = alpha_i * (theta - beta_i)
+        c_offset = bc_off + self.mu
+        c_factor = self.rho_factor * raw_factor
+        return {
+            "theta": theta,
+            "beta_i": beta_i,
+            "alpha_i": alpha_i,
+            "u_s": u_s,
+            "v_i": v_i,
+            "raw_factor": raw_factor,
+            "irt": c_irt,
+            "offset": c_offset,
+            "factor": c_factor,
+        }
+
+    def forward(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+        subject_emb: torch.Tensor | None = None,
+        pool_feats: torch.Tensor | None = None,
+        cluster_ids: torch.Tensor | None = None,
+        judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
+        *,
+        override_alpha: torch.Tensor | None = None,
+        override_beta: torch.Tensor | None = None,
+        override_mlp_zero: bool = False,
+        force_judge_zero: bool = False,
+        force_nn_zero: bool = False,
+    ) -> torch.Tensor:
+        comps = self._components(subject_idx, bc_idx, item_emb)
+        alpha_i = override_alpha if override_alpha is not None else comps["alpha_i"]
+        beta_i = override_beta if override_beta is not None else comps["beta_i"]
+        c_irt = alpha_i * (comps["theta"] - beta_i)
+        c_offset = comps["offset"]
+        c_factor = comps["factor"]
+        if override_mlp_zero:
+            return c_irt + c_offset + c_factor
+        jf = _maybe_zero_judge(self.cfg, judge_feats, force_judge_zero=force_judge_zero)
+        nf = _maybe_zero_nn(self.cfg, nn_feats, force_nn_zero=force_nn_zero)
+        cluster_emb = self._cluster_emb(cluster_ids)
+        x = _build_residual_features_hybrid_irt_kfactor(
+            self.cfg,
+            theta=comps["theta"],
+            beta_i=comps["beta_i"],
+            alpha_i=comps["alpha_i"],
+            u_s=comps["u_s"],
+            v_i=comps["v_i"],
+            raw_factor=comps["raw_factor"],
+            item_emb=item_emb,
+            subject_emb=subject_emb,
+            pool_z=pool_feats,
+            cluster_emb=cluster_emb,
+            judge_feats=jf,
+            nn_feats=nf,
+        )
+        r = self.lambda_resid * self.residual(x)
+        return c_irt + c_offset + c_factor + r
+
+    def decompose(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+        subject_emb: torch.Tensor | None = None,
+        pool_feats: torch.Tensor | None = None,
+        cluster_ids: torch.Tensor | None = None,
+        judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        comps = self._components(subject_idx, bc_idx, item_emb)
+        cluster_emb = self._cluster_emb(cluster_ids)
+        x = _build_residual_features_hybrid_irt_kfactor(
+            self.cfg,
+            theta=comps["theta"],
+            beta_i=comps["beta_i"],
+            alpha_i=comps["alpha_i"],
+            u_s=comps["u_s"],
+            v_i=comps["v_i"],
+            raw_factor=comps["raw_factor"],
+            item_emb=item_emb,
+            subject_emb=subject_emb,
+            pool_z=pool_feats,
+            cluster_emb=cluster_emb,
+            judge_feats=judge_feats,
+            nn_feats=nn_feats,
+        )
+        r = self.lambda_resid * self.residual(x)
+        return {
+            "irt": comps["irt"],
+            "offset": comps["offset"],
+            "factor": comps["factor"],
+            "mlp": r,
+            "theta": comps["theta"],
+            "beta_i": comps["beta_i"],
+            "alpha_i": comps["alpha_i"],
+        }
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -954,6 +1237,7 @@ MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "kfactor_irt_item": IRTItemKFactor,
     "kfactor_irt_item_mlp": IRTItemKFactorMLP,
     "kfactor_irt_item_gated_mlp": IRTItemKFactorGatedMLP,
+    "hybrid_irt_kfactor_gated_mlp": HybridIRTItemKFactorGatedMLP,
 }
 
 
@@ -1156,6 +1440,7 @@ class LookupDataset(torch.utils.data.Dataset):
 __all__ = [
     "DenseMLPResidual",
     "GatedSwiGLUResidual",
+    "HybridIRTItemKFactorGatedMLP",
     "IRTItemKFactor",
     "IRTItemKFactorGatedMLP",
     "IRTItemKFactorMLP",
