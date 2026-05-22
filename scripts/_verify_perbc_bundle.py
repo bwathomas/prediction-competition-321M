@@ -11,6 +11,7 @@ DEFAULT_ZIPS = [
     Path(r"C:/Users/benja/Downloads/submission/submission_streamed_encoder_nn_perbc_cal.zip"),
     Path(r"C:/Users/benja/Downloads/submission/submission_item_sample_perbc_cal.zip"),
     Path(r"C:/Users/benja/Downloads/submission/submission_item_uniform_v2.zip"),
+    Path(r"C:/Users/benja/Downloads/submission/submission_new_model_perbc_cal.zip"),
 ]
 ZIPS = [Path(p) for p in sys.argv[1:]] if len(sys.argv) > 1 else DEFAULT_ZIPS
 

@@ -552,11 +552,17 @@ def replace_calibrator_block(model_py: str) -> str:
 def replace_apply_site(model_py: str) -> str:
     """Patch predict()'s calibrator wiring.
 
-    Supports two bundle shapes:
+    Supports three bundle shapes:
 
-      * "calibrated": predict() already contains
-        ``p = _CALIBRATOR.apply(p)`` -- we just swap it for the bc-routed
+      * "calibrated": predict() contains the legacy
+        ``p = _CALIBRATOR.apply(p)`` -- we swap it for the bc-routed
         equivalent.
+
+      * "already_bc_routed": predict() already calls the bc-routed
+        ``_CALIBRATOR.apply(p, _bc_key_for_apply)``.  No edit needed
+        (e.g. re-packing a bundle that was previously packed with this
+        same module -- a common path when the calibrator block itself
+        is the only thing changing between revisions).
 
       * "nocal": predict() has the apply line commented out AND a
         "Calibration intentionally disabled" block that touches `labeled`
@@ -564,9 +570,10 @@ def replace_apply_site(model_py: str) -> str:
         actually fits and applies the calibrator.
 
     The function detects which shape applies by which markers are
-    present, and raises if neither matches.
+    present, and raises if none of them match.
     """
     has_active = _OLD_APPLY_LINE in model_py
+    has_bc_routed = _NEW_APPLY_LINE.strip() in model_py
     has_nocal = _NOCAL_COMMENTED_APPLY_LINE in model_py and bool(
         _NOCAL_DISABLED_FIT_RE.search(model_py)
     )
@@ -579,6 +586,22 @@ def replace_apply_site(model_py: str) -> str:
         if _OLD_APPLY_LINE in out:
             raise RuntimeError("found multiple active apply sites; aborting")
         return out
+    if has_bc_routed and not has_nocal:
+        # Already patched to the bc-routed apply (e.g. a re-pack of a
+        # bundle that was previously processed by this same module).
+        # Just verify the helpers our calibrator template depends on
+        # are present and return unchanged.
+        for name in (
+            "_labeled_fingerprint",
+            "_LAST_LABELED_FINGERPRINT",
+            "_PROB_CACHE",
+            "_CALIBRATOR = _Calibrator",
+        ):
+            if name not in model_py:
+                raise RuntimeError(
+                    "already-patched bundle is missing required helper: " + name
+                )
+        return model_py
     if has_nocal:
         out = _NOCAL_DISABLED_FIT_RE.sub(
             _NOCAL_DISABLED_FIT_REPLACEMENT, model_py, count=1
