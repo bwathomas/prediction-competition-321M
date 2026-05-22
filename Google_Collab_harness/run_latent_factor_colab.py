@@ -672,7 +672,7 @@ def main() -> None:
     ap.add_argument("--validation-harness-dir", required=True, type=str)
     ap.add_argument("--output-dir", required=True, type=str)
 
-    ap.add_argument("--val-fraction", type=float, default=0.10)
+    ap.add_argument("--val-fraction", type=float, default=0.05)
     ap.add_argument("--split-seed", type=int, default=0)
 
     ap.add_argument("--latent-dim", type=int, default=16)

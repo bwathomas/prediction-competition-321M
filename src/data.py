@@ -517,7 +517,7 @@ class SplitArtifact:
 def make_item_cold_start_split(
     df: pd.DataFrame,
     *,
-    val_fraction: float = 0.10,
+    val_fraction: float = 0.05,
     seed: int = 0,
     holdout_benchmarks: Iterable[str] | None = None,
     split_key: str = "item_split_key",
@@ -627,7 +627,7 @@ def make_benchmark_heldout_split(
 
 
 def make_random_row_split(
-    df: pd.DataFrame, *, val_fraction: float = 0.10, seed: int = 0
+    df: pd.DataFrame, *, val_fraction: float = 0.05, seed: int = 0
 ) -> SplitArtifact:
     """Leaky random-row split. ONLY for debugging.
 

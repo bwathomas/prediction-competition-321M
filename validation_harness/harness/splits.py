@@ -136,7 +136,7 @@ class SplitReport:
 def make_item_cold_start_split(
     df: pd.DataFrame,
     *,
-    val_fraction: float = 0.1,
+    val_fraction: float = 0.05,
     seed: int = 0,
     holdout_benchmarks: Iterable[str] | None = None,
     variant_col: str = "item_split_key",

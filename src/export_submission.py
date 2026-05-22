@@ -842,6 +842,110 @@ class _HybridIRTItemKFactorGatedMLP(_IRTItemBase):
         )
 
 
+def _residual_input_dim_hierarchical_mirt(cfg: dict) -> int:
+    d = max(1, int(cfg["k"]))
+    base = cfg["item_embed_dim"] + 3 + 3 * d + 1
+    if cfg.get("use_subject_text_embedding"):
+        base += int(cfg.get("subject_embed_dim", 0))
+    if cfg.get("use_pool_features"):
+        base += int(cfg.get("pool_feature_dim", 0))
+    if cfg.get("use_cluster_features") and cfg.get("n_clusters", 0) > 0:
+        base += int(cfg.get("cluster_embed_dim", 0))
+    if cfg.get("use_judge_features"):
+        base += int(cfg.get("judge_feature_dim", 0))
+    if cfg.get("use_nn_features"):
+        base += int(cfg.get("nn_feature_dim", 0))
+    return base
+
+
+def _residual_features_hierarchical_mirt(
+    cfg, comps, theta_vec, alpha_vec, raw_mirt, ie, se, pool_feats, cluster_emb,
+    judge_feats, nn_feats,
+):
+    parts = [
+        ie,
+        comps["theta"].unsqueeze(-1),
+        comps["beta_i"].unsqueeze(-1),
+        comps["alpha_i"].unsqueeze(-1),
+        theta_vec,
+        alpha_vec,
+        theta_vec * alpha_vec,
+        raw_mirt.unsqueeze(-1),
+    ]
+    if cfg.get("use_subject_text_embedding") and se is not None and se.shape[-1] > 0:
+        parts.append(se)
+    if cfg.get("use_pool_features") and pool_feats is not None and pool_feats.shape[-1] > 0:
+        parts.append(pool_feats)
+    if (
+        cfg.get("use_cluster_features")
+        and cluster_emb is not None
+        and cluster_emb.shape[-1] > 0
+    ):
+        parts.append(cluster_emb)
+    if (
+        cfg.get("use_judge_features")
+        and judge_feats is not None
+        and judge_feats.shape[-1] > 0
+    ):
+        parts.append(judge_feats)
+    if (
+        cfg.get("use_nn_features")
+        and nn_feats is not None
+        and nn_feats.shape[-1] > 0
+    ):
+        parts.append(nn_feats)
+    return torch.cat(parts, dim=-1)
+
+
+class _HierarchicalMIRT(_IRTItemBase):
+    """Runtime mirror of :class:`HierarchicalMIRT` in ``src/models.py``.
+
+    Scalar 2PL channel + zero-init MIRT-d residual + gated MLP.  The
+    state-dict layout (``theta_vec`` embedding + ``alpha_vec_head``
+    Sequential with the exact same submodule order as the trainer)
+    must match the trainer exactly so checkpoints load cleanly.
+    """
+
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        d = max(1, int(cfg["k"]))
+        self.theta_vec = nn.Embedding(cfg["n_subjects"], d)
+        self.alpha_vec_head = nn.Sequential(
+            nn.LayerNorm(cfg["item_embed_dim"]),
+            nn.Linear(cfg["item_embed_dim"], cfg["item_map_hidden_dim"]),
+            nn.GELU(),
+            nn.Dropout(cfg.get("dropout", 0.0)),
+            nn.Linear(cfg["item_map_hidden_dim"], d),
+        )
+        in_dim = _residual_input_dim_hierarchical_mirt(cfg)
+        self.residual = _GatedResidual(
+            in_dim=in_dim,
+            hidden=cfg["residual_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+        self.lambda_resid = nn.Parameter(
+            torch.tensor(float(cfg.get("lambda_resid_init", 0.1))),
+            requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
+        )
+
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None, nn_feats=None):
+        comps = self._irt_components(s, bc, ie)
+        theta_vec = self.theta_vec(s)
+        alpha_vec = self.alpha_vec_head(ie)
+        raw_mirt = (theta_vec * alpha_vec).sum(dim=-1)
+        cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
+        x = _residual_features_hierarchical_mirt(
+            self.cfg, comps, theta_vec, alpha_vec, raw_mirt, ie, se, pool_feats,
+            cluster_emb, judge_feats, nn_feats,
+        )
+        return (
+            comps["irt"]
+            + comps["offset"]
+            + raw_mirt
+            + self.lambda_resid * self.residual(x)
+        )
+
+
 _REGISTRY = {
     "kfactor": _KFactor,
     "kfactor_mlp": _MLPResidual,
@@ -850,6 +954,7 @@ _REGISTRY = {
     "kfactor_irt_item_mlp": _IRTItemKFactorMLP,
     "kfactor_irt_item_gated_mlp": _IRTItemKFactorGatedMLP,
     "hybrid_irt_kfactor_gated_mlp": _HybridIRTItemKFactorGatedMLP,
+    "hierarchical_mirt": _HierarchicalMIRT,
 }
 
 
@@ -1802,7 +1907,14 @@ _N_TRAIN_PER_SUBJECT: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_subject") or {})
 _N_TRAIN_PER_BC: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_bc") or {})
 
 _MODEL = _REGISTRY[_MODEL_NAME](_MODEL_CFG)
-_MODEL.load_state_dict(_CKPT["model_state"], strict=False)
+_MISSING_KEYS, _UNEXPECTED_KEYS = _MODEL.load_state_dict(
+    _CKPT["model_state"], strict=True
+)
+if _MISSING_KEYS or _UNEXPECTED_KEYS:
+    raise RuntimeError(
+        "Checkpoint/model architecture mismatch: "
+        f"missing={_MISSING_KEYS}, unexpected={_UNEXPECTED_KEYS}"
+    )
 _MODEL.eval().to(_DEVICE)
 
 # Pool-feature stats (z-score normalization, fit on training items only).
@@ -2688,8 +2800,6 @@ def compute_train_counts(train_df) -> dict:
     the shipped runtime can use graded (rather than binary) novelty +
     anchoring acquisition.
     """
-    import hashlib as _hashlib
-
     required = {"subject_content", "benchmark", "condition"}
     missing = required - set(train_df.columns)
     if missing:
@@ -2698,8 +2808,10 @@ def compute_train_counts(train_df) -> dict:
             + ", ".join(sorted(missing))
         )
 
-    def _sha256(s) -> str:
-        return _hashlib.sha256(str(s or "").encode("utf-8")).hexdigest()
+    # Must match runtime ``stable_sha256(subject_content)`` and
+    # ``normalize_condition`` + ``"{benchmark}::{condition}"`` bc keys.
+    from .data import normalize_condition as _normalize_condition
+    from .data import stable_sha256 as _stable_sha256
 
     n_per_subject: dict[str, int] = {}
     n_per_bc: dict[str, int] = {}
@@ -2708,8 +2820,9 @@ def compute_train_counts(train_df) -> dict:
         train_df["benchmark"].tolist(),
         train_df["condition"].tolist(),
     ):
-        sk = _sha256(subj)
-        bc = "{0}::{1}".format(str(bench or ""), str(cond or "none"))
+        sk = _stable_sha256(str(subj or ""))
+        condition = _normalize_condition(cond)
+        bc = "{0}::{1}".format(str(bench or ""), condition)
         n_per_subject[sk] = n_per_subject.get(sk, 0) + 1
         n_per_bc[bc] = n_per_bc.get(bc, 0) + 1
     return {"n_per_subject": n_per_subject, "n_per_bc": n_per_bc}
@@ -2805,6 +2918,14 @@ def export_run(
             "fires). predict() will fall back to bs=1 inference and the "
             "bundle will run ~10-15x slower at runtime. Re-enable "
             "include_labeling=True for any non-diagnostic submission."
+        )
+    elif not train_counts:
+        raise RuntimeError(
+            "export_run: include_labeling=True requires train_counts so the "
+            "shipped labeling.py can use the correct seen-subject and "
+            "seen-benchmark-condition counts. Pass "
+            "train_counts=compute_train_counts(primary.train) (or the exact "
+            "training dataframe for this checkpoint)."
         )
 
     sub = Path(submission_dir)
@@ -3135,6 +3256,30 @@ def export_run(
                 "expected 'adapter_only' | 'hf_upload' | 'none'."
             )
 
+    runtime_encoder_id = lora_runtime_id_override or str(encoder_cfg["model_id"])
+    qwen3_instruction = str(encoder_cfg.get("qwen3_instruction", "") or "")
+    query_prefix = str(encoder_cfg.get("query_prefix", "") or "")
+    passage_prefix = str(encoder_cfg.get("passage_prefix", "") or "")
+    if "Qwen3-Embedding" in runtime_encoder_id and qwen3_instruction:
+        qwen3_prefix = f"Instruct: {qwen3_instruction}\nQuery: "
+        query_prefix = query_prefix or qwen3_prefix
+        passage_prefix = passage_prefix or qwen3_prefix
+
+    encoder_runtime_batch_size = int(
+        encoder_cfg.get(
+            "runtime_batch_size",
+            16
+            if int(encoder_cfg.get("batch_size", 16) or 16) > 64
+            else encoder_cfg.get("batch_size", 16),
+        )
+    )
+    if "Qwen3-Embedding-8B" in runtime_encoder_id and encoder_runtime_batch_size > 8:
+        LOG.info(
+            "Clamping encoder_runtime_batch_size from %d to 8 for Qwen3-Embedding-8B",
+            encoder_runtime_batch_size,
+        )
+        encoder_runtime_batch_size = 8
+
     runtime_meta = {
         "run_id": result.run_id,
         "model_name": result.model_name,
@@ -3145,10 +3290,8 @@ def export_run(
         # ``predict()``), HF_HUB_OFFLINE forced at module import to satisfy
         # PAIEC-NETWORK-001, no encoder eviction (both 4 B models stay
         # co-resident on L4 for the entire round).
-        "runtime_architecture": "streamed_flush_v1",
-        "encoder_model_id": (
-            lora_runtime_id_override or encoder_cfg["model_id"]
-        ),
+        "runtime_architecture": "streamed_flush_v1+perbc_cal",
+        "encoder_model_id": runtime_encoder_id,
         # The encoder side may have promoted max_length from config-null to a
         # data-driven cap. We persist the *effective* number so the runtime
         # tokenizes consistently with the offline cache.
@@ -3159,21 +3302,15 @@ def export_run(
         # the wild). The encoder no longer gets evicted before the judge
         # phase under the streamed-flush architecture, so the safe
         # ceiling is the *co-resident* number.
-        "encoder_runtime_batch_size": int(
-            encoder_cfg.get(
-                "runtime_batch_size",
-                16
-                if int(encoder_cfg.get("batch_size", 16) or 16) > 64
-                else encoder_cfg.get("batch_size", 16),
-            )
-        ),
+        "encoder_runtime_batch_size": encoder_runtime_batch_size,
         "pooling": encoder_cfg.get("pooling", "mean"),
         "use_contextual_item_text": bool(
             encoder_cfg.get("use_contextual_item_text", True)
         ),
-        "query_prefix": encoder_cfg.get("query_prefix", ""),
-        "passage_prefix": encoder_cfg.get("passage_prefix", ""),
-        "qwen3_instruction": encoder_cfg.get("qwen3_instruction", ""),
+        "query_prefix": query_prefix,
+        "passage_prefix": passage_prefix,
+        "qwen3_instruction": qwen3_instruction,
+        "calibration_disabled": False,
         "default_prob": 0.5,
         "default_calibrator": dict(default_calibrator or {"kind": "identity"}),
         "best_val_log_loss": float(result.best_val_log_loss),

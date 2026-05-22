@@ -37,7 +37,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", required=True, type=Path)
     ap.add_argument("--out-dir", required=True, type=Path)
-    ap.add_argument("--val-fraction", type=float, default=0.10)
+    ap.add_argument("--val-fraction", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
         "--holdout-benchmark",

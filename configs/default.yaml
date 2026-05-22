@@ -35,7 +35,7 @@ data:
 # ----------------------------------------------------------------------------
 splits:
   primary: "item_cold_start"     # primary metric uses this split
-  val_fraction: 0.10
+  val_fraction: 0.05
   holdout_benchmarks: []         # for benchmark_heldout split
   enable_random_row_debug: true  # leaky split; reported separately
 
