@@ -276,22 +276,28 @@ def add_stable_keys(df: pd.DataFrame) -> pd.DataFrame:
 
     - ``subject_key`` = sha256(subject_content)
     - ``item_key`` = sha256(benchmark + "\\n" + condition + "\\n" + item_content)
+        - full per-(benchmark, condition, content) cache key. Used everywhere
+        downstream that wants "this exact row's item identity" (caching,
+        embedding deduplication, judge scoring, ...).
+    - ``item_split_key`` = sha256(benchmark + "\\n" + content)
+        - content-only item identity, ignoring condition. This is the key
+        the train/val splitter uses so two rows with the same item_content
+        under different conditions ALWAYS land on the same side of the
+        split. The encoder sees nearly-identical text for those rows, so a
+        condition-aware split (item_key) leaks training items into val
+        (~88% on the v1 split) and silently breaks val_NLL-based epoch
+        selection.
     - ``benchmark_condition_key`` = "{benchmark}::{condition}"
     """
     df = df.copy()
     df["condition"] = df["condition"].map(normalize_condition)
     df["subject_key"] = df["subject_content"].astype(str).map(stable_sha256)
-    df["item_key"] = [
-        stable_sha256(b, c, t)
-        for b, c, t in zip(
-            df["benchmark"].astype(str),
-            df["condition"].astype(str),
-            df["item_content"].astype(str),
-        )
-    ]
-    df["benchmark_condition_key"] = (
-        df["benchmark"].astype(str) + "::" + df["condition"].astype(str)
-    )
+    bench = df["benchmark"].astype(str)
+    cond = df["condition"].astype(str)
+    content = df["item_content"].astype(str)
+    df["item_key"] = [stable_sha256(b, c, t) for b, c, t in zip(bench, cond, content)]
+    df["item_split_key"] = [stable_sha256(b, t) for b, t in zip(bench, content)]
+    df["benchmark_condition_key"] = bench + "::" + cond
     return df
 
 
@@ -468,20 +474,31 @@ class SplitArtifact:
     def assert_invariants(self, *, split_name: str | None = None) -> None:
         """Enforce the invariants the platform actually scores against.
 
-        - item_cold_start / benchmark_heldout: no item_key overlap, every
+        - item_cold_start / benchmark_heldout: no ``item_split_key``
+          overlap (i.e. no shared item content per benchmark), and every
           val subject must appear in train.
         - random_row_debug: do NOT enforce -- this split exists only for
           sanity comparisons and is explicitly leaky.
+
+        We check ``item_split_key`` rather than ``item_key`` because the
+        leaderboard tests cold-start by item content; a multi-condition
+        benchmark whose same-content rows land on opposite sides of the
+        split would pass an ``item_key`` check but still leak ~88% of val
+        item content back into train (this is exactly the v1 splits/v1
+        regression that broke val-based epoch selection).
         """
         name = split_name or self.name
         if name == "random_row_debug":
             return
-        train_items = set(self.train["item_key"])
-        val_items = set(self.val["item_key"])
+        check_col = (
+            "item_split_key" if "item_split_key" in self.train.columns else "item_key"
+        )
+        train_items = set(self.train[check_col])
+        val_items = set(self.val[check_col])
         overlap = train_items & val_items
         if overlap:
             raise AssertionError(
-                f"{name}: {len(overlap)} item_keys appear in both train and val"
+                f"{name}: {len(overlap)} {check_col}s appear in both train and val"
             )
         train_subjects = set(self.train["subject_key"])
         val_subjects = set(self.val["subject_key"])
@@ -503,34 +520,55 @@ def make_item_cold_start_split(
     val_fraction: float = 0.10,
     seed: int = 0,
     holdout_benchmarks: Iterable[str] | None = None,
+    split_key: str = "item_split_key",
 ) -> SplitArtifact:
-    """Item cold-start split: validation item_keys are disjoint from train.
+    """Item cold-start split: validation items are disjoint from train.
 
-    Mirrors `validation_harness.harness.splits.make_item_cold_start_split` so
-    local training agrees with the local validation harness and the hosted
+    Splits on ``item_split_key`` (content-only) by default so that two
+    rows with the same ``item_content`` under different conditions always
+    land on the same side. The legacy behavior (split on ``item_key``,
+    which includes condition) leaks ~88% of val item content back into
+    train on multi-condition benchmarks; pass ``split_key="item_key"`` to
+    opt back into it.
+
+    Mirrors ``validation_harness.harness.splits.make_item_cold_start_split``
+    so local training agrees with the validation harness and the hosted
     platform's item-cold-start regime.
     """
     rng = np.random.default_rng(seed)
     holdout_benchmarks = tuple(holdout_benchmarks or ())
 
-    all_keys = df[["item_key", "benchmark"]].drop_duplicates()
+    if split_key not in df.columns:
+        if split_key == "item_split_key" and {"benchmark", "item_content"}.issubset(
+            df.columns
+        ):
+            df = df.copy()
+            bench = df["benchmark"].astype(str)
+            content = df["item_content"].astype(str)
+            df[split_key] = [stable_sha256(b, t) for b, t in zip(bench, content)]
+        else:
+            raise KeyError(
+                f"{split_key!r} not in df. Call add_stable_keys() first."
+            )
+
+    all_keys = df[[split_key, "benchmark"]].drop_duplicates()
     if holdout_benchmarks:
         held_mask = all_keys["benchmark"].isin(holdout_benchmarks)
-        held = set(all_keys.loc[held_mask, "item_key"])
-        normal_pool = all_keys.loc[~held_mask, "item_key"].to_numpy()
+        held = set(all_keys.loc[held_mask, split_key])
+        normal_pool = all_keys.loc[~held_mask, split_key].to_numpy()
     else:
         held = set()
-        normal_pool = all_keys["item_key"].to_numpy()
+        normal_pool = all_keys[split_key].to_numpy()
 
     n_val = int(round(val_fraction * len(normal_pool)))
     n_val = max(0, min(len(normal_pool), n_val))
     perm = rng.permutation(len(normal_pool))
     val_normal = set(normal_pool[perm[:n_val]].tolist())
     val_items = held | val_normal
-    train_items = set(all_keys["item_key"]) - val_items
+    train_items = set(all_keys[split_key]) - val_items
 
-    train = df[df["item_key"].isin(train_items)].copy().reset_index(drop=True)
-    raw_val = df[df["item_key"].isin(val_items)].copy().reset_index(drop=True)
+    train = df[df[split_key].isin(train_items)].copy().reset_index(drop=True)
+    raw_val = df[df[split_key].isin(val_items)].copy().reset_index(drop=True)
 
     train_subjects = set(train["subject_key"])
     seen_mask = raw_val["subject_key"].isin(train_subjects)
@@ -544,7 +582,8 @@ def make_item_cold_start_split(
         val_unseen_subject=val_unseen,
         notes=(
             f"val_fraction={val_fraction}; seed={seed}; "
-            f"holdout_benchmarks={holdout_benchmarks}"
+            f"holdout_benchmarks={holdout_benchmarks}; "
+            f"split_key={split_key}"
         ),
     )
     art.assert_invariants()

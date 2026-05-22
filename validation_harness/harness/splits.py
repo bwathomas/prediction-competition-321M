@@ -2,15 +2,29 @@
 
 The official competition is item cold-start (NOT subject cold-start), so:
   - validation subjects MUST also appear in training
-  - validation item-variants MUST NOT appear in training
-  - same upstream item under different normalized conditions counts as
-    different item-variants
+  - validation items MUST NOT appear in training
+  - "same item" is judged by upstream content, NOT by the (condition,
+    content) pair: if the same item_content shows up under two different
+    conditions, the encoder produces near-identical embeddings for both,
+    and a model that has seen one of them at training time has effectively
+    seen the other -- so they MUST land on the same side of the split.
 
-We construct an `item_variant_id`. Per benchmark we detect whether the
-official item_id is already condition-specific (each item_id appears under at
-most one normalized condition); if so we use the official id. Otherwise we
-combine it with a stable hash of (normalized condition, item_content) so a
-condition flip produces a fresh variant.
+We construct two columns:
+
+  * ``item_variant_id`` -- "same item under different conditions = different
+    variants". Used by the platform for ``data_category`` bucketing and by
+    the rounds harness for adaptive-labeling. Built per-benchmark: if every
+    item_id in the benchmark appears under at most one normalized condition,
+    the variant id is "<benchmark>::<item_id>"; otherwise it is
+    "<benchmark>::<sha1(condition|item_content)>".
+
+  * ``item_split_key`` -- "same item content = same key, regardless of
+    condition". Always "<benchmark>::<sha1(item_content)>". This is the
+    key the splitter uses for the train/val partition so that no
+    item_content ever appears on both sides. Without this, multi-condition
+    benchmarks (ultrafeedback, agentdojo, livecodebench, afrimedqa, ...)
+    leaked ~88% of val items back into train, masking overfitting from
+    val_NLL-based epoch selection.
 """
 
 from __future__ import annotations
@@ -78,6 +92,32 @@ def add_item_variant_id(
     return df
 
 
+def add_item_split_key(
+    df: pd.DataFrame,
+    *,
+    benchmark_col: str = "benchmark",
+    item_content_col: str = "item_content",
+    out_col: str = "item_split_key",
+) -> pd.DataFrame:
+    """Attach ``item_split_key`` = "<benchmark>::<sha1(item_content)>".
+
+    Unlike ``item_variant_id`` this collapses conditions: two rows with the
+    same ``item_content`` always get the same key, regardless of
+    ``condition``. Use this column as the train/val split key so the model
+    cannot have "seen" a val item at training time under a different
+    condition.
+
+    Returns a copy of df with the new column.
+    """
+    df = df.copy()
+    df[out_col] = (
+        df[benchmark_col].astype(str)
+        + "::"
+        + df[item_content_col].astype(str).map(_stable_hash)
+    )
+    return df
+
+
 @dataclass
 class SplitReport:
     """Bookkeeping returned alongside the split DataFrames."""
@@ -99,20 +139,24 @@ def make_item_cold_start_split(
     val_fraction: float = 0.1,
     seed: int = 0,
     holdout_benchmarks: Iterable[str] | None = None,
-    variant_col: str = "item_variant_id",
+    variant_col: str = "item_split_key",
     subject_col: str = "subject_id",
     benchmark_col: str = "benchmark",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, SplitReport]:
-    """Split by item-variant, item cold-start.
+    """Split by item, item cold-start.
 
     Parameters
     ----------
-    df : DataFrame produced by data_loader.load_responses (must contain
-        item_variant_id; if missing, call add_item_variant_id first).
-    val_fraction : fraction of item-variants to put in validation.
+    df : DataFrame produced by data_loader.load_responses. Must contain the
+        column named by ``variant_col``. The default is ``item_split_key``
+        (content-only; call ``add_item_split_key`` first); pass
+        ``variant_col="item_variant_id"`` to opt back into the legacy
+        condition-aware split, but be aware that this leaks multi-condition
+        benchmarks across train/val.
+    val_fraction : fraction of split keys to put in validation.
     seed : RNG seed.
     holdout_benchmarks : optional set of benchmark names to fully hold out
-        ("stricter held-out benchmark" stress mode). Variants from these
+        ("stricter held-out benchmark" stress mode). Items from these
         benchmarks go entirely to validation; the remaining benchmarks are
         split by `val_fraction` as usual. Subjects in held-out benchmarks
         still must appear in training somewhere (any benchmark).
@@ -128,9 +172,21 @@ def make_item_cold_start_split(
     main score.
     """
     if variant_col not in df.columns:
-        raise KeyError(
-            f"{variant_col!r} not in df. Call add_item_variant_id() first."
-        )
+        if variant_col == "item_split_key" and "item_content" in df.columns:
+            df = add_item_split_key(df)
+        elif variant_col == "item_variant_id" and {
+            "benchmark",
+            "item_id",
+            "condition",
+            "item_content",
+        }.issubset(df.columns):
+            df = add_item_variant_id(df)
+        else:
+            raise KeyError(
+                f"{variant_col!r} not in df. "
+                "Call add_item_split_key() (recommended) or "
+                "add_item_variant_id() (legacy) first."
+            )
 
     rng = np.random.default_rng(seed)
     holdout_benchmarks = tuple(holdout_benchmarks or ())

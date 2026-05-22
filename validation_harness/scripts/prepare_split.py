@@ -26,7 +26,11 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 from harness.data_loader import add_data_category, load_responses  # noqa: E402
-from harness.splits import add_item_variant_id, make_item_cold_start_split  # noqa: E402
+from harness.splits import (  # noqa: E402
+    add_item_split_key,
+    add_item_variant_id,
+    make_item_cold_start_split,
+)
 
 
 def main() -> None:
@@ -68,6 +72,17 @@ def main() -> None:
         default=0,
         help="Seed for the random data_category hash (independent of --seed).",
     )
+    ap.add_argument(
+        "--split-by",
+        default="item_split_key",
+        choices=["item_split_key", "item_variant_id"],
+        help="Column used to partition train vs. val. Default "
+             "'item_split_key' is content-only and produces a true item "
+             "cold-start split. 'item_variant_id' is the legacy "
+             "condition-aware variant key; with multi-condition benchmarks "
+             "it leaks ~88%% of val item content back into train, so "
+             "val_NLL stops being a faithful epoch-selection signal.",
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -83,6 +98,10 @@ def main() -> None:
     df = add_item_variant_id(df)
     print(f"  {df['item_variant_id'].nunique():,} unique item variants")
 
+    print("Computing item_split_key (content-only) ...", flush=True)
+    df = add_item_split_key(df)
+    print(f"  {df['item_split_key'].nunique():,} unique item split keys")
+
     print(f"Assigning data_category (mode={args.data_category_mode!r}) ...", flush=True)
     df = add_data_category(
         df,
@@ -95,14 +114,24 @@ def main() -> None:
           f"variants per category: min={cat_counts.min():,} max={cat_counts.max():,} "
           f"mean={cat_counts.mean():,.0f}")
 
-    print("Splitting (item cold-start) ...", flush=True)
+    print(f"Splitting (item cold-start, split_by={args.split_by!r}) ...", flush=True)
     train_df, val_df, val_unseen_df, report = make_item_cold_start_split(
         df,
         val_fraction=args.val_fraction,
         seed=args.seed,
         holdout_benchmarks=args.holdout_benchmark or None,
+        variant_col=args.split_by,
     )
-    assert report.n_overlap_variants == 0, "BUG: train/val variant overlap"
+    assert report.n_overlap_variants == 0, "BUG: train/val split-key overlap"
+
+    train_items = set(train_df["item_content"].astype(str))
+    val_items = set(val_df["item_content"].astype(str))
+    content_overlap = len(train_items & val_items)
+    print(
+        f"  item_content leakage: {content_overlap:,} / {len(val_items):,} "
+        f"val items also appear in train "
+        f"({content_overlap / max(len(val_items), 1):.2%})"
+    )
 
     print(f"  train rows: {report.n_train_rows:,} (variants: {report.n_train_variants:,})")
     print(f"  val   rows: {report.n_val_rows:,} (variants: {report.n_val_variants:,})")
@@ -126,6 +155,8 @@ def main() -> None:
         "data_category_mode": args.data_category_mode,
         "n_categories": args.n_categories,
         "category_seed": args.category_seed,
+        "split_by": args.split_by,
+        "n_val_items_leaked_to_train": content_overlap,
     }
     (args.out_dir / "split_report.json").write_text(json.dumps(report_dict, indent=2))
     print(f"\nWrote:\n  {train_path}\n  {val_path}\n  {val_unseen_path}\n  "
