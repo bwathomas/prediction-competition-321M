@@ -1162,7 +1162,7 @@ def run(
     model_cfg_dict = asdict(model_cfg)
 
     head_model = build_model(
-        base_model_name or "kfactor_irt_item_gated_mlp", model_cfg
+        base_model_name or "hierarchical_mirt", model_cfg
     )
     missing, unexpected = head_model.load_state_dict(
         base_ckpt["model_state"], strict=False

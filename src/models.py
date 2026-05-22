@@ -1226,6 +1226,314 @@ class HybridIRTItemKFactorGatedMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Hierarchical MIRT (scalar IRT inductive bias + zero-init multi-dim MIRT
+# residual + gated MLP). New variant; see scripts/_sim_cold_start_hierarchical.py
+# for the design rationale and ablation results.
+# ---------------------------------------------------------------------------
+
+
+def _residual_feature_dim_hierarchical_mirt(cfg: ModelConfig) -> int:
+    """Width of the residual-MLP input for the hierarchical-MIRT variant.
+
+    Exposes the scalar-IRT components (theta, beta_i, alpha_i) and the
+    multi-dim MIRT components (theta_vec, alpha_vec, theta_vec * alpha_vec,
+    raw dot scalar) so the residual MLP can correct anything the structured
+    channels miss. ``cfg.k`` is reused as the MIRT dimension d.
+    """
+    d = max(1, int(cfg.k))
+    base = (
+        cfg.item_embed_dim
+        + 3                              # theta, beta_i, alpha_i scalars
+        + d                              # theta_vec
+        + d                              # alpha_vec
+        + d                              # theta_vec * alpha_vec
+        + 1                              # raw MIRT dot scalar
+    )
+    if cfg.use_subject_embed_features:
+        base += cfg.subject_embed_dim
+    if cfg.use_pool_features:
+        base += cfg.effective_pool_dim
+    if cfg.has_cluster_embedding:
+        base += cfg.cluster_embed_dim
+    if cfg.use_judge_features:
+        base += cfg.effective_judge_dim
+    if cfg.use_nn_features:
+        base += cfg.effective_nn_dim
+    return base
+
+
+def _build_residual_features_hierarchical_mirt(
+    cfg: ModelConfig,
+    *,
+    theta: torch.Tensor,
+    beta_i: torch.Tensor,
+    alpha_i: torch.Tensor,
+    theta_vec: torch.Tensor,
+    alpha_vec: torch.Tensor,
+    raw_mirt: torch.Tensor,
+    item_emb: torch.Tensor,
+    subject_emb: torch.Tensor | None,
+    pool_z: torch.Tensor | None,
+    cluster_emb: torch.Tensor | None,
+    judge_feats: torch.Tensor | None = None,
+    nn_feats: torch.Tensor | None = None,
+) -> torch.Tensor:
+    parts = [
+        item_emb,
+        theta.unsqueeze(-1),
+        beta_i.unsqueeze(-1),
+        alpha_i.unsqueeze(-1),
+        theta_vec,
+        alpha_vec,
+        theta_vec * alpha_vec,
+        raw_mirt.unsqueeze(-1),
+    ]
+    if cfg.use_subject_embed_features and subject_emb is not None:
+        parts.append(subject_emb)
+    _maybe_append(
+        parts,
+        cfg,
+        pool_z=pool_z,
+        cluster_emb=cluster_emb,
+        judge_feats=judge_feats,
+        nn_feats=nn_feats,
+    )
+    return torch.cat(parts, dim=-1)
+
+
+class HierarchicalMIRT(nn.Module):
+    """Hierarchical MIRT head: scalar IRT prior + zero-init multi-dim residual.
+
+    The final logit is:
+
+        logit = mu
+              + beta_bc
+              + alpha_i(emb) * (theta_s - beta_i(emb))     # scalar 2PL
+              + < alpha_vec(emb), theta_vec[s] >            # MIRT-d (zero at init)
+              + lambda_resid * gated_residual(F)            # gated MLP correction
+
+    Init recipe (the whole reason this exists):
+
+      * ``theta_s`` zero, ``alpha_i`` softplus pre-biased to start near 1.0
+        (reuses :class:`ItemIRTHeads`), so the scalar-IRT channel is the
+        active learner from step 0.
+      * The output layer of ``alpha_vec_head`` is zero-initialized so the
+        multi-dim contribution is exactly 0 at step 0 and grows only as
+        gradients flow.  ``theta_vec`` carries small N(0, 0.05) noise so
+        the gradient is non-degenerate from step 1.
+      * The gated MLP residual has zero-initialized output (matches the
+        rest of the family) and is scaled by a small ``lambda_resid``.
+
+    The point: classical 2PL inductive bias when data is scarce (the cold-
+    start regime), with the multi-dim MIRT and the residual MLP picking
+    up structure that the scalar prior misses as data accumulates.
+    Simulation results in ``scripts/_sim_cold_start_hierarchical.py``
+    confirmed roughly +0.07 nats over the shipped hybrid at d=16 in the
+    small-data cold-start regime, tying or matching plain MIRT_MLP in
+    higher-data regimes.
+
+    ``cfg.k`` is reused as the MIRT dimension ``d``; the existing notebook
+    plumbing that passes ``k`` through to ``ModelConfig`` works unchanged.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.mu = nn.Parameter(torch.zeros(1))
+        self.theta = nn.Embedding(cfg.n_subjects, 1)          # scalar ability
+        self.beta = nn.Embedding(cfg.n_benchmark_conditions, 1)
+        nn.init.zeros_(self.theta.weight)
+        nn.init.zeros_(self.beta.weight)
+
+        # Scalar IRT channel (2PL): predicts (beta_i, alpha_i>0) from the
+        # item embedding.  Reuses the existing ItemIRTHeads so checkpoints
+        # share the same head layout the older IRT variants use.
+        self.irt_heads = ItemIRTHeads(
+            item_dim=cfg.item_embed_dim,
+            hidden=cfg.item_map_hidden_dim,
+            dropout=cfg.dropout,
+        )
+        # Match the hierarchical-MIRT simulation: the scalar difficulty head
+        # starts at exactly zero so the model begins as mu + beta_bc, then
+        # learns the 2PL channel before the zero-init MIRT residual grows in.
+        # Reusing ItemIRTHeads without this would leave random beta_i logits
+        # active at step 0, which breaks the intended inductive bias.
+        nn.init.zeros_(self.irt_heads.beta_head[-1].weight)
+        nn.init.zeros_(self.irt_heads.beta_head[-1].bias)
+
+        # MIRT-d residual channel (multi-dim discrimination + subject vector).
+        d = max(1, int(cfg.k))
+        self.theta_vec = nn.Embedding(cfg.n_subjects, d)
+        nn.init.normal_(self.theta_vec.weight, std=0.05)
+
+        # alpha_vec_head: LN -> Linear -> GELU -> Dropout -> Linear[hidden -> d].
+        # Output layer is zero-initialized; this is the critical bit that
+        # makes the multi-dim contribution start at exactly 0.
+        self.alpha_vec_head = nn.Sequential(
+            nn.LayerNorm(cfg.item_embed_dim),
+            nn.Linear(cfg.item_embed_dim, cfg.item_map_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.item_map_hidden_dim, d),
+        )
+        nn.init.zeros_(self.alpha_vec_head[-1].weight)
+        nn.init.zeros_(self.alpha_vec_head[-1].bias)
+
+        in_dim = _residual_feature_dim_hierarchical_mirt(cfg)
+        self.residual = GatedSwiGLUResidual(
+            in_dim=in_dim,
+            hidden=cfg.residual_hidden_dim,
+            dropout=cfg.dropout,
+        )
+        self.lambda_resid = nn.Parameter(
+            torch.tensor(float(cfg.lambda_resid_init)),
+            requires_grad=bool(cfg.lambda_resid_trainable),
+        )
+
+        self.cluster_embedding: nn.Embedding | None = None
+        if cfg.has_cluster_embedding:
+            self.cluster_embedding = nn.Embedding(
+                cfg.n_clusters + 1, cfg.cluster_embed_dim, padding_idx=0
+            )
+            nn.init.normal_(self.cluster_embedding.weight, std=0.05)
+
+    @property
+    def has_residual(self) -> bool:
+        return True
+
+    @property
+    def has_irt_heads(self) -> bool:
+        return True
+
+    @property
+    def has_judge_features(self) -> bool:
+        return bool(self.cfg.use_judge_features and self.cfg.effective_judge_dim > 0)
+
+    @property
+    def has_nn_features(self) -> bool:
+        return bool(self.cfg.use_nn_features and self.cfg.effective_nn_dim > 0)
+
+    def _cluster_emb(self, cluster_ids: torch.Tensor | None) -> torch.Tensor | None:
+        if self.cluster_embedding is None or cluster_ids is None:
+            return None
+        if cluster_ids.numel() == 0 or cluster_ids.dim() < 1:
+            return None
+        return self.cluster_embedding(cluster_ids.long())
+
+    def _components(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        theta = self.theta(subject_idx).squeeze(-1)
+        bc_off = self.beta(bc_idx).squeeze(-1)
+        beta_i, alpha_i = self.irt_heads(item_emb)
+        theta_vec = self.theta_vec(subject_idx)
+        alpha_vec = self.alpha_vec_head(item_emb)
+        raw_mirt = (theta_vec * alpha_vec).sum(dim=-1)
+        c_irt = alpha_i * (theta - beta_i)
+        c_offset = bc_off + self.mu
+        c_mirt = raw_mirt
+        return {
+            "theta": theta,
+            "beta_i": beta_i,
+            "alpha_i": alpha_i,
+            "theta_vec": theta_vec,
+            "alpha_vec": alpha_vec,
+            "raw_mirt": raw_mirt,
+            "irt": c_irt,
+            "offset": c_offset,
+            "mirt": c_mirt,
+        }
+
+    def forward(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+        subject_emb: torch.Tensor | None = None,
+        pool_feats: torch.Tensor | None = None,
+        cluster_ids: torch.Tensor | None = None,
+        judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
+        *,
+        override_alpha: torch.Tensor | None = None,
+        override_beta: torch.Tensor | None = None,
+        override_mlp_zero: bool = False,
+        force_judge_zero: bool = False,
+        force_nn_zero: bool = False,
+    ) -> torch.Tensor:
+        comps = self._components(subject_idx, bc_idx, item_emb)
+        alpha_i = override_alpha if override_alpha is not None else comps["alpha_i"]
+        beta_i = override_beta if override_beta is not None else comps["beta_i"]
+        c_irt = alpha_i * (comps["theta"] - beta_i)
+        c_offset = comps["offset"]
+        c_mirt = comps["mirt"]
+        if override_mlp_zero:
+            return c_irt + c_offset + c_mirt
+        jf = _maybe_zero_judge(self.cfg, judge_feats, force_judge_zero=force_judge_zero)
+        nf = _maybe_zero_nn(self.cfg, nn_feats, force_nn_zero=force_nn_zero)
+        cluster_emb = self._cluster_emb(cluster_ids)
+        x = _build_residual_features_hierarchical_mirt(
+            self.cfg,
+            theta=comps["theta"],
+            beta_i=comps["beta_i"],
+            alpha_i=comps["alpha_i"],
+            theta_vec=comps["theta_vec"],
+            alpha_vec=comps["alpha_vec"],
+            raw_mirt=comps["raw_mirt"],
+            item_emb=item_emb,
+            subject_emb=subject_emb,
+            pool_z=pool_feats,
+            cluster_emb=cluster_emb,
+            judge_feats=jf,
+            nn_feats=nf,
+        )
+        r = self.lambda_resid * self.residual(x)
+        return c_irt + c_offset + c_mirt + r
+
+    def decompose(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+        subject_emb: torch.Tensor | None = None,
+        pool_feats: torch.Tensor | None = None,
+        cluster_ids: torch.Tensor | None = None,
+        judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        comps = self._components(subject_idx, bc_idx, item_emb)
+        cluster_emb = self._cluster_emb(cluster_ids)
+        x = _build_residual_features_hierarchical_mirt(
+            self.cfg,
+            theta=comps["theta"],
+            beta_i=comps["beta_i"],
+            alpha_i=comps["alpha_i"],
+            theta_vec=comps["theta_vec"],
+            alpha_vec=comps["alpha_vec"],
+            raw_mirt=comps["raw_mirt"],
+            item_emb=item_emb,
+            subject_emb=subject_emb,
+            pool_z=pool_feats,
+            cluster_emb=cluster_emb,
+            judge_feats=judge_feats,
+            nn_feats=nn_feats,
+        )
+        r = self.lambda_resid * self.residual(x)
+        return {
+            "irt": comps["irt"],
+            "offset": comps["offset"],
+            "mirt": comps["mirt"],
+            "mlp": r,
+            "theta": comps["theta"],
+            "beta_i": comps["beta_i"],
+            "alpha_i": comps["alpha_i"],
+        }
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1238,6 +1546,7 @@ MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "kfactor_irt_item_mlp": IRTItemKFactorMLP,
     "kfactor_irt_item_gated_mlp": IRTItemKFactorGatedMLP,
     "hybrid_irt_kfactor_gated_mlp": HybridIRTItemKFactorGatedMLP,
+    "hierarchical_mirt": HierarchicalMIRT,
 }
 
 
@@ -1440,6 +1749,7 @@ class LookupDataset(torch.utils.data.Dataset):
 __all__ = [
     "DenseMLPResidual",
     "GatedSwiGLUResidual",
+    "HierarchicalMIRT",
     "HybridIRTItemKFactorGatedMLP",
     "IRTItemKFactor",
     "IRTItemKFactorGatedMLP",
