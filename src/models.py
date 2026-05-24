@@ -83,6 +83,25 @@ class ModelConfig:
     n_benchmark_conditions: int = 1      # populated at fit time
     use_subject_text_embedding: bool = False
     subject_embed_dim: int = 0
+    # --- Pattern-2 subject-text -> subject-id soft tying ---
+    # When ``use_subject_tie`` is on AND a raw subject text embedding is
+    # available (``use_subject_text_embedding`` + ``subject_embed_dim > 0``),
+    # we project the raw text embedding through a learned LayerNorm+Linear
+    # into ``subject_proj_dim`` channels and (a) feed the *projected* vector
+    # into the residual MLP in place of the raw text embedding and (b) tie
+    # the projected text embedding to the model's k-dim subject id embedding
+    # (``self.u`` for KFactor-family models, ``self.theta_vec`` for the
+    # hierarchical-MIRT variant). The trainer adds
+    # ``lambda_tie * MSE(id_emb, proj_text)`` to the BCE loss; the per-step
+    # contribution is computed by :func:`compute_subject_tie_loss`.
+    #
+    # Backward compat: when ``use_subject_tie=False`` (the default) the
+    # residual-input width and weight layout are bit-identical to the
+    # pre-Pattern-2 code path -- so existing checkpoints load unchanged.
+    use_subject_tie: bool = False
+    subject_proj_dim: int = 0
+    lambda_tie: float = 0.0
+    tie_direction: str = "id_toward_text"
     lambda_resid_init: float = 0.1
     lambda_resid_trainable: bool = True
 
@@ -148,6 +167,30 @@ class ModelConfig:
     @property
     def use_subject_embed_features(self) -> bool:
         return bool(self.use_subject_text_embedding and self.subject_embed_dim > 0)
+
+    @property
+    def use_pattern2_subject_tie(self) -> bool:
+        """Pattern-2 is *on* iff text embeddings are present AND a tie is requested."""
+        return bool(
+            self.use_subject_embed_features
+            and self.use_subject_tie
+            and int(self.subject_proj_dim) > 0
+        )
+
+    @property
+    def effective_subject_feature_dim(self) -> int:
+        """Width of the subject-side feature actually appended to the residual MLP.
+
+        - Pattern 2 ON   -> low-dim projected embedding (``subject_proj_dim``).
+        - Pattern 2 OFF  -> raw text embedding (``subject_embed_dim``) [legacy].
+        - Subject text   -> 0 when no subject text embedding is configured.
+          embedding OFF
+        """
+        if not self.use_subject_embed_features:
+            return 0
+        if self.use_pattern2_subject_tie:
+            return int(self.subject_proj_dim)
+        return int(self.subject_embed_dim)
 
     @property
     def effective_pool_dim(self) -> int:
@@ -251,6 +294,151 @@ class ItemIRTHeads(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Pattern-2 subject-text projector + tying helpers
+#
+# The projector turns a raw subject text embedding (``subject_embed_dim`` dims,
+# typically 1024-8192 depending on the encoder) into a low-dim vector aligned
+# with the model's k-dim subject id embedding. The same projection is used for
+# (a) feeding the residual MLP a cheap subject-text channel and (b) the soft
+# tying loss that pulls the id embedding toward the (semantically grounded)
+# text-derived embedding -- the marginal generalization across subjects this
+# is meant to buy us comes from forcing the id table to inherit some of the
+# text-derived structure rather than learning a free embedding per subject.
+# ---------------------------------------------------------------------------
+
+
+class SubjectTextProjector(nn.Module):
+    """LayerNorm -> Linear projection from ``in_dim`` to ``out_dim``.
+
+    Two-layer projector was tried in early prototyping and it overfit the
+    sparse subject space; a single linear with LN is enough to align the
+    geometry, and the soft tying loss keeps the id table close to the
+    projected text geometry without collapsing it.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        if int(in_dim) <= 0 or int(out_dim) <= 0:
+            raise ValueError(
+                f"SubjectTextProjector: in_dim={in_dim} and out_dim={out_dim} "
+                "must both be positive."
+            )
+        self.norm = nn.LayerNorm(int(in_dim))
+        self.proj = nn.Linear(int(in_dim), int(out_dim))
+        # Kaiming-ish small init; the tying loss does the rest of the work.
+        nn.init.normal_(self.proj.weight, std=0.02)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, subject_emb: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.norm(subject_emb))
+
+
+def _register_subject_text_proj(model: nn.Module, cfg: ModelConfig) -> None:
+    """Attach (or skip) ``self.subject_text_proj`` based on ``cfg``.
+
+    Idempotent: callers should call this exactly once from each top-level
+    model's ``__init__``. Subclasses inherit the attribute through normal
+    Python attribute lookup so we don't need to call it again.
+    """
+    if cfg.use_pattern2_subject_tie:
+        model.subject_text_proj = SubjectTextProjector(
+            in_dim=int(cfg.subject_embed_dim),
+            out_dim=int(cfg.subject_proj_dim),
+        )
+    else:
+        # Always set the attribute (``None`` sentinel) so downstream
+        # ``getattr(model, "subject_text_proj", None)`` is unambiguous.
+        model.subject_text_proj = None
+
+
+def _maybe_project_subject_emb(
+    model: nn.Module, subject_emb: torch.Tensor | None
+) -> torch.Tensor | None:
+    """Return projected subject emb when Pattern-2 is active, else passthrough."""
+    proj = getattr(model, "subject_text_proj", None)
+    if proj is None or subject_emb is None or subject_emb.shape[-1] == 0:
+        return subject_emb
+    return proj(subject_emb)
+
+
+def _subject_id_embedding_table(model: nn.Module) -> nn.Embedding | None:
+    """Pick the k-dim subject-id embedding table to tie against.
+
+    KFactor-family models use ``self.u``; HierarchicalMIRT uses
+    ``self.theta_vec``. Models without a multi-dim subject table (the
+    scalar-only IRT variants) return ``None`` -- there is nothing to tie.
+    """
+    for name in ("u", "theta_vec"):
+        table = getattr(model, name, None)
+        if isinstance(table, nn.Embedding) and table.embedding_dim > 0:
+            return table
+    return None
+
+
+def compute_subject_tie_loss(
+    model: nn.Module,
+    subject_idx: torch.Tensor,
+    subject_emb: torch.Tensor | None,
+) -> torch.Tensor:
+    """Pattern-2 soft tying loss: ``MSE(subject_id_emb, proj(text_emb))``.
+
+    Returns a zero scalar when tying is disabled, the projector is not
+    registered, or the model has no multi-dim subject id embedding (e.g.
+    the scalar-only IRT variants). The trainer multiplies this by
+    ``cfg.lambda_tie`` before adding it to the BCE loss.
+
+    ``tie_direction``:
+        * ``"id_toward_text"`` (default): gradient flows into ``id_emb``
+          only; text projection is detached. Use this when you trust the
+          text encoder more than the id table (the usual case for sparse
+          subjects).
+        * ``"text_toward_id"``: gradient flows into the projector only.
+        * ``"both"`` / ``"bidirectional"``: gradient flows both ways.
+    """
+    cfg: ModelConfig = model.cfg
+    proj = getattr(model, "subject_text_proj", None)
+    if (
+        proj is None
+        or subject_emb is None
+        or subject_emb.shape[-1] == 0
+        or not bool(cfg.use_subject_tie)
+    ):
+        return torch.zeros(
+            (), device=subject_idx.device, dtype=torch.float32
+        )
+
+    id_table = _subject_id_embedding_table(model)
+    if id_table is None:
+        return torch.zeros(
+            (), device=subject_idx.device, dtype=torch.float32
+        )
+
+    id_emb = id_table(subject_idx)
+    proj_text = proj(subject_emb)
+
+    if id_emb.shape[-1] != proj_text.shape[-1]:
+        raise ValueError(
+            "compute_subject_tie_loss: subject id-emb dim "
+            f"{id_emb.shape[-1]} != projected text dim {proj_text.shape[-1]}. "
+            "Set ModelConfig.subject_proj_dim == k for KFactor-family models "
+            "(or == k for HierarchicalMIRT)."
+        )
+
+    direction = (cfg.tie_direction or "id_toward_text").lower()
+    if direction == "id_toward_text":
+        return F.mse_loss(id_emb, proj_text.detach())
+    if direction == "text_toward_id":
+        return F.mse_loss(proj_text, id_emb.detach())
+    if direction in {"both", "bidirectional", "sym", "symmetric"}:
+        return F.mse_loss(id_emb, proj_text)
+    raise ValueError(
+        "compute_subject_tie_loss: unknown tie_direction "
+        f"{cfg.tie_direction!r}; expected one of "
+        "'id_toward_text', 'text_toward_id', 'both'."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Residual-feature builder (used by both KFactor* and IRTItemKFactor* MLP
 # residuals)
 # ---------------------------------------------------------------------------
@@ -266,7 +454,7 @@ def _residual_feature_dim_kfactor(cfg: ModelConfig) -> int:
         + 1                              # beta_bc scalar
     )
     if cfg.use_subject_embed_features:
-        base += cfg.subject_embed_dim
+        base += cfg.effective_subject_feature_dim
     if cfg.use_pool_features:
         base += cfg.effective_pool_dim
     if cfg.has_cluster_embedding:
@@ -292,7 +480,7 @@ def _residual_feature_dim_irt_item(cfg: ModelConfig) -> int:
         + 3                              # theta, beta_i, alpha_i scalars
     )
     if cfg.use_subject_embed_features:
-        base += cfg.subject_embed_dim
+        base += cfg.effective_subject_feature_dim
     if cfg.use_pool_features:
         base += cfg.effective_pool_dim
     if cfg.has_cluster_embedding:
@@ -405,7 +593,7 @@ def _residual_feature_dim_hybrid_irt_kfactor(cfg: ModelConfig) -> int:
         + 1                              # raw factor interaction scalar
     )
     if cfg.use_subject_embed_features:
-        base += cfg.subject_embed_dim
+        base += cfg.effective_subject_feature_dim
     if cfg.use_pool_features:
         base += cfg.effective_pool_dim
     if cfg.has_cluster_embedding:
@@ -522,6 +710,7 @@ class KFactorModel(nn.Module):
                 padding_idx=0,
             )
             nn.init.normal_(self.cluster_embedding.weight, std=0.05)
+        _register_subject_text_proj(self, cfg)
 
     @property
     def has_residual(self) -> bool:
@@ -696,6 +885,7 @@ class _ResidualKFactor(KFactorModel):
         judge_feats: torch.Tensor | None,
         nn_feats: torch.Tensor | None,
     ) -> torch.Tensor:
+        subject_emb = _maybe_project_subject_emb(self, subject_emb)
         cluster_emb = self._cluster_emb(cluster_ids)
         return _build_residual_features_kfactor(
             self.cfg,
@@ -808,6 +998,7 @@ class IRTItemKFactor(nn.Module):
                 cfg.n_clusters + 1, cfg.cluster_embed_dim, padding_idx=0
             )
             nn.init.normal_(self.cluster_embedding.weight, std=0.05)
+        _register_subject_text_proj(self, cfg)
 
     @property
     def has_residual(self) -> bool:
@@ -930,6 +1121,7 @@ class _ResidualIRTItem(IRTItemKFactor):
         judge_feats: torch.Tensor | None,
         nn_feats: torch.Tensor | None,
     ) -> torch.Tensor:
+        subject_emb = _maybe_project_subject_emb(self, subject_emb)
         cluster_emb = self._cluster_emb(cluster_ids)
         return _build_residual_features_irt(
             self.cfg,
@@ -1087,6 +1279,7 @@ class HybridIRTItemKFactorGatedMLP(nn.Module):
                 cfg.n_clusters + 1, cfg.cluster_embed_dim, padding_idx=0
             )
             nn.init.normal_(self.cluster_embedding.weight, std=0.05)
+        _register_subject_text_proj(self, cfg)
 
     @property
     def has_residual(self) -> bool:
@@ -1166,6 +1359,7 @@ class HybridIRTItemKFactorGatedMLP(nn.Module):
             return c_irt + c_offset + c_factor
         jf = _maybe_zero_judge(self.cfg, judge_feats, force_judge_zero=force_judge_zero)
         nf = _maybe_zero_nn(self.cfg, nn_feats, force_nn_zero=force_nn_zero)
+        subject_emb = _maybe_project_subject_emb(self, subject_emb)
         cluster_emb = self._cluster_emb(cluster_ids)
         x = _build_residual_features_hybrid_irt_kfactor(
             self.cfg,
@@ -1197,6 +1391,7 @@ class HybridIRTItemKFactorGatedMLP(nn.Module):
         nn_feats: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         comps = self._components(subject_idx, bc_idx, item_emb)
+        subject_emb = _maybe_project_subject_emb(self, subject_emb)
         cluster_emb = self._cluster_emb(cluster_ids)
         x = _build_residual_features_hybrid_irt_kfactor(
             self.cfg,
@@ -1250,7 +1445,7 @@ def _residual_feature_dim_hierarchical_mirt(cfg: ModelConfig) -> int:
         + 1                              # raw MIRT dot scalar
     )
     if cfg.use_subject_embed_features:
-        base += cfg.subject_embed_dim
+        base += cfg.effective_subject_feature_dim
     if cfg.use_pool_features:
         base += cfg.effective_pool_dim
     if cfg.has_cluster_embedding:
@@ -1396,6 +1591,7 @@ class HierarchicalMIRT(nn.Module):
                 cfg.n_clusters + 1, cfg.cluster_embed_dim, padding_idx=0
             )
             nn.init.normal_(self.cluster_embedding.weight, std=0.05)
+        _register_subject_text_proj(self, cfg)
 
     @property
     def has_residual(self) -> bool:
@@ -1474,6 +1670,7 @@ class HierarchicalMIRT(nn.Module):
             return c_irt + c_offset + c_mirt
         jf = _maybe_zero_judge(self.cfg, judge_feats, force_judge_zero=force_judge_zero)
         nf = _maybe_zero_nn(self.cfg, nn_feats, force_nn_zero=force_nn_zero)
+        subject_emb = _maybe_project_subject_emb(self, subject_emb)
         cluster_emb = self._cluster_emb(cluster_ids)
         x = _build_residual_features_hierarchical_mirt(
             self.cfg,
@@ -1505,6 +1702,7 @@ class HierarchicalMIRT(nn.Module):
         nn_feats: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         comps = self._components(subject_idx, bc_idx, item_emb)
+        subject_emb = _maybe_project_subject_emb(self, subject_emb)
         cluster_emb = self._cluster_emb(cluster_ids)
         x = _build_residual_features_hierarchical_mirt(
             self.cfg,
@@ -1763,7 +1961,9 @@ __all__ = [
     "LookupDataset",
     "MODEL_REGISTRY",
     "ModelConfig",
+    "SubjectTextProjector",
     "build_model",
+    "compute_subject_tie_loss",
     "irt_regularization",
     "model_has_irt_heads",
 ]

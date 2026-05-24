@@ -46,6 +46,7 @@ from .models import (
     LookupDataset,
     ModelConfig,
     build_model,
+    compute_subject_tie_loss,
     irt_regularization,
     model_has_irt_heads,
 )
@@ -710,6 +711,18 @@ def train_one(
                         lambda_beta=float(model_cfg.irt_lambda_beta),
                         lambda_alpha=float(model_cfg.irt_lambda_alpha),
                     )
+
+                # Pattern-2 subject-text -> subject-id soft tying. Active
+                # only when the model registered a SubjectTextProjector
+                # (``cfg.use_subject_tie`` + ``cfg.subject_proj_dim > 0``
+                # + a subject text emb channel) AND lambda_tie != 0. The
+                # helper returns a zero scalar (no graph) when any of
+                # those conditions are missing, so legacy configs see no
+                # behavioral change.
+                lambda_tie = float(getattr(model_cfg, "lambda_tie", 0.0) or 0.0)
+                if lambda_tie != 0.0 and se is not None:
+                    tie_loss = compute_subject_tie_loss(model, s, se)
+                    loss = loss + lambda_tie * tie_loss
 
             loss.backward()
 
