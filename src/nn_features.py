@@ -34,7 +34,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -725,6 +725,116 @@ def compute_nn_features(
     )
 
 
+def compute_nn_features_streaming(
+    *,
+    query_item_keys: list[str],
+    item_emb_lookup: Mapping[str, np.ndarray],
+    subject_ids: np.ndarray,
+    nn_index: TrainingNNIndex,
+    passrate_csr,
+    passrate_mask_csr,
+    cfg: NNFeaturesConfig,
+    exclude_self: bool | None = None,
+    query_chunk_size: int = 4096,
+) -> np.ndarray:
+    """Memory-bounded equivalent of :func:`compute_nn_features`.
+
+    Produces a bit-identical ``[B, NN_FEATURE_DIM]`` matrix to
+    ``compute_nn_features`` but never materializes the full ``[B, D]``
+    query embedding matrix. Instead:
+
+    1. Dedupes by ``query_item_keys`` (neighbor structure is a function
+       of the query item embedding alone, not the subject id).
+    2. Stacks unique embeddings *one chunk at a time* from
+       ``item_emb_lookup`` and feeds the chunk to ``nn_index.nearest``.
+       Peak working set: ``query_chunk_size * D * 4`` bytes plus the
+       per-unique cached neighbor arrays (``Nu * k * 12`` bytes total).
+    3. Expands neighbor indices / similarities back to per-row before
+       the per-(subject, neighbor) passrate lookup.
+
+    This is what enables Qwen3-Embedding-8B (D=4096) NN feature
+    computation on a 12 GB Colab without OOM: the original
+    ``compute_nn_features`` path peaks at ~3x the
+    ``[B, D]`` matrix (one for the user-supplied stack, one for the
+    cosine-normalized copy, one transient ``np.ascontiguousarray``
+    copy), which crosses ~14 GB for B=300k, D=4096.
+
+    Args:
+        query_item_keys: per-row item keys (length B); duplicates expected.
+        item_emb_lookup: maps item_key -> 1D float array of length D. Only
+            the keys that actually appear in ``query_item_keys`` are
+            looked up.
+        subject_ids: per-row subject indices (length B).
+        nn_index: pre-built training nearest-neighbor index.
+        passrate_csr / passrate_mask_csr: sparse [n_subjects, n_items]
+            matrices over the training index.
+        cfg: same ``NNFeaturesConfig`` used to build ``nn_index``.
+        exclude_self: forwarded to ``nn_index.nearest``. ``None`` means
+            ``cfg.exclude_self_in_training``.
+        query_chunk_size: number of unique queries per ``nn_index.nearest``
+            call. Lowered values reduce peak RAM at modest runtime cost.
+
+    Returns:
+        ``np.ndarray`` of shape ``[B, NN_FEATURE_DIM]`` (float32).
+    """
+    if exclude_self is None:
+        exclude_self = bool(cfg.exclude_self_in_training)
+    k = int(cfg.k)
+    chunk = max(1, int(query_chunk_size))
+
+    keys_arr = np.asarray([str(x) for x in query_item_keys])
+    sids = np.asarray(subject_ids, dtype=np.int64).reshape(-1)
+    if sids.shape[0] != keys_arr.shape[0]:
+        raise ValueError(
+            f"query_item_keys length {keys_arr.shape[0]} != subject_ids length {sids.shape[0]}"
+        )
+
+    unique_keys, inverse = np.unique(keys_arr, return_inverse=True)
+    Nu = int(unique_keys.shape[0])
+
+    unique_idx = np.empty((Nu, k), dtype=np.int64)
+    unique_sims = np.empty((Nu, k), dtype=np.float32)
+
+    for s in range(0, Nu, chunk):
+        e = min(s + chunk, Nu)
+        chunk_keys = unique_keys[s:e].tolist()
+        first = item_emb_lookup[chunk_keys[0]]
+        D = int(np.asarray(first, dtype=np.float32).shape[-1])
+        chunk_emb = np.empty((e - s, D), dtype=np.float32)
+        for j, key in enumerate(chunk_keys):
+            v = np.asarray(item_emb_lookup[key], dtype=np.float32)
+            if v.shape != (D,):
+                raise ValueError(
+                    f"embedding for item_key={key!r} has shape {v.shape}; expected {(D,)}"
+                )
+            chunk_emb[j] = v
+        idx_chunk, sims_chunk = nn_index.nearest(
+            chunk_emb,
+            k=k,
+            exclude_self=exclude_self,
+            query_keys=chunk_keys,
+        )
+        unique_idx[s:e] = idx_chunk
+        unique_sims[s:e] = sims_chunk
+        # Drop the per-chunk stacked / normalized copies eagerly so we
+        # don't carry a 4-5 GB peak across iterations.
+        del chunk_emb, idx_chunk, sims_chunk
+
+    neighbor_idx = unique_idx[inverse]      # [B, K]
+    sims = unique_sims[inverse]             # [B, K]
+
+    passrates, masks = _lookup_neighbor_passrates(
+        sids, neighbor_idx, passrate_csr, passrate_mask_csr
+    )
+    return _aggregate_nn_features(
+        passrates,
+        masks,
+        sims,
+        fallback_value=float(cfg.fallback_value),
+        top1_missing_sentinel=float(cfg.top1_missing_sentinel),
+    )
+
+
 __all__ = [
     "NN_FEATURE_DIM",
     "NN_FEATURE_NAMES",
@@ -733,4 +843,5 @@ __all__ = [
     "_aggregate_nn_features",
     "build_passrate_table",
     "compute_nn_features",
+    "compute_nn_features_streaming",
 ]

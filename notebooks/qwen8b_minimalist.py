@@ -391,7 +391,7 @@ from src.nn_features import (
     NNFeaturesConfig,
     TrainingNNIndex,
     build_passrate_table,
-    compute_nn_features,
+    compute_nn_features_streaming,
 )
 
 # Single source of truth for subject_id / bc_id semantics. Reused below
@@ -427,39 +427,47 @@ nn_passrate_csr, nn_passrate_mask_csr = build_passrate_table(
 print(f"Passrate matrix: shape={nn_passrate_csr.shape}  "
       f"nnz={nn_passrate_csr.nnz:,}")
 
+# `compute_nn_features_streaming` dedupes by item_key (neighbor structure
+# is subject-independent) and stacks queries one chunk at a time, so peak
+# RAM stays at ``NN_QUERY_CHUNK * D * 4`` bytes (~67 MB at chunk=4096,
+# D=4096) instead of the ~14 GB the row-by-row np.stack path would peak
+# at on a 12 GB Colab with Qwen3-Embedding-8B.
+NN_QUERY_CHUNK = int(CFG["nn_features"].get("query_chunk_size", 4096))
 
-def _stack_query(rows_df):
+
+def _split_query(rows_df):
     keys = rows_df["item_key"].astype(str).tolist()
-    embs = np.stack([item_emb_lookup[k] for k in keys], axis=0).astype(np.float32)
     sids = np.array(
         [indexer.subject_id(str(s)) for s in rows_df["subject_key"]],
         dtype=np.int64,
     )
-    return embs, keys, sids
+    return keys, sids
 
 
-train_emb, train_keys_for_nn, train_sid = _stack_query(primary.train)
-val_emb, val_keys_for_nn, val_sid = _stack_query(primary.val)
+train_keys_for_nn, train_sid = _split_query(primary.train)
+val_keys_for_nn, val_sid = _split_query(primary.val)
 
-nn_train_mat = compute_nn_features(
-    query_embeds=train_emb,
+nn_train_mat = compute_nn_features_streaming(
     query_item_keys=train_keys_for_nn,
+    item_emb_lookup=item_emb_lookup,
     subject_ids=train_sid,
     nn_index=nn_index,
     passrate_csr=nn_passrate_csr,
     passrate_mask_csr=nn_passrate_mask_csr,
     cfg=nn_cfg,
     exclude_self=True,
+    query_chunk_size=NN_QUERY_CHUNK,
 )
-nn_val_mat = compute_nn_features(
-    query_embeds=val_emb,
+nn_val_mat = compute_nn_features_streaming(
     query_item_keys=val_keys_for_nn,
+    item_emb_lookup=item_emb_lookup,
     subject_ids=val_sid,
     nn_index=nn_index,
     passrate_csr=nn_passrate_csr,
     passrate_mask_csr=nn_passrate_mask_csr,
     cfg=nn_cfg,
     exclude_self=False,
+    query_chunk_size=NN_QUERY_CHUNK,
 )
 print(f"NN feature matrices: train={nn_train_mat.shape}  val={nn_val_mat.shape}")
 
@@ -748,11 +756,30 @@ val_subj_ids_np = np.array(
     [indexer.subject_id(str(s)) for s in primary.val["subject_key"]],
     dtype=np.int64,
 )
-val_neighbor_rows, val_neighbor_sims = nn_index.nearest(
-    val_emb,
-    k=int(CFG["nn_calibration"]["k"]),
-    exclude_self=False,
-)
+
+# Same dedupe + chunked search trick as the NN feature build above:
+# stack per-unique-item embeddings only, in NN_QUERY_CHUNK chunks, then
+# expand back to per-row. Avoids the [N_val, D] peak that would crash
+# the kernel on Qwen3-Embedding-8B.
+val_keys_arr = np.asarray([str(k) for k in primary.val["item_key"]])
+val_unique_keys, val_inverse = np.unique(val_keys_arr, return_inverse=True)
+K_CAL = int(CFG["nn_calibration"]["k"])
+val_uniq_idx = np.empty((len(val_unique_keys), K_CAL), dtype=np.int64)
+val_uniq_sims = np.empty((len(val_unique_keys), K_CAL), dtype=np.float32)
+for _s in range(0, len(val_unique_keys), NN_QUERY_CHUNK):
+    _e = min(_s + NN_QUERY_CHUNK, len(val_unique_keys))
+    _chunk_keys = list(val_unique_keys[_s:_e])
+    _chunk_emb = np.stack(
+        [item_emb_lookup[k] for k in _chunk_keys], axis=0
+    ).astype(np.float32, copy=False)
+    _idx, _sims = nn_index.nearest(
+        _chunk_emb, k=K_CAL, exclude_self=False, query_keys=_chunk_keys,
+    )
+    val_uniq_idx[_s:_e] = _idx
+    val_uniq_sims[_s:_e] = _sims
+    del _chunk_emb, _idx, _sims
+val_neighbor_rows = val_uniq_idx[val_inverse]
+val_neighbor_sims = val_uniq_sims[val_inverse]
 
 calibrator = NNCalibrator.fit_alpha_on_val(
     residual_table=residual_table,

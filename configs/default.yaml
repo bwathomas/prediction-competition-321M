@@ -136,6 +136,13 @@ nn_features:
   # argpartition so this is safe to leave on -- on a GPU box it speeds
   # up the index build by ~50x for typical embedding corpus sizes.
   prefer_gpu: true
+  # Number of unique queries fed to ``nn_index.nearest`` per chunk inside
+  # ``compute_nn_features_streaming``. Peak RAM during NN feature
+  # computation is roughly ``query_chunk_size * D * 4`` bytes, so the
+  # default keeps Qwen3-Embedding-8B (D=4096) NN feature build under
+  # ~70 MB of working set on a 12 GB Colab. Increase if you have RAM
+  # headroom; lower if you hit OOM on the streaming path.
+  query_chunk_size: 4096
 
 # ----------------------------------------------------------------------------
 # Centroid-distance features (embedding-derived pool-feature columns)
