@@ -598,3 +598,124 @@ def test_train_pairs_aggregation():
     assert math.isclose(
         state_pairs.global_passrate, state_dense.global_passrate, abs_tol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# Vectorization regression tests
+# ---------------------------------------------------------------------------
+
+
+def _make_state_for_vec_tests(N=80, D=32, S=4, seed=0, coverage=0.7,
+                              quant="fp16", k=8, pca_dim=16):
+    """Helper: ``_make_synthetic`` plus a fitted state, returned together."""
+    item_keys, subject_keys, item_embs, pr, mk, _ = _make_synthetic(
+        N=N, D=D, S=S, seed=seed, coverage=coverage
+    )
+    state = fit_knn_member(
+        item_keys=item_keys,
+        item_embeddings=item_embs,
+        subject_keys=subject_keys,
+        passrate_dense=pr,
+        passrate_mask=mk,
+        pca_dim=pca_dim,
+        quantization=quant,
+        k=k,
+    )
+    return state, item_embs
+
+
+def test_apply_batch_matches_per_row_loop_functionally():
+    """The vectorized ``apply_batch`` and the per-row ``apply_one``
+    loop are NOT bit-identical because ``embs @ q`` (per-row) vs
+    ``Qp @ embs.T`` (batched) take different BLAS paths and round
+    differently in the LSB. Occasionally that flips a near-tied
+    neighbor in the top-K and shifts the prediction. We verify
+    functional equivalence:
+      * P99 |delta| <= 0.05 (most rows are within fp32 jitter).
+      * Mean |delta| <= 0.005.
+    """
+    state, item_embs = _make_state_for_vec_tests(
+        N=200, D=64, S=6, seed=12, coverage=0.65, quant="fp16", k=10, pca_dim=16
+    )
+    rng = np.random.default_rng(2)
+    n_bench = 100
+    q_idx = rng.integers(0, item_embs.shape[0], size=n_bench)
+    q_batch = item_embs[q_idx].copy()
+    s_idx = rng.integers(0, len(state.subject_keys), size=n_bench)
+    s_batch = [state.subject_keys[s] for s in s_idx]
+
+    p_loop = np.array(
+        [apply_one(state, q_batch[i], s_batch[i]) for i in range(n_bench)],
+        dtype=np.float32,
+    )
+    p_vec = apply_batch(state, q_batch, s_batch)
+
+    delta_max = float(np.abs(p_loop - p_vec).max())
+    delta_p99 = float(np.percentile(np.abs(p_loop - p_vec), 99))
+    delta_mean = float(np.abs(p_loop - p_vec).mean())
+    assert delta_p99 < 0.05, (
+        f"Vectorized parity broke: max={delta_max} p99={delta_p99} mean={delta_mean}"
+    )
+    assert delta_mean < 0.005, (
+        f"Vectorized parity broke (mean): max={delta_max} p99={delta_p99} mean={delta_mean}"
+    )
+
+
+def test_decoded_embeddings_cache_is_reused():
+    """``_decode_embeddings`` must cache its result on the state so
+    repeated ``apply_one`` calls don't re-decode the int8 table."""
+    from src.knn_member import _decode_embeddings
+
+    state, _ = _make_state_for_vec_tests(
+        N=50, D=32, S=3, seed=7, coverage=0.8, quant="int8", pca_dim=16
+    )
+    e1 = _decode_embeddings(state)
+    e2 = _decode_embeddings(state)
+    assert e1 is e2  # identity, not just equality
+    assert hasattr(state, "_decoded_emb_cache")
+
+
+def test_apply_batch_handles_empty_input():
+    """Edge case: empty query batch -> empty output, no crash."""
+    state, _ = _make_state_for_vec_tests(N=20, D=16, S=2, seed=4, coverage=0.5)
+    D_in = int(state.pca_mean.shape[0])
+    out = apply_batch(state, np.empty((0, D_in), dtype=np.float32), [])
+    assert out.shape == (0,)
+    assert out.dtype == np.float32
+
+
+def test_apply_batch_handles_unknown_subject_in_batch():
+    """Mix of known + unknown subject keys -> unknown rows return
+    the global prior, known rows return their normal prediction."""
+    state, item_embs = _make_state_for_vec_tests(
+        N=80, D=32, S=8, seed=9, coverage=0.6, quant="fp16", pca_dim=12
+    )
+    rng = np.random.default_rng(0)
+    n_known = 5
+    n_unknown = 5
+    q_idx = rng.integers(0, item_embs.shape[0], size=n_known + n_unknown)
+    queries = item_embs[q_idx].copy()
+    known_keys = list(state.subject_keys[:n_known])
+    unknown_keys = [f"unknown_{i}" for i in range(n_unknown)]
+    assert len(known_keys) == n_known
+    out = apply_batch(state, queries, known_keys + unknown_keys)
+    expected_global = max(min(state.global_passrate, 1 - 1e-6), 1e-6)
+    np.testing.assert_allclose(out[n_known:], expected_global, atol=1e-6)
+
+
+def test_apply_batch_handles_nan_inf_queries():
+    """NaN/Inf rows in the batch must not poison finite-row predictions."""
+    state, item_embs = _make_state_for_vec_tests(
+        N=60, D=32, S=3, seed=5, coverage=0.7, quant="fp16", pca_dim=12
+    )
+    rng = np.random.default_rng(0)
+    D_in = int(state.pca_mean.shape[0])
+    rows = rng.integers(0, item_embs.shape[0], size=6)
+    Q = item_embs[rows].copy().astype(np.float32)
+    Q[1] = np.nan
+    Q[3] = np.inf
+    Q[5] = -np.inf
+    keys = [state.subject_keys[i % len(state.subject_keys)] for i in range(6)]
+    out = apply_batch(state, Q, keys)
+    assert np.all(np.isfinite(out))
+    assert np.all((out > 0) & (out < 1))

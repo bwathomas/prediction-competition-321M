@@ -384,3 +384,102 @@ def test_feature_index_outside_vector_returns_finite():
     # default_left=True, leaf_value=0.7 -> bias 0 + 0.7 = 0.7 raw -> sigmoid
     expected = 1.0 / (1.0 + math.exp(-0.7))
     assert math.isclose(p, expected, rel_tol=1e-6, abs_tol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Vectorization regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_vectorized_apply_batch_matches_per_row_loop_exactly():
+    """Unlike kNN (which has fp32 matmul-reordering jitter), the
+    GBDT tree walk is integer arithmetic on the same per-row feature
+    values, so vectorized apply_batch and per-row apply_one MUST
+    produce bit-identical outputs."""
+    rng = np.random.default_rng(0)
+    n_rows, n_features = 1500, 24
+    X = rng.normal(size=(n_rows, n_features)).astype(np.float32)
+    # Inject NaN in 5% of feature cells to exercise default_left.
+    nan_mask = rng.uniform(size=X.shape) < 0.05
+    X[nan_mask] = np.nan
+    y = (X[:, 0] + X[:, 1] - 0.3 * X[:, 2] +
+         rng.normal(size=n_rows) * 0.4 > 0).astype(np.float32)
+
+    state = fit_gbdt_member(
+        X=X,
+        y=y,
+        feature_names=tuple(f"f{i}" for i in range(n_features)),
+        n_estimators=40,
+        learning_rate=0.1,
+        num_leaves=15,
+        min_data_in_leaf=10,
+        early_stopping_rounds=10,
+        seed=0,
+        parity_atol=1e-5,
+    )
+    p_loop = np.array(
+        [apply_one(state, X[i]) for i in range(n_rows)],
+        dtype=np.float32,
+    )
+    p_vec = apply_batch(state, X)
+    np.testing.assert_array_equal(p_loop, p_vec), (
+        "Vectorized GBDT apply_batch deviated from per-row apply_one"
+    )
+
+
+def test_vectorized_apply_batch_handles_empty_input():
+    """Edge case: empty feature matrix -> empty output, no crash."""
+    feat = np.array([-1], dtype=np.int32)
+    thr = np.array([0.123], dtype=np.float64)
+    l = np.array([-1], dtype=np.int32)
+    r = np.array([-1], dtype=np.int32)
+    dl = np.array([False], dtype=np.bool_)
+    state = GBDTMemberState(
+        feature_concat=feat,
+        threshold_concat=thr,
+        left_concat=l,
+        right_concat=r,
+        default_left_concat=dl,
+        tree_offsets=np.array([0, 1], dtype=np.int32),
+        feature_dim=4,
+        feature_names=("a", "b", "c", "d"),
+        bias=0.0,
+        fit_method="hand",
+        n_train=0,
+        n_pos=0,
+        n_trees=1,
+        train_loss=0.0,
+        val_loss=0.0,
+    )
+    out = apply_batch(state, np.empty((0, 4), dtype=np.float32))
+    assert out.shape == (0,)
+    assert out.dtype == np.float32
+
+
+def test_vectorized_apply_batch_with_all_nan_rows_uses_default_left():
+    """All-NaN feature rows must hit the default_left path on every
+    split, identical to the per-row loop."""
+    rng = np.random.default_rng(1)
+    n_rows, n_features = 200, 12
+    X = rng.normal(size=(n_rows, n_features)).astype(np.float32)
+    y = (X[:, 0] > 0).astype(np.float32)
+    state = fit_gbdt_member(
+        X=X,
+        y=y,
+        feature_names=tuple(f"f{i}" for i in range(n_features)),
+        n_estimators=15,
+        learning_rate=0.1,
+        num_leaves=8,
+        min_data_in_leaf=5,
+        early_stopping_rounds=5,
+        seed=0,
+        parity_atol=1e-5,
+    )
+    X_nan = np.full((50, n_features), np.nan, dtype=np.float32)
+    p_loop = np.array(
+        [apply_one(state, X_nan[i]) for i in range(50)], dtype=np.float32
+    )
+    p_vec = apply_batch(state, X_nan)
+    np.testing.assert_array_equal(p_loop, p_vec)
+    assert np.all(np.isfinite(p_vec))
+    assert np.all((p_vec > 0) & (p_vec < 1))

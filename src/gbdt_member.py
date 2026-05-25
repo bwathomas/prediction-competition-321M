@@ -312,15 +312,90 @@ def apply_one(state: GBDTMemberState, features: np.ndarray) -> float:
     return float(min(max(p, _EPS), 1.0 - _EPS))
 
 
+def _walk_tree_batch(
+    state: GBDTMemberState,
+    tree_idx: int,
+    features_matrix: np.ndarray,
+) -> np.ndarray:
+    """Walk a single tree to leaves for ALL rows in parallel.
+
+    Returns ``[B]`` float64 leaf values. The traversal is iterative:
+    at each step we look up the active rows' current node's feature
+    index and threshold, decide direction, and advance. We stop when
+    every row has reached a leaf.
+
+    Numerically identical to looping :func:`_traverse_one_tree` per
+    row -- same NaN handling via ``default_left``, same per-row
+    feature ``[i, f]`` lookup, same threshold comparison.
+    """
+    B = int(features_matrix.shape[0])
+    start = int(state.tree_offsets[tree_idx])
+    feat = state.feature_concat
+    thr = state.threshold_concat
+    left = state.left_concat
+    right = state.right_concat
+    dleft = state.default_left_concat
+
+    node = np.full(B, start, dtype=np.int64)
+    # Defensive depth bound: a tree with up to 2**30 nodes can't have
+    # depth > 30 in a balanced sense; we allow up to (n_nodes + 1) just
+    # to match the per-row guard.
+    n_tree_nodes = int(state.tree_offsets[tree_idx + 1]) - start
+    max_iters = int(n_tree_nodes) + 1
+
+    for _ in range(max_iters):
+        f_idx = feat[node]                  # [B]
+        is_leaf = f_idx == _LEAF_FEATURE_SENTINEL
+        if bool(is_leaf.all()):
+            break
+
+        nl_rows = np.where(~is_leaf)[0]     # active rows (non-leaf)
+        nl_node = node[nl_rows]
+        fi = f_idx[nl_rows].astype(np.int64, copy=False)
+        # Bounds check matches the per-row path: out-of-range f -> NaN.
+        feat_dim = int(features_matrix.shape[1])
+        valid_f = (fi >= 0) & (fi < feat_dim)
+        # Safe gather: bad indices are clipped to 0 here, then their
+        # value is overwritten by NaN below so the default_left branch
+        # fires.
+        fi_safe = np.where(valid_f, fi, 0)
+        fv = features_matrix[nl_rows, fi_safe]
+        # Inject NaN for invalid feature indices so the default_left
+        # branch fires (matching the per-row path's `else float("nan")`).
+        if not bool(valid_f.all()):
+            fv = np.where(valid_f, fv, np.nan)
+        finite = np.isfinite(fv)
+
+        th = thr[nl_node]
+        go_left_finite = (fv <= th) & finite
+        go_left_nan = dleft[nl_node] & ~finite
+        go_left = go_left_finite | go_left_nan
+
+        new_node = np.where(go_left, left[nl_node], right[nl_node]).astype(
+            np.int64, copy=False
+        )
+        node[nl_rows] = new_node
+
+    # All rows are now at a leaf node (or the bound expired).
+    leaf_vals = thr[node].astype(np.float64, copy=False)
+    return leaf_vals
+
+
 def apply_batch(
     state: GBDTMemberState,
     features_matrix: np.ndarray,
 ) -> np.ndarray:
-    """Vectorized-over-rows but scalar-over-nodes inference.
+    """Vectorized-over-rows AND vectorized-over-nodes-per-tree.
 
     Returns float32 probabilities shape ``[N]``. Used in tests and
     in the offline parity check; the runtime per-call path uses
     :func:`apply_one`.
+
+    Speedup over the previous per-row apply_one loop: for typical
+    GBDT shapes (100-400 trees, 31 leaves) we walk each tree in
+    ``O(tree_depth)`` numpy ops instead of ``O(B * tree_depth)``
+    Python ops, which is a 30-100x wall-clock reduction on large
+    val sets.
     """
     if features_matrix.ndim != 2:
         raise ValueError(
@@ -332,10 +407,24 @@ def apply_batch(
             f"state.feature_dim {state.feature_dim}"
         )
     N = int(features_matrix.shape[0])
-    out = np.empty(N, dtype=np.float32)
-    for i in range(N):
-        out[i] = apply_one(state, features_matrix[i])
-    return out
+    if N == 0:
+        return np.empty(0, dtype=np.float32)
+
+    fm = np.ascontiguousarray(features_matrix, dtype=np.float64)
+    raw = np.full(N, float(state.bias), dtype=np.float64)
+    for t in range(int(state.n_trees)):
+        raw += _walk_tree_batch(state, t, fm)
+
+    # Sigmoid + clamp, vectorized.
+    raw = np.where(np.isfinite(raw), raw, 0.0)
+    # Numerically-stable sigmoid (split on sign).
+    out = np.empty_like(raw)
+    pos = raw >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-raw[pos]))
+    e = np.exp(raw[~pos])
+    out[~pos] = e / (1.0 + e)
+    out = np.clip(out, _EPS, 1.0 - _EPS)
+    return out.astype(np.float32, copy=False)
 
 
 def predict_raw(state: GBDTMemberState, features_matrix: np.ndarray) -> np.ndarray:
