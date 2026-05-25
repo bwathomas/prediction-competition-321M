@@ -354,6 +354,22 @@ class NNCalibratorState:
     apply_in_logit_space: bool = False
     fit_method: str = "identity"
     fit_n_val: int = 0
+    # Continuous shrinkage parameter (Phase 4 of the four-member
+    # stacked-ensemble upgrade). Replaces the legacy hard
+    # ``min_weight_sum`` cutoff with a smooth dampener:
+    #
+    #   effective_correction = alpha * (w_sum / (w_sum + shrinkage_tau))
+    #                        * weighted_residual
+    #
+    # When ``shrinkage_tau == 0.0`` (default), behavior is identical
+    # to the legacy form (``alpha * weighted_residual`` with the
+    # ``min_weight_sum`` floor still applied as a safety check).
+    # When ``shrinkage_tau > 0``, weak neighborhoods (small w_sum)
+    # shrink continuously toward the uncalibrated/stacked prediction
+    # rather than abruptly dropping to no correction. The
+    # ``min_weight_sum`` floor is retained as a sanity check
+    # (w_sum < 1e-9 still skips, regardless of shrinkage_tau).
+    shrinkage_tau: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -371,6 +387,7 @@ class NNCalibratorState:
             apply_in_logit_space=bool(d.get("apply_in_logit_space", False)),
             fit_method=str(d.get("fit_method", "identity")),
             fit_n_val=int(d.get("fit_n_val", 0)),
+            shrinkage_tau=float(d.get("shrinkage_tau", 0.0)),
         )
 
 
@@ -402,25 +419,45 @@ class NNCalibrator:
         similarity: str = "cosine",
         temperature: float = 1.0,
         similarity_floor: float = 0.0,
-        min_weight_sum: float = 1e-3,
+        min_weight_sum: float = 1e-9,
         apply_in_logit_space: bool = False,
         alphas: Sequence[float] | None = None,
+        shrinkage_taus: Sequence[float] | None = None,
     ) -> "NNCalibrator":
-        """Sweep ``alpha`` on the validation split and pick the best NLL.
+        """Sweep ``(alpha, shrinkage_tau)`` on the val split and pick the best NLL.
 
-        The alpha grid defaults to a 21-point sweep over [0, 1]. We
-        evaluate the binary cross-entropy (log-loss) on the validation
-        rows after applying the kNN residual correction and pick the
-        alpha that minimizes it. If every alpha gives a worse loss
-        than the un-corrected baseline, alpha=0.0 (identity) is
-        returned -- the calibrator becomes a no-op rather than
-        actively making things worse.
+        The default grid is a 21-point alpha sweep over [0, 1] crossed
+        with a 5-point shrinkage_tau sweep over {0, 0.5, 1, 2, 5}. We
+        evaluate the binary cross-entropy on the validation rows
+        AFTER applying the kNN residual correction and pick the pair
+        that minimizes it. If every (alpha, tau) combo gives a worse
+        loss than the un-corrected baseline, ``alpha=0`` /
+        ``shrinkage_tau=0`` is returned -- the calibrator becomes a
+        no-op rather than actively making things worse.
+
+        ``shrinkage_tau`` controls the per-row continuous shrinkage:
+
+            effective_correction = alpha * (w_sum / (w_sum + tau))
+                                 * weighted_residual
+
+        Setting ``shrinkage_taus=[0.0]`` recovers the legacy
+        single-axis sweep behavior bit-exactly.
+
+        ``min_weight_sum`` is now a sanity floor (default 1e-9). Rows
+        with ``w_sum < min_weight_sum`` skip correction unconditionally
+        regardless of ``shrinkage_tau``; this only fires for rows with
+        literally no labeled neighbors and no positive similarity at
+        all.
         """
         if alphas is None:
             alphas = list(np.linspace(0.0, 1.0, 21))
+        if shrinkage_taus is None:
+            shrinkage_taus = [0.0, 0.5, 1.0, 2.0, 5.0]
 
-        # Cache the per-row signed residual sum / weight sum so we
-        # only loop once over the val set.
+        # Cache the per-row signed residual mean / weight sum so we
+        # only loop once over the val set; the alpha+tau sweep then
+        # consumes those caches O(|alphas| * |taus|) times instead of
+        # re-traversing the residual table.
         s_arr = np.asarray(val_subject_ids, dtype=np.int64)
         nbrs = np.asarray(val_neighbor_rows, dtype=np.int64)
         sims = np.asarray(val_neighbor_sims, dtype=np.float32)
@@ -440,6 +477,7 @@ class NNCalibrator:
                 apply_in_logit_space=bool(apply_in_logit_space),
                 fit_method="empty",
                 fit_n_val=0,
+                shrinkage_tau=0.0,
             ))
 
         if int(nbrs.shape[0]) != s_arr.shape[0]:
@@ -452,13 +490,14 @@ class NNCalibrator:
         nbrs = nbrs[:, :K_eff]
         sims = sims[:, :K_eff]
 
-        # Per-row weighted residual mean, in logit space if requested.
+        # Per-row weighted residual mean + weight sum (= effective
+        # neighbor support).
         weighted_residual = np.zeros(N, dtype=np.float64)
+        weight_sums = np.zeros(N, dtype=np.float64)
 
         weights = np.clip(sims - float(similarity_floor), 0.0, None)
         if float(temperature) != 1.0:
             weights = np.power(weights, float(temperature))
-        weight_sums = np.zeros(N, dtype=np.float64)
 
         for i in range(N):
             ys, ps, m = residual_table.lookup(int(s_arr[i]), nbrs[i])
@@ -469,12 +508,6 @@ class NNCalibrator:
             if w_sum < float(min_weight_sum):
                 continue
             if apply_in_logit_space:
-                # residual on logit scale: logit(y) is undefined, so
-                # we use logit(neighbor_p_uncal) - logit(y_smoothed)
-                # with y smoothed away from {0, 1} via the same eps.
-                # For a binary label the residual is well approximated
-                # by (y - p) at p ~ y, but the logit form is more
-                # numerically stable when p is near 0 or 1.
                 target_logit = _logit(ys)
                 base_logit = _logit(ps)
                 r = target_logit - base_logit
@@ -492,29 +525,41 @@ class NNCalibrator:
             (y_val * np.log(p_val) + (1.0 - y_val) * np.log(1.0 - p_val)).mean()
         )
         best_alpha = 0.0
+        best_tau = 0.0
         best_nll = baseline_nll
-        for a in alphas:
-            a = float(a)
-            if apply_in_logit_space:
-                logit_cal = logit_val + a * weighted_residual
-                p_cal = 1.0 / (1.0 + np.exp(-logit_cal))
-                p_cal = np.clip(p_cal, _EPS, 1.0 - _EPS)
+        for tau in shrinkage_taus:
+            tau = float(tau)
+            if tau < 0:
+                continue
+            if tau == 0.0:
+                shrink = np.ones_like(weight_sums)
             else:
-                p_cal = np.clip(
-                    p_val + a * weighted_residual, _EPS, 1.0 - _EPS
+                shrink = weight_sums / (weight_sums + tau)
+            shrunk_residual = weighted_residual * shrink
+            for a in alphas:
+                a = float(a)
+                if apply_in_logit_space:
+                    logit_cal = logit_val + a * shrunk_residual
+                    p_cal = 1.0 / (1.0 + np.exp(-logit_cal))
+                    p_cal = np.clip(p_cal, _EPS, 1.0 - _EPS)
+                else:
+                    p_cal = np.clip(
+                        p_val + a * shrunk_residual, _EPS, 1.0 - _EPS
+                    )
+                nll = -float(
+                    (y_val * np.log(p_cal) + (1.0 - y_val) * np.log(1.0 - p_cal)).mean()
                 )
-            nll = -float(
-                (y_val * np.log(p_cal) + (1.0 - y_val) * np.log(1.0 - p_cal)).mean()
-            )
-            if nll < best_nll - 1e-9:
-                best_nll = nll
-                best_alpha = a
+                if nll < best_nll - 1e-9:
+                    best_nll = nll
+                    best_alpha = a
+                    best_tau = tau
 
         LOG.info(
-            "NNCalibrator fit: alpha=%.3f val_nll=%.5f baseline_nll=%.5f "
-            "(N=%d, K=%d, similarity=%s, temperature=%.2f, logit=%s)",
-            best_alpha, best_nll, baseline_nll, N, K_eff, similarity,
-            float(temperature), bool(apply_in_logit_space),
+            "NNCalibrator fit: alpha=%.3f shrinkage_tau=%.3f val_nll=%.5f "
+            "baseline_nll=%.5f (N=%d, K=%d, similarity=%s, temperature=%.2f, "
+            "logit=%s)",
+            best_alpha, best_tau, best_nll, baseline_nll, N, K_eff,
+            similarity, float(temperature), bool(apply_in_logit_space),
         )
 
         return cls(NNCalibratorState(
@@ -525,8 +570,9 @@ class NNCalibrator:
             min_weight_sum=float(min_weight_sum),
             similarity_floor=float(similarity_floor),
             apply_in_logit_space=bool(apply_in_logit_space),
-            fit_method="alpha_grid_val_nll",
+            fit_method="alpha_tau_grid_val_nll",
             fit_n_val=int(N),
+            shrinkage_tau=float(best_tau),
         ))
 
     # ---------------------------------------------------- apply
@@ -584,6 +630,7 @@ class NNCalibrator:
             return np.asarray(p_uncal, dtype=np.float32).copy()
 
         weighted_residual = np.zeros(N, dtype=np.float64)
+        weight_sums = np.zeros(N, dtype=np.float64)
         for i in range(N):
             ys, ps, m = residual_table.lookup(int(s_arr[i]), nbrs[i])
             if not bool(m.any()):
@@ -597,15 +644,27 @@ class NNCalibrator:
             else:
                 r = ys.astype(np.float64) - ps.astype(np.float64)
             weighted_residual[i] = float((w.astype(np.float64) * r).sum() / w_sum)
+            weight_sums[i] = w_sum
+
+        # Continuous shrinkage: weak neighborhoods (small w_sum) shrink
+        # toward the uncalibrated/stacked prediction. With tau == 0
+        # this multiplier is identically 1 and the formula reduces to
+        # the legacy ``alpha * weighted_residual``.
+        tau = float(st.shrinkage_tau)
+        if tau > 0.0:
+            shrink = weight_sums / (weight_sums + tau)
+            shrunk_residual = weighted_residual * shrink
+        else:
+            shrunk_residual = weighted_residual
 
         if st.apply_in_logit_space:
             logit_uncal = _logit(np.asarray(p_uncal, dtype=np.float64))
-            logit_cal = logit_uncal + float(st.alpha) * weighted_residual
+            logit_cal = logit_uncal + float(st.alpha) * shrunk_residual
             return _sigmoid(logit_cal).astype(np.float32)
         else:
             return np.clip(
                 np.asarray(p_uncal, dtype=np.float64)
-                + float(st.alpha) * weighted_residual,
+                + float(st.alpha) * shrunk_residual,
                 _EPS,
                 1.0 - _EPS,
             ).astype(np.float32)

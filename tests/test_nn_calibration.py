@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -224,7 +225,11 @@ def test_calibrator_recovers_per_subject_bias():
         val_uncal_probs=val_p, val_labels=val_y, k=K,
     )
     assert cal.state.alpha > 0
-    assert cal.state.fit_method == "alpha_grid_val_nll"
+    # The fitter now sweeps (alpha, shrinkage_tau) jointly, so the
+    # method tag reflects the 2-D grid. The legacy "alpha_grid_val_nll"
+    # tag is only emitted when shrinkage_taus=[0.0] is explicitly
+    # passed, which matches the legacy behavior bit-exactly.
+    assert cal.state.fit_method == "alpha_tau_grid_val_nll"
 
     # Test holdout: calibration should reduce log-loss.
     N_test = 1500
@@ -331,3 +336,212 @@ def test_calibrator_min_weight_sum_blocks_low_coverage():
         p_uncal=np.array([0.5], dtype=np.float32),
     )
     np.testing.assert_allclose(out, [0.5], rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 RED-TEAM: continuous shrinkage
+# ---------------------------------------------------------------------------
+
+
+def _two_subject_residual_table_with_known_residual():
+    """Build a 1-subject 4-item table where:
+      neighbor 0 has y=1.0, p=0.4 (residual = +0.6)
+      neighbor 1 has y=1.0, p=0.5 (residual = +0.5)
+      neighbor 2 has y=1.0, p=0.6 (residual = +0.4)
+      neighbor 3 has y=1.0, p=0.7 (residual = +0.3)
+    Mean residual = +0.45. Uniform-similarity weights -> any
+    neighbor combo gives this mean. Useful for checking the
+    shrinkage multiplier is applied correctly.
+    """
+    return SubjectResidualTable.from_rows(
+        subject_ids=[0, 0, 0, 0],
+        training_item_rows=[0, 1, 2, 3],
+        labels=[1.0, 1.0, 1.0, 1.0],
+        uncal_probs=[0.4, 0.5, 0.6, 0.7],
+        n_subjects=1,
+        n_training_items=4,
+    )
+
+
+def test_shrinkage_tau_zero_matches_legacy_correction():
+    """tau=0 must reproduce the legacy alpha * weighted_residual exactly."""
+    table = _two_subject_residual_table_with_known_residual()
+    cal_legacy = NNCalibrator(NNCalibratorState(
+        alpha=0.5, similarity_floor=0.0, min_weight_sum=1e-9,
+        shrinkage_tau=0.0,
+    ))
+    sims = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+    nbrs = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    out = cal_legacy.apply(
+        residual_table=table,
+        subject_ids=np.array([0], dtype=np.int64),
+        neighbor_rows=nbrs,
+        neighbor_sims=sims,
+        p_uncal=np.array([0.5], dtype=np.float32),
+    )
+    # weighted_residual = (1*0.6 + 1*0.5 + 1*0.4 + 1*0.3) / 4 = 0.45
+    # p_cal = 0.5 + 0.5 * 0.45 = 0.725
+    np.testing.assert_allclose(out, [0.725], atol=1e-5)
+
+
+def test_shrinkage_tau_dampens_strong_correction_when_w_sum_small():
+    """When effective weight sum is small relative to tau, the
+    correction is heavily attenuated (shrinks toward p_uncal)."""
+    table = _two_subject_residual_table_with_known_residual()
+    # Use very small similarities so w_sum ~ 0.4 (4 * 0.1).
+    sims = np.array([[0.1, 0.1, 0.1, 0.1]], dtype=np.float32)
+    nbrs = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    p_uncal = np.array([0.5], dtype=np.float32)
+
+    # tau=0 (no shrinkage): correction = alpha * 0.45 = 0.225
+    cal_no_shrink = NNCalibrator(NNCalibratorState(
+        alpha=0.5, similarity_floor=0.0, min_weight_sum=1e-9, shrinkage_tau=0.0,
+    ))
+    out_no = cal_no_shrink.apply(
+        residual_table=table,
+        subject_ids=np.array([0], dtype=np.int64),
+        neighbor_rows=nbrs, neighbor_sims=sims, p_uncal=p_uncal,
+    )
+
+    # tau=4 (heavy shrinkage): w_sum=0.4, shrink=0.4/(0.4+4)=0.0909
+    # correction = 0.5 * 0.0909 * 0.45 = 0.0205
+    cal_heavy = NNCalibrator(NNCalibratorState(
+        alpha=0.5, similarity_floor=0.0, min_weight_sum=1e-9, shrinkage_tau=4.0,
+    ))
+    out_heavy = cal_heavy.apply(
+        residual_table=table,
+        subject_ids=np.array([0], dtype=np.int64),
+        neighbor_rows=nbrs, neighbor_sims=sims, p_uncal=p_uncal,
+    )
+
+    # Both should be > p_uncal but the heavy-tau output should be MUCH closer.
+    assert float(out_no[0]) > 0.6
+    assert float(out_heavy[0]) < float(out_no[0])
+    # Quantitative check on heavy-tau: 0.5 + 0.0205 ~ 0.520
+    np.testing.assert_allclose(out_heavy, [0.5 + 0.5 * (0.4 / 4.4) * 0.45], atol=1e-4)
+
+
+def test_shrinkage_tau_preserves_strong_correction_when_w_sum_large():
+    """When effective weight sum >> tau, shrinkage multiplier ~ 1
+    and the correction is essentially unchanged."""
+    table = _two_subject_residual_table_with_known_residual()
+    # w_sum = 4 * 1 = 4
+    sims = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+    nbrs = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    p_uncal = np.array([0.5], dtype=np.float32)
+
+    cal_no_shrink = NNCalibrator(NNCalibratorState(
+        alpha=0.5, similarity_floor=0.0, min_weight_sum=1e-9, shrinkage_tau=0.0,
+    ))
+    cal_mild_shrink = NNCalibrator(NNCalibratorState(
+        alpha=0.5, similarity_floor=0.0, min_weight_sum=1e-9, shrinkage_tau=0.1,
+    ))
+    out_no = cal_no_shrink.apply(
+        residual_table=table,
+        subject_ids=np.array([0], dtype=np.int64),
+        neighbor_rows=nbrs, neighbor_sims=sims, p_uncal=p_uncal,
+    )
+    out_mild = cal_mild_shrink.apply(
+        residual_table=table,
+        subject_ids=np.array([0], dtype=np.int64),
+        neighbor_rows=nbrs, neighbor_sims=sims, p_uncal=p_uncal,
+    )
+    # tau=0.1, w_sum=4 -> shrink=4/4.1=0.976 -> correction barely changed
+    np.testing.assert_allclose(out_no, [0.725], atol=1e-5)
+    np.testing.assert_allclose(out_mild, [0.5 + 0.5 * (4.0 / 4.1) * 0.45], atol=1e-4)
+
+
+def test_fit_alpha_on_val_includes_shrinkage_tau():
+    """The new fitter must search over shrinkage_tau and report which
+    value won."""
+    rng = np.random.default_rng(0)
+    # Manufacture data where shrinkage helps: weak neighborhoods are
+    # noisier than strong ones.
+    N_subj = 4
+    N_train = 200
+    s_ids = rng.integers(0, N_subj, size=2000)
+    t_rows = rng.integers(0, N_train, size=2000)
+    bias = rng.normal(0, 0.5, size=N_subj)
+    p_uncal = rng.uniform(0.2, 0.8, size=2000)
+    logit_p = np.log(p_uncal / (1 - p_uncal)) + bias[s_ids]
+    p_true = 1 / (1 + np.exp(-logit_p))
+    labels = (rng.uniform(size=2000) < p_true).astype(np.float32)
+    table = SubjectResidualTable.from_rows(
+        subject_ids=s_ids, training_item_rows=t_rows,
+        labels=labels, uncal_probs=p_uncal.astype(np.float32),
+        n_subjects=N_subj, n_training_items=N_train,
+    )
+    K = 8
+    N_val = 400
+    val_s = rng.integers(0, N_subj, size=N_val)
+    val_p = rng.uniform(0.1, 0.9, size=N_val).astype(np.float32)
+    val_logit = np.log(val_p / (1 - val_p)) + bias[val_s]
+    val_y = (1 / (1 + np.exp(-val_logit)) > rng.uniform(size=N_val)).astype(np.float32)
+    val_nbrs = rng.integers(0, N_train, size=(N_val, K)).astype(np.int64)
+    val_sims = rng.uniform(0.3, 1.0, size=(N_val, K)).astype(np.float32)
+
+    cal = NNCalibrator.fit_alpha_on_val(
+        residual_table=table, val_subject_ids=val_s,
+        val_neighbor_rows=val_nbrs, val_neighbor_sims=val_sims,
+        val_uncal_probs=val_p, val_labels=val_y, k=K,
+        shrinkage_taus=[0.0, 0.5, 1.0, 2.0, 5.0],
+    )
+    assert cal.state.fit_method == "alpha_tau_grid_val_nll"
+    assert cal.state.shrinkage_tau in [0.0, 0.5, 1.0, 2.0, 5.0]
+    # And the calibrated output is finite + bounded.
+    out = cal.apply(
+        residual_table=table, subject_ids=val_s,
+        neighbor_rows=val_nbrs, neighbor_sims=val_sims, p_uncal=val_p,
+    )
+    assert np.isfinite(out).all()
+    assert ((out > 0) & (out < 1)).all()
+
+
+def test_calibrator_state_serialization_roundtrips_shrinkage():
+    state = NNCalibratorState(alpha=0.4, shrinkage_tau=2.5)
+    d = state.to_dict()
+    s2 = NNCalibratorState.from_dict(d)
+    assert s2.shrinkage_tau == 2.5
+    assert s2.alpha == 0.4
+
+    # And round-trip via JSON serialization.
+    j = json.dumps(d)
+    s3 = NNCalibratorState.from_dict(json.loads(j))
+    assert s3.shrinkage_tau == 2.5
+
+
+def test_calibrator_with_empty_labeled_is_noop():
+    """RED-TEAM (Calibrator c): with an empty labeled list (== empty
+    residual table), the calibrator must be a no-op, never a crash."""
+    table = SubjectResidualTable.from_rows(
+        subject_ids=[],
+        training_item_rows=[],
+        labels=[],
+        uncal_probs=[],
+        n_subjects=1,
+        n_training_items=4,
+    )
+    cal = NNCalibrator(NNCalibratorState(
+        alpha=0.5, shrinkage_tau=2.0, similarity_floor=0.0,
+    ))
+    out = cal.apply(
+        residual_table=table,
+        subject_ids=np.array([0], dtype=np.int64),
+        neighbor_rows=np.array([[0, 1, 2, 3]], dtype=np.int64),
+        neighbor_sims=np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32),
+        p_uncal=np.array([0.42], dtype=np.float32),
+    )
+    np.testing.assert_allclose(out, [0.42], rtol=1e-5)
+    assert math.isfinite(float(out[0]))
+
+
+def test_calibrator_runtime_is_faiss_free():
+    """RED-TEAM (Calibrator a): the calibrator's runtime path
+    must not import faiss."""
+    import re
+    src_text = open("src/nn_calibration.py", encoding="utf-8").read()
+    for pattern in (r"^\s*import\s+faiss", r"^\s*from\s+faiss"):
+        matches = list(re.finditer(pattern, src_text, flags=re.MULTILINE))
+        assert len(matches) == 0, (
+            f"src/nn_calibration.py must not import faiss; matched {pattern}"
+        )
