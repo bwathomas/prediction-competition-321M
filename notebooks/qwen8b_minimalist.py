@@ -82,6 +82,25 @@ sys.path.insert(0, str(ROOT))
 print(f"Working directory: {ROOT}")
 print(f"In Colab: {IN_COLAB}")
 
+# Configure Python's root logger so per-epoch validation metrics from
+# ``src.train`` (and other ``LOG.info(...)`` calls across the package)
+# actually show up in the notebook. Without this, Jupyter / Colab
+# defaults the root logger to WARNING and the trainer's per-epoch
+# `val_log_loss / val_brier / val_auc` lines are silently dropped --
+# you only see the final ``best val log-loss`` print at the end of
+# the cell. ``force=True`` (Python 3.8+) replaces any pre-installed
+# Colab handlers so we get a single, predictable formatter.
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
+# The ``train`` logger is the one that emits per-epoch summaries.
+logging.getLogger("train").setLevel(logging.INFO)
+
 # %% [markdown]
 # ## 2. Configuration: Qwen8B + metadata + NN + centroid distances ON
 
