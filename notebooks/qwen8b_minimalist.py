@@ -7,10 +7,18 @@
 #     trained with **metadata dropout** (per-row Bernoulli masking of
 #     subject and benchmark metadata so the `__MISSING__` embeddings
 #     and the missingness-gate get gradient signal).
-#   * **Model B**: no-metadata (`hybrid_irt_kfactor_gated_mlp`) trained
-#     with **bc-id dropout** (per-row Bernoulli replacement of `bc_idx`
-#     with the UNK slot so the residual MLP learns to predict without
-#     the per-benchmark bias signal).
+#   * **Model B**: subject-metadata-only (also
+#     `meta_hybrid_irt_kfactor_gated_mlp`, but trained with
+#     `p_bench=1.0` so its bench tables only ever train the
+#     `__MISSING__` row) plus **bc-id dropout** (`q_bc=0.15`) so
+#     `beta[0]` and the residual MLP learn to predict robustly
+#     without the per-benchmark bias signal. At inference, Member B
+#     is flagged `force_bench_missing=True` so the runtime feeds it
+#     the MISSING bench pattern even when metadata is available.
+#     Subject-side metadata (model org, family, release date, etc.)
+#     stays real and trained so Member B can exploit "Claude models
+#     are related" / "released-in-2024" / org-level signal even on
+#     cold-start benchmarks.
 #
 # After training, fit a **coverage-conditional blend** on a synthetic
 # benchmark-cold-start val slice: two scalars `w_present` and
@@ -24,20 +32,25 @@
 # benchmarks, Model A's metadata gate sees `__MISSING__` patterns it
 # has been explicitly trained on (good), and Model A's per-bc bias
 # `beta[0]` is the well-trained UNK slot (good); Model B is trained
-# specifically to predict robustly without per-bc bias (good). Either
-# model alone is suboptimal: A's metadata channel can dominate when
-# it shouldn't, B has no access to subject/benchmark metadata signal
-# even when the test row HAS that metadata. The blend lets each
-# model contribute where it's strongest. Math: Jensen's slack from
-# blending is `(1/2) * w * (1-w) * Var(p_A - p_B) / (p * (1-p))`,
-# maximized when `w_A` matches the relative reliability per regime.
+# specifically to predict robustly without per-bc bias AND without
+# bench-side metadata, while still using subject-side metadata
+# (model org / family / release date / etc.) which is usually
+# available even on cold-start benchmarks. Either model alone is
+# suboptimal: A's metadata channel can dominate when it shouldn't,
+# B doesn't use bench metadata even when the test row HAS that
+# metadata. The blend lets each model contribute where it's
+# strongest. Math: Jensen's slack from blending is
+# `(1/2) * w * (1-w) * Var(p_A - p_B) / (p * (1-p))`, maximized when
+# `w_A` matches the relative reliability per regime.
 #
 # What ships in the bundle:
 #
 # - `artifacts/checkpoint.pt` -- ensemble bundle with both members'
-#   state dicts and the per-coverage blend weights. Loaded by the
-#   runtime via the existing `_EnsembleModel` path
-#   (heterogeneous meta+nometa members supported).
+#   state dicts, the per-coverage blend weights, and the per-member
+#   `force_bench_missing` flags. Loaded by the runtime via the
+#   existing `_EnsembleModel` path; Member B's bench fields in the
+#   incoming `meta_override` are auto-spliced to row-0 (MISSING)
+#   before forward() so inference matches Member B's training.
 # - `artifacts/cluster_centroids.npy` -- runtime computes top-m
 #   centroid distances on every prediction.
 # - `artifacts/pool_features_stats.json` -- z-score stats including
@@ -203,6 +216,16 @@ CFG["nn_calibration"]["min_weight_sum"] = 1e-3
 #    gate learn the worst-case "no metadata at all" pattern but not
 #    enough to dominate.
 #
+#  * Model B's ``p_bench=1.0`` is the "always-MISSING bench" mode.
+#    The bench-side embeddings, towers, and FM crosses only ever
+#    update on row 0 (the MISSING token), so Member B effectively
+#    has no benchmark-metadata channel. At inference the runtime
+#    flips ``force_bench_missing=True`` for Member B, so the
+#    incoming meta_override has its bench fields swapped for row 0
+#    before forward() -- training distribution == test distribution.
+#    Subject side ``p_subj=0.10`` keeps the model robust to
+#    cold-start subjects (orgs not in model_info.csv).
+#
 #  * Model B's ``q_bc=0.15`` regularizes the per-benchmark bias
 #    ``beta[bc_idx]``. With prob 0.15 we replace ``bc_idx`` with 0
 #    (the UNK slot), so the residual MLP and the IRT channel learn to
@@ -210,6 +233,14 @@ CFG["nn_calibration"]["min_weight_sum"] = 1e-3
 #    unavailable. 15% is conservative: any higher and we starve the
 #    in-distribution bc bias; any lower and ``beta[0]`` stays under-
 #    trained for hosted cold-start rows.
+#
+#  * ``epochs=3`` for BOTH members. Empirically the metadata head
+#    overfits past ~3 epochs (the meta channel is a high-capacity
+#    sponge for spurious benchmark / subject regularities); the
+#    no-bench-meta head is also at the edge of overfitting on a
+#    typical Colab-budget run. Three epochs is the safe default;
+#    raise it explicitly only after measuring val log-loss per epoch
+#    and confirming it's still trending down at epoch 3.
 #
 #  Seeding strategy (also a deliberate choice):
 #
@@ -227,10 +258,11 @@ CFG["coverage_blend"] = {
         "q_bc": 0.0,
     },
     "model_b": {
-        "p_bench": 0.0,
-        "p_subj": 0.0,
+        "p_bench": 1.0,
+        "p_subj": 0.10,
         "q_bc": 0.15,
     },
+    "epochs_per_member": 3,
     "synthetic_cold_start_frac": 0.15,
     "model_a_seed_offset": 11,
     "model_b_seed_offset": 23,
@@ -762,8 +794,11 @@ CKPT_DIR = ROOT / "artifacts" / "checkpoints" / "qwen8b_minimalist"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 K_LATENT = int((CFG["train"].get("k_factors") or [16])[0])
+# Both members use the metadata-aware variant. Member B's bench-side
+# pathway is rendered unused at inference via force_bench_missing
+# (see cell 11), and at training is starved of gradient by p_bench=1.0.
 MODEL_A_NAME = "meta_hybrid_irt_kfactor_gated_mlp"
-MODEL_B_NAME = "hybrid_irt_kfactor_gated_mlp"
+MODEL_B_NAME = "meta_hybrid_irt_kfactor_gated_mlp"
 
 SPLIT_SEED = SEED
 MODEL_A_SEED = SEED + int(CFG["coverage_blend"]["model_a_seed_offset"])
@@ -813,11 +848,18 @@ print(json.dumps(asdict(model_a_cfg), default=str, indent=2)[:1200])
 # Build TrainConfig once -- reused for both members so any wall-clock
 # comparison between A and B reflects only the architecture / dropout
 # delta, not optimizer hyperparameters.
+#
+# ``epochs`` is pinned to ``CFG["coverage_blend"]["epochs_per_member"]``
+# (default 3) instead of reading from ``CFG["train"]["epochs"]``. The
+# 3-epoch budget is the empirically-safe default to prevent the
+# meta-channel from overfitting; bump it deliberately if val log-loss
+# is still trending down at epoch 3.
+EPOCHS_PER_MEMBER = int(CFG["coverage_blend"]["epochs_per_member"])
 train_cfg = TrainConfig(
     learning_rate=float(CFG["train"].get("learning_rate", 3.0e-3)),
     weight_decay=float(CFG["train"].get("weight_decay", 1.0e-4)),
     batch_size=int(CFG["train"].get("batch_size", 65536)),
-    epochs=int(CFG["train"].get("epochs", 5)),
+    epochs=EPOCHS_PER_MEMBER,
     warmup_steps=int(CFG["train"].get("warmup_steps", 30)),
     scheduler=str(CFG["train"].get("scheduler", "cosine")),
     grad_clip=float(CFG["train"].get("grad_clip", 1.0)),
@@ -825,6 +867,7 @@ train_cfg = TrainConfig(
     bf16=bool(CFG["encoder"].get("bf16", True)),
     num_workers=int(CFG["train"].get("num_workers", 0)),
 )
+print(f"epochs per member: {train_cfg.epochs}")
 
 # Monkey-patch ``build_model`` so train_one's internal model
 # construction also gets:
@@ -838,7 +881,14 @@ _active_dropout_cfg: dict = {"cfg": None, "name": None, "installed_handles": []}
 
 def _build_with_overrides(name, cfg):
     m = _orig_build_model(name, cfg)
-    if name == MODEL_A_NAME and bool(getattr(cfg, "use_metadata_features", False)):
+    # Both Member A and Member B use the meta-aware variant with the
+    # full schema; attach the same id tables to either when the cfg
+    # asks for metadata features. The training-time dropout below
+    # makes Member B's bench buffers gradient-only-on-row-0 even
+    # though both members share the buffer layout.
+    if bool(getattr(cfg, "use_metadata_features", False)) and hasattr(
+        m, "attach_metadata_tables"
+    ):
         m.attach_metadata_tables(meta_id_tables)
     drop_cfg = _active_dropout_cfg["cfg"]
     if drop_cfg is not None and name == _active_dropout_cfg["name"]:
@@ -895,34 +945,65 @@ print(
 )
 
 # %% [markdown]
-# ## 8b. Train Model B: no-metadata + benchmark-id dropout
+# ## 8b. Train Model B: subject-metadata-only + bc-dropout (3 epochs)
 #
-# **Why bc-idx dropout for the no-metadata model?** Model B's
-# `HybridIRTItemKFactorGatedMLP` predicts via
-# `mu + beta[bc_idx] + alpha_i*(theta - beta_i) + factor + residual`.
-# At hosted-test time on a cold-start benchmark, `bc_idx=0` (the UNK
-# slot), so `beta[0]` is the only piece of the per-bc bias channel
-# the runtime sees. Without dropout `beta[0]` receives no gradient
-# during training (no row uses bc_idx=0), so at test time it returns
-# whatever the random initializer gave us, plus the residual MLP has
-# never had to predict without a per-bc bias signal. With prob
-# `q_bc=0.15` we replace `bc_idx` with 0 during the forward pass,
-# training `beta[0]` to be a useful "average benchmark" prior and
-# forcing the MLP to learn bias-free predictions.
+# **Why bc-idx dropout?** Model B's `MetaHybridIRTKFactorGatedMLP`
+# predicts via `mu + beta[bc_idx] + alpha_i*(theta - beta_i) +
+# factor + meta_logit + residual`. At hosted-test time on a
+# cold-start benchmark, `bc_idx=0` (the UNK slot), so `beta[0]` is
+# the only piece of the per-bc bias channel the runtime sees.
+# Without dropout `beta[0]` receives no gradient during training
+# (no row uses bc_idx=0), so at test time it returns whatever the
+# random initializer gave us, plus the residual MLP has never had
+# to predict without a per-bc bias signal. With prob `q_bc=0.15`
+# we replace `bc_idx` with 0 during the forward pass, training
+# `beta[0]` to be a useful "average benchmark" prior and forcing
+# the MLP to learn bias-free predictions.
 #
-# **Why no metadata at all?** Model B's role in the blend is to be
-# the "metadata-free fallback". Even if we COULD wire metadata into
-# this model variant, doing so would defeat the purpose of having
-# two complementary members. The blend math (Jensen's slack) is
-# maximized when `Var(p_A - p_B)` is large, which requires Model B
-# to use a different feature subset.
+# **Why subject metadata only?** The user's ask: incorporate model
+# metadata (Claude family / org / release date / etc.) into the
+# second head while explicitly NOT using benchmark metadata.
+# Subject side stays usable because hosted-test models usually have
+# entries in `model_info.csv` (or are siblings of an entry whose
+# subject-tower output generalizes); benchmark side is unusable
+# because hosted-test benchmarks are often brand-new with no entry.
+# `p_bench=1.0` at training (via the dropout pre-hook) makes only
+# row 0 of the bench tables get gradient, and `force_bench_missing
+# =True` at export makes inference match by splicing row 0 into
+# every incoming meta_override before Member B's forward(). Net
+# effect: Member B uses subject metadata + bc_idx (with bc-dropout)
+# + pool / NN features, and ignores the bench tower entirely.
+#
+# **Why this still yields Jensen slack with Model A?** Member B's
+# meta channel has a different feature set than Member A (subject-
+# only vs subject+bench), and `Var(p_A - p_B)` is further amplified
+# by independent seeds, dropout RNG, and random batch order. We
+# don't need a fundamentally different architecture to get blend
+# benefit; we need a different effective feature subspace.
 
 # %%
+# Member B uses the SAME schema as Member A so both share one set of
+# metadata buffers and one preprocessor. The asymmetry is encoded
+# entirely via:
+#   * train-time ``p_bench=1.0`` (only the bench-side ``__MISSING__``
+#     embedding gets gradient signal),
+#   * inference-time ``force_bench_missing=True`` on the export side
+#     (the runtime ``_EnsembleModel`` swaps Member B's incoming
+#     bench fields for row 0 of its own ``bc_meta_*`` buffers
+#     before forward()).
+# This keeps the bundle layout uniform (one ``meta_preprocessor.json``,
+# one indexer, one set of buffer shapes) and the only difference
+# between A and B is the dropout schedule.
 model_b_cfg = ModelConfig(
-    use_metadata_features=False,
+    use_metadata_features=True,
+    meta_subject_categorical=_meta_schema.subject_categorical,
+    meta_subject_numeric=_meta_schema.subject_numeric,
+    meta_benchmark_categorical=_meta_schema.benchmark_categorical,
+    meta_benchmark_numeric=_meta_schema.benchmark_numeric,
+    meta_explicit_crosses=_meta_schema.explicit_crosses,
     **_common_kwargs,
 )
-print("Model B (no_meta + bc-dropout):")
+print("Model B (subject-meta only via p_bench=1.0 + bc-dropout):")
 print(json.dumps(asdict(model_b_cfg), default=str, indent=2)[:1200])
 
 train_mod.build_model = _build_with_overrides
@@ -944,14 +1025,18 @@ try:
         val_ds=val_ds,
         indexer=indexer,
         seed=MODEL_B_SEED,
-        run_id="qwen8b_minimalist_B_no_meta_bc_dropout",
+        run_id="qwen8b_minimalist_B_subj_meta_bc_dropout",
         checkpoint_dir=CKPT_DIR,
         extra_metadata={
             "encoder_model_id": CFG["encoder"]["model_id"],
-            "use_metadata_features": False,
+            # Model B keeps ``use_metadata_features=True`` (subject
+            # tower trains, bench tower starves at row 0) and is
+            # paired with ``force_bench_missing=True`` at export.
+            "use_metadata_features": True,
             "use_nn_features": True,
             "centroid_distances_top_m": int(top_m),
-            "bc_dropout": asdict(b_drop),
+            "subj_meta_dropout_and_bc_dropout": asdict(b_drop),
+            "force_bench_missing_at_inference": True,
         },
     )
     for h in _active_dropout_cfg["installed_handles"]:
@@ -1009,6 +1094,7 @@ def _score_dataset(
     *,
     bc_override: torch.Tensor | None = None,
     meta_override_template: dict | None = None,
+    bench_missing_real_subject: bool = False,
     batch_size: int = 8192,
 ) -> np.ndarray:
     """Run ``model`` over ``ds`` and return per-row uncalibrated
@@ -1019,9 +1105,17 @@ def _score_dataset(
     `bc_idx -> 0` on the synthetic cold-start slice.
 
     ``meta_override_template`` (when not None) is a dict with the
-    same keys as ``MetadataIdTables.row(0)``; the same MISSING row
-    is broadcast to every row of every batch. Only consumed by
-    metadata-aware models.
+    same keys as ``MetadataIdTables.row(0)``; the same row is
+    broadcast to every row of every batch. Use this for the
+    "all-MISSING" pattern (synthetic cold-start, Model A).
+
+    ``bench_missing_real_subject`` is the pattern Member B was
+    trained on: for each batch, look up REAL subject metadata via
+    the model's own ``subject_meta_*[subject_idx]`` buffers and
+    splice in row-0 (MISSING) for the bench fields. Mutually
+    exclusive with ``meta_override_template`` -- if both are set,
+    ``meta_override_template`` wins (so Member A's all-MISSING
+    pattern still works for synthetic-cold-start scoring).
     """
     n = len(ds)
     out = np.zeros(n, dtype=np.float32)
@@ -1045,6 +1139,30 @@ def _score_dataset(
                 kw["meta_override"] = {
                     k: v.expand(B_chunk, -1).to(device).contiguous()
                     for k, v in meta_override_template.items()
+                }
+            elif accepts_meta and bench_missing_real_subject:
+                B_chunk = end - start
+                sub_idx_chunk = ds.subject_ids[start:end].to(device)
+                # Real subject lookup from the model's buffers, MISSING
+                # bench from row 0 of the same buffers. Matches what
+                # the dropout pre-hook produced at training time.
+                real_sub_cat = model.subject_meta_cat_ids[sub_idx_chunk]
+                real_sub_num = model.subject_meta_num[sub_idx_chunk]
+                miss_bc_cat = (
+                    model.bc_meta_cat_ids[0:1]
+                    .expand(B_chunk, -1)
+                    .contiguous()
+                )
+                miss_bc_num = (
+                    model.bc_meta_num[0:1]
+                    .expand(B_chunk, -1)
+                    .contiguous()
+                )
+                kw["meta_override"] = {
+                    "subj_cat": real_sub_cat,
+                    "subj_num": real_sub_num,
+                    "bc_cat": miss_bc_cat,
+                    "bc_num": miss_bc_num,
                 }
             bc_chunk = (
                 bc_override[start:end] if bc_override is not None
@@ -1071,6 +1189,9 @@ trained_a.load_state_dict(ckpt_a["model_state"])
 trained_a = trained_a.to(device).eval()
 
 trained_b = _build_model_for_inf(MODEL_B_NAME, model_b_cfg)
+# Member B also uses the meta-aware variant -- attach the same id
+# tables before loading its state dict, just like Member A.
+trained_b.attach_metadata_tables(meta_id_tables)
 ckpt_b = torch.load(result_b.checkpoint_path, map_location=device, weights_only=False)
 trained_b.load_state_dict(ckpt_b["model_state"])
 trained_b = trained_b.to(device).eval()
@@ -1127,10 +1248,20 @@ p_a_cold = _score_dataset(
 )
 p_a_val = np.where(synth_mask, p_a_cold, p_a_real)
 
-print("Scoring Model B: real-bc pass...")
-p_b_real = _score_dataset(val_ds, trained_b)
-print("Scoring Model B: cold-start (bc=0) pass...")
-p_b_cold = _score_dataset(val_ds, trained_b, bc_override=val_bc_synth)
+# Member B was trained with p_bench=1.0 + p_subj=0.10, so its bench-
+# side parameters only ever saw row-0 (MISSING) bench input while
+# its subject-side parameters trained on REAL subject metadata
+# (with row 0 mixed in 10% of the time). We MUST score it with the
+# matching pattern -- real subject + MISSING bench -- otherwise the
+# real-bench embeddings (untrained random init) emit noise. The
+# synthetic-cold-start subset additionally forces ``bc_idx -> 0``
+# to simulate the per-bc-bias-missing test-time regime.
+print("Scoring Model B: real-bc + real-subj-meta + MISSING-bench-meta pass...")
+p_b_real = _score_dataset(val_ds, trained_b, bench_missing_real_subject=True)
+print("Scoring Model B: cold-start (bc=0 + same meta pattern) pass...")
+p_b_cold = _score_dataset(
+    val_ds, trained_b, bc_override=val_bc_synth, bench_missing_real_subject=True
+)
 p_b_val = np.where(synth_mask, p_b_cold, p_b_real)
 
 ylab_val = primary.val["label"].astype(float).to_numpy()
@@ -1224,8 +1355,10 @@ from src.nn_calibration import NNCalibrator, SubjectResidualTable
 
 print("Scoring Model A on train (real meta)...")
 p_a_train = _score_dataset(train_ds, trained_a)
-print("Scoring Model B on train (real bc)...")
-p_b_train = _score_dataset(train_ds, trained_b)
+print("Scoring Model B on train (real bc + real-subj + MISSING-bench-meta)...")
+p_b_train = _score_dataset(
+    train_ds, trained_b, bench_missing_real_subject=True
+)
 p_uncal_train_blend = (
     BLEND_PRESENT[0] * p_a_train + BLEND_PRESENT[1] * p_b_train
 ).astype(np.float32)
@@ -1344,7 +1477,14 @@ sub_dir = export_coverage_blend_run(
     member_b_state_dict=ckpt_b["model_state"],
     member_b_model_name=MODEL_B_NAME,
     member_b_model_cfg=asdict(model_b_cfg),
-    member_b_config_id="no_meta_bc_dropout",
+    member_b_config_id="subj_meta_bc_dropout",
+    # Member B was trained with p_bench=1.0; the runtime must always
+    # feed it MISSING bench input to match. Setting this flag tells
+    # the embedded ``_EnsembleModel`` to splice row-0 of Member B's
+    # ``bc_meta_*`` buffers into every incoming meta_override before
+    # forward(). Subject side is untouched.
+    member_a_force_bench_missing=False,
+    member_b_force_bench_missing=True,
     blend_weights_present=BLEND_PRESENT,
     blend_weights_missing=BLEND_MISSING,
     indexer={

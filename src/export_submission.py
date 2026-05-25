@@ -1651,6 +1651,7 @@ class _EnsembleModel(nn.Module):
         members,
         blend_weights,
         blend_weights_missing=None,
+        force_bench_missing=None,
     ):
         super().__init__()
         if not members:
@@ -1667,6 +1668,14 @@ class _EnsembleModel(nn.Module):
             raise RuntimeError(
                 "_EnsembleModel: blend_weights_missing length "
                 f"{len(blend_weights_missing)} != n_members {len(members)}"
+            )
+        if (
+            force_bench_missing is not None
+            and len(force_bench_missing) != len(members)
+        ):
+            raise RuntimeError(
+                "_EnsembleModel: force_bench_missing length "
+                f"{len(force_bench_missing)} != n_members {len(members)}"
             )
         flag_keys = (
             "use_pool_features",
@@ -1716,6 +1725,19 @@ class _EnsembleModel(nn.Module):
                 except (TypeError, ValueError):
                     accepts = False
             self._member_accepts_meta_override.append(accepts)
+
+        # Per-member ``force_bench_missing``: when True, splice the
+        # incoming ``meta_override``'s benchmark fields with row 0
+        # (the ``__MISSING__`` pattern) of the member's own
+        # ``bc_meta_*`` buffers before calling forward. Used for
+        # members that were trained with ``p_bench=1.0`` so the
+        # only trained bench-side embedding is the MISSING token --
+        # at inference we must ALWAYS feed them MISSING bench input
+        # to match the training distribution. Stored as a Python
+        # list (not buffer) because it's pure metadata, not weights.
+        self._force_bench_missing: list[bool] = [
+            bool(x) for x in (force_bench_missing or [False] * len(members))
+        ]
 
         w = torch.as_tensor(list(blend_weights), dtype=torch.float64)
         w = torch.clamp(w, min=0.0)
@@ -1778,8 +1800,47 @@ class _EnsembleModel(nn.Module):
             p_member = None
             n_folds = len(ml)
             accepts_meta = self._member_accepts_meta_override[w_idx]
+            force_miss = self._force_bench_missing[w_idx]
+            # Per-member meta_override splicing. When ``force_miss`` is
+            # set we substitute the bench fields with row 0 of the
+            # member's own ``bc_meta_*`` buffers (the MISSING pattern).
+            # Subject side passes through unchanged.
+            member_override = meta_override
+            if (
+                accepts_meta
+                and force_miss
+                and meta_override is not None
+                and len(ml) > 0
+            ):
+                fold0 = ml[0]
+                bc_cat_buf = getattr(fold0, "bc_meta_cat_ids", None)
+                bc_num_buf = getattr(fold0, "bc_meta_num", None)
+                if bc_cat_buf is not None and bc_num_buf is not None:
+                    bc_cat_in = meta_override["bc_cat"]
+                    bc_num_in = meta_override["bc_num"]
+                    B = int(bc_cat_in.shape[0])
+                    bc_cat_miss = (
+                        bc_cat_buf[0:1]
+                        .to(bc_cat_in.device)
+                        .to(bc_cat_in.dtype)
+                        .expand(B, -1)
+                        .contiguous()
+                    )
+                    bc_num_miss = (
+                        bc_num_buf[0:1]
+                        .to(bc_num_in.device)
+                        .to(bc_num_in.dtype)
+                        .expand(B, -1)
+                        .contiguous()
+                    )
+                    member_override = {
+                        "subj_cat": meta_override["subj_cat"],
+                        "subj_num": meta_override["subj_num"],
+                        "bc_cat": bc_cat_miss,
+                        "bc_num": bc_num_miss,
+                    }
             for fold_model in ml:
-                if accepts_meta and meta_override is not None:
+                if accepts_meta and member_override is not None:
                     logit = fold_model(
                         s,
                         bc,
@@ -1789,7 +1850,7 @@ class _EnsembleModel(nn.Module):
                         cluster_ids,
                         judge_feats,
                         nn_feats,
-                        meta_override=meta_override,
+                        meta_override=member_override,
                     )
                 else:
                     logit = fold_model(
@@ -3002,15 +3063,28 @@ if _IS_ENSEMBLE:
         if _BLEND_WEIGHTS_MISSING_RAW is not None
         else None
     )
+    # Optional per-member ``force_bench_missing`` flag list. Members
+    # with True force their incoming ``meta_override``'s bench fields
+    # to row 0 of their own ``bc_meta_*`` buffers (the MISSING pattern)
+    # before forward(). Used for the subject-meta-only member of the
+    # coverage-blend ensemble (trained with p_bench=1.0).
+    _FORCE_BENCH_MISSING_RAW = _CKPT.get("force_bench_missing")
+    _FORCE_BENCH_MISSING = (
+        [bool(x) for x in _FORCE_BENCH_MISSING_RAW]
+        if _FORCE_BENCH_MISSING_RAW is not None
+        else None
+    )
     _MODEL = _EnsembleModel(
         _ENSEMBLE_MEMBERS,
         list(_CKPT["blend_weights"]),
         blend_weights_missing=_BLEND_WEIGHTS_MISSING,
+        force_bench_missing=_FORCE_BENCH_MISSING,
     )
     _MODEL.eval().to(_DEVICE)
     LOG.info(
         "Loaded ensemble bundle: %d configurations, blend_weights=%s, "
-        "blend_weights_missing=%s, fold_assignment_sha256=%s",
+        "blend_weights_missing=%s, force_bench_missing=%s, "
+        "fold_assignment_sha256=%s",
         len(_ENSEMBLE_MEMBERS),
         [float(w) for w in _MODEL.blend_weights.tolist()],
         (
@@ -3018,6 +3092,7 @@ if _IS_ENSEMBLE:
             if getattr(_MODEL, "_has_coverage_blend", False)
             else "<absent>"
         ),
+        list(_FORCE_BENCH_MISSING) if _FORCE_BENCH_MISSING is not None else "<absent>",
         str(_CKPT.get("fold_assignment_sha256", "<absent>"))[:16],
     )
 else:
@@ -5065,6 +5140,7 @@ def export_ensemble_run(
     nn_calibrator_state: Mapping | None = None,
     nn_calibrator_table_dir: str | os.PathLike[str] | None = None,
     blend_weights_missing: list[float] | None = None,
+    force_bench_missing: list[bool] | None = None,
 ) -> Path:
     """Materialize a submission folder backed by a K-fold ensemble bundle.
 
@@ -5123,6 +5199,16 @@ def export_ensemble_run(
             f"{len(blend_weights_missing)} != n_members {len(members)}. "
             "Pass either None (legacy scalar blend) or a list with one "
             "weight per member (coverage-conditional blend)."
+        )
+    if (
+        force_bench_missing is not None
+        and len(force_bench_missing) != len(members)
+    ):
+        raise RuntimeError(
+            "export_ensemble_run: force_bench_missing length "
+            f"{len(force_bench_missing)} != n_members {len(members)}. "
+            "Pass either None (no forced masking) or a list with one "
+            "bool per member."
         )
 
     flag_keys = (
@@ -5207,6 +5293,10 @@ def export_ensemble_run(
     if blend_weights_missing is not None:
         ensemble_ckpt["blend_weights_missing"] = [
             float(w) for w in blend_weights_missing
+        ]
+    if force_bench_missing is not None:
+        ensemble_ckpt["force_bench_missing"] = [
+            bool(x) for x in force_bench_missing
         ]
 
     sub = Path(submission_dir)
@@ -5506,6 +5596,11 @@ def export_ensemble_run(
                 if blend_weights_missing is not None
                 else None
             ),
+            "force_bench_missing": (
+                [bool(x) for x in force_bench_missing]
+                if force_bench_missing is not None
+                else None
+            ),
             "fold_assignment_sha256": str(fold_assignment_sha256),
         },
     }
@@ -5589,6 +5684,8 @@ def export_coverage_blend_run(
     member_b_model_name: str,
     member_b_model_cfg: Mapping,
     member_b_config_id: str = "no_meta_bc_dropout",
+    member_a_force_bench_missing: bool = False,
+    member_b_force_bench_missing: bool = False,
     blend_weights_present: tuple[float, float],
     blend_weights_missing: tuple[float, float],
     indexer: Mapping,
@@ -5692,6 +5789,10 @@ def export_coverage_blend_run(
             members=members,
             blend_weights=list(blend_weights_present),
             blend_weights_missing=list(blend_weights_missing),
+            force_bench_missing=[
+                bool(member_a_force_bench_missing),
+                bool(member_b_force_bench_missing),
+            ],
             indexer=indexer,
             encoder_cfg=encoder_cfg,
             fold_assignment_sha256=str(fold_assignment_sha256),

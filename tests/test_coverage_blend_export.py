@@ -57,11 +57,26 @@ _EnsembleModel = _NS["_EnsembleModel"]
 
 
 class _MetaForward(nn.Module):
-    """Toy fold-model whose forward DECLARES ``meta_override``."""
+    """Toy fold-model whose forward DECLARES ``meta_override``.
 
-    def __init__(self, scale=1.0):
+    Carries ``bc_meta_cat_ids`` / ``bc_meta_num`` buffers like
+    ``MetaHybridIRTKFactorGatedMLP`` so the per-member
+    ``force_bench_missing`` splice path has something to read row 0
+    from. The forward uses the override's bc_cat sum as the bias so
+    tests can verify whether bench-missing splicing happened.
+    """
+
+    def __init__(self, scale=1.0, bc_buf_value=7.0):
         super().__init__()
         self.scale = float(scale)
+        # Row 0 = MISSING (zeros). Other rows carry ``bc_buf_value``
+        # so the splice swaps a non-zero override input for zeros.
+        bc_cat = torch.zeros((4, 2), dtype=torch.long)
+        bc_cat[1:] = 5
+        bc_num = torch.zeros((4, 2), dtype=torch.float32)
+        bc_num[1:] = float(bc_buf_value)
+        self.register_buffer("bc_meta_cat_ids", bc_cat)
+        self.register_buffer("bc_meta_num", bc_num)
 
     def forward(
         self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None,
@@ -69,9 +84,13 @@ class _MetaForward(nn.Module):
     ):
         # Output is a logit per row -- we encode the scale into the
         # output so blending is verifiable.
-        # Also encode whether meta_override was passed by adding 100.
+        # Also encode whether meta_override was passed (bias=100) AND
+        # the sum of override["bc_num"] (so tests can verify whether
+        # bench-missing splicing happened).
         B = ie.shape[0]
         bias = 100.0 if meta_override is not None else 0.0
+        if meta_override is not None:
+            bias = bias + float(meta_override["bc_num"].sum().item())
         return torch.full((B,), self.scale + bias, dtype=ie.dtype, device=ie.device)
 
 
@@ -221,6 +240,148 @@ def test_constructor_normalizes_missing_weights():
         em.blend_weights_missing.cpu(),
         torch.tensor([0.5, 0.5], dtype=torch.float32),
     )
+
+
+def test_force_bench_missing_splices_override_with_row0():
+    """When a member has ``force_bench_missing=True``, its forward
+    should receive a meta_override whose ``bc_cat`` and ``bc_num``
+    fields are replaced with row 0 of the member's own
+    ``bc_meta_*`` buffers (the MISSING pattern).
+    """
+    em = _EnsembleModel(
+        _members(scale_a=0.0, scale_b=0.0),
+        blend_weights=[1.0, 0.0],  # all weight on Member A
+        force_bench_missing=[True, False],
+    )
+    s = torch.tensor([0])
+    bc = torch.tensor([0])
+    ie = torch.zeros(1, 4)
+    # Override carries non-zero bench numerics; with force flag those
+    # should be overwritten with row 0 (zeros) before forward sees them.
+    override = {
+        "subj_cat": torch.zeros(1, 1, dtype=torch.long),
+        "subj_num": torch.zeros(1, 1),
+        "bc_cat": torch.full((1, 2), 5, dtype=torch.long),
+        "bc_num": torch.full((1, 2), 7.0),
+    }
+    out = em(s, bc, ie, meta_override=override)
+    # _MetaForward returns scale + 100 + bc_num.sum(). With splicing
+    # ON, bc_num.sum() = 0 (row 0 is zeros). Without splicing,
+    # bc_num.sum() = 14. So output sigmoid is ~sigmoid(100) for
+    # spliced, ~sigmoid(114) for unspliced -- both ~1.0, hard to
+    # distinguish. We instead check the raw logit closely.
+    # Since we set blend weight all on Member A, the blended output
+    # is sigmoid(member_A_logit) blended uniquely.
+    p = torch.sigmoid(out).item()
+    # Verify Member A saw spliced override (bc_num=0).
+    # Reproduce the expected path: B=1, scale_a=0, bias=100+0=100.
+    # The logit going into the inverse_sigmoid round-trip is approx 100.
+    # We can verify by checking that p >= 1 - 1e-7 (clamped). Equivalently
+    # confirm the splice by also running with force=False and checking
+    # that the underlying bias differs.
+    em_no_force = _EnsembleModel(
+        _members(scale_a=0.0, scale_b=0.0),
+        blend_weights=[1.0, 0.0],
+        force_bench_missing=[False, False],
+    )
+    out_no = em_no_force(s, bc, ie, meta_override=override)
+    # Both paths get clamped to ~1.0 due to sigmoid saturation, but
+    # the LOGIT we returned (log(p/(1-p))) differs. Check that the
+    # raw output (which IS the logit) reflects different bias values.
+    # With force ON: bias = 100 + 0 = 100
+    # With force OFF: bias = 100 + 14 = 114
+    # Both saturate sigmoid to ~1, so the returned logit re-derived
+    # from clamp(sigmoid(x)) is the same (the eps clamp). The cleanest
+    # check is to register a hook on Member A that captures what it
+    # actually receives.
+    captured = {}
+    fold_a = em._member_lists[0][0]
+    orig_forward = fold_a.forward
+
+    def _capture(s_, bc_, ie_, *args, meta_override=None, **kwargs):
+        captured["override"] = meta_override
+        return orig_forward(s_, bc_, ie_, *args, meta_override=meta_override, **kwargs)
+
+    fold_a.forward = _capture
+    try:
+        em(s, bc, ie, meta_override=override)
+    finally:
+        fold_a.forward = orig_forward
+
+    spliced = captured["override"]
+    assert spliced is not None
+    # bc_num row 0 of the buffer is zeros; the splice should reflect that.
+    assert torch.equal(spliced["bc_num"], torch.zeros(1, 2))
+    assert torch.equal(spliced["bc_cat"], torch.zeros(1, 2, dtype=torch.long))
+    # Subject side passes through unchanged.
+    assert torch.equal(spliced["subj_cat"], override["subj_cat"])
+    assert torch.equal(spliced["subj_num"], override["subj_num"])
+
+
+def test_force_bench_missing_does_not_affect_non_meta_member():
+    """Member B (no meta_override kwarg) should be unaffected by
+    its own ``force_bench_missing`` flag -- the splice only triggers
+    for members that accept the kwarg.
+    """
+    em = _EnsembleModel(
+        _members(scale_a=0.0, scale_b=5.0),
+        blend_weights=[0.0, 1.0],  # all weight on Member B
+        force_bench_missing=[False, True],
+    )
+    # Member B doesn't have ``bc_meta_*`` buffers in our test fixture
+    # AND doesn't accept meta_override. The forward should still work.
+    s = torch.tensor([0])
+    bc = torch.tensor([0])
+    ie = torch.zeros(1, 4)
+    out = em(s, bc, ie, meta_override={
+        "subj_cat": torch.zeros(1, 1, dtype=torch.long),
+        "subj_num": torch.zeros(1, 1),
+        "bc_cat": torch.zeros(1, 2, dtype=torch.long),
+        "bc_num": torch.zeros(1, 2),
+    })
+    p = torch.sigmoid(out).item()
+    # Member B logit = 5 -> p ~ 0.99
+    assert p > 0.99
+
+
+def test_force_bench_missing_default_is_passthrough():
+    """When ``force_bench_missing=None`` (legacy callers), no member
+    should have its meta_override spliced."""
+    em = _EnsembleModel(_members(), [0.5, 0.5])
+    assert em._force_bench_missing == [False, False]
+
+
+def test_force_bench_missing_rejects_mismatched_length():
+    with pytest.raises(RuntimeError, match="force_bench_missing"):
+        _EnsembleModel(_members(), [0.5, 0.5], force_bench_missing=[True])
+
+
+def test_export_ensemble_run_rejects_mismatched_force_bench_missing():
+    from src.export_submission import export_ensemble_run
+
+    members = [
+        {
+            "config_id": "a",
+            "model_name": "x",
+            "model_cfg": {},
+            "fold_checkpoint_paths": [],
+        },
+        {
+            "config_id": "b",
+            "model_name": "y",
+            "model_cfg": {},
+            "fold_checkpoint_paths": [],
+        },
+    ]
+    with pytest.raises(RuntimeError, match="force_bench_missing length"):
+        export_ensemble_run(
+            members=members,
+            blend_weights=[0.5, 0.5],
+            force_bench_missing=[True],  # mismatch
+            indexer={"subject_to_id": {}, "bc_to_id": {}},
+            encoder_cfg={"model_id": "x"},
+            fold_assignment_sha256="x",
+        )
 
 
 def test_export_ensemble_run_rejects_mismatched_missing_weights():
