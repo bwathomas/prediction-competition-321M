@@ -226,6 +226,127 @@ def assign_clusters(
     return (out + 1).astype(np.int64, copy=False)
 
 
+def compute_top_m_distances(
+    centroids: np.ndarray,
+    item_embeddings: np.ndarray,
+    *,
+    top_m: int,
+    batch_size: int = 16384,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute top-m nearest centroids per item with squared L2 distances.
+
+    Returns ``(top_m_ids, top_m_dists)`` where:
+
+    - ``top_m_ids`` has shape ``[N, top_m]`` and stores cluster ids in
+      ``[1, k]`` (consistent with :func:`assign_clusters`; ``0`` stays
+      reserved for UNK), sorted by ascending distance.
+    - ``top_m_dists`` has shape ``[N, top_m]`` and stores the
+      *squared* L2 distances. Squared L2 (rather than the square root)
+      is what FAISS' ``IndexFlatL2`` and ``faiss.Kmeans`` compute and
+      avoids a downstream ``sqrt`` per query that mostly amplifies
+      numerical noise. Both representations are monotonic in the same
+      ranking so the consumer can take ``sqrt`` if they want true L2.
+
+    Backend selection mirrors :func:`assign_clusters`: FAISS GPU when
+    available, FAISS CPU otherwise, and a numpy chunked argpartition
+    fallback if FAISS is missing entirely. The on-disk schema of
+    centroids is the same as for the existing nearest-centroid path so
+    callers can re-use one centroid file for both single-id assignment
+    and top-m distance features.
+
+    The output is row-aligned with ``item_embeddings``.
+    """
+    X = np.asarray(item_embeddings, dtype=np.float32)
+    C = np.asarray(centroids, dtype=np.float32)
+    if X.ndim != 2:
+        raise ValueError(f"item_embeddings must be 2-D; got shape {X.shape}")
+    if C.ndim != 2:
+        raise ValueError(f"centroids must be 2-D; got shape {C.shape}")
+    if X.shape[1] != C.shape[1]:
+        raise ValueError(
+            f"dim mismatch: items {X.shape[1]} vs centroids {C.shape[1]}"
+        )
+    k_clusters = int(C.shape[0])
+    top_m = int(top_m)
+    if top_m <= 0:
+        raise ValueError(f"top_m must be > 0; got {top_m}")
+    if top_m > k_clusters:
+        raise ValueError(
+            f"top_m={top_m} exceeds n_centroids={k_clusters}; pick smaller top_m"
+        )
+    n = int(X.shape[0])
+
+    try:
+        import faiss  # type: ignore
+
+        d = C.shape[1]
+        cpu_index = faiss.IndexFlatL2(d)
+        cpu_index.add(np.ascontiguousarray(C))
+
+        gpu_available, _ = _faiss_gpu_available()
+        if gpu_available:
+            try:
+                res = faiss.StandardGpuResources()
+                index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+            except Exception as exc:  # noqa: BLE001
+                LOG.info(
+                    "FAISS GPU index construction failed (%s); using CPU index",
+                    exc,
+                )
+                index = cpu_index
+        else:
+            index = cpu_index
+
+        out_ids = np.empty((n, top_m), dtype=np.int64)
+        out_dists = np.empty((n, top_m), dtype=np.float32)
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            d2, labels = index.search(
+                np.ascontiguousarray(X[start:end]), top_m
+            )
+            # FAISS returns squared L2 for IndexFlatL2.
+            out_dists[start:end] = np.asarray(d2, dtype=np.float32)
+            out_ids[start:end] = np.asarray(labels, dtype=np.int64)
+        # offset by 1 so that 0 stays reserved for the UNK fallback id
+        # (matches assign_clusters' convention exactly).
+        out_ids = out_ids + 1
+        # Squared L2 should be non-negative; FAISS sometimes emits tiny
+        # negative numbers (-1e-7 on duplicate vectors). Clamp to avoid
+        # surprising the consumer.
+        np.maximum(out_dists, 0.0, out=out_dists)
+        return out_ids.astype(np.int64, copy=False), out_dists
+    except Exception as exc:  # noqa: BLE001
+        LOG.info(
+            "FAISS unavailable for top-m distances (%s); using numpy fallback",
+            exc,
+        )
+
+    # Numpy fallback: full pairwise squared-L2, then argpartition+sort
+    # of the top-m on each row. O(N * K) memory per batch; we chunk
+    # over rows to keep peak RAM bounded.
+    out_ids = np.empty((n, top_m), dtype=np.int64)
+    out_dists = np.empty((n, top_m), dtype=np.float32)
+    c_norm = (C * C).sum(axis=1)  # [k]
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        chunk = X[start:end]
+        x_norm = (chunk * chunk).sum(axis=1, keepdims=True)
+        d2 = x_norm + c_norm[None, :] - 2.0 * (chunk @ C.T)
+        # Argpartition gives the top_m indices unsorted, then sort
+        # within the partition.
+        part = np.argpartition(d2, kth=top_m - 1, axis=1)[:, :top_m]
+        # Gather the partitioned distances + sort each row ascending.
+        gathered = np.take_along_axis(d2, part, axis=1)
+        order = np.argsort(gathered, axis=1)
+        sorted_idx = np.take_along_axis(part, order, axis=1)
+        sorted_d2 = np.take_along_axis(gathered, order, axis=1)
+        out_ids[start:end] = sorted_idx.astype(np.int64)
+        out_dists[start:end] = np.asarray(sorted_d2, dtype=np.float32)
+    out_ids = out_ids + 1
+    np.maximum(out_dists, 0.0, out=out_dists)
+    return out_ids.astype(np.int64, copy=False), out_dists
+
+
 # Persistence ----------------------------------------------------------------
 
 
@@ -471,6 +592,7 @@ def cluster_id_for_embedding(
 __all__ = [
     "assign_clusters",
     "cluster_id_for_embedding",
+    "compute_top_m_distances",
     "fit_and_assign",
     "fit_kmeans",
     "load_assignments",

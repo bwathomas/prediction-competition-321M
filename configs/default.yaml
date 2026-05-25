@@ -131,6 +131,32 @@ nn_features:
   # features when these fallbacks fire.
   fallback_value: 0.0
   top1_missing_sentinel: -1.0
+  # When True, build the training index with FAISS GPU. The nn_features
+  # module silently falls back to FAISS CPU and then to a numpy chunked
+  # argpartition so this is safe to leave on -- on a GPU box it speeds
+  # up the index build by ~50x for typical embedding corpus sizes.
+  prefer_gpu: true
+
+# ----------------------------------------------------------------------------
+# Centroid-distance features (embedding-derived pool-feature columns)
+#
+# After fitting k-means in the `clustering` block above, every item's
+# top-m squared L2 distances to the nearest centroids become extra
+# `centroid_dist_0` ... `centroid_dist_{top_m-1}` columns of the pool
+# feature dataframe. They give the residual MLP a soft cluster signal
+# (rank-ordered closeness to multiple centroids) on top of the
+# discrete `cluster_ids` lookup. See `src/item_features.py:
+# build_centroid_distance_features` for the implementation.
+#
+# Because they share the pool-feature plumbing, no extra ModelConfig
+# field or LookupDataset channel is required: enabling this just
+# extends `pool_feature_dim` by `top_m`. The notebook
+# `notebooks/qwen8b_minimalist.ipynb` flips this on by default; legacy
+# notebooks see the existing 9-feature schema unchanged.
+# ----------------------------------------------------------------------------
+centroid_distances:
+  enabled: false
+  top_m: 8
 
 # ----------------------------------------------------------------------------
 # Structured metadata channel (subject + benchmark)

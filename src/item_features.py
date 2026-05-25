@@ -274,16 +274,157 @@ def build_feature_matrix(
     return arr
 
 
+# Centroid-distance features ------------------------------------------------
+#
+# These are *embedding-derived* scalar features (not text-derived like
+# the canonical 9 above): the squared L2 distances from each item's
+# embedding to the top-m nearest k-means centroids, sorted ascending.
+# They give the residual MLP a soft cluster signal -- "this item is
+# very close to centroid 12 (typical short MCQ math) and somewhat close
+# to centroid 7 (Latex-heavy)" -- without committing to a single hard
+# id like the existing ``cluster_ids`` channel does.
+#
+# We surface these through the same plumbing as the text features:
+# they're appended as extra columns of the pool-feature dataframe,
+# mean/std-fit against the train split, and concatenated into the
+# residual MLP via ModelConfig.pool_feature_dim. The runtime computes
+# them from the cached centroids file + the per-prediction item
+# embedding, so no additional artifact beyond cluster_centroids.npy
+# needs to ship.
+
+
+def centroid_distance_feature_names(top_m: int) -> list[str]:
+    """Canonical ``centroid_dist_0`` ... ``centroid_dist_{top_m-1}`` order.
+
+    The numbering is the rank of the centroid (0 = nearest), NOT the
+    centroid id, since centroid ids are not stable across runs (kmeans
+    is initialization-dependent) but the rank ordering of
+    "1st nearest vs 2nd nearest" is what the model actually uses.
+    """
+    if int(top_m) <= 0:
+        raise ValueError(f"top_m must be > 0; got {top_m}")
+    return [f"centroid_dist_{i}" for i in range(int(top_m))]
+
+
+def build_centroid_distance_features(
+    item_keys: Sequence[str],
+    item_emb_lookup: dict[str, np.ndarray] | dict[str, list[float]],
+    centroids: np.ndarray,
+    *,
+    top_m: int,
+) -> pd.DataFrame:
+    """Compute per-item top-m centroid-distance columns.
+
+    Returns a DataFrame with columns
+    ``["item_key", "centroid_dist_0", ..., "centroid_dist_{top_m-1}"]``,
+    one row per ``item_keys`` entry, sorted by ascending squared L2
+    distance. Distances are squared L2 (matches what FAISS' IndexFlatL2
+    and our :func:`src.clustering.compute_top_m_distances` emit) so the
+    runtime / training paths stay numerically identical.
+
+    Items missing from ``item_emb_lookup`` get the sentinel value
+    ``np.nan`` -- the consumer is expected to z-score these (NaN -> 0
+    after z-score), which is the "treat unknown as average" fallback the
+    rest of the pool-feature pipeline already uses.
+    """
+    from .clustering import compute_top_m_distances
+
+    if int(top_m) <= 0:
+        raise ValueError(f"top_m must be > 0; got {top_m}")
+
+    keys = [str(k) for k in item_keys]
+
+    # Two passes so we never pay a stack/copy for items that are
+    # missing from the lookup; tracked via a bool mask.
+    present_idx: list[int] = []
+    present_vecs: list[np.ndarray] = []
+    for i, k in enumerate(keys):
+        v = item_emb_lookup.get(k)
+        if v is None:
+            continue
+        arr = np.asarray(v, dtype=np.float32)
+        if arr.ndim != 1:
+            raise ValueError(
+                f"item_emb_lookup[{k!r}] must be 1-D; got shape {arr.shape}"
+            )
+        present_idx.append(i)
+        present_vecs.append(arr)
+
+    cols = centroid_distance_feature_names(int(top_m))
+    if not present_vecs:
+        # No items had embeddings -- emit an all-NaN frame so caller can
+        # detect and fall back. (Shape still consistent with cols.)
+        empty = pd.DataFrame(
+            {c: np.full(len(keys), np.nan, dtype=np.float32) for c in cols}
+        )
+        empty.insert(0, "item_key", keys)
+        return empty
+
+    X = np.stack(present_vecs, axis=0)
+    if X.shape[1] != int(centroids.shape[1]):
+        raise ValueError(
+            f"item embedding dim {X.shape[1]} != centroid dim {int(centroids.shape[1])}"
+        )
+
+    _, dists = compute_top_m_distances(
+        centroids,
+        X,
+        top_m=int(top_m),
+    )
+
+    out = np.full((len(keys), int(top_m)), np.nan, dtype=np.float32)
+    for row_pos, idx in enumerate(present_idx):
+        out[idx] = dists[row_pos]
+
+    df = pd.DataFrame({c: out[:, i] for i, c in enumerate(cols)})
+    df.insert(0, "item_key", keys)
+    return df
+
+
+def merge_pool_and_centroid_features(
+    pool_df: pd.DataFrame,
+    centroid_df: pd.DataFrame | None,
+    *,
+    key_col: str = "item_key",
+) -> tuple[pd.DataFrame, list[str]]:
+    """Outer-join ``pool_df`` with ``centroid_df`` on ``key_col``.
+
+    Returns ``(merged_df, feature_cols)`` where ``feature_cols`` is the
+    canonical column order the consumer should pass into
+    :func:`fit_zscore_stats` / :func:`build_feature_matrix`.
+
+    When ``centroid_df`` is ``None`` we just return the pool features
+    plus the canonical 9-column order. This is the "centroid distances
+    disabled" path so callers can use one merge call for both modes.
+    """
+    base_cols = list(POOL_FEATURE_NAMES)
+    if centroid_df is None or len(centroid_df.columns) <= 1:
+        return pool_df, base_cols
+
+    # The centroid_df has [item_key, centroid_dist_0, ..., centroid_dist_{m-1}].
+    extra_cols = [c for c in centroid_df.columns if c != key_col]
+    merged = pool_df.merge(
+        centroid_df[[key_col, *extra_cols]],
+        on=key_col,
+        how="left",
+        validate="one_to_one",
+    )
+    return merged, base_cols + extra_cols
+
+
 __all__ = [
     "POOL_FEATURE_NAMES",
     "apply_zscore",
+    "build_centroid_distance_features",
     "build_feature_matrix",
+    "centroid_distance_feature_names",
     "compute_features_for_items",
     "compute_pool_features",
     "feature_names",
     "fit_zscore_stats",
     "load_pool_features",
     "load_zscore_stats",
+    "merge_pool_and_centroid_features",
     "save_pool_features",
     "save_zscore_stats",
 ]

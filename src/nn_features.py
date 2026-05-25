@@ -75,6 +75,11 @@ class NNFeaturesConfig:
     top1_missing_sentinel: float = -1.0
     exclude_self_in_training: bool = True
     cache_dir: str = "artifacts/nn_features"
+    # Promote the FAISS IndexFlat to GPU when one is visible. The
+    # on-disk artifact is always the CPU index (faiss.write_index does
+    # not accept a GPU handle), so this only affects query-time speed.
+    # Ignored on machines with no GPU / no faiss-gpu build.
+    prefer_gpu: bool = True
 
     @classmethod
     def from_dict(cls, d: Mapping | None) -> "NNFeaturesConfig":
@@ -90,6 +95,7 @@ class NNFeaturesConfig:
                 d.get("exclude_self_in_training", True)
             ),
             cache_dir=str(d.get("cache_dir", "artifacts/nn_features")),
+            prefer_gpu=bool(d.get("prefer_gpu", True)),
         )
 
     def to_dict(self) -> dict:
@@ -359,6 +365,31 @@ class TrainingNNIndex:
 
     # --------------------------------------------------------------- backend
 
+    def _maybe_to_gpu(self, faiss_module, cpu_index):
+        """Move ``cpu_index`` to GPU when ``cfg.prefer_gpu`` is on and a GPU exists.
+
+        Returns the GPU-resident index on success, the original CPU
+        index on any failure. We persist a CPU copy to disk regardless
+        (faiss.write_index doesn't accept a GPU index) so reloads are
+        symmetric.
+        """
+        if not bool(getattr(self.cfg, "prefer_gpu", True)):
+            return cpu_index
+        try:
+            n_gpus = int(faiss_module.get_num_gpus())
+        except Exception:  # noqa: BLE001
+            return cpu_index
+        if n_gpus <= 0:
+            return cpu_index
+        try:
+            res = faiss_module.StandardGpuResources()
+            return faiss_module.index_cpu_to_gpu(res, 0, cpu_index)
+        except Exception as exc:  # noqa: BLE001
+            LOG.info(
+                "FAISS GPU promotion failed (%s); keeping CPU index", exc
+            )
+            return cpu_index
+
     def _try_build_faiss(self, out_dir: Path) -> None:
         if self.embeddings is None:
             return
@@ -377,8 +408,11 @@ class TrainingNNIndex:
             else:
                 index = faiss.IndexFlatL2(D)
             index.add(np.ascontiguousarray(self.embeddings, dtype=np.float32))
+            # Persist the CPU copy first so the on-disk format stays
+            # symmetric whether or not a GPU is attached.
             faiss.write_index(index, str(out_dir / self.FAISS_FILE))
-            self._faiss_index = index
+            # Then optionally promote to GPU for query-time speed.
+            self._faiss_index = self._maybe_to_gpu(faiss, index)
         except Exception as exc:  # noqa: BLE001
             self._faiss_error = f"faiss build failed: {exc}"
         finally:
@@ -391,7 +425,8 @@ class TrainingNNIndex:
         try:
             import faiss  # type: ignore
 
-            self._faiss_index = faiss.read_index(str(path))
+            cpu_index = faiss.read_index(str(path))
+            self._faiss_index = self._maybe_to_gpu(faiss, cpu_index)
         except Exception as exc:  # noqa: BLE001
             self._faiss_error = f"faiss read failed: {exc}"
 

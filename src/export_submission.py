@@ -1975,6 +1975,180 @@ class _Calibrator:
         return float(min(max(q, EPS), 1.0 - EPS))
 
 
+class _NNCalibrator:
+    """Netflix-Prize-style nearest-neighbor calibrator.
+
+    For each (subject, item) prediction this calibrator looks up the
+    top-K nearest training items in embedding space, computes the
+    similarity-weighted mean of ``(y_neighbor - p_uncal_neighbor)``
+    over neighbors that have a recorded label for the same subject,
+    and shifts the model's prediction by ``alpha`` times that mean.
+    The state (``alpha``, ``temperature``, ``k``, ``similarity``,
+    ``min_weight_sum``, ``similarity_floor``,
+    ``apply_in_logit_space``) is loaded from
+    ``runtime_meta.json["nn_calibrator"]``; the per-(subject, item)
+    label + uncalibrated-probability table is loaded from
+    ``cache/nn_residual/`` (four .npy files plus meta.json).
+
+    When the state is absent, the loader returns a no-op instance
+    (``alpha=0``) and ``apply`` is the identity. This keeps existing
+    submission bundles backwards compatible.
+    """
+
+    def __init__(self, state: dict | None = None) -> None:
+        st = dict(state or {})
+        self.alpha: float = float(st.get("alpha", 0.0))
+        self.temperature: float = float(st.get("temperature", 1.0))
+        self.k: int = int(st.get("k", 16))
+        self.similarity: str = str(st.get("similarity", "cosine"))
+        self.min_weight_sum: float = float(st.get("min_weight_sum", 1e-3))
+        self.similarity_floor: float = float(st.get("similarity_floor", 0.0))
+        self.apply_in_logit_space: bool = bool(
+            st.get("apply_in_logit_space", False)
+        )
+        # Sparse table; each is None until ``load_table`` succeeds.
+        self.passrate_indptr: np.ndarray | None = None
+        self.passrate_indices: np.ndarray | None = None
+        self.passrate_data: np.ndarray | None = None
+        self.uncal_prob_data: np.ndarray | None = None
+        self.n_subjects: int = 0
+        self.n_training_items: int = 0
+
+    @property
+    def has_table(self) -> bool:
+        return (
+            self.passrate_indptr is not None
+            and self.passrate_indices is not None
+            and self.passrate_data is not None
+            and self.uncal_prob_data is not None
+        )
+
+    def load_table(self, table_dir: Path) -> None:
+        """Load the four sparse arrays + meta. No-op on any failure."""
+        try:
+            meta = json.loads(
+                (table_dir / "meta.json").read_text(encoding="utf-8")
+            )
+            self.passrate_indptr = np.load(
+                table_dir / "passrate_indptr.npy"
+            ).astype(np.int64, copy=False)
+            self.passrate_indices = np.load(
+                table_dir / "passrate_indices.npy"
+            ).astype(np.int32, copy=False)
+            self.passrate_data = np.load(
+                table_dir / "passrate_data.npy"
+            ).astype(np.float32, copy=False)
+            self.uncal_prob_data = np.load(
+                table_dir / "uncal_prob_data.npy"
+            ).astype(np.float32, copy=False)
+            self.n_subjects = int(meta.get("n_subjects", 0))
+            self.n_training_items = int(meta.get("n_training_items", 0))
+            LOG.info(
+                "NN calibrator table loaded: n_subjects=%d n_training_items=%d nnz=%d",
+                self.n_subjects,
+                self.n_training_items,
+                int(self.passrate_data.shape[0]),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.passrate_indptr = None
+            self.passrate_indices = None
+            self.passrate_data = None
+            self.uncal_prob_data = None
+            LOG.info("NN calibrator table load skipped (%s)", exc)
+
+    def _lookup(
+        self, subject_id: int, neighbor_rows: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.has_table:
+            n = neighbor_rows.shape[0]
+            return (
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+            )
+        s = int(subject_id)
+        if s < 0 or s >= int(self.n_subjects):
+            n = neighbor_rows.shape[0]
+            return (
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+            )
+        a = int(self.passrate_indptr[s])
+        b = int(self.passrate_indptr[s + 1])
+        if a == b:
+            n = neighbor_rows.shape[0]
+            return (
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+            )
+        sub_idx = self.passrate_indices[a:b]
+        sub_y = self.passrate_data[a:b]
+        sub_p = self.uncal_prob_data[a:b]
+        nbr = np.asarray(neighbor_rows, dtype=np.int64)
+        pos = np.searchsorted(sub_idx, nbr)
+        clipped = np.clip(pos, 0, len(sub_idx) - 1)
+        hit = (clipped == pos) & (sub_idx[clipped] == nbr)
+        labels = np.where(hit, sub_y[clipped], 0.0).astype(np.float32)
+        probs = np.where(hit, sub_p[clipped], 0.0).astype(np.float32)
+        mask = hit.astype(np.float32)
+        return labels, probs, mask
+
+    def apply(
+        self,
+        p_uncal: float,
+        subject_id: int,
+        neighbor_rows: np.ndarray | None,
+        neighbor_sims: np.ndarray | None,
+    ) -> float:
+        """Adjust ``p_uncal`` by the kNN residual term. Identity when
+        the state is degenerate (alpha=0, no table, or no neighbors)."""
+        if (
+            float(self.alpha) == 0.0
+            or not self.has_table
+            or neighbor_rows is None
+            or neighbor_sims is None
+        ):
+            return float(p_uncal)
+        nbrs = np.asarray(neighbor_rows, dtype=np.int64).reshape(-1)
+        sims = np.asarray(neighbor_sims, dtype=np.float32).reshape(-1)
+        if nbrs.size == 0 or sims.size == 0:
+            return float(p_uncal)
+        K_eff = min(int(self.k), int(nbrs.shape[0]))
+        nbrs = nbrs[:K_eff]
+        sims = sims[:K_eff]
+        ys, ps, m = self._lookup(int(subject_id), nbrs)
+        if not bool(m.any()):
+            return float(p_uncal)
+        weights = np.clip(sims - float(self.similarity_floor), 0.0, None)
+        if float(self.temperature) != 1.0:
+            weights = np.power(weights, float(self.temperature))
+        w = weights * m
+        w_sum = float(w.sum())
+        if w_sum < float(self.min_weight_sum):
+            return float(p_uncal)
+        if self.apply_in_logit_space:
+            ys_c = np.clip(ys, EPS, 1.0 - EPS).astype(np.float64)
+            ps_c = np.clip(ps, EPS, 1.0 - EPS).astype(np.float64)
+            r = np.log(ys_c / (1.0 - ys_c)) - np.log(ps_c / (1.0 - ps_c))
+            shift = float((w.astype(np.float64) * r).sum() / w_sum)
+            p_in = float(min(max(p_uncal, EPS), 1.0 - EPS))
+            logit_in = math.log(p_in / (1.0 - p_in))
+            logit_out = logit_in + float(self.alpha) * shift
+            try:
+                q = 1.0 / (1.0 + math.exp(-logit_out))
+            except OverflowError:
+                q = 0.0 if logit_out < 0 else 1.0
+        else:
+            r = ys.astype(np.float64) - ps.astype(np.float64)
+            shift = float((w.astype(np.float64) * r).sum() / w_sum)
+            q = float(p_uncal) + float(self.alpha) * shift
+        if not math.isfinite(q):
+            return float(p_uncal)
+        return float(min(max(q, EPS), 1.0 - EPS))
+
+
 # ---------------------------------------------------------------------------
 # Training-item cache (nearest-neighbor lookup over training items).
 #
@@ -2818,6 +2992,18 @@ _PROB_CACHE: dict[tuple[str, str], float] = {}
 _CALIBRATOR = _Calibrator(META.get("default_calibrator"))
 _LAST_LABELED_FINGERPRINT: tuple | None = None
 
+# NN calibrator: state from runtime_meta.json["nn_calibrator"]; per-
+# (subject, training-item) label/p_uncal table from
+# ``cache/nn_residual/`` (sibling of the existing training cache). When
+# the state is absent or the table fails to load, the calibrator stays
+# in identity mode (alpha=0) and the chain becomes a no-op.
+_NN_CALIBRATOR = _NNCalibrator(META.get("nn_calibrator"))
+_NN_RESIDUAL_TABLE_DIR = (
+    Path(__file__).resolve().parent / "cache" / "nn_residual"
+)
+if _NN_RESIDUAL_TABLE_DIR.exists() and float(_NN_CALIBRATOR.alpha) != 0.0:
+    _NN_CALIBRATOR.load_table(_NN_RESIDUAL_TABLE_DIR)
+
 # --- Streamed-flush state (per-call timeout-safe architecture) -------------
 #
 # The platform enforces a 10-second per-call timeout on ``predict()``.  An
@@ -3179,14 +3365,101 @@ def _get_subject_embedding(subject_content: str) -> np.ndarray:
     return vec
 
 
-def _compute_pool_features_vec(item_content: str) -> np.ndarray:
-    """Compute the z-scored pool feature vector for a single item."""
+_CENTROID_DIST_PREFIX = "centroid_dist_"
+
+# Cache of centroid squared norms so we don't recompute them on every
+# prediction (the centroid file never changes after import).
+_CENTROID_NORM2_CACHE: np.ndarray | None = None
+
+
+def _centroid_norm2() -> np.ndarray | None:
+    """Return cached ``[k]`` squared L2 norms of the centroid rows."""
+    global _CENTROID_NORM2_CACHE
+    if _CLUSTER_CENTROIDS is None or _CLUSTER_CENTROIDS.size == 0:
+        return None
+    if _CENTROID_NORM2_CACHE is None:
+        _CENTROID_NORM2_CACHE = (
+            (_CLUSTER_CENTROIDS * _CLUSTER_CENTROIDS).sum(axis=1).astype(np.float32)
+        )
+    return _CENTROID_NORM2_CACHE
+
+
+def _compute_centroid_distance_vec(
+    item_emb: np.ndarray, top_m: int
+) -> np.ndarray:
+    """Return ``[top_m]`` squared L2 distances to the nearest centroids.
+
+    Output is sorted ascending (matches the training-time
+    :func:`src.clustering.compute_top_m_distances` schema). Returns
+    zeros when the centroid artifact is missing or when the consumer
+    requested more centroids than exist (degraded but non-crashing).
+    """
+    if top_m <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if _CLUSTER_CENTROIDS is None or _CLUSTER_CENTROIDS.size == 0:
+        return np.zeros(int(top_m), dtype=np.float32)
+    c_norm2 = _centroid_norm2()
+    x = item_emb.astype(np.float32)[None, :]
+    C = _CLUSTER_CENTROIDS
+    k_clusters = int(C.shape[0])
+    # Squared L2: |x|^2 + |c|^2 - 2 x.c
+    d2 = (x * x).sum(axis=1, keepdims=True) + c_norm2[None, :] - 2.0 * (x @ C.T)
+    d2 = np.clip(d2, 0.0, None)[0]
+    eff_m = min(int(top_m), k_clusters)
+    # argpartition + sort over the partition is O(k + m log m).
+    if eff_m == k_clusters:
+        sorted_d2 = np.sort(d2)
+    else:
+        part = np.argpartition(d2, eff_m - 1)[:eff_m]
+        sorted_d2 = np.sort(d2[part])
+    if eff_m < int(top_m):
+        # Pad with the last available value to keep the model's input
+        # width stable. Padding with zero would bias the residual MLP.
+        pad = np.full(int(top_m) - eff_m, sorted_d2[-1], dtype=np.float32)
+        return np.concatenate([sorted_d2.astype(np.float32), pad])
+    return sorted_d2.astype(np.float32)
+
+
+def _compute_pool_features_vec(
+    item_content: str, item_emb: np.ndarray | None = None
+) -> np.ndarray:
+    """Compute the z-scored pool feature vector for a single item.
+
+    ``item_emb`` is required when ``POOL_FEATURE_NAMES`` contains any
+    ``centroid_dist_*`` entries (these are computed from the embedding
+    against the shipped ``cluster_centroids.npy``); for the canonical
+    9-feature pool list it is ignored. Older bundles whose runtime
+    meta has no centroid columns will pass ``None`` and the function
+    keeps its pre-existing behaviour.
+    """
     if not _MODEL_CFG.get("use_pool_features"):
         return np.zeros(0, dtype=np.float32)
     feats = compute_pool_features_runtime(item_content)
+    # Pre-compute centroid distances once when needed so we don't pay
+    # the GEMM cost per scalar.
+    centroid_top_m = sum(
+        1 for n in POOL_FEATURE_NAMES if n.startswith(_CENTROID_DIST_PREFIX)
+    )
+    centroid_vals: dict[str, float] = {}
+    if centroid_top_m > 0 and item_emb is not None:
+        d_vec = _compute_centroid_distance_vec(item_emb, centroid_top_m)
+        # Map "centroid_dist_<rank>" -> distance. If the names are
+        # non-contiguous (e.g. someone manually edited
+        # runtime_meta.json["pool_feature_names"]), we still resolve
+        # by rank index.
+        ranks_seen = sorted(
+            int(n[len(_CENTROID_DIST_PREFIX):])
+            for n in POOL_FEATURE_NAMES
+            if n.startswith(_CENTROID_DIST_PREFIX)
+        )
+        for slot, r in enumerate(ranks_seen):
+            centroid_vals[f"{_CENTROID_DIST_PREFIX}{r}"] = float(d_vec[slot])
     out = np.zeros(len(POOL_FEATURE_NAMES), dtype=np.float32)
     for i, name in enumerate(POOL_FEATURE_NAMES):
-        v = float(feats.get(name, 0.0))
+        if name.startswith(_CENTROID_DIST_PREFIX):
+            v = float(centroid_vals.get(name, 0.0))
+        else:
+            v = float(feats.get(name, 0.0))
         s = _POOL_STATS.get(name) or {}
         mean = float(s.get("mean", 0.0))
         std = float(s.get("std", 1.0))
@@ -3312,7 +3585,7 @@ def _predict_uncalibrated(
 
     item_emb = _get_item_embedding(benchmark, condition, item_content)
     subject_emb = _get_subject_embedding(subject_content)
-    pool_vec = _compute_pool_features_vec(item_content)
+    pool_vec = _compute_pool_features_vec(item_content, item_emb)
     cluster_id = _assign_cluster_id(item_emb)
     judge_vec = _get_judge_features(benchmark, condition, subject_content, item_content)
     item_cache_key = stable_sha256(benchmark, condition, item_content)
@@ -3453,6 +3726,40 @@ def predict(input: dict, labeled: list[dict] | None = None) -> float:
         p = _predict_uncalibrated(benchmark, condition, subject_content, item_content)
         _bc_key_for_apply = "{0}::{1}".format(benchmark, condition)
         p = _CALIBRATOR.apply(p, _bc_key_for_apply)
+        # Netflix-style nearest-neighbor calibration. No-op when the
+        # calibrator is in identity mode (alpha=0) or the residual
+        # table failed to load. We re-use the same training-cache FAISS
+        # index that the NN feature path uses, plus the cached item
+        # embedding (already computed inside _predict_uncalibrated and
+        # memoised in _ITEM_EMB_CACHE), so this adds at most one FAISS
+        # search per predict() call.
+        if (
+            _NN_CALIBRATOR is not None
+            and float(_NN_CALIBRATOR.alpha) != 0.0
+            and _NN_CALIBRATOR.has_table
+            and TRAINING_CACHE is not None
+        ):
+            try:
+                subject_key = stable_sha256(subject_content)
+                _subj_nn_id = -1
+                if TRAINING_CACHE.subject_key_to_id:
+                    _subj_nn_id = int(
+                        TRAINING_CACHE.subject_key_to_id.get(subject_key, -1)
+                    )
+                if _subj_nn_id >= 0:
+                    item_emb = _get_item_embedding(
+                        benchmark, condition, item_content
+                    )
+                    nbr_idx, nbr_sims = TRAINING_CACHE.nearest(
+                        item_emb, k=int(_NN_CALIBRATOR.k)
+                    )
+                    p = _NN_CALIBRATOR.apply(
+                        p, _subj_nn_id, nbr_idx, nbr_sims
+                    )
+            except Exception:
+                LOG.exception(
+                    "NN calibrator apply failed; falling back to base calibrator"
+                )
         p = float(min(max(p, EPS), 1.0 - EPS))
         _PROB_CACHE[cache_key] = p
         return p
@@ -3759,6 +4066,8 @@ def export_run(
     ship_requirements_txt: bool = False,
     train_counts: Mapping | None = None,
     meta_preprocessor: Any = None,
+    nn_calibrator_state: Mapping | None = None,
+    nn_calibrator_table_dir: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -3999,6 +4308,60 @@ def export_run(
                 "training_cache_dir=%s does not exist; skipping cache bundle",
                 src_cache,
             )
+
+    # --- NN calibrator residual table -----------------------------------
+    # The state alone (alpha, k, etc.) is useless without the per-
+    # (subject, training-item) labels + uncalibrated probabilities.
+    # We always copy the table when one is provided AND the calibrator
+    # state opts in (alpha != 0); otherwise the runtime stays in
+    # identity mode and the table is unused dead weight in the zip.
+    if (
+        nn_calibrator_table_dir is not None
+        and float((nn_calibrator_state or {}).get("alpha", 0.0)) != 0.0
+    ):
+        src_resid = Path(nn_calibrator_table_dir)
+        required_resid_files = (
+            "passrate_indptr.npy",
+            "passrate_indices.npy",
+            "passrate_data.npy",
+            "uncal_prob_data.npy",
+            "meta.json",
+        )
+        if not src_resid.exists():
+            raise RuntimeError(
+                f"export_run: nn_calibrator_table_dir={src_resid} does not "
+                "exist but nn_calibrator_state.alpha != 0. Either pass "
+                "alpha=0 to ship a no-op calibrator or fit and persist "
+                "the residual table first."
+            )
+        missing_resid = [
+            f for f in required_resid_files if not (src_resid / f).exists()
+        ]
+        if missing_resid:
+            raise RuntimeError(
+                "export_run: nn_calibrator_table_dir is missing required "
+                f"files: {missing_resid}. Re-run "
+                "SubjectResidualTable.from_rows(...).save(...)."
+            )
+        dst_resid = sub / "cache" / "nn_residual"
+        dst_resid.parent.mkdir(parents=True, exist_ok=True)
+        if dst_resid.exists():
+            shutil.rmtree(dst_resid)
+        shutil.copytree(src_resid, dst_resid)
+        LOG.info(
+            "Bundled NN-calibrator residual table from %s -> %s "
+            "(alpha=%.3f, k=%d)",
+            src_resid,
+            dst_resid,
+            float((nn_calibrator_state or {}).get("alpha", 0.0)),
+            int((nn_calibrator_state or {}).get("k", 16)),
+        )
+    elif nn_calibrator_table_dir is not None:
+        LOG.info(
+            "NN calibrator state.alpha=0; skipping residual-table bundle "
+            "(would have been copied from %s)",
+            nn_calibrator_table_dir,
+        )
 
     # Normalize the judge block for the runtime. We persist the locked
     # prompt template + yes/no token lists so the runtime never diverges
@@ -4269,6 +4632,28 @@ def export_run(
     }
     if lora_block is not None:
         runtime_meta["lora"] = lora_block
+
+    # --- NN calibrator (Netflix-Prize style residual) -------------------
+    # The state is a small JSON blob loaded by ``_NNCalibrator`` at
+    # runtime. The data table is copied into ``submission/cache/nn_residual/``
+    # below. When ``alpha == 0`` (or the caller passes None) we still
+    # persist the state with alpha=0 so downstream tooling can audit
+    # what was shipped.
+    nncal_state = dict(nn_calibrator_state or {"alpha": 0.0})
+    runtime_meta["nn_calibrator"] = {
+        "alpha": float(nncal_state.get("alpha", 0.0)),
+        "temperature": float(nncal_state.get("temperature", 1.0)),
+        "k": int(nncal_state.get("k", 16)),
+        "similarity": str(nncal_state.get("similarity", "cosine")),
+        "min_weight_sum": float(nncal_state.get("min_weight_sum", 1e-3)),
+        "similarity_floor": float(nncal_state.get("similarity_floor", 0.0)),
+        "apply_in_logit_space": bool(
+            nncal_state.get("apply_in_logit_space", False)
+        ),
+        "fit_method": str(nncal_state.get("fit_method", "")),
+        "fit_n_val": int(nncal_state.get("fit_n_val", 0)),
+    }
+
     if train_counts:
         # Embed per-subject and per-bc training row counts so the runtime
         # labeling.py can switch from BINARY -> GRADED novelty + anchoring
@@ -4536,6 +4921,9 @@ def export_ensemble_run(
     ship_training_cache: bool = False,
     ship_requirements_txt: bool = False,
     train_counts: Mapping | None = None,
+    meta_preprocessor: Any = None,
+    nn_calibrator_state: Mapping | None = None,
+    nn_calibrator_table_dir: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Materialize a submission folder backed by a K-fold ensemble bundle.
 
@@ -4736,6 +5124,40 @@ def export_ensemble_run(
         )
         judge_cfg = None
 
+    # --- Metadata preprocessor (cold-start subject / benchmark fields).
+    # Mirror the export_run guard so ensembles built from metadata-aware
+    # heads don't silently lose the cold-start signal.
+    ckpt_uses_meta_ens = bool(first_cfg.get("use_metadata_features", False))
+    if ckpt_uses_meta_ens:
+        if meta_preprocessor is None:
+            raise RuntimeError(
+                "export_ensemble_run: ensemble members declare "
+                "use_metadata_features=True but the caller passed "
+                "meta_preprocessor=None. Pass the fitted MetadataPreprocessor "
+                "(or its .to_dict()) so the runtime can encode cold-start rows."
+            )
+        if hasattr(meta_preprocessor, "to_dict") and callable(
+            meta_preprocessor.to_dict
+        ):
+            meta_blob_ens = meta_preprocessor.to_dict()
+        elif isinstance(meta_preprocessor, Mapping):
+            meta_blob_ens = dict(meta_preprocessor)
+        else:
+            raise TypeError(
+                "export_ensemble_run: meta_preprocessor must be a "
+                "MetadataPreprocessor or a dict; got "
+                f"{type(meta_preprocessor).__name__}"
+            )
+        (artifacts / "meta_preprocessor.json").write_text(
+            json.dumps(meta_blob_ens, indent=2, default=str), encoding="utf-8"
+        )
+    elif meta_preprocessor is not None:
+        LOG.warning(
+            "export_ensemble_run: meta_preprocessor was passed but ensemble "
+            "members have use_metadata_features=False; skipping "
+            "meta_preprocessor.json"
+        )
+
     # Copy auxiliary artifacts (pool stats / cluster centroids / training cache)
     # using the same conventions as export_run.
     pool_src = (
@@ -4760,6 +5182,42 @@ def export_ensemble_run(
             if dst_cache.exists():
                 shutil.rmtree(dst_cache)
             shutil.copytree(src_cache, dst_cache)
+
+    # NN calibrator residual table (ensemble path mirrors export_run).
+    if (
+        nn_calibrator_table_dir is not None
+        and float((nn_calibrator_state or {}).get("alpha", 0.0)) != 0.0
+    ):
+        src_resid = Path(nn_calibrator_table_dir)
+        required_resid_files = (
+            "passrate_indptr.npy",
+            "passrate_indices.npy",
+            "passrate_data.npy",
+            "uncal_prob_data.npy",
+            "meta.json",
+        )
+        if not src_resid.exists():
+            raise RuntimeError(
+                f"export_ensemble_run: nn_calibrator_table_dir={src_resid} "
+                "does not exist but nn_calibrator_state.alpha != 0."
+            )
+        missing_resid = [
+            f for f in required_resid_files if not (src_resid / f).exists()
+        ]
+        if missing_resid:
+            raise RuntimeError(
+                "export_ensemble_run: nn_calibrator_table_dir is missing "
+                f"required files: {missing_resid}."
+            )
+        dst_resid = sub / "cache" / "nn_residual"
+        dst_resid.parent.mkdir(parents=True, exist_ok=True)
+        if dst_resid.exists():
+            shutil.rmtree(dst_resid)
+        shutil.copytree(src_resid, dst_resid)
+        LOG.info(
+            "Ensemble: bundled NN-calibrator residual table from %s -> %s",
+            src_resid, dst_resid,
+        )
 
     # Judge / encoder runtime block mirrors export_run.
     jcfg = dict(judge_cfg or {})
@@ -4890,6 +5348,23 @@ def export_ensemble_run(
             "blend_weights": [float(w) for w in blend_weights],
             "fold_assignment_sha256": str(fold_assignment_sha256),
         },
+    }
+    # NN calibrator state -- shared across the ensemble. Future
+    # ensemble work may ship per-member residual tables; this single-
+    # state form is the MVP that mirrors export_run.
+    _nncal_state_ens = dict(nn_calibrator_state or {"alpha": 0.0})
+    runtime_meta["nn_calibrator"] = {
+        "alpha": float(_nncal_state_ens.get("alpha", 0.0)),
+        "temperature": float(_nncal_state_ens.get("temperature", 1.0)),
+        "k": int(_nncal_state_ens.get("k", 16)),
+        "similarity": str(_nncal_state_ens.get("similarity", "cosine")),
+        "min_weight_sum": float(_nncal_state_ens.get("min_weight_sum", 1e-3)),
+        "similarity_floor": float(_nncal_state_ens.get("similarity_floor", 0.0)),
+        "apply_in_logit_space": bool(
+            _nncal_state_ens.get("apply_in_logit_space", False)
+        ),
+        "fit_method": str(_nncal_state_ens.get("fit_method", "")),
+        "fit_n_val": int(_nncal_state_ens.get("fit_n_val", 0)),
     }
     if train_counts:
         if not isinstance(train_counts, Mapping):
