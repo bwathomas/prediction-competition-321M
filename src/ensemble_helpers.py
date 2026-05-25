@@ -41,6 +41,71 @@ import pandas as pd
 
 LOG = logging.getLogger("ensemble_helpers")
 
+
+def _install_pandas_stringdtype_shim() -> bool:
+    """Make ``pd.StringDtype('storage', na_value)`` work on older pandas.
+
+    Some Codabench bundles ship a ``preprocessor.pkl`` that was pickled
+    with pandas >= 2.3, where ``StringDtype.__init__`` accepts an
+    ``na_value`` positional in addition to ``storage``.  On pandas 2.0-2.2
+    (still the default in many Colab images as of late-2025) only
+    ``storage`` is accepted and unpickling raises::
+
+        TypeError: StringDtype.__init__() takes from 1 to 2 positional
+                   arguments but 3 were given
+
+    Rather than forcing every notebook user to upgrade pandas (which can
+    cascade into ABI breaks against numpy/pyarrow), we install a one-shot
+    shim that swallows the extra positional and pops the ``na_value`` kwarg.
+    The result is a ``StringDtype`` instance with the requested ``storage``;
+    the ``na_value`` is dropped (pandas <2.3 always uses ``pd.NA``), which
+    is a benign no-op for the column-typing the LFM bundle uses.
+
+    Returns ``True`` if the shim was needed and installed, ``False`` if
+    the current pandas already accepts the modern signature.
+    """
+    try:
+        from pandas import StringDtype
+    except Exception:  # noqa: BLE001
+        return False
+    # Already shimmed (idempotent): bail.
+    if getattr(StringDtype.__init__, "_ensemble_shim", False):
+        return True
+    # Detect by trying the modern call with na_value=pd.NA.
+    try:
+        StringDtype("python", pd.NA)  # type: ignore[arg-type]
+        return False
+    except TypeError:
+        pass
+    original_init = StringDtype.__init__
+
+    def patched_init(self, storage=None, *args, **kwargs):
+        kwargs.pop("na_value", None)
+        if args:
+            # Silently drop trailing positionals (the na_value from
+            # newer-pandas pickles is in args[0]).
+            args = ()
+        try:
+            return original_init(self, storage, *args, **kwargs)
+        except TypeError:
+            return original_init(self)
+
+    patched_init._ensemble_shim = True  # type: ignore[attr-defined]
+    StringDtype.__init__ = patched_init  # type: ignore[method-assign]
+    LOG.info(
+        "installed pandas StringDtype shim (current pandas=%s)", pd.__version__
+    )
+    return True
+
+
+# Install the shim at module import so any pickle-load triggered by
+# ``load_submodel`` -> ``model.py`` -> ``load_artifacts`` is safe.
+try:
+    _install_pandas_stringdtype_shim()
+except Exception as _shim_exc:  # noqa: BLE001
+    LOG.warning("pandas StringDtype shim install skipped: %s", _shim_exc)
+
+
 # Per-input field whitelist; mirrors validation_harness/harness/utils.py
 INPUT_FIELDS: tuple[str, ...] = (
     "benchmark",
@@ -109,6 +174,13 @@ def load_submodel(
     model_path = submission_dir / "model.py"
     if not model_path.is_file():
         raise FileNotFoundError(f"model.py not found in {submission_dir}")
+    # Reinstall the pandas StringDtype shim in case pandas was upgraded
+    # mid-session and the previously-patched class no longer points at the
+    # active object (idempotent if not needed).
+    try:
+        _install_pandas_stringdtype_shim()
+    except Exception:  # noqa: BLE001
+        pass
     mod_name = name or f"_ensemble_submodel_{abs(hash(str(submission_dir))) & 0xFFFFFFFF:08x}"
     if reload:
         sys.modules.pop(mod_name, None)
