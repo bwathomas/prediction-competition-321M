@@ -212,11 +212,11 @@ if _HAS_STACKED_BUNDLE:
                 feats_m24 = np.zeros(_GBDT_STATE.feature_dim, dtype=np.float32)
             p2 = float(_gbdt_mod.apply_one(_GBDT_STATE, feats_m24))
             if int(_LOGREG_STATE.feature_dim) == int(feats_m24.shape[0]):
-                p4 = float(_logreg_mod.apply_one(_LOGREG_STATE, feats_m24))
+                p4 = float(_logreg_mod.apply_state_one(_LOGREG_STATE, feats_m24))
             else:
                 # Member 4 may have been trained on a different feature
                 # schema; fall back to its bias.
-                p4 = float(_logreg_mod.apply_one(
+                p4 = float(_logreg_mod.apply_state_one(
                     _LOGREG_STATE,
                     np.zeros(int(_LOGREG_STATE.feature_dim), dtype=np.float32),
                 ))

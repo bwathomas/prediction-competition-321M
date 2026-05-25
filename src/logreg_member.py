@@ -223,6 +223,25 @@ def apply_one(
 
 
 # ---------------------------------------------------------------------------
+# State-keyed convenience wrappers (uniform with gbdt_member / knn_member /
+# stacker conventions). These let callers pass a single ``state`` argument
+# instead of unpacking ``state.weights`` and ``state.bias`` at every call
+# site -- the export postprocessing block and the integration test rely
+# on the uniform signature.
+# ---------------------------------------------------------------------------
+
+
+def apply_state_one(state: "LogRegMemberState", features: np.ndarray) -> float:
+    """State-keyed single-row inference (uniform with other members)."""
+    return apply_one(state.weights, float(state.bias), features)
+
+
+def apply_state_batch(state: "LogRegMemberState", features: np.ndarray) -> np.ndarray:
+    """State-keyed batched inference (uniform with other members)."""
+    return apply_batch(state.weights, float(state.bias), features)
+
+
+# ---------------------------------------------------------------------------
 # Offline trainer (uses torch, called from the notebook only)
 # ---------------------------------------------------------------------------
 
@@ -394,5 +413,7 @@ __all__ = [
     "LogRegMemberState",
     "apply_one",
     "apply_batch",
+    "apply_state_one",
+    "apply_state_batch",
     "fit_logreg_member",
 ]
