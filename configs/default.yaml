@@ -133,6 +133,74 @@ nn_features:
   top1_missing_sentinel: -1.0
 
 # ----------------------------------------------------------------------------
+# Structured metadata channel (subject + benchmark)
+#
+# The ``meta_hybrid_irt_kfactor_gated_mlp`` model variant fuses three new
+# additive channels on top of the standard hybrid:
+#
+#   1. Metadata MLP towers -- map structured columns
+#      (organization, family, macro_family, log_params, release_date for
+#      subjects; topic, benchmark_age for benchmarks) to additive priors
+#      ``(a_meta_m, u_meta_m)`` for subject ability/skill and ``b_meta_bc``
+#      for benchmark-condition easiness. These give cold-start subjects
+#      and benchmarks an informed starting point instead of a random-init
+#      UNK row.
+#
+#   2. Factorization-machine cross head -- the per-field metadata
+#      embeddings are projected into a shared FM latent space and all
+#      pairwise interactions ``<v_i, v_j>`` are summed into one extra
+#      logit. Sample-efficient for the "Mistral x Medicine" style
+#      crosses we *don't* know about up front.
+#
+#   3. Explicit cross embedding tables -- dedicated lookup per named
+#      ``(subject_field, benchmark_field)`` cross. Maximally
+#      sample-efficient for the crosses we know matter.
+#
+# All output heads are zero-initialized so flipping ``enabled: true``
+# with the same checkpoint structure does NOT change predictions until
+# gradients have flowed through the metadata channels. See
+# ``src/metadata_features.py`` for the implementation and
+# ``src/models.py::MetaHybridIRTKFactorGatedMLP`` for the wiring.
+# ----------------------------------------------------------------------------
+metadata:
+  enabled: false                    # master switch; flip to use the meta model
+  # Paths to the version-controlled metadata CSVs. The structured
+  # columns these carry (organization / family / macro_family /
+  # parameters / release_date for subjects; topic / age / has_conditions
+  # for benchmarks) are the input to the metadata channels above.
+  model_info_path: "data/metadata/model_info.csv"
+  benchmark_info_path: "data/metadata/benchmark_info.csv"
+  # Schema -- which columns feed each channel. The fields named here
+  # MUST exist in the corresponding CSV (after the preprocessor's
+  # alias normalization: ``params`` -> ``parameters``, ``age`` ->
+  # ``benchmark_age``, ``macro-family`` -> ``macro_family``).
+  subject_categorical: ["organization", "family", "macro_family"]
+  subject_numeric:     ["log_params", "release_date"]
+  benchmark_categorical: ["topic"]
+  benchmark_numeric:     ["benchmark_age"]
+  # Hand-picked categorical crosses. Each is
+  # ``"subject_field__benchmark_field"`` and gets its own
+  # ``Embedding(card_subj * card_bench + 1, emb_dim)`` table.
+  explicit_crosses: ["family__topic", "macro_family__topic"]
+  # Per-channel mask (lets ablations turn pathways off without
+  # rebuilding the checkpoint).
+  include_tower_priors: true       # a_meta, u_meta, b_meta additive priors
+  include_fm_cross: true           # FM head over per-field embeddings
+  include_explicit_crosses: true   # named-cross lookup tables
+  include_in_residual: true        # feed raw metadata into the gated MLP
+  # Architecture hyperparameters.
+  tower_hidden_dim: 128
+  tower_num_layers: 2
+  emb_max_dim: 16                  # cap on auto-sized per-field embedding dim
+  fm_dim: 16                       # FM latent dimension
+  explicit_cross_emb_dim: 8
+  # Pattern-1-style soft tie pulling the subject-id (theta, u)
+  # embeddings toward the metadata-tower-derived prior. Default off;
+  # set ``> 0`` (e.g. ``1.0e-4``) to encourage warm-to-cold transfer
+  # without giving the metadata channel full control.
+  lambda_meta_tie: 0.0
+
+# ----------------------------------------------------------------------------
 # Pool features (hand-engineered per-item scalars, fed *into* the MLP)
 # ----------------------------------------------------------------------------
 item_features:
@@ -172,9 +240,19 @@ clustering:
 # ----------------------------------------------------------------------------
 train:
   # Default scoped to a single fast variant for iteration speed.
-  # The full ablation grid (all six variants, multiple ks/seeds) is
+  # The full ablation grid (all seven variants, multiple ks/seeds) is
   # re-enabled by editing this list + flipping
   # ``RUN_FEATURE_TOGGLE_GRID = True`` in notebook cell 13.
+  #
+  # To train the metadata-aware variant, set:
+  #     train.models: [meta_hybrid_irt_kfactor_gated_mlp]
+  #     metadata.enabled: true
+  # The notebook (or your own driver) calls
+  # ``src.data.prepare_metadata_artifacts(train_df, indexer)`` to get
+  # the fitted preprocessor + per-id tables and then
+  # ``model.attach_metadata_tables(tables)`` before training. The
+  # exporter takes a ``meta_preprocessor=`` arg that ships the fitted
+  # state into the bundle so the runtime can encode cold-start rows.
   models:
     - kfactor_irt_item_gated_mlp
   # Hyperparameters
@@ -221,6 +299,80 @@ train:
     normalize: true
     item_col: "item_key"
     log_report: true
+
+# ----------------------------------------------------------------------------
+# K-fold cross-validation + OOF ensemble (notebook cell 13b).
+#
+# Builds a single FROZEN K-fold partition over ``item_split_key`` (the
+# content-only item identity from src/data.py:add_stable_keys). Splitting
+# on ``item_split_key`` rather than ``item_key`` is REQUIRED for the
+# cold-start invariant: ``item_key`` encodes (benchmark, condition, content)
+# and so leaks the same item-content across folds whenever a benchmark
+# appears under multiple conditions (~88% leakage on v1 multi-condition
+# benchmarks).
+#
+# Every model trained by the K-fold cell loads the on-disk SHA-256 of the
+# fold assignment and refuses to train if it disagrees with the in-memory
+# hash, so an accidental re-randomization is loud rather than silent.
+#
+# Out-of-fold (OOF) predictions -- not in-fold -- are used to fit blend
+# weights because every OOF row is predicted by a model that did NOT train
+# on it; this matches the leaderboard's cold-start regime and prevents the
+# blend from rewarding memorization.
+# ----------------------------------------------------------------------------
+kfold:
+  # Master switch. When false, the K-fold cell prints a short "skipped"
+  # message and exits without touching disk.
+  enabled: false
+  # Number of folds. 5 = 80/20 train/val partition per fold, the standard
+  # bias/variance trade-off for CV ensembling.
+  n_folds: 5
+  # Seed for the fold-assignment permutation. Frozen so the SHA-256 hash
+  # check catches accidental re-randomization across reruns.
+  seed: 0
+  # Where the fold assignment, fold checkpoints, OOF predictions, blend
+  # weights, and summary tables are saved (relative to project root).
+  artifact_dir: "artifacts/kfold"
+  # Per-configuration training overrides. Each entry must include ``id``
+  # (used as the checkpoint filename prefix) and ``model_name``. Anything
+  # not specified here falls back to the matching ``train.*`` /
+  # ``encoder.*`` field above so the K-fold path tracks the single-model
+  # training cell by default.
+  models:
+    - id: "kfactor_irt_item_gated_mlp_k16_lo_dropout"
+      model_name: "kfactor_irt_item_gated_mlp"
+      k: 16
+      seed: 0
+      dropout: 0.1
+      weight_decay: 1.0e-4
+    - id: "kfactor_irt_item_gated_mlp_k16_hi_dropout"
+      model_name: "kfactor_irt_item_gated_mlp"
+      k: 16
+      seed: 1
+      dropout: 0.2
+      weight_decay: 1.0e-4
+  # Feature-flag overrides for the K-fold path. The K-fold cell does NOT
+  # re-fit per-fold pool z-scores / cluster centroids / NN passrate
+  # matrices (those are expensive and would re-fit K times per config).
+  # Default disables those channels so every fold sees the same minimal
+  # input set. Flip a flag on only if the matching artifact is already
+  # cached and stable across folds.
+  feature_flags:
+    use_pool_features: false
+    use_cluster_features: false
+    use_judge_features: false
+    use_nn_features: false
+    use_subject_text_embedding: false
+  # Blend-weight fit. We minimize OOF log-loss over non-negative weights
+  # constrained to sum to 1 (constrained least-squares via
+  # ``scipy.optimize.minimize`` SLSQP). When scipy is unavailable the cell
+  # falls back to equal weights and logs the fact loudly.
+  blend:
+    # Whether to print the per-config solo OOF + blended OOF table at the
+    # end of the cell.
+    report_summary: true
+    # Floor weights below this threshold to 0 and renormalize.
+    min_weight: 0.0
 
 # ----------------------------------------------------------------------------
 # LoRA fine-tuning of the item-side encoder (optional, opt-in)

@@ -724,6 +724,20 @@ def train_one(
                     tie_loss = compute_subject_tie_loss(model, s, se)
                     loss = loss + lambda_tie * tie_loss
 
+                # Metadata-tower tie: pulls the subject id embeddings
+                # (theta, u) toward the metadata-derived prior, in the
+                # spirit of Pattern-2 above but using the structured
+                # metadata channel instead of a text embedding. The
+                # model exposes the hook only when it has metadata
+                # towers attached; ``getattr(...)`` keeps the call site
+                # generic for variants that don't.
+                lambda_meta_tie = float(
+                    getattr(model_cfg, "lambda_meta_tie", 0.0) or 0.0
+                )
+                if lambda_meta_tie != 0.0 and hasattr(model, "compute_meta_tie_loss"):
+                    meta_tie_loss = model.compute_meta_tie_loss(s)
+                    loss = loss + lambda_meta_tie * meta_tie_loss
+
             loss.backward()
 
             if train_cfg.grad_clip and train_cfg.grad_clip > 0:

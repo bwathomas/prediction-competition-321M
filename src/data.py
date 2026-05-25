@@ -40,6 +40,18 @@ REQUIRED_RUNTIME_FIELDS: tuple[str, ...] = (
     "item_content",
 )
 
+# Where the version-controlled metadata CSVs (subject + benchmark) live.
+# These were lifted from the original ``codabench_submission`` bundle's
+# ``model_info.csv`` and ``benchmark_info.csv``: they carry the rich
+# structured columns (organization / family / macro_family / parameters
+# / release_date for subjects, topic / age / has_conditions for
+# benchmarks) that the HF ``subjects.parquet`` / ``benchmarks.parquet``
+# either don't have or have mostly null. The metadata-aware model
+# variant (``meta_hybrid_irt_kfactor_gated_mlp``) joins on these.
+METADATA_DIR: Path = Path(__file__).resolve().parents[1] / "data" / "metadata"
+METADATA_MODEL_INFO: Path = METADATA_DIR / "model_info.csv"
+METADATA_BENCHMARK_INFO: Path = METADATA_DIR / "benchmark_info.csv"
+
 
 # ---------------------------------------------------------------------------
 # Normalization helpers
@@ -657,6 +669,133 @@ def make_random_row_split(
 # ---------------------------------------------------------------------------
 # End-to-end loader
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Metadata CSV loaders (subject + benchmark structured columns)
+# ---------------------------------------------------------------------------
+
+
+def load_metadata_frames(
+    *,
+    model_info_path: str | os.PathLike[str] | None = None,
+    benchmark_info_path: str | os.PathLike[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the version-controlled metadata CSVs as raw dataframes.
+
+    Defaults to the bundled paths under ``data/metadata/`` so callers
+    don't need to know where the files live. Pass explicit paths for
+    augmented metadata (e.g. an updated organization map shipped with
+    a new model release).
+
+    Returns ``(model_info_df, benchmark_info_df)``. The model variant
+    that consumes these (``meta_hybrid_irt_kfactor_gated_mlp``) is the
+    sole place where the join semantics are defined, so we keep this
+    loader column-agnostic and let
+    :class:`src.metadata_features.MetadataPreprocessor` normalize.
+    """
+    mi_path = Path(model_info_path) if model_info_path else METADATA_MODEL_INFO
+    bi_path = Path(benchmark_info_path) if benchmark_info_path else METADATA_BENCHMARK_INFO
+    if not mi_path.exists():
+        raise FileNotFoundError(
+            f"model_info.csv not found at {mi_path}. The metadata model "
+            f"variant requires the structured-metadata CSVs under "
+            f"data/metadata/ (or pass --model_info_path explicitly)."
+        )
+    if not bi_path.exists():
+        raise FileNotFoundError(
+            f"benchmark_info.csv not found at {bi_path}."
+        )
+    model_info = pd.read_csv(mi_path)
+    benchmark_info = pd.read_csv(bi_path)
+    LOG.info(
+        "Loaded metadata: %d model rows from %s, %d benchmark rows from %s",
+        len(model_info),
+        mi_path,
+        len(benchmark_info),
+        bi_path,
+    )
+    return model_info, benchmark_info
+
+
+def build_subject_content_lookup(df: pd.DataFrame) -> dict[str, str]:
+    """Map ``subject_key`` -> raw ``subject_content`` for the metadata join.
+
+    The metadata preprocessor needs the raw subject_content string so it
+    can extract ``display_name`` via the ``Name: ...`` regex. We
+    de-duplicate by ``subject_key`` (the sha256 of subject_content)
+    since the join is one-to-one on that.
+    """
+    if "subject_key" not in df.columns:
+        raise KeyError(
+            "build_subject_content_lookup: df must have a 'subject_key' "
+            "column. Call add_stable_keys(df) first."
+        )
+    if "subject_content" not in df.columns:
+        raise KeyError(
+            "build_subject_content_lookup: df must have a 'subject_content' "
+            "column."
+        )
+    # ``drop_duplicates`` keeps the first occurrence; subject_key is a
+    # deterministic hash of subject_content so any duplicate row has
+    # the same subject_content as the first.
+    paired = df[["subject_key", "subject_content"]].drop_duplicates(subset=["subject_key"])
+    return {
+        str(k): str(v)
+        for k, v in zip(paired["subject_key"].tolist(), paired["subject_content"].tolist())
+    }
+
+
+def prepare_metadata_artifacts(
+    train_df: pd.DataFrame,
+    indexer,
+    *,
+    model_info_df: pd.DataFrame | None = None,
+    benchmark_info_df: pd.DataFrame | None = None,
+    schema=None,
+):
+    """One-shot helper: fit MetadataPreprocessor + build per-id tables.
+
+    Returns ``(preprocessor, id_tables)`` ready to attach to a
+    :class:`src.models.MetaHybridIRTKFactorGatedMLP` via
+    ``model.attach_metadata_tables(id_tables)``.
+
+    Use case (notebook side):
+
+        from src.data import prepare_metadata_artifacts
+        from src.models import build_model
+
+        mp, tables = prepare_metadata_artifacts(train_df, indexer)
+        model = build_model("meta_hybrid_irt_kfactor_gated_mlp", model_cfg)
+        model.attach_metadata_tables(tables)
+
+    The preprocessor object goes into ``runtime_meta.json`` at export
+    time so the runtime can reconstruct the same encoding for true
+    cold-start subjects/benchmarks.
+    """
+    from .metadata_features import (
+        MetadataPreprocessor,
+        MetadataSchema,
+        build_metadata_id_tables,
+    )
+
+    if model_info_df is None or benchmark_info_df is None:
+        mi, bi = load_metadata_frames()
+        if model_info_df is None:
+            model_info_df = mi
+        if benchmark_info_df is None:
+            benchmark_info_df = bi
+
+    schema = schema or MetadataSchema()
+    mp = MetadataPreprocessor.fit(model_info_df, benchmark_info_df, schema=schema)
+    subject_content_by_key = build_subject_content_lookup(train_df)
+    tables = build_metadata_id_tables(
+        preprocessor=mp,
+        subject_to_id=indexer.subject_to_id,
+        bc_to_id=indexer.bc_to_id,
+        subject_content_by_key=subject_content_by_key,
+    )
+    return mp, tables
 
 
 def prepare_dataset(

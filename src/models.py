@@ -136,6 +136,46 @@ class ModelConfig:
     use_nn_features: bool = False
     nn_feature_dim: int = 8
 
+    # --- Structured-metadata features (subject + benchmark-condition) ---
+    # When True, the model gains two metadata MLP "towers", a
+    # factorization-machine cross head, and a small explicit-cross head
+    # that all consume the columns from ``model_info.csv`` (subject
+    # side: organization, family, macro_family, log_params,
+    # release_date) and ``benchmark_info.csv`` (benchmark side: topic,
+    # benchmark_age). Towers' outputs are added as cold-start priors to
+    # the structured channels (``theta_eff = theta + a_meta``,
+    # ``beta_eff = beta + b_meta``, ``u_eff = u + u_meta``); the FM and
+    # explicit-cross heads add directly to the logit; the raw per-field
+    # embeddings are also fed into the gated residual MLP for higher-
+    # order nonlinear crosses. All output heads are zero-initialized so
+    # ``use_metadata_features=True`` boots up bit-identical to the
+    # non-metadata baseline (parity) and grows in only from gradients.
+    use_metadata_features: bool = False
+    meta_subject_categorical: tuple = ("organization", "family", "macro_family")
+    meta_subject_numeric: tuple = ("log_params", "release_date")
+    meta_benchmark_categorical: tuple = ("topic",)
+    meta_benchmark_numeric: tuple = ("benchmark_age",)
+    meta_explicit_crosses: tuple = ("family__topic", "macro_family__topic")
+    meta_tower_hidden_dim: int = 128
+    meta_tower_num_layers: int = 2
+    meta_emb_max_dim: int = 16
+    meta_fm_dim: int = 16
+    meta_explicit_cross_emb_dim: int = 8
+    # Channel mask -- lets ablations turn individual pathways off without
+    # rebuilding the model. ``include_in_residual`` controls whether the
+    # raw per-field metadata embeddings are concatenated into the gated
+    # residual MLP input (the higher-order nonlinear channel).
+    meta_include_tower_priors: bool = True
+    meta_include_fm_cross: bool = True
+    meta_include_explicit_crosses: bool = True
+    meta_include_in_residual: bool = True
+    # Pattern-2-style soft tie between the subject id embeddings and the
+    # subject-tower metadata-derived embeddings. ``lambda_meta_tie > 0``
+    # adds ``lambda * (MSE(theta, a_meta) + MSE(u, u_meta))`` to the
+    # training loss. Off by default; the trainer calls a hook on the
+    # model when this is non-zero.
+    lambda_meta_tie: float = 0.0
+
     def __post_init__(self) -> None:
         # Repair the cluster channel when the caller (or an old checkpoint
         # whose ``model_cfg`` dict predates the ``cluster_embed_dim`` field)
@@ -1421,6 +1461,689 @@ class HybridIRTItemKFactorGatedMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Metadata-aware hybrid: IRT + k-factor + gated MLP + structured metadata
+# (towers / FM cross / explicit crosses). The training-time class. The
+# runtime mirror lives in src/export_submission.py inside the
+# _RUNTIME_MODEL_PY string.
+# ---------------------------------------------------------------------------
+
+
+def _residual_feature_dim_meta_hybrid(cfg: ModelConfig, *, meta_subj_emb_dim: int, meta_bc_emb_dim: int) -> int:
+    """Width of the residual-MLP input for the metadata hybrid variant.
+
+    Superset of :func:`_residual_feature_dim_hybrid_irt_kfactor`, plus
+    (when ``cfg.meta_include_in_residual`` is set):
+      - the concatenated per-field subject categorical embeddings,
+      - the per-field benchmark categorical embeddings,
+      - the subject numeric channels (scaled + missingness, 2*N),
+      - the benchmark numeric channels,
+      - an elementwise interaction ``proj(subj_meta) * proj(bench_meta)``
+        materialized by the model (matches the existing ``u_s, v_i,
+        u_s * v_i`` pattern so the MLP can directly read the cross).
+    """
+    base = _residual_feature_dim_hybrid_irt_kfactor(cfg)
+    if not cfg.use_metadata_features or not cfg.meta_include_in_residual:
+        return base
+    n_sub_num = 2 * len(cfg.meta_subject_numeric)
+    n_bc_num = 2 * len(cfg.meta_benchmark_numeric)
+    inter_dim = min(meta_subj_emb_dim, meta_bc_emb_dim) if (meta_subj_emb_dim and meta_bc_emb_dim) else 0
+    base += int(meta_subj_emb_dim) + int(meta_bc_emb_dim) + int(n_sub_num) + int(n_bc_num) + int(inter_dim)
+    return base
+
+
+class MetaHybridIRTKFactorGatedMLP(nn.Module):
+    """Hybrid IRT + k-factor + gated MLP + structured metadata channels.
+
+    Final logit:
+
+        logit = mu
+              + beta_bc_id + b_meta_bc
+              + alpha_i * ((theta_id + a_meta_m) - beta_i)
+              + rho_factor * ((u_id + u_meta_m) . v_i) / sqrt(k)
+              + eta_fm_cross
+              + eta_explicit_crosses
+              + lambda_resid * gated_residual(F + meta_raw)
+
+    Where ``a_meta_m, u_meta_m, b_meta_bc`` come from the per-side
+    metadata MLP towers, and the FM + explicit-cross heads compose
+    nonlinear interactions like ``family=Mistral x topic=Medicine``.
+
+    Per-id metadata tensors live on the model as buffers (registered via
+    :meth:`attach_metadata_tables`), so the existing ``LookupDataset``
+    and trainer plumbing do not need to thread metadata through the
+    batch. The buffers ship in the state_dict, so save / load is
+    automatic.
+
+    All metadata output heads (towers, FM, explicit cross) are
+    zero-initialized -- a freshly built model with metadata enabled is
+    bit-identical to its non-metadata sibling, and learns the metadata
+    channel only as gradients flow.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        # Late import to avoid a circular import (data.py imports models;
+        # metadata_features is standalone but kept untouched at the top
+        # of this module so the existing import graph stays unchanged).
+        from .metadata_features import (
+            ExplicitCrossEmbeddings,
+            FactorizationMachineCross,
+            MetaTower,
+            MetadataSchema,
+            _PerFieldCategoricalEmbeddings,
+        )
+
+        self.cfg = cfg
+
+        # --- Hybrid IRT + k-factor core (mirrors HybridIRTItemKFactorGatedMLP) ---
+        self.mu = nn.Parameter(torch.zeros(1))
+        self.theta = nn.Embedding(cfg.n_subjects, 1)
+        self.beta = nn.Embedding(cfg.n_benchmark_conditions, 1)
+        nn.init.zeros_(self.theta.weight)
+        nn.init.zeros_(self.beta.weight)
+        self.irt_heads = ItemIRTHeads(
+            item_dim=cfg.item_embed_dim,
+            hidden=cfg.item_map_hidden_dim,
+            dropout=cfg.dropout,
+        )
+        self.u = nn.Embedding(cfg.n_subjects, cfg.k)
+        nn.init.normal_(self.u.weight, std=0.05)
+        self.item_map = ItemParameterMap(
+            item_embed_dim=cfg.item_embed_dim,
+            k=cfg.k,
+            hidden=cfg.item_map_hidden_dim,
+            dropout=cfg.dropout,
+        )
+        self.rho_factor = nn.Parameter(torch.tensor(0.1))
+
+        # --- Metadata channels (built only when use_metadata_features=True) ---
+        schema = MetadataSchema(
+            subject_categorical=tuple(cfg.meta_subject_categorical),
+            subject_numeric=tuple(cfg.meta_subject_numeric),
+            benchmark_categorical=tuple(cfg.meta_benchmark_categorical),
+            benchmark_numeric=tuple(cfg.meta_benchmark_numeric),
+            explicit_crosses=tuple(cfg.meta_explicit_crosses),
+        )
+        self._meta_schema = schema
+        # Cardinalities are populated when ``attach_metadata_tables`` is
+        # called; we register placeholder modules with the right
+        # *width* but zero rows so checkpoints save/load consistently
+        # regardless of attachment order.
+        self.subject_cat_embs = _PerFieldCategoricalEmbeddings(
+            cardinalities=(2,) * len(schema.subject_categorical),
+            max_emb_dim=cfg.meta_emb_max_dim,
+        )
+        self.benchmark_cat_embs = _PerFieldCategoricalEmbeddings(
+            cardinalities=(2,) * len(schema.benchmark_categorical),
+            max_emb_dim=cfg.meta_emb_max_dim,
+        )
+        n_sub_num = 2 * len(schema.subject_numeric)
+        n_bc_num = 2 * len(schema.benchmark_numeric)
+        subj_in = self.subject_cat_embs.total_dim + n_sub_num
+        bench_in = self.benchmark_cat_embs.total_dim + n_bc_num
+
+        self.subject_meta_tower = MetaTower(
+            in_dim=subj_in,
+            hidden_dim=cfg.meta_tower_hidden_dim,
+            k=cfg.k,
+            dropout=cfg.dropout,
+            num_layers=cfg.meta_tower_num_layers,
+        )
+        # Benchmark tower only emits the scalar prior (b_meta_bc). The
+        # k-vec on the bench side would have to combine with v_i and
+        # is already covered by the bench_cat_embs flowing through the
+        # residual MLP -- making it a tower output would duplicate that
+        # path and risk double-counting against ``v_i``. So we set
+        # ``k=1`` (a single dummy channel) and ignore the vector output.
+        self.bench_meta_tower = MetaTower(
+            in_dim=bench_in,
+            hidden_dim=cfg.meta_tower_hidden_dim,
+            k=1,
+            dropout=cfg.dropout,
+            num_layers=cfg.meta_tower_num_layers,
+        )
+
+        # Factorization-machine cross head over the per-field embedding
+        # bag. Uses one ``Linear(d_field -> d_fm)`` per field on each
+        # side.
+        self.fm_cross = FactorizationMachineCross(
+            subject_field_dims=self.subject_cat_embs.dims,
+            benchmark_field_dims=self.benchmark_cat_embs.dims,
+            d_fm=cfg.meta_fm_dim,
+        )
+
+        # Explicit per-pair cross embeddings (one table per named cross).
+        self.explicit_cross = ExplicitCrossEmbeddings(
+            crosses=tuple(cfg.meta_explicit_crosses),
+            schema=schema,
+            subject_cardinalities=self.subject_cat_embs.cardinalities,
+            benchmark_cardinalities=self.benchmark_cat_embs.cardinalities,
+            emb_dim=cfg.meta_explicit_cross_emb_dim,
+        )
+
+        # Projection used to align the subject- and benchmark-side
+        # categorical bags before elementwise interaction in the
+        # residual-MLP feed. Matches the (u_s, v_i, u_s * v_i) trick
+        # the hybrid already uses.
+        inter_dim = (
+            min(self.subject_cat_embs.total_dim, self.benchmark_cat_embs.total_dim)
+            if (self.subject_cat_embs.total_dim and self.benchmark_cat_embs.total_dim)
+            else 0
+        )
+        self.meta_inter_dim = int(inter_dim)
+        if inter_dim > 0:
+            self.meta_subj_inter_proj = nn.Linear(self.subject_cat_embs.total_dim, inter_dim)
+            self.meta_bench_inter_proj = nn.Linear(self.benchmark_cat_embs.total_dim, inter_dim)
+            nn.init.normal_(self.meta_subj_inter_proj.weight, std=0.05)
+            nn.init.zeros_(self.meta_subj_inter_proj.bias)
+            nn.init.normal_(self.meta_bench_inter_proj.weight, std=0.05)
+            nn.init.zeros_(self.meta_bench_inter_proj.bias)
+        else:
+            self.meta_subj_inter_proj = None
+            self.meta_bench_inter_proj = None
+
+        # --- Per-id metadata buffer tables (filled by ``attach_metadata_tables``) ---
+        # We register zero-sized buffers up front so ``state_dict`` /
+        # ``load_state_dict`` always include the buffers; the attach
+        # call resizes them in place. ``persistent=True`` is the
+        # default and what we want for save/load.
+        self.register_buffer(
+            "subject_meta_cat_ids",
+            torch.zeros((cfg.n_subjects, max(1, len(schema.subject_categorical))), dtype=torch.long),
+        )
+        self.register_buffer(
+            "subject_meta_num",
+            torch.zeros((cfg.n_subjects, max(2, n_sub_num)), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "bc_meta_cat_ids",
+            torch.zeros(
+                (cfg.n_benchmark_conditions, max(1, len(schema.benchmark_categorical))),
+                dtype=torch.long,
+            ),
+        )
+        self.register_buffer(
+            "bc_meta_num",
+            torch.zeros(
+                (cfg.n_benchmark_conditions, max(2, n_bc_num)),
+                dtype=torch.float32,
+            ),
+        )
+
+        # --- Residual gated MLP (sized to the new total) ---
+        meta_subj_emb_dim = self.subject_cat_embs.total_dim
+        meta_bc_emb_dim = self.benchmark_cat_embs.total_dim
+        in_dim = _residual_feature_dim_meta_hybrid(
+            cfg,
+            meta_subj_emb_dim=meta_subj_emb_dim if cfg.use_metadata_features else 0,
+            meta_bc_emb_dim=meta_bc_emb_dim if cfg.use_metadata_features else 0,
+        )
+        self.residual = GatedSwiGLUResidual(
+            in_dim=in_dim,
+            hidden=cfg.residual_hidden_dim,
+            dropout=cfg.dropout,
+        )
+        self.lambda_resid = nn.Parameter(
+            torch.tensor(float(cfg.lambda_resid_init)),
+            requires_grad=bool(cfg.lambda_resid_trainable),
+        )
+
+        # Pattern-1 cluster channel + Pattern-2 subject tie (carry over
+        # the existing hybrid's channels so toggling metadata on top of
+        # an established run is a clean superset).
+        self.cluster_embedding: nn.Embedding | None = None
+        if cfg.has_cluster_embedding:
+            self.cluster_embedding = nn.Embedding(
+                cfg.n_clusters + 1, cfg.cluster_embed_dim, padding_idx=0
+            )
+            nn.init.normal_(self.cluster_embedding.weight, std=0.05)
+        _register_subject_text_proj(self, cfg)
+
+    @property
+    def has_residual(self) -> bool:
+        return True
+
+    @property
+    def has_irt_heads(self) -> bool:
+        return True
+
+    @property
+    def has_metadata(self) -> bool:
+        return bool(self.cfg.use_metadata_features)
+
+    @property
+    def has_judge_features(self) -> bool:
+        return bool(self.cfg.use_judge_features and self.cfg.effective_judge_dim > 0)
+
+    @property
+    def has_nn_features(self) -> bool:
+        return bool(self.cfg.use_nn_features and self.cfg.effective_nn_dim > 0)
+
+    def _cluster_emb(self, cluster_ids: torch.Tensor | None) -> torch.Tensor | None:
+        if self.cluster_embedding is None or cluster_ids is None:
+            return None
+        if cluster_ids.numel() == 0 or cluster_ids.dim() < 1:
+            return None
+        return self.cluster_embedding(cluster_ids.long())
+
+    def attach_metadata_tables(self, tables) -> None:
+        """Rebuild per-field embeddings + buffers from a MetadataIdTables.
+
+        Called once after construction and before training so the embedding
+        cardinalities, buffer shapes, and FM / explicit-cross modules
+        agree with the actual fitted preprocessor. Idempotent: calling
+        twice with the same tables is safe and produces no diff.
+
+        This is the only place the model touches the
+        :class:`MetadataIdTables` type, so the import stays local.
+        """
+        from .metadata_features import (
+            ExplicitCrossEmbeddings,
+            FactorizationMachineCross,
+            MetadataIdTables,
+            _PerFieldCategoricalEmbeddings,
+        )
+
+        if not isinstance(tables, MetadataIdTables):
+            raise TypeError(
+                f"attach_metadata_tables expects MetadataIdTables, got {type(tables).__name__}"
+            )
+        cfg = self.cfg
+        schema = self._meta_schema
+        n_sub_cat = len(schema.subject_categorical)
+        n_bc_cat = len(schema.benchmark_categorical)
+        n_sub_num = 2 * len(schema.subject_numeric)
+        n_bc_num = 2 * len(schema.benchmark_numeric)
+
+        # Rebuild per-field embedding tables with the *real* cardinalities.
+        self.subject_cat_embs = _PerFieldCategoricalEmbeddings(
+            cardinalities=tuple(tables.subject_cat_cardinalities) or (2,) * n_sub_cat,
+            max_emb_dim=cfg.meta_emb_max_dim,
+        )
+        self.benchmark_cat_embs = _PerFieldCategoricalEmbeddings(
+            cardinalities=tuple(tables.benchmark_cat_cardinalities) or (2,) * n_bc_cat,
+            max_emb_dim=cfg.meta_emb_max_dim,
+        )
+        subj_in = self.subject_cat_embs.total_dim + n_sub_num
+        bench_in = self.benchmark_cat_embs.total_dim + n_bc_num
+
+        # Rebuild the towers so their input dims match the new emb widths.
+        from .metadata_features import MetaTower
+
+        self.subject_meta_tower = MetaTower(
+            in_dim=subj_in,
+            hidden_dim=cfg.meta_tower_hidden_dim,
+            k=cfg.k,
+            dropout=cfg.dropout,
+            num_layers=cfg.meta_tower_num_layers,
+        )
+        self.bench_meta_tower = MetaTower(
+            in_dim=bench_in,
+            hidden_dim=cfg.meta_tower_hidden_dim,
+            k=1,
+            dropout=cfg.dropout,
+            num_layers=cfg.meta_tower_num_layers,
+        )
+        self.fm_cross = FactorizationMachineCross(
+            subject_field_dims=self.subject_cat_embs.dims,
+            benchmark_field_dims=self.benchmark_cat_embs.dims,
+            d_fm=cfg.meta_fm_dim,
+        )
+        self.explicit_cross = ExplicitCrossEmbeddings(
+            crosses=tuple(cfg.meta_explicit_crosses),
+            schema=schema,
+            subject_cardinalities=self.subject_cat_embs.cardinalities,
+            benchmark_cardinalities=self.benchmark_cat_embs.cardinalities,
+            emb_dim=cfg.meta_explicit_cross_emb_dim,
+        )
+
+        # Refresh the elementwise-interaction projections.
+        inter_dim = (
+            min(self.subject_cat_embs.total_dim, self.benchmark_cat_embs.total_dim)
+            if (self.subject_cat_embs.total_dim and self.benchmark_cat_embs.total_dim)
+            else 0
+        )
+        self.meta_inter_dim = int(inter_dim)
+        if inter_dim > 0:
+            self.meta_subj_inter_proj = nn.Linear(
+                self.subject_cat_embs.total_dim, inter_dim
+            )
+            self.meta_bench_inter_proj = nn.Linear(
+                self.benchmark_cat_embs.total_dim, inter_dim
+            )
+            nn.init.normal_(self.meta_subj_inter_proj.weight, std=0.05)
+            nn.init.zeros_(self.meta_subj_inter_proj.bias)
+            nn.init.normal_(self.meta_bench_inter_proj.weight, std=0.05)
+            nn.init.zeros_(self.meta_bench_inter_proj.bias)
+        else:
+            self.meta_subj_inter_proj = None
+            self.meta_bench_inter_proj = None
+
+        # Resize / refill the buffers with the attached tables. Keep the
+        # tensors on whatever device the model lives on.
+        device = self.subject_meta_cat_ids.device
+        self.subject_meta_cat_ids = tables.subject_cat_ids.to(device).long()
+        self.subject_meta_num = tables.subject_num.to(device).float()
+        self.bc_meta_cat_ids = tables.bc_cat_ids.to(device).long()
+        self.bc_meta_num = tables.bc_num.to(device).float()
+
+        # Re-register so PyTorch's state_dict / device-move plumbing
+        # tracks the new tensors. The simple ``self.attr = tensor`` swap
+        # would not register them as persistent buffers; we have to call
+        # ``register_buffer`` to maintain the persistent flag.
+        self.register_buffer("subject_meta_cat_ids", self.subject_meta_cat_ids)
+        self.register_buffer("subject_meta_num", self.subject_meta_num)
+        self.register_buffer("bc_meta_cat_ids", self.bc_meta_cat_ids)
+        self.register_buffer("bc_meta_num", self.bc_meta_num)
+
+        # Rebuild the residual MLP with the right input width.
+        meta_subj_emb_dim = self.subject_cat_embs.total_dim
+        meta_bc_emb_dim = self.benchmark_cat_embs.total_dim
+        in_dim = _residual_feature_dim_meta_hybrid(
+            cfg,
+            meta_subj_emb_dim=meta_subj_emb_dim if cfg.use_metadata_features else 0,
+            meta_bc_emb_dim=meta_bc_emb_dim if cfg.use_metadata_features else 0,
+        )
+        self.residual = GatedSwiGLUResidual(
+            in_dim=in_dim,
+            hidden=cfg.residual_hidden_dim,
+            dropout=cfg.dropout,
+        )
+
+    # ------------------------------------------------------------------
+    # Forward / decompose
+    # ------------------------------------------------------------------
+
+    def _gather_metadata(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        meta_override: Mapping[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Look up per-row metadata tensors via the buffers (or override).
+
+        At inference time the runtime can pass ``meta_override`` to
+        substitute the buffer lookup for true cold-start subjects/bcs.
+        """
+        if meta_override is not None:
+            return {
+                "subj_cat": meta_override["subj_cat"].to(subject_idx.device).long(),
+                "subj_num": meta_override["subj_num"].to(subject_idx.device).float(),
+                "bc_cat": meta_override["bc_cat"].to(bc_idx.device).long(),
+                "bc_num": meta_override["bc_num"].to(bc_idx.device).float(),
+            }
+        return {
+            "subj_cat": self.subject_meta_cat_ids[subject_idx],
+            "subj_num": self.subject_meta_num[subject_idx],
+            "bc_cat": self.bc_meta_cat_ids[bc_idx],
+            "bc_num": self.bc_meta_num[bc_idx],
+        }
+
+    def _meta_channels(
+        self,
+        meta: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Run the metadata stack: per-field embeddings + towers + FM + crosses.
+
+        Returns a dict with the additive contributions and the raw
+        per-field embedding bags so the residual MLP can read them.
+        """
+        cfg = self.cfg
+
+        # Per-field categorical embedding bags. Each side returns a
+        # (B, total_emb_dim) tensor; the *list* of per-field tensors is
+        # what the FM head wants.
+        subj_emb_bag = self.subject_cat_embs(meta["subj_cat"])
+        bench_emb_bag = self.benchmark_cat_embs(meta["bc_cat"])
+        subj_field_embs = [
+            self.subject_cat_embs.embs[i](meta["subj_cat"][:, i])
+            for i in range(len(self.subject_cat_embs.embs))
+        ]
+        bench_field_embs = [
+            self.benchmark_cat_embs.embs[i](meta["bc_cat"][:, i])
+            for i in range(len(self.benchmark_cat_embs.embs))
+        ]
+
+        # Subject + benchmark concatenated (categorical + numeric) for the towers.
+        subj_tower_in = torch.cat([subj_emb_bag, meta["subj_num"]], dim=-1)
+        bench_tower_in = torch.cat([bench_emb_bag, meta["bc_num"]], dim=-1)
+        a_meta, u_meta = self.subject_meta_tower(subj_tower_in)
+        b_meta, _bench_vec_unused = self.bench_meta_tower(bench_tower_in)
+
+        # FM cross (over the per-field embedding lists)
+        if cfg.meta_include_fm_cross:
+            eta_fm = self.fm_cross(subj_field_embs, bench_field_embs)
+        else:
+            eta_fm = torch.zeros_like(a_meta)
+        # Explicit crosses
+        if cfg.meta_include_explicit_crosses and self.explicit_cross.has_any:
+            eta_explicit = self.explicit_cross(meta["subj_cat"], meta["bc_cat"])
+        else:
+            eta_explicit = torch.zeros_like(a_meta)
+
+        return {
+            "a_meta": a_meta,
+            "u_meta": u_meta,
+            "b_meta": b_meta,
+            "eta_fm": eta_fm,
+            "eta_explicit": eta_explicit,
+            "subj_emb_bag": subj_emb_bag,
+            "bench_emb_bag": bench_emb_bag,
+        }
+
+    def _components(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+        meta_override: Mapping[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        theta_id = self.theta(subject_idx).squeeze(-1)
+        bc_off = self.beta(bc_idx).squeeze(-1)
+        beta_i, alpha_i = self.irt_heads(item_emb)
+        u_id = self.u(subject_idx)
+        v_i, _unused_d_i = self.item_map(item_emb)
+        k = max(1, self.cfg.k)
+
+        if self.cfg.use_metadata_features:
+            meta = self._gather_metadata(subject_idx, bc_idx, meta_override)
+            mc = self._meta_channels(meta)
+            if self.cfg.meta_include_tower_priors:
+                theta_eff = theta_id + mc["a_meta"]
+                u_eff = u_id + mc["u_meta"]
+                b_meta_for_offset = mc["b_meta"]
+            else:
+                theta_eff = theta_id
+                u_eff = u_id
+                b_meta_for_offset = torch.zeros_like(theta_id)
+            eta_fm = mc["eta_fm"] if self.cfg.meta_include_fm_cross else torch.zeros_like(theta_id)
+            eta_explicit = (
+                mc["eta_explicit"]
+                if self.cfg.meta_include_explicit_crosses
+                else torch.zeros_like(theta_id)
+            )
+        else:
+            mc = None
+            theta_eff = theta_id
+            u_eff = u_id
+            b_meta_for_offset = torch.zeros_like(theta_id)
+            eta_fm = torch.zeros_like(theta_id)
+            eta_explicit = torch.zeros_like(theta_id)
+
+        raw_factor = (u_eff * v_i).sum(dim=-1) / math.sqrt(k)
+        c_irt = alpha_i * (theta_eff - beta_i)
+        c_offset = bc_off + self.mu + b_meta_for_offset
+        c_factor = self.rho_factor * raw_factor
+
+        return {
+            "theta_id": theta_id,
+            "theta_eff": theta_eff,
+            "beta_i": beta_i,
+            "alpha_i": alpha_i,
+            "u_id": u_id,
+            "u_eff": u_eff,
+            "v_i": v_i,
+            "raw_factor": raw_factor,
+            "irt": c_irt,
+            "offset": c_offset,
+            "factor": c_factor,
+            "eta_fm": eta_fm,
+            "eta_explicit": eta_explicit,
+            "meta_channels": mc,
+        }
+
+    def _residual_input(
+        self,
+        comps: dict[str, torch.Tensor],
+        item_emb: torch.Tensor,
+        subject_emb: torch.Tensor | None,
+        pool_feats: torch.Tensor | None,
+        cluster_ids: torch.Tensor | None,
+        judge_feats: torch.Tensor | None,
+        nn_feats: torch.Tensor | None,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+        subject_emb_p = _maybe_project_subject_emb(self, subject_emb)
+        cluster_emb = self._cluster_emb(cluster_ids)
+        parts = [
+            item_emb,
+            comps["theta_eff"].unsqueeze(-1),
+            comps["beta_i"].unsqueeze(-1),
+            comps["alpha_i"].unsqueeze(-1),
+            comps["u_eff"],
+            comps["v_i"],
+            comps["u_eff"] * comps["v_i"],
+            comps["raw_factor"].unsqueeze(-1),
+        ]
+        if cfg.use_subject_embed_features and subject_emb_p is not None:
+            parts.append(subject_emb_p)
+        _maybe_append(
+            parts,
+            cfg,
+            pool_z=pool_feats,
+            cluster_emb=cluster_emb,
+            judge_feats=judge_feats,
+            nn_feats=nn_feats,
+        )
+        if cfg.use_metadata_features and cfg.meta_include_in_residual and comps["meta_channels"] is not None:
+            mc = comps["meta_channels"]
+            # The two cat-embedding bags + the two numeric channels go in
+            # raw so the gated MLP can read per-field embeddings and
+            # missingness directly. The elementwise interaction term
+            # ``proj(subj_emb) * proj(bench_emb)`` is the "the MLP can
+            # discover Mistral x Medicine" hard prior, matching the
+            # existing ``u_s, v_i, u_s * v_i`` trick the hybrid already
+            # uses for the k-factor channel.
+            parts.append(mc["subj_emb_bag"])
+            parts.append(mc["bench_emb_bag"])
+            parts.append(mc["subj_num"])
+            parts.append(mc["bc_num"])
+            if (
+                self.meta_subj_inter_proj is not None
+                and self.meta_bench_inter_proj is not None
+                and self.meta_inter_dim > 0
+            ):
+                inter = self.meta_subj_inter_proj(mc["subj_emb_bag"]) * self.meta_bench_inter_proj(mc["bench_emb_bag"])
+                parts.append(inter)
+        return torch.cat(parts, dim=-1)
+
+    def forward(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+        subject_emb: torch.Tensor | None = None,
+        pool_feats: torch.Tensor | None = None,
+        cluster_ids: torch.Tensor | None = None,
+        judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
+        *,
+        override_alpha: torch.Tensor | None = None,
+        override_beta: torch.Tensor | None = None,
+        override_mlp_zero: bool = False,
+        force_judge_zero: bool = False,
+        force_nn_zero: bool = False,
+        meta_override: Mapping[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        comps = self._components(subject_idx, bc_idx, item_emb, meta_override=meta_override)
+        alpha_i = override_alpha if override_alpha is not None else comps["alpha_i"]
+        beta_i = override_beta if override_beta is not None else comps["beta_i"]
+        c_irt = alpha_i * (comps["theta_eff"] - beta_i)
+        c_offset = comps["offset"]
+        c_factor = comps["factor"]
+        eta_struct = c_irt + c_offset + c_factor + comps["eta_fm"] + comps["eta_explicit"]
+        if override_mlp_zero:
+            return eta_struct
+        jf = _maybe_zero_judge(self.cfg, judge_feats, force_judge_zero=force_judge_zero)
+        nf = _maybe_zero_nn(self.cfg, nn_feats, force_nn_zero=force_nn_zero)
+        # Attach the raw numerics to the meta_channels dict so
+        # ``_residual_input`` can include them in the residual feed.
+        if comps["meta_channels"] is not None:
+            meta = self._gather_metadata(subject_idx, bc_idx, meta_override)
+            comps["meta_channels"]["subj_num"] = meta["subj_num"]
+            comps["meta_channels"]["bc_num"] = meta["bc_num"]
+        x = self._residual_input(comps, item_emb, subject_emb, pool_feats, cluster_ids, jf, nf)
+        r = self.lambda_resid * self.residual(x)
+        return eta_struct + r
+
+    def decompose(
+        self,
+        subject_idx: torch.Tensor,
+        bc_idx: torch.Tensor,
+        item_emb: torch.Tensor,
+        subject_emb: torch.Tensor | None = None,
+        pool_feats: torch.Tensor | None = None,
+        cluster_ids: torch.Tensor | None = None,
+        judge_feats: torch.Tensor | None = None,
+        nn_feats: torch.Tensor | None = None,
+        meta_override: Mapping[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        comps = self._components(subject_idx, bc_idx, item_emb, meta_override=meta_override)
+        if comps["meta_channels"] is not None:
+            meta = self._gather_metadata(subject_idx, bc_idx, meta_override)
+            comps["meta_channels"]["subj_num"] = meta["subj_num"]
+            comps["meta_channels"]["bc_num"] = meta["bc_num"]
+        x = self._residual_input(
+            comps, item_emb, subject_emb, pool_feats, cluster_ids, judge_feats, nn_feats
+        )
+        r = self.lambda_resid * self.residual(x)
+        return {
+            "irt": comps["irt"],
+            "offset": comps["offset"],
+            "factor": comps["factor"],
+            "fm": comps["eta_fm"],
+            "explicit_cross": comps["eta_explicit"],
+            "mlp": r,
+            "theta": comps["theta_eff"],
+            "beta_i": comps["beta_i"],
+            "alpha_i": comps["alpha_i"],
+        }
+
+    def compute_meta_tie_loss(
+        self, subject_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Pattern-1-style soft tie between subject id and metadata-tower outputs.
+
+        Trainer multiplies the result by ``cfg.lambda_meta_tie`` and
+        adds it to the BCE loss. Returns zero when metadata is disabled
+        or when no subjects in the batch have any metadata (the all-
+        UNK case at module-init time before ``attach_metadata_tables``).
+        """
+        if not self.cfg.use_metadata_features or self.cfg.lambda_meta_tie == 0.0:
+            return torch.zeros((), device=subject_idx.device, dtype=torch.float32)
+        meta = self._gather_metadata(subject_idx, subject_idx.new_zeros(subject_idx.shape))
+        mc = self._meta_channels(meta)
+        theta_id = self.theta(subject_idx).squeeze(-1)
+        u_id = self.u(subject_idx)
+        # Detach the metadata side to send gradients into the id table
+        # only (we trust the metadata tower as a stable prior and pull
+        # the id embedding toward it -- "id_toward_meta" direction).
+        loss_theta = F.mse_loss(theta_id, mc["a_meta"].detach())
+        loss_u = F.mse_loss(u_id, mc["u_meta"].detach())
+        return loss_theta + loss_u
+
+
+# ---------------------------------------------------------------------------
 # Hierarchical MIRT (scalar IRT inductive bias + zero-init multi-dim MIRT
 # residual + gated MLP). New variant; see scripts/_sim_cold_start_hierarchical.py
 # for the design rationale and ablation results.
@@ -1744,6 +2467,7 @@ MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "kfactor_irt_item_mlp": IRTItemKFactorMLP,
     "kfactor_irt_item_gated_mlp": IRTItemKFactorGatedMLP,
     "hybrid_irt_kfactor_gated_mlp": HybridIRTItemKFactorGatedMLP,
+    "meta_hybrid_irt_kfactor_gated_mlp": MetaHybridIRTKFactorGatedMLP,
     "hierarchical_mirt": HierarchicalMIRT,
 }
 
@@ -1960,6 +2684,7 @@ __all__ = [
     "KFactorModel",
     "LookupDataset",
     "MODEL_REGISTRY",
+    "MetaHybridIRTKFactorGatedMLP",
     "ModelConfig",
     "SubjectTextProjector",
     "build_model",

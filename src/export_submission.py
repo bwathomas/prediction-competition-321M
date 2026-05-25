@@ -26,7 +26,7 @@ import shutil
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 
@@ -212,6 +212,175 @@ LORA_META: dict = dict(META.get("lora") or {})
 LORA_MODE: str = str(LORA_META.get("mode", "none"))
 LORA_ADAPTER_REL_PATH: str = str(LORA_META.get("adapter_rel_path", "lora_adapter"))
 LORA_ADAPTER_DIR: Path = HERE / LORA_ADAPTER_REL_PATH
+
+
+# ---------------------------------------------------------------------------
+# Structured-metadata preprocessor (shipped as JSON next to the checkpoint).
+# Only loaded when the trained model declares ``use_metadata_features=True``;
+# otherwise META_PREPROCESSOR stays None and the runtime model falls through
+# its per-id buffer lookup for every row.
+# ---------------------------------------------------------------------------
+
+
+META_PREPROCESSOR_PATH = ARTIFACTS / "meta_preprocessor.json"
+_TOKEN_MISSING = "__MISSING__"
+_TOKEN_UNK = "__UNK__"
+_NAME_RE_RUNTIME = re.compile(r"(?im)^\s*Name:\s*(.*?)\s*$")
+
+
+class _RuntimeMetadataPreprocessor:
+    """Slim runtime-side mirror of MetadataPreprocessor.
+
+    Re-encodes a (display_name, benchmark) pair into the same vocab /
+    scaler ids the training-side preprocessor produces. Used by the
+    runtime to override the per-id buffer lookup when the model
+    encounters a true cold-start subject (s_id == 0) or bc (bc_id == 0).
+    """
+
+    def __init__(self, blob: dict) -> None:
+        self.schema = dict(blob.get("schema") or {})
+        self.subject_cat_vocabs = {
+            k: dict(v["token_to_id"]) for k, v in (blob.get("subject_cat_vocabs") or {}).items()
+        }
+        self.benchmark_cat_vocabs = {
+            k: dict(v["token_to_id"]) for k, v in (blob.get("benchmark_cat_vocabs") or {}).items()
+        }
+        self.subject_num_scalers = {
+            k: dict(v) for k, v in (blob.get("subject_num_scalers") or {}).items()
+        }
+        self.benchmark_num_scalers = {
+            k: dict(v) for k, v in (blob.get("benchmark_num_scalers") or {}).items()
+        }
+        self.subject_by_name = {
+            str(rec.get("name", "")): dict(rec)
+            for rec in (blob.get("model_info_records") or [])
+        }
+        self.benchmark_by_id = {
+            str(rec.get("benchmark", "")): dict(rec)
+            for rec in (blob.get("benchmark_info_records") or [])
+        }
+
+    @staticmethod
+    def _key_for(v: Any) -> str:
+        if v is None:
+            return _TOKEN_MISSING
+        try:
+            if isinstance(v, float) and math.isnan(v):
+                return _TOKEN_MISSING
+        except Exception:
+            pass
+        s = str(v).strip()
+        if not s or s.lower() in {"nan", "none", "null", "unknown"}:
+            return _TOKEN_MISSING
+        return s
+
+    def _encode_cat(self, vocab_map: dict, value: Any) -> int:
+        k = self._key_for(value)
+        if k == _TOKEN_MISSING:
+            return 0
+        return int(vocab_map.get(k, vocab_map.get(_TOKEN_UNK, 1)))
+
+    def _scale_num(self, scaler: dict, value: Any) -> tuple[float, float]:
+        try:
+            x = float(value)
+            if not math.isfinite(x):
+                raise ValueError
+        except (TypeError, ValueError):
+            return float(scaler.get("mean", 0.0)) * 0.0, 1.0
+        if bool(scaler.get("log_transform", False)):
+            x = math.log1p(max(x, 0.0))
+        mean = float(scaler.get("mean", 0.0))
+        std = float(scaler.get("std", 1.0)) or 1.0
+        return (x - mean) / std, 0.0
+
+    def encode_subject(self, display_name: str) -> tuple[list, list, list]:
+        info = self.subject_by_name.get(str(display_name).strip(), {})
+        cat_fields = list(self.schema.get("subject_categorical", []))
+        num_fields = list(self.schema.get("subject_numeric", []))
+        cat_ids = []
+        for col in cat_fields:
+            cat_ids.append(self._encode_cat(self.subject_cat_vocabs.get(col, {}), info.get(col)))
+        num_vals = []
+        num_miss = []
+        for col in num_fields:
+            sc = self.subject_num_scalers.get(col, {})
+            src = info.get("parameters") if col == "log_params" else info.get(col)
+            x, m = self._scale_num(sc, src)
+            num_vals.append(x)
+            num_miss.append(m)
+        return cat_ids, num_vals, num_miss
+
+    def encode_benchmark(self, benchmark: str) -> tuple[list, list, list]:
+        info = self.benchmark_by_id.get(str(benchmark).strip(), {})
+        cat_fields = list(self.schema.get("benchmark_categorical", []))
+        num_fields = list(self.schema.get("benchmark_numeric", []))
+        cat_ids = []
+        for col in cat_fields:
+            cat_ids.append(self._encode_cat(self.benchmark_cat_vocabs.get(col, {}), info.get(col)))
+        num_vals = []
+        num_miss = []
+        for col in num_fields:
+            sc = self.benchmark_num_scalers.get(col, {})
+            src = info.get(col)
+            x, m = self._scale_num(sc, src)
+            num_vals.append(x)
+            num_miss.append(m)
+        return cat_ids, num_vals, num_miss
+
+
+META_PREPROCESSOR: _RuntimeMetadataPreprocessor | None = None
+try:
+    if META_PREPROCESSOR_PATH.exists():
+        with open(META_PREPROCESSOR_PATH, "r", encoding="utf-8") as _fh:
+            _meta_blob = json.load(_fh)
+        META_PREPROCESSOR = _RuntimeMetadataPreprocessor(_meta_blob)
+        LOG.info(
+            "Loaded metadata preprocessor (%d subject names, %d benchmarks)",
+            len(META_PREPROCESSOR.subject_by_name),
+            len(META_PREPROCESSOR.benchmark_by_id),
+        )
+except Exception:
+    LOG.exception("Failed to load metadata preprocessor; metadata channel will use buffer fallback")
+    META_PREPROCESSOR = None
+
+
+def _extract_display_name_runtime(subject_content: str) -> str:
+    if not isinstance(subject_content, str):
+        return ""
+    m = _NAME_RE_RUNTIME.search(subject_content)
+    return m.group(1).strip() if m else ""
+
+
+def _build_meta_override(
+    benchmark: str,
+    subject_content: str,
+) -> dict | None:
+    """Build a one-row metadata override for cold-start subjects/bcs.
+
+    Returns None when the runtime preprocessor is not loaded (i.e. the
+    trained model did not enable metadata features). The model's
+    ``forward(..., meta_override=...)`` substitutes this for its
+    per-id buffer lookup.
+    """
+    if META_PREPROCESSOR is None:
+        return None
+    name = _extract_display_name_runtime(subject_content)
+    subj_cat, subj_num, subj_miss = META_PREPROCESSOR.encode_subject(name)
+    bc_cat, bc_num, bc_miss = META_PREPROCESSOR.encode_benchmark(benchmark)
+    # Interleave (scaled, missing) per numeric field to match the
+    # training-time layout in MetadataIdTables.subject_num / bc_num.
+    subj_num_flat = []
+    for x, m in zip(subj_num, subj_miss):
+        subj_num_flat.extend([x, m])
+    bc_num_flat = []
+    for x, m in zip(bc_num, bc_miss):
+        bc_num_flat.extend([x, m])
+    return {
+        "subj_cat": torch.tensor([subj_cat], dtype=torch.long) if subj_cat else torch.zeros((1, 0), dtype=torch.long),
+        "subj_num": torch.tensor([subj_num_flat], dtype=torch.float32) if subj_num_flat else torch.zeros((1, 0), dtype=torch.float32),
+        "bc_cat": torch.tensor([bc_cat], dtype=torch.long) if bc_cat else torch.zeros((1, 0), dtype=torch.long),
+        "bc_num": torch.tensor([bc_num_flat], dtype=torch.float32) if bc_num_flat else torch.zeros((1, 0), dtype=torch.float32),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +1011,497 @@ class _HybridIRTItemKFactorGatedMLP(_IRTItemBase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Metadata-aware hybrid -- runtime mirror of
+# ``src.models.MetaHybridIRTKFactorGatedMLP``. Keeps the state-dict layout
+# identical so checkpoints load cleanly. The per-id metadata buffers ship
+# in the checkpoint, so a known subject_idx / bc_idx returns the same
+# metadata at runtime as it saw at training time. For true cold-start
+# subjects (s == 0) or benchmarks (bc == 0) the runtime can additionally
+# build a ``meta_override`` from the shipped meta_preprocessor.json +
+# raw subject_content; predict() routes that override down through
+# forward().
+# ---------------------------------------------------------------------------
+
+
+def _runtime_auto_emb_dim(card: int, max_dim: int = 16) -> int:
+    raw = max(4, int(round(1.6 * max(2, int(card)) ** 0.56)))
+    return int(min(int(max_dim), raw))
+
+
+class _RuntimePerFieldCategoricalEmbeddings(nn.Module):
+    def __init__(self, cardinalities, max_emb_dim: int = 16):
+        super().__init__()
+        self.cardinalities = tuple(int(c) for c in cardinalities)
+        dims = []
+        embs = []
+        for c in self.cardinalities:
+            d = _runtime_auto_emb_dim(c, max_dim=max_emb_dim)
+            dims.append(d)
+            embs.append(nn.Embedding(max(1, c), d, padding_idx=0))
+        self.embs = nn.ModuleList(embs)
+        self.dims = tuple(dims)
+        self.total_dim = int(sum(dims))
+
+    def forward(self, cat_ids):
+        if self.total_dim == 0 or cat_ids.shape[-1] == 0:
+            return torch.zeros((cat_ids.shape[0], 0), device=cat_ids.device, dtype=torch.float32)
+        parts = [self.embs[i](cat_ids[:, i]) for i in range(len(self.embs))]
+        return torch.cat(parts, dim=-1)
+
+
+class _RuntimeMetaTower(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, k: int, dropout: float, num_layers: int = 2):
+        super().__init__()
+        self.is_noop = in_dim <= 0
+        self.k = int(k)
+        if self.is_noop:
+            self.scalar_bias = nn.Parameter(torch.zeros(1))
+            return
+        layers = [nn.LayerNorm(in_dim)]
+        d = in_dim
+        for _ in range(max(1, num_layers)):
+            layers += [nn.Linear(d, hidden_dim), nn.GELU(), nn.Dropout(dropout)]
+            d = hidden_dim
+        self.trunk = nn.Sequential(*layers)
+        self.head_scalar = nn.Linear(d, 1)
+        self.head_vec = nn.Linear(d, max(1, int(k)))
+
+    def forward(self, x):
+        if self.is_noop or x.shape[-1] == 0:
+            b = x.shape[0]
+            return (
+                torch.zeros(b, device=x.device, dtype=torch.float32),
+                torch.zeros(b, max(1, self.k), device=x.device, dtype=torch.float32),
+            )
+        h = self.trunk(x)
+        return self.head_scalar(h).squeeze(-1), self.head_vec(h)
+
+
+class _RuntimeFactorizationMachineCross(nn.Module):
+    def __init__(self, subject_field_dims, benchmark_field_dims, d_fm: int):
+        super().__init__()
+        self.d_fm = int(d_fm)
+        self.subj_projs = nn.ModuleList([nn.Linear(int(d), self.d_fm) for d in subject_field_dims])
+        self.bench_projs = nn.ModuleList([nn.Linear(int(d), self.d_fm) for d in benchmark_field_dims])
+        self.head = nn.Linear(self.d_fm, 1)
+
+    def forward(self, subj_field_embs, bench_field_embs):
+        vs = []
+        for proj, e in zip(self.subj_projs, subj_field_embs):
+            vs.append(proj(e))
+        for proj, e in zip(self.bench_projs, bench_field_embs):
+            vs.append(proj(e))
+        if not vs:
+            return torch.zeros((subj_field_embs[0].shape[0] if subj_field_embs else 0,), dtype=torch.float32)
+        v = torch.stack(vs, dim=1)
+        sum_v = v.sum(dim=1)
+        sum_v_sq = (v * v).sum(dim=1)
+        interactions = 0.5 * (sum_v * sum_v - sum_v_sq)
+        return self.head(interactions).squeeze(-1)
+
+
+class _RuntimeExplicitCrossEmbeddings(nn.Module):
+    def __init__(self, crosses, sub_index, bench_index, subject_cardinalities, benchmark_cardinalities, emb_dim: int = 8):
+        super().__init__()
+        self.crosses = []
+        for spec in crosses:
+            if "__" not in spec:
+                continue
+            sf, bf = spec.split("__", 1)
+            if sf not in sub_index or bf not in bench_index:
+                continue
+            si = sub_index[sf]
+            bi = bench_index[bf]
+            sc = int(subject_cardinalities[si])
+            bc = int(benchmark_cardinalities[bi])
+            self.crosses.append((si, bi, sc, bc))
+        self.emb_dim = int(emb_dim)
+        tables = []
+        for _, _, sc, bc in self.crosses:
+            n = max(1, sc * bc) + 1
+            tables.append(nn.Embedding(n, self.emb_dim, padding_idx=0))
+        self.tables = nn.ModuleList(tables)
+        self.head = nn.Linear(self.emb_dim, 1) if self.tables else None
+
+    def forward(self, subj_cat_ids, bench_cat_ids):
+        if not self.tables or self.head is None:
+            return torch.zeros((subj_cat_ids.shape[0],), dtype=torch.float32, device=subj_cat_ids.device)
+        per_cross = []
+        for (si, bi, sc, bc), table in zip(self.crosses, self.tables):
+            s_id = subj_cat_ids[:, si].long()
+            b_id = bench_cat_ids[:, bi].long()
+            is_oov = (s_id == 0) | (b_id == 0)
+            cross_id = s_id * bc + b_id + 1
+            cross_id = torch.where(
+                is_oov,
+                torch.zeros_like(cross_id),
+                cross_id.clamp(min=1, max=table.num_embeddings - 1),
+            )
+            per_cross.append(table(cross_id))
+        merged = torch.stack(per_cross, dim=1).sum(dim=1)
+        return self.head(merged).squeeze(-1)
+
+
+def _residual_input_dim_meta_hybrid(cfg: dict, meta_subj_emb_dim: int, meta_bc_emb_dim: int) -> int:
+    base = _residual_input_dim_hybrid_irt_kfactor(cfg)
+    if not cfg.get("use_metadata_features", False) or not cfg.get("meta_include_in_residual", True):
+        return base
+    n_sub_num = 2 * len(cfg.get("meta_subject_numeric", ()))
+    n_bc_num = 2 * len(cfg.get("meta_benchmark_numeric", ()))
+    inter_dim = min(meta_subj_emb_dim, meta_bc_emb_dim) if (meta_subj_emb_dim and meta_bc_emb_dim) else 0
+    return base + int(meta_subj_emb_dim) + int(meta_bc_emb_dim) + int(n_sub_num) + int(n_bc_num) + int(inter_dim)
+
+
+class _MetaHybridIRTKFactorGatedMLP(_IRTItemBase):
+    """Runtime mirror of ``MetaHybridIRTKFactorGatedMLP``.
+
+    The construction order and submodule names MUST match the training
+    class exactly so checkpoints load cleanly. We deduce the per-field
+    embedding cardinalities from the saved buffer / weight shapes
+    inside ``rebuild_from_state_dict`` (called by the loader before
+    ``load_state_dict``).
+    """
+
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        self.u = nn.Embedding(cfg["n_subjects"], cfg["k"])
+        self.item_map = _ItemParameterMap(
+            item_embed_dim=cfg["item_embed_dim"],
+            k=cfg["k"],
+            hidden=cfg["item_map_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+        self.rho_factor = nn.Parameter(torch.tensor(0.1))
+
+        schema_sub_cat = tuple(cfg.get("meta_subject_categorical", ()))
+        schema_sub_num = tuple(cfg.get("meta_subject_numeric", ()))
+        schema_bench_cat = tuple(cfg.get("meta_benchmark_categorical", ()))
+        schema_bench_num = tuple(cfg.get("meta_benchmark_numeric", ()))
+        self._schema_sub_cat = schema_sub_cat
+        self._schema_bench_cat = schema_bench_cat
+        self._schema_sub_num = schema_sub_num
+        self._schema_bench_num = schema_bench_num
+
+        # Default cardinalities of 2 (just MISSING + UNK) for module
+        # construction. We rebuild with the real cardinalities inside
+        # ``rebuild_from_state_dict`` once we can inspect the saved
+        # checkpoint's tensors.
+        self.subject_cat_embs = _RuntimePerFieldCategoricalEmbeddings(
+            cardinalities=(2,) * len(schema_sub_cat),
+            max_emb_dim=int(cfg.get("meta_emb_max_dim", 16)),
+        )
+        self.benchmark_cat_embs = _RuntimePerFieldCategoricalEmbeddings(
+            cardinalities=(2,) * len(schema_bench_cat),
+            max_emb_dim=int(cfg.get("meta_emb_max_dim", 16)),
+        )
+        n_sub_num = 2 * len(schema_sub_num)
+        n_bc_num = 2 * len(schema_bench_num)
+        subj_in = self.subject_cat_embs.total_dim + n_sub_num
+        bench_in = self.benchmark_cat_embs.total_dim + n_bc_num
+
+        self.subject_meta_tower = _RuntimeMetaTower(
+            in_dim=subj_in,
+            hidden_dim=int(cfg.get("meta_tower_hidden_dim", 128)),
+            k=int(cfg["k"]),
+            dropout=float(cfg.get("dropout", 0.0)),
+            num_layers=int(cfg.get("meta_tower_num_layers", 2)),
+        )
+        self.bench_meta_tower = _RuntimeMetaTower(
+            in_dim=bench_in,
+            hidden_dim=int(cfg.get("meta_tower_hidden_dim", 128)),
+            k=1,
+            dropout=float(cfg.get("dropout", 0.0)),
+            num_layers=int(cfg.get("meta_tower_num_layers", 2)),
+        )
+
+        self.fm_cross = _RuntimeFactorizationMachineCross(
+            subject_field_dims=self.subject_cat_embs.dims,
+            benchmark_field_dims=self.benchmark_cat_embs.dims,
+            d_fm=int(cfg.get("meta_fm_dim", 16)),
+        )
+
+        sub_index = {c: i for i, c in enumerate(schema_sub_cat)}
+        bench_index = {c: i for i, c in enumerate(schema_bench_cat)}
+        self.explicit_cross = _RuntimeExplicitCrossEmbeddings(
+            crosses=tuple(cfg.get("meta_explicit_crosses", ())),
+            sub_index=sub_index,
+            bench_index=bench_index,
+            subject_cardinalities=self.subject_cat_embs.cardinalities,
+            benchmark_cardinalities=self.benchmark_cat_embs.cardinalities,
+            emb_dim=int(cfg.get("meta_explicit_cross_emb_dim", 8)),
+        )
+
+        inter_dim = (
+            min(self.subject_cat_embs.total_dim, self.benchmark_cat_embs.total_dim)
+            if (self.subject_cat_embs.total_dim and self.benchmark_cat_embs.total_dim)
+            else 0
+        )
+        self.meta_inter_dim = int(inter_dim)
+        if inter_dim > 0:
+            self.meta_subj_inter_proj = nn.Linear(self.subject_cat_embs.total_dim, inter_dim)
+            self.meta_bench_inter_proj = nn.Linear(self.benchmark_cat_embs.total_dim, inter_dim)
+        else:
+            self.meta_subj_inter_proj = None
+            self.meta_bench_inter_proj = None
+
+        self.register_buffer(
+            "subject_meta_cat_ids",
+            torch.zeros((cfg["n_subjects"], max(1, len(schema_sub_cat))), dtype=torch.long),
+        )
+        self.register_buffer(
+            "subject_meta_num",
+            torch.zeros((cfg["n_subjects"], max(2, n_sub_num)), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "bc_meta_cat_ids",
+            torch.zeros((cfg["n_benchmark_conditions"], max(1, len(schema_bench_cat))), dtype=torch.long),
+        )
+        self.register_buffer(
+            "bc_meta_num",
+            torch.zeros((cfg["n_benchmark_conditions"], max(2, n_bc_num)), dtype=torch.float32),
+        )
+
+        in_dim = _residual_input_dim_meta_hybrid(
+            cfg,
+            meta_subj_emb_dim=self.subject_cat_embs.total_dim if cfg.get("use_metadata_features", False) else 0,
+            meta_bc_emb_dim=self.benchmark_cat_embs.total_dim if cfg.get("use_metadata_features", False) else 0,
+        )
+        self.residual = _GatedResidual(
+            in_dim=in_dim,
+            hidden=cfg["residual_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+        self.lambda_resid = nn.Parameter(
+            torch.tensor(float(cfg.get("lambda_resid_init", 0.1))),
+            requires_grad=bool(cfg.get("lambda_resid_trainable", True)),
+        )
+
+    def rebuild_from_state_dict(self, state: dict) -> None:
+        """Inspect the saved state and rebuild meta submodules with matching shapes.
+
+        Called by the loader BEFORE ``load_state_dict`` so the per-field
+        embedding cardinalities, FM projection input dims, explicit-cross
+        table sizes, and residual MLP input dim all match the trained
+        widths. This is the runtime equivalent of
+        ``attach_metadata_tables`` on the training side.
+        """
+        cfg = self.cfg
+
+        # Subject categorical cardinalities from
+        # ``subject_cat_embs.embs.{i}.weight`` shape[0].
+        sub_cards = []
+        for i in range(len(self._schema_sub_cat)):
+            key = f"subject_cat_embs.embs.{i}.weight"
+            if key in state:
+                sub_cards.append(int(state[key].shape[0]))
+            else:
+                sub_cards.append(2)
+        bench_cards = []
+        for i in range(len(self._schema_bench_cat)):
+            key = f"benchmark_cat_embs.embs.{i}.weight"
+            if key in state:
+                bench_cards.append(int(state[key].shape[0]))
+            else:
+                bench_cards.append(2)
+
+        self.subject_cat_embs = _RuntimePerFieldCategoricalEmbeddings(
+            cardinalities=tuple(sub_cards),
+            max_emb_dim=int(cfg.get("meta_emb_max_dim", 16)),
+        )
+        self.benchmark_cat_embs = _RuntimePerFieldCategoricalEmbeddings(
+            cardinalities=tuple(bench_cards),
+            max_emb_dim=int(cfg.get("meta_emb_max_dim", 16)),
+        )
+        n_sub_num = 2 * len(self._schema_sub_num)
+        n_bc_num = 2 * len(self._schema_bench_num)
+        subj_in = self.subject_cat_embs.total_dim + n_sub_num
+        bench_in = self.benchmark_cat_embs.total_dim + n_bc_num
+
+        self.subject_meta_tower = _RuntimeMetaTower(
+            in_dim=subj_in,
+            hidden_dim=int(cfg.get("meta_tower_hidden_dim", 128)),
+            k=int(cfg["k"]),
+            dropout=float(cfg.get("dropout", 0.0)),
+            num_layers=int(cfg.get("meta_tower_num_layers", 2)),
+        )
+        self.bench_meta_tower = _RuntimeMetaTower(
+            in_dim=bench_in,
+            hidden_dim=int(cfg.get("meta_tower_hidden_dim", 128)),
+            k=1,
+            dropout=float(cfg.get("dropout", 0.0)),
+            num_layers=int(cfg.get("meta_tower_num_layers", 2)),
+        )
+
+        self.fm_cross = _RuntimeFactorizationMachineCross(
+            subject_field_dims=self.subject_cat_embs.dims,
+            benchmark_field_dims=self.benchmark_cat_embs.dims,
+            d_fm=int(cfg.get("meta_fm_dim", 16)),
+        )
+        sub_index = {c: i for i, c in enumerate(self._schema_sub_cat)}
+        bench_index = {c: i for i, c in enumerate(self._schema_bench_cat)}
+        self.explicit_cross = _RuntimeExplicitCrossEmbeddings(
+            crosses=tuple(cfg.get("meta_explicit_crosses", ())),
+            sub_index=sub_index,
+            bench_index=bench_index,
+            subject_cardinalities=self.subject_cat_embs.cardinalities,
+            benchmark_cardinalities=self.benchmark_cat_embs.cardinalities,
+            emb_dim=int(cfg.get("meta_explicit_cross_emb_dim", 8)),
+        )
+
+        inter_dim = (
+            min(self.subject_cat_embs.total_dim, self.benchmark_cat_embs.total_dim)
+            if (self.subject_cat_embs.total_dim and self.benchmark_cat_embs.total_dim)
+            else 0
+        )
+        self.meta_inter_dim = int(inter_dim)
+        if inter_dim > 0:
+            self.meta_subj_inter_proj = nn.Linear(self.subject_cat_embs.total_dim, inter_dim)
+            self.meta_bench_inter_proj = nn.Linear(self.benchmark_cat_embs.total_dim, inter_dim)
+        else:
+            self.meta_subj_inter_proj = None
+            self.meta_bench_inter_proj = None
+
+        # Buffer shapes come from the saved state -- the trainer wrote
+        # the buffers with the exact (n_subjects, n_fields) shape.
+        if "subject_meta_cat_ids" in state:
+            t = state["subject_meta_cat_ids"]
+            self.register_buffer("subject_meta_cat_ids", torch.zeros_like(t))
+        if "subject_meta_num" in state:
+            t = state["subject_meta_num"]
+            self.register_buffer("subject_meta_num", torch.zeros_like(t))
+        if "bc_meta_cat_ids" in state:
+            t = state["bc_meta_cat_ids"]
+            self.register_buffer("bc_meta_cat_ids", torch.zeros_like(t))
+        if "bc_meta_num" in state:
+            t = state["bc_meta_num"]
+            self.register_buffer("bc_meta_num", torch.zeros_like(t))
+
+        in_dim = _residual_input_dim_meta_hybrid(
+            cfg,
+            meta_subj_emb_dim=self.subject_cat_embs.total_dim if cfg.get("use_metadata_features", False) else 0,
+            meta_bc_emb_dim=self.benchmark_cat_embs.total_dim if cfg.get("use_metadata_features", False) else 0,
+        )
+        self.residual = _GatedResidual(
+            in_dim=in_dim,
+            hidden=cfg["residual_hidden_dim"],
+            dropout=cfg.get("dropout", 0.0),
+        )
+
+    def _gather_metadata(self, s, bc, meta_override=None):
+        if meta_override is not None:
+            return {
+                "subj_cat": meta_override["subj_cat"].to(s.device).long(),
+                "subj_num": meta_override["subj_num"].to(s.device).float(),
+                "bc_cat": meta_override["bc_cat"].to(bc.device).long(),
+                "bc_num": meta_override["bc_num"].to(bc.device).float(),
+            }
+        return {
+            "subj_cat": self.subject_meta_cat_ids[s],
+            "subj_num": self.subject_meta_num[s],
+            "bc_cat": self.bc_meta_cat_ids[bc],
+            "bc_num": self.bc_meta_num[bc],
+        }
+
+    def _meta_channels(self, meta):
+        cfg = self.cfg
+        subj_emb_bag = self.subject_cat_embs(meta["subj_cat"])
+        bench_emb_bag = self.benchmark_cat_embs(meta["bc_cat"])
+        subj_field_embs = [
+            self.subject_cat_embs.embs[i](meta["subj_cat"][:, i])
+            for i in range(len(self.subject_cat_embs.embs))
+        ]
+        bench_field_embs = [
+            self.benchmark_cat_embs.embs[i](meta["bc_cat"][:, i])
+            for i in range(len(self.benchmark_cat_embs.embs))
+        ]
+        subj_tower_in = torch.cat([subj_emb_bag, meta["subj_num"]], dim=-1)
+        bench_tower_in = torch.cat([bench_emb_bag, meta["bc_num"]], dim=-1)
+        a_meta, u_meta = self.subject_meta_tower(subj_tower_in)
+        b_meta, _ = self.bench_meta_tower(bench_tower_in)
+        if cfg.get("meta_include_fm_cross", True):
+            eta_fm = self.fm_cross(subj_field_embs, bench_field_embs)
+        else:
+            eta_fm = torch.zeros_like(a_meta)
+        if cfg.get("meta_include_explicit_crosses", True) and self.explicit_cross.tables:
+            eta_explicit = self.explicit_cross(meta["subj_cat"], meta["bc_cat"])
+        else:
+            eta_explicit = torch.zeros_like(a_meta)
+        return {
+            "a_meta": a_meta,
+            "u_meta": u_meta,
+            "b_meta": b_meta,
+            "eta_fm": eta_fm,
+            "eta_explicit": eta_explicit,
+            "subj_emb_bag": subj_emb_bag,
+            "bench_emb_bag": bench_emb_bag,
+            "subj_num": meta["subj_num"],
+            "bc_num": meta["bc_num"],
+        }
+
+    def forward(self, s, bc, ie, se=None, pool_feats=None, cluster_ids=None, judge_feats=None, nn_feats=None, meta_override=None):
+        comps = self._irt_components(s, bc, ie)
+        u_id = self.u(s)
+        v_i, _unused_d_i = self.item_map(ie)
+        k = max(1, self.cfg["k"])
+
+        cfg = self.cfg
+        if cfg.get("use_metadata_features", False):
+            meta = self._gather_metadata(s, bc, meta_override)
+            mc = self._meta_channels(meta)
+            if cfg.get("meta_include_tower_priors", True):
+                theta_eff = comps["theta"] + mc["a_meta"]
+                u_eff = u_id + mc["u_meta"]
+                b_meta = mc["b_meta"]
+            else:
+                theta_eff = comps["theta"]
+                u_eff = u_id
+                b_meta = torch.zeros_like(comps["theta"])
+            eta_fm = mc["eta_fm"]
+            eta_explicit = mc["eta_explicit"]
+        else:
+            mc = None
+            theta_eff = comps["theta"]
+            u_eff = u_id
+            b_meta = torch.zeros_like(comps["theta"])
+            eta_fm = torch.zeros_like(comps["theta"])
+            eta_explicit = torch.zeros_like(comps["theta"])
+
+        raw_factor = (u_eff * v_i).sum(dim=-1) / math.sqrt(k)
+        c_irt = comps["alpha_i"] * (theta_eff - comps["beta_i"])
+        c_offset = comps["offset"] + b_meta
+        c_factor = self.rho_factor * raw_factor
+
+        cluster_emb = _cluster_emb_runtime(self.cfg, self.cluster_embedding, cluster_ids)
+        # Reuse the base hybrid's residual feature builder with theta_eff
+        # / u_eff substituted via a shim that re-packs comps with the
+        # metadata-augmented fields.
+        shim_comps = dict(comps)
+        shim_comps["theta"] = theta_eff
+        x = _residual_features_hybrid_irt_kfactor(
+            self.cfg, shim_comps, u_eff, v_i, raw_factor, ie, se, pool_feats, cluster_emb, judge_feats, nn_feats
+        )
+        if mc is not None and cfg.get("meta_include_in_residual", True):
+            extra = [mc["subj_emb_bag"], mc["bench_emb_bag"], mc["subj_num"], mc["bc_num"]]
+            if (
+                self.meta_subj_inter_proj is not None
+                and self.meta_bench_inter_proj is not None
+                and self.meta_inter_dim > 0
+            ):
+                inter = self.meta_subj_inter_proj(mc["subj_emb_bag"]) * self.meta_bench_inter_proj(mc["bench_emb_bag"])
+                extra.append(inter)
+            x = torch.cat([x] + extra, dim=-1)
+
+        return (
+            c_irt
+            + c_offset
+            + c_factor
+            + eta_fm
+            + eta_explicit
+            + self.lambda_resid * self.residual(x)
+        )
+
+
 def _residual_input_dim_hierarchical_mirt(cfg: dict) -> int:
     d = max(1, int(cfg["k"]))
     base = cfg["item_embed_dim"] + 3 + 3 * d + 1
@@ -954,8 +1614,122 @@ _REGISTRY = {
     "kfactor_irt_item_mlp": _IRTItemKFactorMLP,
     "kfactor_irt_item_gated_mlp": _IRTItemKFactorGatedMLP,
     "hybrid_irt_kfactor_gated_mlp": _HybridIRTItemKFactorGatedMLP,
+    "meta_hybrid_irt_kfactor_gated_mlp": _MetaHybridIRTKFactorGatedMLP,
     "hierarchical_mirt": _HierarchicalMIRT,
 }
+
+
+class _EnsembleModel(nn.Module):
+    """Wraps an ensemble of fold-models from K-fold CV training.
+
+    The bundle layout written by ``export_ensemble_run`` packs M
+    configurations -- each with its own ``model_name`` / ``model_cfg`` --
+    and per-configuration K trained fold checkpoints. The final
+    submission prediction is
+
+        p = sum_c w_c * (mean_k sigmoid(model_{c,k}(x)))
+
+    where ``w_c`` are non-negative blend weights fit on the
+    out-of-fold predictions. We return a *logit* (the log-odds of
+    that blended probability) so the existing
+    ``torch.sigmoid(_MODEL(...))`` call site in
+    ``_predict_uncalibrated`` recovers ``p`` unchanged -- single-model
+    and ensemble submissions then share one inference path, including
+    the per-bc calibrator that runs against probabilities downstream.
+
+    Constraint enforced at construction time: every member must share
+    the same auxiliary-feature flags (``use_pool_features``,
+    ``use_cluster_features``, ``use_judge_features``,
+    ``use_nn_features``, ``use_subject_text_embedding``). This is
+    what lets ``_predict_uncalibrated`` consult a single
+    ``_MODEL_CFG`` to decide which input channels to build, instead
+    of materializing every superset channel and routing per member.
+    """
+
+    def __init__(
+        self,
+        members,
+        blend_weights,
+    ):
+        super().__init__()
+        if not members:
+            raise RuntimeError("_EnsembleModel: empty members list")
+        if len(blend_weights) != len(members):
+            raise RuntimeError(
+                "_EnsembleModel: blend_weights length "
+                f"{len(blend_weights)} != n_members {len(members)}"
+            )
+        flag_keys = (
+            "use_pool_features",
+            "use_cluster_features",
+            "use_judge_features",
+            "use_nn_features",
+            "use_subject_text_embedding",
+        )
+        ref_flags = {
+            k: bool(members[0]["model_cfg"].get(k, False)) for k in flag_keys
+        }
+        for m in members[1:]:
+            cur = {k: bool(m["model_cfg"].get(k, False)) for k in flag_keys}
+            if cur != ref_flags:
+                raise RuntimeError(
+                    "_EnsembleModel: ensemble members disagree on auxiliary "
+                    f"feature flags: ref={ref_flags} member={cur}. Re-export "
+                    "with members that share these flags."
+                )
+
+        # Register every fold-model so .to() / .eval() / .cuda() propagate.
+        self._member_lists: list[nn.ModuleList] = []
+        self.member_names: list[str] = []
+        for member in members:
+            ml = nn.ModuleList(member["fold_models"])
+            self._member_lists.append(ml)
+            self.member_names.append(str(member.get("config_id", "")))
+        # nn.ModuleList objects must be set as attributes for parameter
+        # tracking. We give them stable names so torch.save inspection is
+        # readable, but the runtime never relies on the names.
+        for idx, ml in enumerate(self._member_lists):
+            setattr(self, f"_member_{idx:02d}", ml)
+
+        w = torch.as_tensor(list(blend_weights), dtype=torch.float64)
+        w = torch.clamp(w, min=0.0)
+        s = float(w.sum().item())
+        if s <= 0.0:
+            w = torch.ones_like(w) / float(len(members))
+        else:
+            w = w / s
+        self.register_buffer("blend_weights", w.to(torch.float32), persistent=False)
+
+    def forward(
+        self,
+        s,
+        bc,
+        ie,
+        se=None,
+        pool_feats=None,
+        cluster_ids=None,
+        judge_feats=None,
+        nn_feats=None,
+    ):
+        eps = 1.0e-7
+        p_blend = None
+        for w_idx, ml in enumerate(self._member_lists):
+            p_member = None
+            n_folds = len(ml)
+            for fold_model in ml:
+                logit = fold_model(
+                    s, bc, ie, se, pool_feats, cluster_ids, judge_feats, nn_feats
+                )
+                p_fold = torch.sigmoid(logit)
+                p_member = p_fold if p_member is None else (p_member + p_fold)
+            p_member = p_member / float(max(1, n_folds))
+            w_c = self.blend_weights[w_idx].to(p_member.dtype)
+            contrib = w_c * p_member
+            p_blend = contrib if p_blend is None else (p_blend + contrib)
+        # Return a logit so the existing predict() path can sigmoid() to
+        # recover the blended probability unchanged.
+        p_blend = p_blend.clamp(min=eps, max=1.0 - eps)
+        return torch.log(p_blend / (1.0 - p_blend))
 
 
 # ---------------------------------------------------------------------------
@@ -1861,61 +2635,164 @@ elif LORA_MODE == "hf_upload":
     )
 
 _CKPT = torch.load(CKPT_PATH, map_location=_DEVICE)
-_MODEL_CFG: dict = dict(_CKPT["model_cfg"])
 
-# The checkpoint's ``model_cfg`` is the single source of truth for the
-# trained architecture: every shape in ``model_state`` was emitted by
-# instantiating the model from exactly these dims. Mutating any of them
-# here -- including "repairs" that try to interpret zero/missing values
-# as defaults -- desynchronizes the constructed Module's parameter
-# shapes from the saved tensor shapes and crashes ``load_state_dict``.
-# Specifically: ``use_cluster_features=True`` together with
-# ``cluster_embed_dim=0`` is a *valid, intentional* configuration meaning
-# "no cluster embedding layer was trained" (the residual's input dim
-# was computed without the cluster channel). Coercing it to a nonzero
-# default at runtime would add a randomly-initialized embedding that
-# the residual was never trained against, *and* widen the residual's
-# expected input dim, producing exactly the
-# "Error(s) in loading state_dict ... size mismatch for residual.*"
-# failure mode at module init.
-if (
-    _MODEL_CFG.get("use_cluster_features")
-    and int(_MODEL_CFG.get("n_clusters", 0) or 0) > 0
-    and int(_MODEL_CFG.get("cluster_embed_dim", 0) or 0) <= 0
-):
+# Two bundle layouts are supported:
+#
+#   * SINGLE-MODEL (legacy / single-checkpoint export_run):
+#       _CKPT = {"model_cfg": {...}, "indexer": {...}, "model_state": {...}}
+#
+#   * ENSEMBLE (export_ensemble_run, K-fold ensemble bundle):
+#       _CKPT = {
+#         "ensemble": True,
+#         "indexer": {...},               # shared by every member
+#         "model_cfg": {...},             # representative cfg for input
+#                                         # building; every member shares
+#                                         # the auxiliary-feature flags
+#         "members": [
+#             {
+#                 "config_id": str,
+#                 "model_name": str,
+#                 "model_cfg": {...},
+#                 "fold_state_dicts": [sd0, sd1, ...],
+#             }, ...
+#         ],
+#         "blend_weights": [w_0, w_1, ...],     # one per member, sum=1
+#         "fold_assignment_sha256": str,        # provenance only
+#       }
+#
+# In the ensemble branch ``_MODEL`` is set to an ``_EnsembleModel`` whose
+# ``forward(...)`` returns a logit such that ``sigmoid(logit)`` is the
+# blended probability. That keeps ``_predict_uncalibrated`` identical
+# across single-model and ensemble bundles (including the per-bc
+# calibrator that runs against probabilities downstream).
+_IS_ENSEMBLE: bool = bool(_CKPT.get("ensemble", False))
+
+if _IS_ENSEMBLE:
+    if "members" not in _CKPT or "blend_weights" not in _CKPT:
+        raise RuntimeError(
+            "checkpoint claims ensemble=True but is missing 'members' or "
+            "'blend_weights'. Re-export with src.export_submission."
+            "export_ensemble_run."
+        )
+    _MODEL_CFG: dict = dict(_CKPT.get("model_cfg") or {})
+    _INDEXER: dict = dict(_CKPT["indexer"])
+    _MODEL_NAME = str(META.get("model_name") or "ensemble")
+    _SUBJECT_TO_ID: dict = dict(_INDEXER["subject_to_id"])
+    _BC_TO_ID: dict = dict(_INDEXER["bc_to_id"])
+    _TRAIN_COUNTS_RAW: dict = dict(META.get("train_counts") or {})
+    _N_TRAIN_PER_SUBJECT: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_subject") or {})
+    _N_TRAIN_PER_BC: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_bc") or {})
+
+    _ENSEMBLE_MEMBERS: list = []
+    for member in _CKPT["members"]:
+        mname = str(member["model_name"])
+        mcfg = dict(member["model_cfg"])
+        fold_state_dicts = list(member["fold_state_dicts"])
+        if not fold_state_dicts:
+            raise RuntimeError(
+                f"ensemble member {member.get('config_id')!r} has zero "
+                "fold_state_dicts; re-export with at least one fold per "
+                "member."
+            )
+        if mname not in _REGISTRY:
+            raise RuntimeError(
+                f"ensemble member declares model_name={mname!r} which is not "
+                f"in the runtime registry (known: {list(_REGISTRY)})"
+            )
+        fold_models = []
+        for fold_idx, sd in enumerate(fold_state_dicts):
+            m = _REGISTRY[mname](mcfg)
+            missing, unexpected = m.load_state_dict(sd, strict=True)
+            if missing or unexpected:
+                raise RuntimeError(
+                    "Ensemble fold checkpoint mismatch "
+                    f"(config={member.get('config_id')}, fold={fold_idx}): "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            m.eval().to(_DEVICE)
+            fold_models.append(m)
+        _ENSEMBLE_MEMBERS.append(
+            {
+                "config_id": str(member.get("config_id", "")),
+                "model_name": mname,
+                "model_cfg": mcfg,
+                "fold_models": fold_models,
+            }
+        )
+
+    _MODEL = _EnsembleModel(_ENSEMBLE_MEMBERS, list(_CKPT["blend_weights"]))
+    _MODEL.eval().to(_DEVICE)
     LOG.info(
-        "checkpoint has use_cluster_features=True, n_clusters=%d, "
-        "cluster_embed_dim=%r -- preserving as-is (cluster channel was a "
-        "no-op at training time and must remain a no-op at inference).",
-        int(_MODEL_CFG.get("n_clusters", 0) or 0),
-        _MODEL_CFG.get("cluster_embed_dim"),
+        "Loaded ensemble bundle: %d configurations, blend_weights=%s, "
+        "fold_assignment_sha256=%s",
+        len(_ENSEMBLE_MEMBERS),
+        [float(w) for w in _MODEL.blend_weights.tolist()],
+        str(_CKPT.get("fold_assignment_sha256", "<absent>"))[:16],
     )
+else:
+    _MODEL_CFG: dict = dict(_CKPT["model_cfg"])
 
-_INDEXER: dict = dict(_CKPT["indexer"])
-_MODEL_NAME: str = META["model_name"]
-_SUBJECT_TO_ID: dict = dict(_INDEXER["subject_to_id"])
-_BC_TO_ID: dict = dict(_INDEXER["bc_to_id"])
+    # The checkpoint's ``model_cfg`` is the single source of truth for the
+    # trained architecture: every shape in ``model_state`` was emitted by
+    # instantiating the model from exactly these dims. Mutating any of them
+    # here -- including "repairs" that try to interpret zero/missing values
+    # as defaults -- desynchronizes the constructed Module's parameter
+    # shapes from the saved tensor shapes and crashes ``load_state_dict``.
+    # Specifically: ``use_cluster_features=True`` together with
+    # ``cluster_embed_dim=0`` is a *valid, intentional* configuration meaning
+    # "no cluster embedding layer was trained" (the residual's input dim
+    # was computed without the cluster channel). Coercing it to a nonzero
+    # default at runtime would add a randomly-initialized embedding that
+    # the residual was never trained against, *and* widen the residual's
+    # expected input dim, producing exactly the
+    # "Error(s) in loading state_dict ... size mismatch for residual.*"
+    # failure mode at module init.
+    if (
+        _MODEL_CFG.get("use_cluster_features")
+        and int(_MODEL_CFG.get("n_clusters", 0) or 0) > 0
+        and int(_MODEL_CFG.get("cluster_embed_dim", 0) or 0) <= 0
+    ):
+        LOG.info(
+            "checkpoint has use_cluster_features=True, n_clusters=%d, "
+            "cluster_embed_dim=%r -- preserving as-is (cluster channel was a "
+            "no-op at training time and must remain a no-op at inference).",
+            int(_MODEL_CFG.get("n_clusters", 0) or 0),
+            _MODEL_CFG.get("cluster_embed_dim"),
+        )
 
-# Per-(subject, bc) training row counts, used by labeling.py for graded
-# novelty + graded anchoring acquisition.  Optional: present only when
-# ``export_run`` was called with ``train_counts={...}`` -- otherwise these
-# stay empty and labeling.py falls back to binary novelty + anchoring
-# (which still preserves the priority ordering, just without the
-# continuous gradient within each tier).
-_TRAIN_COUNTS_RAW: dict = dict(META.get("train_counts") or {})
-_N_TRAIN_PER_SUBJECT: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_subject") or {})
-_N_TRAIN_PER_BC: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_bc") or {})
+    _INDEXER: dict = dict(_CKPT["indexer"])
+    _MODEL_NAME: str = META["model_name"]
+    _SUBJECT_TO_ID: dict = dict(_INDEXER["subject_to_id"])
+    _BC_TO_ID: dict = dict(_INDEXER["bc_to_id"])
 
-_MODEL = _REGISTRY[_MODEL_NAME](_MODEL_CFG)
-_MISSING_KEYS, _UNEXPECTED_KEYS = _MODEL.load_state_dict(
-    _CKPT["model_state"], strict=True
-)
-if _MISSING_KEYS or _UNEXPECTED_KEYS:
-    raise RuntimeError(
-        "Checkpoint/model architecture mismatch: "
-        f"missing={_MISSING_KEYS}, unexpected={_UNEXPECTED_KEYS}"
+    # Per-(subject, bc) training row counts, used by labeling.py for graded
+    # novelty + graded anchoring acquisition.  Optional: present only when
+    # ``export_run`` was called with ``train_counts={...}`` -- otherwise these
+    # stay empty and labeling.py falls back to binary novelty + anchoring
+    # (which still preserves the priority ordering, just without the
+    # continuous gradient within each tier).
+    _TRAIN_COUNTS_RAW: dict = dict(META.get("train_counts") or {})
+    _N_TRAIN_PER_SUBJECT: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_subject") or {})
+    _N_TRAIN_PER_BC: dict = dict(_TRAIN_COUNTS_RAW.get("n_per_bc") or {})
+
+    _MODEL = _REGISTRY[_MODEL_NAME](_MODEL_CFG)
+    # The metadata-aware variant has data-dependent submodule shapes
+    # (per-field embedding cardinalities depend on the fitted vocab,
+    # the residual MLP input dim depends on those embedding widths,
+    # etc.). We rebuild the submodules from the saved state shapes
+    # BEFORE loading -- the runtime equivalent of the trainer's
+    # ``attach_metadata_tables`` call.
+    if hasattr(_MODEL, "rebuild_from_state_dict"):
+        _MODEL.rebuild_from_state_dict(_CKPT["model_state"])
+    _MISSING_KEYS, _UNEXPECTED_KEYS = _MODEL.load_state_dict(
+        _CKPT["model_state"], strict=True
     )
-_MODEL.eval().to(_DEVICE)
+    if _MISSING_KEYS or _UNEXPECTED_KEYS:
+        raise RuntimeError(
+            "Checkpoint/model architecture mismatch: "
+            f"missing={_MISSING_KEYS}, unexpected={_UNEXPECTED_KEYS}"
+        )
+    _MODEL.eval().to(_DEVICE)
 
 # Pool-feature stats (z-score normalization, fit on training items only).
 _POOL_STATS: dict = {}
@@ -2474,8 +3351,41 @@ def _predict_uncalibrated(
     s = torch.tensor([s_id], dtype=torch.long, device=_DEVICE)
     bc = torch.tensor([bc_id], dtype=torch.long, device=_DEVICE)
 
+    # Cold-start metadata override. Only meaningful when:
+    #   * the trained checkpoint uses metadata features
+    #     (``_MODEL_CFG["use_metadata_features"]``), AND
+    #   * the runtime preprocessor JSON was shipped and loaded
+    #     successfully (``META_PREPROCESSOR is not None``), AND
+    #   * the underlying model variant exposes a ``meta_override``
+    #     parameter in its forward signature.
+    # For a known (s_id > 0, bc_id > 0) row the buffer lookup already
+    # holds the right metadata, so the override is a no-op upgrade --
+    # we send it anyway so genuinely-unseen subjects/benchmarks still
+    # get a useful prediction at test time. We only build the override
+    # for single-model bundles; the ensemble path expects an
+    # ``_EnsembleModel`` that doesn't take the kwarg yet (a deliberate
+    # MVP limit; see #future-work).
+    meta_override = None
+    if (
+        _MODEL_CFG.get("use_metadata_features", False)
+        and META_PREPROCESSOR is not None
+        and not isinstance(_MODEL, _EnsembleModel)
+    ):
+        try:
+            override_cpu = _build_meta_override(benchmark, subject_content)
+            if override_cpu is not None:
+                meta_override = {
+                    k: v.to(_DEVICE) for k, v in override_cpu.items()
+                }
+        except Exception:
+            LOG.exception("meta_override build failed; falling back to buffer")
+            meta_override = None
+
     with torch.inference_mode():
-        logit = _MODEL(s, bc, ie, se, pf, ci, jf, nf)
+        if meta_override is not None:
+            logit = _MODEL(s, bc, ie, se, pf, ci, jf, nf, meta_override=meta_override)
+        else:
+            logit = _MODEL(s, bc, ie, se, pf, ci, jf, nf)
         prob = torch.sigmoid(logit).float().cpu().item()
     if not math.isfinite(prob):
         prob = DEFAULT_PROB
@@ -2848,6 +3758,7 @@ def export_run(
     ship_training_cache: bool = False,
     ship_requirements_txt: bool = False,
     train_counts: Mapping | None = None,
+    meta_preprocessor: Any = None,
 ) -> Path:
     """Materialize the submission folder from a single trained run.
 
@@ -3388,6 +4299,48 @@ def export_run(
         json.dumps(runtime_meta, indent=2, default=str)
     )
 
+    # --- Structured metadata ----------------------------------------------
+    # Ship the fitted preprocessor as JSON if the checkpoint uses
+    # metadata features. The runtime model.py reads this file at module
+    # import time and uses it to override the per-id buffer lookup for
+    # cold-start subjects/benchmarks. If the trained model doesn't use
+    # metadata features but the caller passed a preprocessor anyway, we
+    # log and skip (matches the symmetric judge / NN guard above).
+    ckpt_uses_meta = bool(ckpt_model_cfg.get("use_metadata_features", False))
+    if ckpt_uses_meta:
+        if meta_preprocessor is None:
+            raise RuntimeError(
+                "export_run: checkpoint declares use_metadata_features=True "
+                "but the caller passed meta_preprocessor=None. The runtime "
+                "would fall back to the per-id buffer for cold-start subjects, "
+                "losing the metadata channel. Pass the fitted "
+                "MetadataPreprocessor (or the dict from .to_dict()) so the "
+                "bundle can re-encode cold-start rows at test time."
+            )
+        if hasattr(meta_preprocessor, "to_dict") and callable(meta_preprocessor.to_dict):
+            meta_blob = meta_preprocessor.to_dict()
+        elif isinstance(meta_preprocessor, Mapping):
+            meta_blob = dict(meta_preprocessor)
+        else:
+            raise TypeError(
+                "export_run: meta_preprocessor must be a MetadataPreprocessor "
+                "or a dict; got "
+                f"{type(meta_preprocessor).__name__}"
+            )
+        (artifacts / "meta_preprocessor.json").write_text(
+            json.dumps(meta_blob, indent=2, default=str), encoding="utf-8"
+        )
+        LOG.info(
+            "Wrote meta_preprocessor.json (%d subject names, %d benchmarks)",
+            len(meta_blob.get("model_info_records") or []),
+            len(meta_blob.get("benchmark_info_records") or []),
+        )
+    elif meta_preprocessor is not None:
+        LOG.warning(
+            "export_run: meta_preprocessor was passed but the checkpoint has "
+            "use_metadata_features=False; skipping meta_preprocessor.json"
+        )
+
     (sub / "model.py").write_text(_RUNTIME_MODEL_PY, encoding="utf-8")
     if include_labeling:
         (sub / "labeling.py").write_text(_RUNTIME_LABELING_PY, encoding="utf-8")
@@ -3557,4 +4510,438 @@ def make_submission_zip(
     return zip_path
 
 
-__all__ = ["bundle_training_cache", "export_run", "make_submission_zip"]
+# ---------------------------------------------------------------------------
+# Ensemble export (K-fold OOF blend)
+# ---------------------------------------------------------------------------
+
+
+def export_ensemble_run(
+    *,
+    members: list[Mapping],
+    blend_weights: list[float],
+    indexer: Mapping,
+    encoder_cfg: Mapping,
+    fold_assignment_sha256: str,
+    submission_dir: str | os.PathLike[str] = "submission",
+    representative_result: TrainResult | None = None,
+    include_labeling: bool = True,
+    extra_models_txt: list[str] | None = None,
+    default_calibrator: Mapping | None = None,
+    pool_stats_path: str | os.PathLike[str] | None = None,
+    cluster_centroids_path: str | os.PathLike[str] | None = None,
+    pool_feature_names: list[str] | None = None,
+    training_cache_dir: str | os.PathLike[str] | None = None,
+    judge_cfg: Mapping | None = None,
+    nn_features_cfg: Mapping | None = None,
+    ship_training_cache: bool = False,
+    ship_requirements_txt: bool = False,
+    train_counts: Mapping | None = None,
+) -> Path:
+    """Materialize a submission folder backed by a K-fold ensemble bundle.
+
+    ``members`` is a list of dicts, one per ensemble configuration:
+
+        {
+            "config_id": str,
+            "model_name": str,                  # must exist in _REGISTRY
+            "model_cfg": Mapping,               # ModelConfig as dict
+            "fold_checkpoint_paths": [Path, ...]  # one .pt per fold
+        }
+
+    Every member's ``fold_checkpoint_paths`` must be the per-fold
+    checkpoints written by the K-fold notebook cell (state_dict +
+    model_cfg under standard keys). The exporter loads each one with
+    ``torch.load``, extracts ``model_state``, and packs all of them into
+    a single ensemble ``checkpoint.pt`` so the runtime can mmap one
+    artifact instead of ``M * K`` separate files.
+
+    Every member must share auxiliary-feature flags (use_pool_features,
+    use_cluster_features, use_judge_features, use_nn_features,
+    use_subject_text_embedding) because the runtime's
+    ``_predict_uncalibrated`` consults a single ``_MODEL_CFG`` to decide
+    which input channels to build; the runtime raises loudly if this
+    invariant is violated. Mixing checkpoints with different feature
+    flags is not supported here -- the K-fold cell uses identical flags
+    across configurations by default.
+
+    The shared ``indexer`` (a Mapping with ``subject_to_id`` and
+    ``bc_to_id`` keys) is written once into the ensemble checkpoint and
+    used by every member at inference time, so all members agree on the
+    integer ids for subject_id / bc_id lookups.
+
+    ``representative_result`` is optional and only affects the
+    ``runtime_meta.json`` cosmetics (run_id, k, best_val_log_loss). If
+    omitted, those fields are populated from the first member.
+
+    Returns the submission directory path. Single-model export via
+    ``export_run`` is unaffected.
+    """
+    import torch as _torch  # local import; keep module-level import cheap
+
+    if not members:
+        raise RuntimeError("export_ensemble_run: members list is empty")
+    if len(blend_weights) != len(members):
+        raise RuntimeError(
+            "export_ensemble_run: blend_weights length "
+            f"{len(blend_weights)} != n_members {len(members)}"
+        )
+
+    flag_keys = (
+        "use_pool_features",
+        "use_cluster_features",
+        "use_judge_features",
+        "use_nn_features",
+        "use_subject_text_embedding",
+    )
+    ref_flags = {k: bool(dict(members[0]["model_cfg"]).get(k, False)) for k in flag_keys}
+    for m in members[1:]:
+        cur = {k: bool(dict(m["model_cfg"]).get(k, False)) for k in flag_keys}
+        if cur != ref_flags:
+            raise RuntimeError(
+                "export_ensemble_run: ensemble members disagree on auxiliary "
+                f"feature flags (ref={ref_flags} vs {cur}). The runtime can "
+                "only consult one _MODEL_CFG; re-train members with matching "
+                "flags or split the ensemble."
+            )
+
+    if not include_labeling:
+        LOG.warning(
+            "export_ensemble_run: include_labeling=False -- the streamed-flush "
+            "architecture is disabled. predict() will fall back to bs=1 "
+            "inference and the bundle will run ~10-15x slower. Re-enable for "
+            "any real submission."
+        )
+    elif not train_counts:
+        raise RuntimeError(
+            "export_ensemble_run: include_labeling=True requires train_counts "
+            "(use compute_train_counts(...) on the full training dataframe so "
+            "labeling.py can route GRADED novelty + anchoring queries)."
+        )
+
+    # ---- Aggregate all fold state dicts into one ensemble checkpoint ----
+    aggregated_members: list[dict] = []
+    for member in members:
+        config_id = str(member["config_id"])
+        model_name = str(member["model_name"])
+        mcfg = dict(member["model_cfg"])
+        fold_paths = [Path(p) for p in member["fold_checkpoint_paths"]]
+        if not fold_paths:
+            raise RuntimeError(
+                f"member {config_id!r}: fold_checkpoint_paths is empty"
+            )
+        fold_state_dicts = []
+        for fp in fold_paths:
+            if not fp.exists():
+                raise FileNotFoundError(
+                    f"member {config_id!r}: missing fold checkpoint {fp}"
+                )
+            ck = _torch.load(fp, map_location="cpu", weights_only=False)
+            if "model_state" not in ck:
+                raise RuntimeError(
+                    f"fold checkpoint {fp} is missing 'model_state' key"
+                )
+            fold_state_dicts.append(ck["model_state"])
+        aggregated_members.append(
+            {
+                "config_id": config_id,
+                "model_name": model_name,
+                "model_cfg": mcfg,
+                "fold_state_dicts": fold_state_dicts,
+            }
+        )
+
+    # Use the first member's config as the representative for runtime input
+    # building (every member shares the auxiliary-feature flags). The
+    # numeric weights are stored as plain floats for transparency.
+    first_cfg = dict(aggregated_members[0]["model_cfg"])
+    ensemble_ckpt = {
+        "ensemble": True,
+        "indexer": {
+            "subject_to_id": dict(indexer["subject_to_id"]),
+            "bc_to_id": dict(indexer["bc_to_id"]),
+        },
+        "model_cfg": first_cfg,
+        "members": aggregated_members,
+        "blend_weights": [float(w) for w in blend_weights],
+        "fold_assignment_sha256": str(fold_assignment_sha256),
+    }
+
+    sub = Path(submission_dir)
+    artifacts = sub / "artifacts"
+    if sub.exists():
+        shutil.rmtree(sub)
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    _torch.save(ensemble_ckpt, artifacts / "checkpoint.pt")
+
+    # NN features / judge sanity checks: the ensemble's first member is the
+    # canonical "uses NN / uses judge" answer (we already required every
+    # member to agree).
+    ckpt_uses_nn = bool(first_cfg.get("use_nn_features", False))
+    ckpt_uses_judge = bool(first_cfg.get("use_judge_features", False))
+    ckpt_nn_feature_dim = int(first_cfg.get("nn_feature_dim", 0))
+    ckpt_judge_feature_dim = int(first_cfg.get("judge_feature_dim", 0))
+
+    if ckpt_uses_nn:
+        if nn_features_cfg is None:
+            raise RuntimeError(
+                "export_ensemble_run: ensemble members declare "
+                f"use_nn_features=True (dim={ckpt_nn_feature_dim}) but "
+                "nn_features_cfg=None. The runtime would silently feed "
+                "zeros into the trained NN slot."
+            )
+        if training_cache_dir is None:
+            raise RuntimeError(
+                "export_ensemble_run: ensemble members declare "
+                "use_nn_features=True but training_cache_dir=None."
+            )
+        cache_src = Path(training_cache_dir)
+        required_nn_files = (
+            "subject_passrate.npz",
+            "subject_passrate_mask.npz",
+            "subject_key_to_id.json",
+            "nn_features_config.json",
+        )
+        missing = [f for f in required_nn_files if not (cache_src / f).exists()]
+        if missing:
+            raise RuntimeError(
+                f"export_ensemble_run: training cache at {cache_src} missing "
+                f"NN files: {missing}."
+            )
+    elif nn_features_cfg is not None and bool(
+        (nn_features_cfg or {}).get("enabled", False)
+    ):
+        LOG.warning(
+            "export_ensemble_run: nn_features_cfg.enabled=True but ensemble "
+            "members have use_nn_features=False. Ignoring nn_features_cfg."
+        )
+        nn_features_cfg = None
+
+    if ckpt_uses_judge:
+        jcfg_chk = dict(judge_cfg or {})
+        if not (
+            bool(jcfg_chk.get("enabled", False))
+            and bool(jcfg_chk.get("ship_at_runtime", True))
+            and str(jcfg_chk.get("model_id", ""))
+        ):
+            raise RuntimeError(
+                "export_ensemble_run: ensemble declares use_judge_features=True "
+                f"(dim={ckpt_judge_feature_dim}) but judge_cfg is missing one "
+                "of {enabled, ship_at_runtime, model_id}."
+            )
+    elif judge_cfg is not None and bool((judge_cfg or {}).get("enabled", False)):
+        LOG.warning(
+            "export_ensemble_run: judge_cfg.enabled=True but ensemble has "
+            "use_judge_features=False. Shipping without judge runtime metadata."
+        )
+        judge_cfg = None
+
+    # Copy auxiliary artifacts (pool stats / cluster centroids / training cache)
+    # using the same conventions as export_run.
+    pool_src = (
+        Path(pool_stats_path)
+        if pool_stats_path
+        else Path("artifacts/item_features/pool_features_stats.json")
+    )
+    if pool_src.exists():
+        shutil.copy2(pool_src, artifacts / "pool_features_stats.json")
+    centroids_src = (
+        Path(cluster_centroids_path)
+        if cluster_centroids_path
+        else Path("artifacts/cluster_centroids.npy")
+    )
+    if centroids_src.exists():
+        shutil.copy2(centroids_src, artifacts / "cluster_centroids.npy")
+
+    if ship_training_cache and training_cache_dir is not None:
+        src_cache = Path(training_cache_dir)
+        if src_cache.exists():
+            dst_cache = sub / "cache"
+            if dst_cache.exists():
+                shutil.rmtree(dst_cache)
+            shutil.copytree(src_cache, dst_cache)
+
+    # Judge / encoder runtime block mirrors export_run.
+    jcfg = dict(judge_cfg or {})
+    runtime_judge_bs = int(
+        jcfg.get(
+            "runtime_batch_size",
+            8 if int(jcfg.get("batch_size", 8) or 8) > 64 else jcfg.get("batch_size", 8),
+        )
+    )
+    judge_block = {
+        "enabled": bool(ckpt_uses_judge),
+        "ship_at_runtime": bool(jcfg.get("ship_at_runtime", True)),
+        "model_id": str(jcfg.get("model_id", "")),
+        "batch_size": int(jcfg.get("batch_size", 16)),
+        "runtime_batch_size": runtime_judge_bs,
+        "max_prompt_tokens": int(jcfg.get("max_prompt_tokens", 1024)),
+        "bf16": bool(jcfg.get("bf16", True)),
+        "use_flash_attention": bool(jcfg.get("use_flash_attention", True)),
+        "trust_remote_code": bool(jcfg.get("trust_remote_code", False)),
+        "suffix_reserve_tokens": int(jcfg.get("suffix_reserve_tokens", 256)),
+        "yes_tokens": list(jcfg.get("yes_tokens", (" yes", "yes", " Yes", "Yes"))),
+        "no_tokens": list(jcfg.get("no_tokens", (" no", "no", " No", "No"))),
+        "prompt_template": str(
+            jcfg.get(
+                "prompt_template",
+                (
+                    "You will see a description of an AI subject and an evaluation item. "
+                    "Decide whether the subject would answer the item correctly. "
+                    "Reply with a single token: yes or no.\n\n"
+                    "Benchmark: {benchmark}\n"
+                    "Condition: {condition}\n"
+                    "Subject: {subject_content}\n"
+                    "Item: {item_content}\n"
+                    "Answer:"
+                ),
+            )
+        ),
+        "feature_in_residual": bool(jcfg.get("feature_in_residual", True)),
+    }
+
+    qwen3_instruction = str(encoder_cfg.get("qwen3_instruction", "") or "")
+    query_prefix = str(encoder_cfg.get("query_prefix", "") or "")
+    passage_prefix = str(encoder_cfg.get("passage_prefix", "") or "")
+    runtime_encoder_id = str(encoder_cfg["model_id"])
+    if "Qwen3-Embedding" in runtime_encoder_id and qwen3_instruction:
+        qwen3_prefix = f"Instruct: {qwen3_instruction}\nQuery: "
+        query_prefix = query_prefix or qwen3_prefix
+        passage_prefix = passage_prefix or qwen3_prefix
+    encoder_runtime_batch_size = int(
+        encoder_cfg.get(
+            "runtime_batch_size",
+            16
+            if int(encoder_cfg.get("batch_size", 16) or 16) > 64
+            else encoder_cfg.get("batch_size", 16),
+        )
+    )
+    if "Qwen3-Embedding-8B" in runtime_encoder_id and encoder_runtime_batch_size > 8:
+        encoder_runtime_batch_size = 8
+
+    rep = representative_result
+    runtime_meta = {
+        "run_id": (
+            rep.run_id if rep is not None
+            else f"ensemble_{aggregated_members[0]['config_id']}_blend"
+        ),
+        # Use ``"ensemble"`` as model_name so the runtime branch detects the
+        # ensemble bundle even if a caller forgets to set _CKPT["ensemble"].
+        "model_name": "ensemble",
+        "runtime_architecture": "streamed_flush_v1+perbc_cal+ensemble",
+        "encoder_model_id": runtime_encoder_id,
+        "max_length": int(encoder_cfg.get("max_length") or 512),
+        "encoder_runtime_batch_size": encoder_runtime_batch_size,
+        "pooling": encoder_cfg.get("pooling", "mean"),
+        "use_contextual_item_text": bool(
+            encoder_cfg.get("use_contextual_item_text", True)
+        ),
+        "query_prefix": query_prefix,
+        "passage_prefix": passage_prefix,
+        "qwen3_instruction": qwen3_instruction,
+        "calibration_disabled": False,
+        "default_prob": 0.5,
+        "default_calibrator": dict(default_calibrator or {"kind": "identity"}),
+        "best_val_log_loss": float(rep.best_val_log_loss) if rep is not None else None,
+        "best_val_brier": float(rep.best_val_brier) if rep is not None else None,
+        "best_val_auc": rep.best_val_auc if rep is not None else None,
+        "k": int(rep.k) if rep is not None else int(first_cfg.get("k", 0)),
+        "epoch_best": int(rep.epoch_best) if rep is not None else -1,
+        "pool_feature_names": list(pool_feature_names) if pool_feature_names else [
+            "token_len",
+            "char_len",
+            "has_latex",
+            "has_code",
+            "n_questions",
+            "n_numbers",
+            "is_multiple_choice",
+            "n_choices",
+            "lang_en",
+        ],
+        "judge": judge_block,
+        "nn_features": {
+            "enabled": bool(ckpt_uses_nn),
+            "k": int((nn_features_cfg or {}).get("k", 16)),
+            "runtime_k": int(
+                (nn_features_cfg or {}).get(
+                    "runtime_k", (nn_features_cfg or {}).get("k", 16)
+                )
+            ),
+            "similarity": str((nn_features_cfg or {}).get("similarity", "cosine")),
+            "feature_dim": int(
+                (nn_features_cfg or {}).get(
+                    "feature_dim", ckpt_nn_feature_dim or 8
+                )
+            ),
+            "fallback_value": float(
+                (nn_features_cfg or {}).get("fallback_value", 0.0)
+            ),
+            "top1_missing_sentinel": float(
+                (nn_features_cfg or {}).get("top1_missing_sentinel", -1.0)
+            ),
+        },
+        "ensemble": {
+            "n_members": len(aggregated_members),
+            "config_ids": [m["config_id"] for m in aggregated_members],
+            "model_names": [m["model_name"] for m in aggregated_members],
+            "n_folds_per_member": [
+                len(m["fold_state_dicts"]) for m in aggregated_members
+            ],
+            "blend_weights": [float(w) for w in blend_weights],
+            "fold_assignment_sha256": str(fold_assignment_sha256),
+        },
+    }
+    if train_counts:
+        if not isinstance(train_counts, Mapping):
+            raise TypeError(
+                "export_ensemble_run: train_counts must be a mapping"
+            )
+        n_per_subject = train_counts.get("n_per_subject") or {}
+        n_per_bc = train_counts.get("n_per_bc") or {}
+        runtime_meta["train_counts"] = {
+            "n_per_subject": {str(k): int(v) for k, v in n_per_subject.items()},
+            "n_per_bc": {str(k): int(v) for k, v in n_per_bc.items()},
+        }
+    (artifacts / "runtime_meta.json").write_text(
+        json.dumps(runtime_meta, indent=2, default=str)
+    )
+
+    (sub / "model.py").write_text(_RUNTIME_MODEL_PY, encoding="utf-8")
+    if include_labeling:
+        (sub / "labeling.py").write_text(_RUNTIME_LABELING_PY, encoding="utf-8")
+
+    declared = [str(encoder_cfg["model_id"])]
+    if (
+        judge_block["enabled"]
+        and judge_block["ship_at_runtime"]
+        and judge_block["model_id"]
+        and judge_block["model_id"] not in declared
+    ):
+        declared.append(judge_block["model_id"])
+    if extra_models_txt:
+        for m in extra_models_txt:
+            if m and m not in declared:
+                declared.append(m)
+    (sub / "models.txt").write_text("\n".join(declared) + "\n", encoding="utf-8")
+
+    if ship_requirements_txt:
+        (sub / "requirements.txt").write_text(
+            _RUNTIME_REQUIREMENTS, encoding="utf-8"
+        )
+
+    LOG.info(
+        "Wrote ensemble submission to %s (n_members=%d, folds=%s, weights=%s)",
+        sub.resolve(),
+        len(aggregated_members),
+        [len(m["fold_state_dicts"]) for m in aggregated_members],
+        [float(w) for w in blend_weights],
+    )
+    return sub
+
+
+__all__ = [
+    "bundle_training_cache",
+    "export_ensemble_run",
+    "export_run",
+    "make_submission_zip",
+]
