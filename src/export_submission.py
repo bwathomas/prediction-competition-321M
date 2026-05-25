@@ -1650,6 +1650,7 @@ class _EnsembleModel(nn.Module):
         self,
         members,
         blend_weights,
+        blend_weights_missing=None,
     ):
         super().__init__()
         if not members:
@@ -1658,6 +1659,14 @@ class _EnsembleModel(nn.Module):
             raise RuntimeError(
                 "_EnsembleModel: blend_weights length "
                 f"{len(blend_weights)} != n_members {len(members)}"
+            )
+        if (
+            blend_weights_missing is not None
+            and len(blend_weights_missing) != len(members)
+        ):
+            raise RuntimeError(
+                "_EnsembleModel: blend_weights_missing length "
+                f"{len(blend_weights_missing)} != n_members {len(members)}"
             )
         flag_keys = (
             "use_pool_features",
@@ -1691,6 +1700,23 @@ class _EnsembleModel(nn.Module):
         for idx, ml in enumerate(self._member_lists):
             setattr(self, f"_member_{idx:02d}", ml)
 
+        # Per-member kwarg-acceptance: only forward ``meta_override`` to
+        # members whose fold-model forward declares the kwarg. Lets us
+        # mix ``MetaHybrid*`` (accepts the kwarg) with ``Hybrid*`` (does
+        # not) inside the same coverage-gated ensemble.
+        import inspect as _inspect
+
+        self._member_accepts_meta_override: list[bool] = []
+        for ml in self._member_lists:
+            accepts = False
+            if len(ml) > 0:
+                try:
+                    sig = _inspect.signature(ml[0].forward)
+                    accepts = "meta_override" in sig.parameters
+                except (TypeError, ValueError):
+                    accepts = False
+            self._member_accepts_meta_override.append(accepts)
+
         w = torch.as_tensor(list(blend_weights), dtype=torch.float64)
         w = torch.clamp(w, min=0.0)
         s = float(w.sum().item())
@@ -1699,6 +1725,29 @@ class _EnsembleModel(nn.Module):
         else:
             w = w / s
         self.register_buffer("blend_weights", w.to(torch.float32), persistent=False)
+
+        # Optional coverage-conditional second weight vector. When
+        # provided, the bundle interprets ``blend_weights`` as the
+        # weights to use for rows whose benchmark IS in the indexer
+        # (``bench_present == 1``), and ``blend_weights_missing`` for
+        # cold-start rows (``bench_present == 0``). When None, the
+        # ensemble blends with a single scalar weight per member as
+        # before. Stored as a non-persistent buffer to mirror
+        # ``blend_weights``.
+        self._has_coverage_blend = blend_weights_missing is not None
+        if self._has_coverage_blend:
+            wm = torch.as_tensor(list(blend_weights_missing), dtype=torch.float64)
+            wm = torch.clamp(wm, min=0.0)
+            sm = float(wm.sum().item())
+            if sm <= 0.0:
+                wm = torch.ones_like(wm) / float(len(members))
+            else:
+                wm = wm / sm
+            self.register_buffer(
+                "blend_weights_missing",
+                wm.to(torch.float32),
+                persistent=False,
+            )
 
     def forward(
         self,
@@ -1710,20 +1759,61 @@ class _EnsembleModel(nn.Module):
         cluster_ids=None,
         judge_feats=None,
         nn_feats=None,
+        meta_override=None,
+        bench_present=None,
     ):
         eps = 1.0e-7
+        use_per_row = (
+            self._has_coverage_blend
+            and bench_present is not None
+        )
+        bp = None
+        if use_per_row:
+            bp = bench_present
+            if not isinstance(bp, torch.Tensor):
+                bp = torch.as_tensor(bp)
+            bp = bp.to(torch.float32).reshape(-1)
         p_blend = None
         for w_idx, ml in enumerate(self._member_lists):
             p_member = None
             n_folds = len(ml)
+            accepts_meta = self._member_accepts_meta_override[w_idx]
             for fold_model in ml:
-                logit = fold_model(
-                    s, bc, ie, se, pool_feats, cluster_ids, judge_feats, nn_feats
-                )
+                if accepts_meta and meta_override is not None:
+                    logit = fold_model(
+                        s,
+                        bc,
+                        ie,
+                        se,
+                        pool_feats,
+                        cluster_ids,
+                        judge_feats,
+                        nn_feats,
+                        meta_override=meta_override,
+                    )
+                else:
+                    logit = fold_model(
+                        s,
+                        bc,
+                        ie,
+                        se,
+                        pool_feats,
+                        cluster_ids,
+                        judge_feats,
+                        nn_feats,
+                    )
                 p_fold = torch.sigmoid(logit)
                 p_member = p_fold if p_member is None else (p_member + p_fold)
             p_member = p_member / float(max(1, n_folds))
-            w_c = self.blend_weights[w_idx].to(p_member.dtype)
+            if use_per_row:
+                bp_d = bp.to(p_member.device).to(p_member.dtype)
+                while bp_d.dim() < p_member.dim():
+                    bp_d = bp_d.unsqueeze(-1)
+                w_pres = self.blend_weights[w_idx].to(p_member.dtype)
+                w_miss = self.blend_weights_missing[w_idx].to(p_member.dtype)
+                w_c = bp_d * w_pres + (1.0 - bp_d) * w_miss
+            else:
+                w_c = self.blend_weights[w_idx].to(p_member.dtype)
             contrib = w_c * p_member
             p_blend = contrib if p_blend is None else (p_blend + contrib)
         # Return a logit so the existing predict() path can sigmoid() to
@@ -2876,6 +2966,13 @@ if _IS_ENSEMBLE:
         fold_models = []
         for fold_idx, sd in enumerate(fold_state_dicts):
             m = _REGISTRY[mname](mcfg)
+            # Metadata-aware variants have data-dependent submodule
+            # shapes; rebuild them from the saved state before
+            # load_state_dict, mirroring the single-model loader path.
+            # Hybrid (non-meta) variants don't expose this method --
+            # the hasattr check makes the call safely conditional.
+            if hasattr(m, "rebuild_from_state_dict"):
+                m.rebuild_from_state_dict(sd)
             missing, unexpected = m.load_state_dict(sd, strict=True)
             if missing or unexpected:
                 raise RuntimeError(
@@ -2894,13 +2991,33 @@ if _IS_ENSEMBLE:
             }
         )
 
-    _MODEL = _EnsembleModel(_ENSEMBLE_MEMBERS, list(_CKPT["blend_weights"]))
+    # Optional second weight vector for coverage-conditional blending.
+    # When present, the ensemble blends per-row: ``blend_weights`` is
+    # used for rows whose benchmark IS in ``_BC_TO_ID`` (bench_present=1)
+    # and ``blend_weights_missing`` is used for cold-start rows
+    # (bench_present=0). When absent, the legacy scalar blend applies.
+    _BLEND_WEIGHTS_MISSING_RAW = _CKPT.get("blend_weights_missing")
+    _BLEND_WEIGHTS_MISSING = (
+        list(_BLEND_WEIGHTS_MISSING_RAW)
+        if _BLEND_WEIGHTS_MISSING_RAW is not None
+        else None
+    )
+    _MODEL = _EnsembleModel(
+        _ENSEMBLE_MEMBERS,
+        list(_CKPT["blend_weights"]),
+        blend_weights_missing=_BLEND_WEIGHTS_MISSING,
+    )
     _MODEL.eval().to(_DEVICE)
     LOG.info(
         "Loaded ensemble bundle: %d configurations, blend_weights=%s, "
-        "fold_assignment_sha256=%s",
+        "blend_weights_missing=%s, fold_assignment_sha256=%s",
         len(_ENSEMBLE_MEMBERS),
         [float(w) for w in _MODEL.blend_weights.tolist()],
+        (
+            [float(w) for w in _MODEL.blend_weights_missing.tolist()]
+            if getattr(_MODEL, "_has_coverage_blend", False)
+            else "<absent>"
+        ),
         str(_CKPT.get("fold_assignment_sha256", "<absent>"))[:16],
     )
 else:
@@ -3634,15 +3751,15 @@ def _predict_uncalibrated(
     # For a known (s_id > 0, bc_id > 0) row the buffer lookup already
     # holds the right metadata, so the override is a no-op upgrade --
     # we send it anyway so genuinely-unseen subjects/benchmarks still
-    # get a useful prediction at test time. We only build the override
-    # for single-model bundles; the ensemble path expects an
-    # ``_EnsembleModel`` that doesn't take the kwarg yet (a deliberate
-    # MVP limit; see #future-work).
+    # get a useful prediction at test time. The ensemble path also
+    # accepts the kwarg now: ``_EnsembleModel`` introspects each
+    # member's forward signature and forwards the kwarg only to
+    # members that declare it (``MetaHybrid*``), so heterogeneous
+    # ensembles that mix meta + no-meta members work transparently.
     meta_override = None
     if (
         _MODEL_CFG.get("use_metadata_features", False)
         and META_PREPROCESSOR is not None
-        and not isinstance(_MODEL, _EnsembleModel)
     ):
         try:
             override_cpu = _build_meta_override(benchmark, subject_content)
@@ -3654,8 +3771,31 @@ def _predict_uncalibrated(
             LOG.exception("meta_override build failed; falling back to buffer")
             meta_override = None
 
+    # Coverage-gated blend signal for ensemble bundles. ``bench_present``
+    # is 1.0 when the row's benchmark IS in the trained indexer (so its
+    # per-bc bias and metadata buffers are well-trained) and 0.0 for
+    # cold-start benchmarks (where the runtime should lean on the
+    # no-metadata blend partner). Single-model bundles ignore this
+    # value entirely. We always compute it so the kwarg routing below
+    # is uniform across bundle types.
+    bench_present = torch.tensor(
+        [1.0 if bc_id != 0 else 0.0],
+        dtype=torch.float32,
+        device=_DEVICE,
+    )
+
     with torch.inference_mode():
-        if meta_override is not None:
+        # The ensemble forward accepts both ``meta_override`` and
+        # ``bench_present`` as kwargs; non-ensemble model variants
+        # accept only ``meta_override``. We branch on isinstance so
+        # the single-model path stays bit-identical to before.
+        if isinstance(_MODEL, _EnsembleModel):
+            logit = _MODEL(
+                s, bc, ie, se, pf, ci, jf, nf,
+                meta_override=meta_override,
+                bench_present=bench_present,
+            )
+        elif meta_override is not None:
             logit = _MODEL(s, bc, ie, se, pf, ci, jf, nf, meta_override=meta_override)
         else:
             logit = _MODEL(s, bc, ie, se, pf, ci, jf, nf)
@@ -4924,6 +5064,7 @@ def export_ensemble_run(
     meta_preprocessor: Any = None,
     nn_calibrator_state: Mapping | None = None,
     nn_calibrator_table_dir: str | os.PathLike[str] | None = None,
+    blend_weights_missing: list[float] | None = None,
 ) -> Path:
     """Materialize a submission folder backed by a K-fold ensemble bundle.
 
@@ -4972,6 +5113,16 @@ def export_ensemble_run(
         raise RuntimeError(
             "export_ensemble_run: blend_weights length "
             f"{len(blend_weights)} != n_members {len(members)}"
+        )
+    if (
+        blend_weights_missing is not None
+        and len(blend_weights_missing) != len(members)
+    ):
+        raise RuntimeError(
+            "export_ensemble_run: blend_weights_missing length "
+            f"{len(blend_weights_missing)} != n_members {len(members)}. "
+            "Pass either None (legacy scalar blend) or a list with one "
+            "weight per member (coverage-conditional blend)."
         )
 
     flag_keys = (
@@ -5053,6 +5204,10 @@ def export_ensemble_run(
         "blend_weights": [float(w) for w in blend_weights],
         "fold_assignment_sha256": str(fold_assignment_sha256),
     }
+    if blend_weights_missing is not None:
+        ensemble_ckpt["blend_weights_missing"] = [
+            float(w) for w in blend_weights_missing
+        ]
 
     sub = Path(submission_dir)
     artifacts = sub / "artifacts"
@@ -5346,6 +5501,11 @@ def export_ensemble_run(
                 len(m["fold_state_dicts"]) for m in aggregated_members
             ],
             "blend_weights": [float(w) for w in blend_weights],
+            "blend_weights_missing": (
+                [float(w) for w in blend_weights_missing]
+                if blend_weights_missing is not None
+                else None
+            ),
             "fold_assignment_sha256": str(fold_assignment_sha256),
         },
     }
@@ -5414,8 +5574,152 @@ def export_ensemble_run(
     return sub
 
 
+# ---------------------------------------------------------------------------
+# Coverage-blend ensemble (2-member, metadata-coverage-conditional)
+# ---------------------------------------------------------------------------
+
+
+def export_coverage_blend_run(
+    *,
+    member_a_state_dict: Mapping,
+    member_a_model_name: str,
+    member_a_model_cfg: Mapping,
+    member_a_config_id: str = "meta_dropout",
+    member_b_state_dict: Mapping,
+    member_b_model_name: str,
+    member_b_model_cfg: Mapping,
+    member_b_config_id: str = "no_meta_bc_dropout",
+    blend_weights_present: tuple[float, float],
+    blend_weights_missing: tuple[float, float],
+    indexer: Mapping,
+    encoder_cfg: Mapping,
+    submission_dir: str | os.PathLike[str] = "submission",
+    representative_result: TrainResult | None = None,
+    include_labeling: bool = True,
+    extra_models_txt: list[str] | None = None,
+    default_calibrator: Mapping | None = None,
+    pool_stats_path: str | os.PathLike[str] | None = None,
+    cluster_centroids_path: str | os.PathLike[str] | None = None,
+    pool_feature_names: list[str] | None = None,
+    training_cache_dir: str | os.PathLike[str] | None = None,
+    judge_cfg: Mapping | None = None,
+    nn_features_cfg: Mapping | None = None,
+    ship_training_cache: bool = False,
+    ship_requirements_txt: bool = False,
+    train_counts: Mapping | None = None,
+    meta_preprocessor: Any = None,
+    nn_calibrator_state: Mapping | None = None,
+    nn_calibrator_table_dir: str | os.PathLike[str] | None = None,
+    fold_assignment_sha256: str = "coverage_blend_v1",
+) -> Path:
+    """Export a 2-member coverage-conditional ensemble bundle.
+
+    Convenience wrapper around ``export_ensemble_run`` for the
+    common case of "metadata-aware model + no-metadata model"
+    blended per-row by whether the row's benchmark is in the
+    trained indexer (i.e. seen during training, ``bench_present=1``)
+    or not (``bench_present=0``).
+
+    Member A is conventionally the metadata-aware model trained
+    with metadata-dropout regularization (so it handles partial-
+    metadata inputs at test time); Member B is the no-metadata
+    model trained with bc-id dropout (so it handles unknown
+    benchmarks). The blend weights are fit on a held-out
+    benchmark-cold-start val slice in the notebook.
+
+    Each member contributes ONE fold; the existing K-fold ensemble
+    plumbing is reused with ``fold_state_dicts=[state_dict]`` per
+    member. The runtime ``_EnsembleModel`` introspects each member's
+    forward signature and only forwards ``meta_override`` to members
+    that accept it, so heterogeneous meta+nometa ensembles work
+    transparently.
+    """
+    import tempfile
+
+    if len(blend_weights_present) != 2:
+        raise RuntimeError(
+            "export_coverage_blend_run: blend_weights_present must be a "
+            f"length-2 tuple/list, got len={len(blend_weights_present)}"
+        )
+    if len(blend_weights_missing) != 2:
+        raise RuntimeError(
+            "export_coverage_blend_run: blend_weights_missing must be a "
+            f"length-2 tuple/list, got len={len(blend_weights_missing)}"
+        )
+
+    # ``export_ensemble_run`` reads each fold from ``fold_checkpoint_paths``
+    # via torch.load, so we materialize the two state dicts to a temp
+    # directory. The exporter then re-packs them into the final
+    # ensemble checkpoint.pt and the temp dir is dropped.
+    import torch as _torch
+
+    tmp = Path(tempfile.mkdtemp(prefix="coverage_blend_"))
+    try:
+        path_a = tmp / "member_a.pt"
+        _torch.save(
+            {
+                "model_state": dict(member_a_state_dict),
+                "model_cfg": dict(member_a_model_cfg),
+                "model_name": str(member_a_model_name),
+            },
+            path_a,
+        )
+        path_b = tmp / "member_b.pt"
+        _torch.save(
+            {
+                "model_state": dict(member_b_state_dict),
+                "model_cfg": dict(member_b_model_cfg),
+                "model_name": str(member_b_model_name),
+            },
+            path_b,
+        )
+
+        members: list[Mapping] = [
+            {
+                "config_id": str(member_a_config_id),
+                "model_name": str(member_a_model_name),
+                "model_cfg": dict(member_a_model_cfg),
+                "fold_checkpoint_paths": [path_a],
+            },
+            {
+                "config_id": str(member_b_config_id),
+                "model_name": str(member_b_model_name),
+                "model_cfg": dict(member_b_model_cfg),
+                "fold_checkpoint_paths": [path_b],
+            },
+        ]
+        return export_ensemble_run(
+            members=members,
+            blend_weights=list(blend_weights_present),
+            blend_weights_missing=list(blend_weights_missing),
+            indexer=indexer,
+            encoder_cfg=encoder_cfg,
+            fold_assignment_sha256=str(fold_assignment_sha256),
+            submission_dir=submission_dir,
+            representative_result=representative_result,
+            include_labeling=include_labeling,
+            extra_models_txt=extra_models_txt,
+            default_calibrator=default_calibrator,
+            pool_stats_path=pool_stats_path,
+            cluster_centroids_path=cluster_centroids_path,
+            pool_feature_names=pool_feature_names,
+            training_cache_dir=training_cache_dir,
+            judge_cfg=judge_cfg,
+            nn_features_cfg=nn_features_cfg,
+            ship_training_cache=ship_training_cache,
+            ship_requirements_txt=ship_requirements_txt,
+            train_counts=train_counts,
+            meta_preprocessor=meta_preprocessor,
+            nn_calibrator_state=nn_calibrator_state,
+            nn_calibrator_table_dir=nn_calibrator_table_dir,
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 __all__ = [
     "bundle_training_cache",
+    "export_coverage_blend_run",
     "export_ensemble_run",
     "export_run",
     "make_submission_zip",

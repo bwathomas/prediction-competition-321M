@@ -1,36 +1,62 @@
 # %% [markdown]
-# # Qwen3-Embedding-8B minimalist notebook
+# # Qwen3-Embedding-8B minimalist notebook -- coverage-blend ensemble
 #
-# **Goal**: train one metadata-aware head on cached `Qwen/Qwen3-Embedding-8B`
-# vectors, with FAISS-GPU nearest-neighbor features + multi-centroid soft
-# cluster distances ON by default, fit a Netflix-Prize-style nearest-
-# neighbor calibrator on validation, and export a Codabench-ready
-# submission. No judge LLM, no LoRA fine-tuning, no K-fold ablation grid.
+# **Goal**: train two heads on cached `Qwen/Qwen3-Embedding-8B` vectors --
+#
+#   * **Model A**: metadata-aware (`meta_hybrid_irt_kfactor_gated_mlp`)
+#     trained with **metadata dropout** (per-row Bernoulli masking of
+#     subject and benchmark metadata so the `__MISSING__` embeddings
+#     and the missingness-gate get gradient signal).
+#   * **Model B**: no-metadata (`hybrid_irt_kfactor_gated_mlp`) trained
+#     with **bc-id dropout** (per-row Bernoulli replacement of `bc_idx`
+#     with the UNK slot so the residual MLP learns to predict without
+#     the per-benchmark bias signal).
+#
+# After training, fit a **coverage-conditional blend** on a synthetic
+# benchmark-cold-start val slice: two scalars `w_present` and
+# `w_missing` such that the runtime blends per-row by whether the
+# row's benchmark is in the trained indexer. Fit a Netflix-Prize-style
+# NN calibrator on the blended predictions, and export a Codabench-
+# ready ensemble bundle that ships both checkpoints + both weight
+# vectors.
+#
+# **Why blend with coverage gating?** On hosted test rows for unseen
+# benchmarks, Model A's metadata gate sees `__MISSING__` patterns it
+# has been explicitly trained on (good), and Model A's per-bc bias
+# `beta[0]` is the well-trained UNK slot (good); Model B is trained
+# specifically to predict robustly without per-bc bias (good). Either
+# model alone is suboptimal: A's metadata channel can dominate when
+# it shouldn't, B has no access to subject/benchmark metadata signal
+# even when the test row HAS that metadata. The blend lets each
+# model contribute where it's strongest. Math: Jensen's slack from
+# blending is `(1/2) * w * (1-w) * Var(p_A - p_B) / (p * (1-p))`,
+# maximized when `w_A` matches the relative reliability per regime.
 #
 # What ships in the bundle:
 #
-# - `artifacts/checkpoint.pt` -- trained `meta_hybrid_irt_kfactor_gated_mlp`.
-# - `artifacts/cluster_centroids.npy` -- runtime computes top-m centroid
-#   distances on every prediction. Same math as training, see
-#   `src/clustering.py:compute_top_m_distances`.
-# - `artifacts/pool_features_stats.json` -- z-score stats including the
-#   `centroid_dist_*` columns.
-# - `artifacts/meta_preprocessor.json` -- cold-start subject / benchmark
-#   metadata encoder.
-# - `artifacts/runtime_meta.json` -- includes `nn_calibrator` block (alpha,
-#   k, similarity, ...).
-# - `cache/` -- training-item cache (PCA + int8 + FAISS) for runtime NN
-#   feature lookup. **Required** when NN features are on (without it the
-#   trained NN slot would receive zeros at test time and the head would
-#   regress).
+# - `artifacts/checkpoint.pt` -- ensemble bundle with both members'
+#   state dicts and the per-coverage blend weights. Loaded by the
+#   runtime via the existing `_EnsembleModel` path
+#   (heterogeneous meta+nometa members supported).
+# - `artifacts/cluster_centroids.npy` -- runtime computes top-m
+#   centroid distances on every prediction.
+# - `artifacts/pool_features_stats.json` -- z-score stats including
+#   the `centroid_dist_*` columns.
+# - `artifacts/meta_preprocessor.json` -- cold-start subject /
+#   benchmark metadata encoder, used by Member A's `meta_override`.
+# - `artifacts/runtime_meta.json` -- includes `nn_calibrator` block
+#   (alpha, k, similarity, ...) AND `ensemble.blend_weights[_missing]`
+#   for diagnostic visibility.
+# - `cache/` -- training-item cache (PCA + int8 + FAISS) for runtime
+#   NN feature lookup. **Required** when NN features are on.
 # - `cache/nn_residual/` -- `(subject_id, training_item_row) ->
-#   (label, p_uncal)` sparse table for the NN calibrator. **Required**
-#   whenever `nn_calibrator.alpha != 0`.
+#   (label, p_uncal)` sparse table for the NN calibrator. The
+#   `p_uncal` column here is the BLENDED uncalibrated prediction
+#   (so the calibrator's residuals are taken w.r.t. what the runtime
+#   actually emits before NN calibration).
 #
-# Future ensemble work consumes the same `cache/nn_residual/` artifact:
-# every member ships its own table (alongside its own checkpoint), the
-# orchestrator can then either average the per-member NN-calibrated
-# probabilities or fit a per-member alpha on a held-out blend split.
+# Design rationale (dropout rates, seeds, blend tuning) is documented
+# at the top of each cell below.
 
 # %% [markdown]
 # ## 1. Setup (Colab + local both supported)
@@ -157,6 +183,59 @@ CFG["nn_calibration"]["k"] = 16
 CFG["nn_calibration"]["temperature"] = 1.0
 CFG["nn_calibration"]["min_weight_sum"] = 1e-3
 
+# --- Coverage-blend ensemble: two models trained with complementary
+#     dropouts, blended per-row by benchmark-coverage at runtime.
+#
+#  Why these specific defaults?
+#
+#  * Model A's ``p_bench=0.20`` matches a defensible upper bound on the
+#    test-time fraction of cold-start benchmarks (the hosted comp's
+#    leaderboard is heavily new-benchmark). Train-time mask rate ≈
+#    test-time mask rate is the bias-variance optimum: too low and the
+#    MISSING embedding stays under-trained; too high and the in-
+#    distribution metadata signal is starved.
+#
+#  * Model A's ``p_subj=0.10`` is half of p_bench because subject-side
+#    cold-start is rarer than benchmark-side (the comp re-uses many
+#    model orgs across benchmarks). Independence between the two flags
+#    (no joint-mask dependency) means we get joint-missing rows at the
+#    product probability ``0.20 * 0.10 = 0.02`` -- enough to let the
+#    gate learn the worst-case "no metadata at all" pattern but not
+#    enough to dominate.
+#
+#  * Model B's ``q_bc=0.15`` regularizes the per-benchmark bias
+#    ``beta[bc_idx]``. With prob 0.15 we replace ``bc_idx`` with 0
+#    (the UNK slot), so the residual MLP and the IRT channel learn to
+#    predict robustly even when the per-bc intercept signal is
+#    unavailable. 15% is conservative: any higher and we starve the
+#    in-distribution bc bias; any lower and ``beta[0]`` stays under-
+#    trained for hosted cold-start rows.
+#
+#  Seeding strategy (also a deliberate choice):
+#
+#  * SPLIT_SEED is shared across both models so the val rows are
+#    identical -- needed for blend tuning to be on a comparable slice.
+#  * MODEL_A_SEED and MODEL_B_SEED differ from SEED and from each
+#    other: different inits + batch order + dropout RNG = larger
+#    ``Var(p_A - p_B)`` = larger Jensen slack from blending. Empirical
+#    ensembling literature consistently reports ~1-3% log-loss gain
+#    per seed-diversification on top of architectural diversity.
+CFG["coverage_blend"] = {
+    "model_a": {
+        "p_bench": 0.20,
+        "p_subj": 0.10,
+        "q_bc": 0.0,
+    },
+    "model_b": {
+        "p_bench": 0.0,
+        "p_subj": 0.0,
+        "q_bc": 0.15,
+    },
+    "synthetic_cold_start_frac": 0.15,
+    "model_a_seed_offset": 11,
+    "model_b_seed_offset": 23,
+}
+
 print("Encoder:", CFG["encoder"]["model_id"])
 print("Model variant:", CFG["train"]["models"])
 print("Metadata enabled:", CFG["metadata"]["enabled"])
@@ -164,6 +243,16 @@ print("NN features:", CFG["nn_features"]["enabled"], "k=", CFG["nn_features"]["k
 print("Centroid distances:", CFG["centroid_distances"]["enabled"],
       "top_m=", CFG["centroid_distances"]["top_m"])
 print("Judge:", CFG["judge"]["enabled"])
+print(
+    "Coverage blend: A(p_bench={p_bench}, p_subj={p_subj}, q_bc={q_bc}), "
+    "B(q_bc={q_bc_b})  synth cold-start={cs:.0%}".format(
+        p_bench=CFG["coverage_blend"]["model_a"]["p_bench"],
+        p_subj=CFG["coverage_blend"]["model_a"]["p_subj"],
+        q_bc=CFG["coverage_blend"]["model_a"]["q_bc"],
+        q_bc_b=CFG["coverage_blend"]["model_b"]["q_bc"],
+        cs=CFG["coverage_blend"]["synthetic_cold_start_frac"],
+    )
+)
 
 # %%
 from src.embeddings import login_huggingface, resolve_hf_token
@@ -642,7 +731,24 @@ print(
 )
 
 # %% [markdown]
-# ## 8. Train the metadata-aware head
+# ## 8a. Train Model A: metadata-aware + metadata dropout
+#
+# **Why metadata dropout, not vanilla training?** Model A's
+# `MetaHybridIRTKFactorGatedMLP` reserves row 0 of every metadata
+# buffer for the all-`__MISSING__` pattern. Without dropout, every
+# training row uses real metadata, so row 0's embedding receives ZERO
+# gradients during training. At test time on a cold-start benchmark
+# the runtime substitutes row 0 via `meta_override`, the model sees
+# a never-trained embedding, and the metadata channel emits
+# essentially-random logits. Metadata dropout fixes this: with prob
+# `p_bench` we replace bench metadata with row 0 during the forward
+# pass, so the row 0 embedding (and the missingness gate) get gradient
+# signal proportional to expected test-time exposure.
+#
+# **Implementation**: a forward-pre-hook installed on the model. The
+# hook is no-op during eval (so val metrics are honest) and seeds
+# its RNG from `MODEL_A_SEED` so every training run is reproducible
+# bit-for-bit.
 
 # %%
 from dataclasses import asdict
@@ -650,14 +756,26 @@ from dataclasses import asdict
 import src.train as train_mod
 from src.models import ModelConfig
 from src.train import TrainConfig, train_one
+from src.train_dropout import TrainDropoutConfig, install_train_dropout
 
 CKPT_DIR = ROOT / "artifacts" / "checkpoints" / "qwen8b_minimalist"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 K_LATENT = int((CFG["train"].get("k_factors") or [16])[0])
-MODEL_NAME = "meta_hybrid_irt_kfactor_gated_mlp"
+MODEL_A_NAME = "meta_hybrid_irt_kfactor_gated_mlp"
+MODEL_B_NAME = "hybrid_irt_kfactor_gated_mlp"
 
-model_cfg = ModelConfig(
+SPLIT_SEED = SEED
+MODEL_A_SEED = SEED + int(CFG["coverage_blend"]["model_a_seed_offset"])
+MODEL_B_SEED = SEED + int(CFG["coverage_blend"]["model_b_seed_offset"])
+print(
+    f"Seeds: SPLIT={SPLIT_SEED}  MODEL_A={MODEL_A_SEED}  "
+    f"MODEL_B={MODEL_B_SEED}"
+)
+
+# Common ModelConfig fields shared between A and B. Only the metadata
+# block + the model variant differs across the two members.
+_common_kwargs = dict(
     k=K_LATENT,
     item_embed_dim=ITEM_EMB_DIM,
     item_map_hidden_dim=int(CFG["train"].get("item_map_hidden_dim", 512)),
@@ -678,97 +796,239 @@ model_cfg = ModelConfig(
     judge_feature_dim=0,
     use_nn_features=True,
     nn_feature_dim=int(nn_train_mat.shape[1]),
+)
+
+model_a_cfg = ModelConfig(
     use_metadata_features=True,
     meta_subject_categorical=_meta_schema.subject_categorical,
     meta_subject_numeric=_meta_schema.subject_numeric,
     meta_benchmark_categorical=_meta_schema.benchmark_categorical,
     meta_benchmark_numeric=_meta_schema.benchmark_numeric,
     meta_explicit_crosses=_meta_schema.explicit_crosses,
+    **_common_kwargs,
 )
-print("ModelConfig:")
-print(json.dumps(asdict(model_cfg), default=str, indent=2)[:1200])
+print("Model A (meta + meta-dropout):")
+print(json.dumps(asdict(model_a_cfg), default=str, indent=2)[:1200])
 
-# Monkey-patch ``build_model`` so train_one's internal model construction
-# also gets the metadata id tables attached. The trainer doesn't know
-# about meta tables, so without this hook the model trains with a
-# zero-init metadata channel -- behavior identical to the non-metadata
-# baseline. We restore the original in a finally block.
+# Build TrainConfig once -- reused for both members so any wall-clock
+# comparison between A and B reflects only the architecture / dropout
+# delta, not optimizer hyperparameters.
+train_cfg = TrainConfig(
+    learning_rate=float(CFG["train"].get("learning_rate", 3.0e-3)),
+    weight_decay=float(CFG["train"].get("weight_decay", 1.0e-4)),
+    batch_size=int(CFG["train"].get("batch_size", 65536)),
+    epochs=int(CFG["train"].get("epochs", 5)),
+    warmup_steps=int(CFG["train"].get("warmup_steps", 30)),
+    scheduler=str(CFG["train"].get("scheduler", "cosine")),
+    grad_clip=float(CFG["train"].get("grad_clip", 1.0)),
+    early_stopping_patience=int(CFG["train"].get("early_stopping_patience", 5)),
+    bf16=bool(CFG["encoder"].get("bf16", True)),
+    num_workers=int(CFG["train"].get("num_workers", 0)),
+)
+
+# Monkey-patch ``build_model`` so train_one's internal model
+# construction also gets:
+#   1. the metadata id tables attached (for Model A)
+#   2. the dropout pre-hook installed (for whichever model we're training)
+# We track the active dropout config in a closure so the patch can be
+# parametric. Restored in finally blocks.
 _orig_build_model = train_mod.build_model
+_active_dropout_cfg: dict = {"cfg": None, "name": None, "installed_handles": []}
 
 
-def _build_with_meta(name, cfg):
+def _build_with_overrides(name, cfg):
     m = _orig_build_model(name, cfg)
-    if name == MODEL_NAME and bool(getattr(cfg, "use_metadata_features", False)):
+    if name == MODEL_A_NAME and bool(getattr(cfg, "use_metadata_features", False)):
         m.attach_metadata_tables(meta_id_tables)
+    drop_cfg = _active_dropout_cfg["cfg"]
+    if drop_cfg is not None and name == _active_dropout_cfg["name"]:
+        h = install_train_dropout(m, drop_cfg)
+        _active_dropout_cfg["installed_handles"].append(h)
     return m
 
 
-train_mod.build_model = _build_with_meta
+train_mod.build_model = _build_with_overrides
 try:
-    train_cfg = TrainConfig(
-        learning_rate=float(CFG["train"].get("learning_rate", 3.0e-3)),
-        weight_decay=float(CFG["train"].get("weight_decay", 1.0e-4)),
-        batch_size=int(CFG["train"].get("batch_size", 65536)),
-        epochs=int(CFG["train"].get("epochs", 5)),
-        warmup_steps=int(CFG["train"].get("warmup_steps", 30)),
-        scheduler=str(CFG["train"].get("scheduler", "cosine")),
-        grad_clip=float(CFG["train"].get("grad_clip", 1.0)),
-        early_stopping_patience=int(CFG["train"].get("early_stopping_patience", 5)),
-        bf16=bool(CFG["encoder"].get("bf16", True)),
-        num_workers=int(CFG["train"].get("num_workers", 0)),
+    a_drop = TrainDropoutConfig(
+        p_bench=float(CFG["coverage_blend"]["model_a"]["p_bench"]),
+        p_subj=float(CFG["coverage_blend"]["model_a"]["p_subj"]),
+        q_bc=float(CFG["coverage_blend"]["model_a"]["q_bc"]),
+        seed=MODEL_A_SEED,
     )
-    result = train_one(
-        model_name=MODEL_NAME,
-        model_cfg=model_cfg,
+    _active_dropout_cfg["cfg"] = a_drop
+    _active_dropout_cfg["name"] = MODEL_A_NAME
+    _active_dropout_cfg["installed_handles"] = []
+    result_a = train_one(
+        model_name=MODEL_A_NAME,
+        model_cfg=model_a_cfg,
         train_cfg=train_cfg,
         train_ds=train_ds,
         val_ds=val_ds,
         indexer=indexer,
-        seed=SEED,
-        run_id="qwen8b_minimalist",
+        seed=MODEL_A_SEED,
+        run_id="qwen8b_minimalist_A_meta_dropout",
         checkpoint_dir=CKPT_DIR,
         extra_metadata={
             "encoder_model_id": CFG["encoder"]["model_id"],
             "use_metadata_features": True,
             "use_nn_features": True,
             "centroid_distances_top_m": int(top_m),
+            "meta_dropout": asdict(a_drop),
         },
     )
+    for h in _active_dropout_cfg["installed_handles"]:
+        print(
+            f"  Model A dropout stats: train_calls={h.n_train_calls}  "
+            f"rows={h.n_rows_seen}  bench_masked={h.n_rows_bench_masked}  "
+            f"subj_masked={h.n_rows_subj_masked}  "
+            f"bc_idx_masked={h.n_rows_bc_idx_masked}"
+        )
+        h.remove()
 finally:
-    train_mod.build_model = _orig_build_model
+    _active_dropout_cfg["cfg"] = None
+    _active_dropout_cfg["name"] = None
 
 print(
-    f"\nbest val log-loss: {result.best_val_log_loss:.6f}  "
-    f"brier: {result.best_val_brier:.6f}  "
-    f"epoch_best: {result.epoch_best}"
+    f"\nModel A best val log-loss: {result_a.best_val_log_loss:.6f}  "
+    f"brier: {result_a.best_val_brier:.6f}  "
+    f"epoch_best: {result_a.epoch_best}"
 )
 
 # %% [markdown]
-# ## 9. Score uncalibrated train + val, fit the NN calibrator
+# ## 8b. Train Model B: no-metadata + benchmark-id dropout
 #
-# The runtime NN calibrator needs `(subject_id, training_item_row) ->
-# (label, p_uncal)` for every training pair. We re-run the trained
-# model over the training set in inference mode to record `p_uncal`,
-# then fit the shrinkage `alpha` on the validation split.
+# **Why bc-idx dropout for the no-metadata model?** Model B's
+# `HybridIRTItemKFactorGatedMLP` predicts via
+# `mu + beta[bc_idx] + alpha_i*(theta - beta_i) + factor + residual`.
+# At hosted-test time on a cold-start benchmark, `bc_idx=0` (the UNK
+# slot), so `beta[0]` is the only piece of the per-bc bias channel
+# the runtime sees. Without dropout `beta[0]` receives no gradient
+# during training (no row uses bc_idx=0), so at test time it returns
+# whatever the random initializer gave us, plus the residual MLP has
+# never had to predict without a per-bc bias signal. With prob
+# `q_bc=0.15` we replace `bc_idx` with 0 during the forward pass,
+# training `beta[0]` to be a useful "average benchmark" prior and
+# forcing the MLP to learn bias-free predictions.
+#
+# **Why no metadata at all?** Model B's role in the blend is to be
+# the "metadata-free fallback". Even if we COULD wire metadata into
+# this model variant, doing so would defeat the purpose of having
+# two complementary members. The blend math (Jensen's slack) is
+# maximized when `Var(p_A - p_B)` is large, which requires Model B
+# to use a different feature subset.
+
+# %%
+model_b_cfg = ModelConfig(
+    use_metadata_features=False,
+    **_common_kwargs,
+)
+print("Model B (no_meta + bc-dropout):")
+print(json.dumps(asdict(model_b_cfg), default=str, indent=2)[:1200])
+
+train_mod.build_model = _build_with_overrides
+try:
+    b_drop = TrainDropoutConfig(
+        p_bench=float(CFG["coverage_blend"]["model_b"]["p_bench"]),
+        p_subj=float(CFG["coverage_blend"]["model_b"]["p_subj"]),
+        q_bc=float(CFG["coverage_blend"]["model_b"]["q_bc"]),
+        seed=MODEL_B_SEED,
+    )
+    _active_dropout_cfg["cfg"] = b_drop
+    _active_dropout_cfg["name"] = MODEL_B_NAME
+    _active_dropout_cfg["installed_handles"] = []
+    result_b = train_one(
+        model_name=MODEL_B_NAME,
+        model_cfg=model_b_cfg,
+        train_cfg=train_cfg,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        indexer=indexer,
+        seed=MODEL_B_SEED,
+        run_id="qwen8b_minimalist_B_no_meta_bc_dropout",
+        checkpoint_dir=CKPT_DIR,
+        extra_metadata={
+            "encoder_model_id": CFG["encoder"]["model_id"],
+            "use_metadata_features": False,
+            "use_nn_features": True,
+            "centroid_distances_top_m": int(top_m),
+            "bc_dropout": asdict(b_drop),
+        },
+    )
+    for h in _active_dropout_cfg["installed_handles"]:
+        print(
+            f"  Model B dropout stats: train_calls={h.n_train_calls}  "
+            f"rows={h.n_rows_seen}  bc_idx_masked={h.n_rows_bc_idx_masked}"
+        )
+        h.remove()
+finally:
+    _active_dropout_cfg["cfg"] = None
+    _active_dropout_cfg["name"] = None
+    train_mod.build_model = _orig_build_model
+
+print(
+    f"\nModel B best val log-loss: {result_b.best_val_log_loss:.6f}  "
+    f"brier: {result_b.best_val_brier:.6f}  "
+    f"epoch_best: {result_b.epoch_best}"
+)
+
+# %% [markdown]
+# ## 9. Score both models + fit per-coverage blend weights
+#
+# **Blend tuning needs a benchmark-cold-start val signal.** Our val
+# split is item-cold-start (item-disjoint from train), but every val
+# row's benchmark IS in `_BC_TO_ID`. Naive blend tuning would push
+# `w_present == w_missing` because we never measure log-loss on
+# rows where `bench_present=0`.
+#
+# We synthesize cold-start at scoring time: pick a random
+# `synthetic_cold_start_frac` of val benchmarks, and for those
+# benchmarks' val rows force `bc_idx -> 0` AND `meta_override`
+# to all-MISSING when scoring Model A. The model has actually seen
+# those benchmarks during training, so beta[that_bc] is well-tuned;
+# at scoring time we strip both signals to simulate the test-time
+# regime. Remaining (1 - frac) of val rows use real bc_idx + real
+# metadata. Now we have two predictions per row + a `bench_present`
+# flag, and can fit `w_present` on present rows + `w_missing` on
+# missing rows independently.
+#
+# Each is a 1D convex log-loss minimization. We solve it via golden-
+# section search over [0, 1].
 
 # %%
 import torch
 from tqdm.auto import tqdm
 
 from src.models import build_model as _build_model_for_inf
-from src.nn_calibration import (
-    NNCalibrator,
-    SubjectResidualTable,
-)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _score_dataset(ds: LookupDataset, model, batch_size: int = 8192) -> np.ndarray:
-    device = next(model.parameters()).device
+def _score_dataset(
+    ds: LookupDataset,
+    model,
+    *,
+    bc_override: torch.Tensor | None = None,
+    meta_override_template: dict | None = None,
+    batch_size: int = 8192,
+) -> np.ndarray:
+    """Run ``model`` over ``ds`` and return per-row uncalibrated
+    probabilities.
+
+    ``bc_override`` (when not None) is a (N,) int64 tensor that
+    replaces ``ds.bc_ids`` for this scoring pass -- used to force
+    `bc_idx -> 0` on the synthetic cold-start slice.
+
+    ``meta_override_template`` (when not None) is a dict with the
+    same keys as ``MetadataIdTables.row(0)``; the same MISSING row
+    is broadcast to every row of every batch. Only consumed by
+    metadata-aware models.
+    """
     n = len(ds)
     out = np.zeros(n, dtype=np.float32)
     has_pool = ds.pool_feats.shape[-1] > 0
     has_cluster = bool(getattr(model.cfg, "has_cluster_embedding", False))
     has_nn = ds.nn_feats.shape[-1] > 0
+    accepts_meta = bool(getattr(model.cfg, "use_metadata_features", False))
     model.eval()
     with torch.no_grad():
         for start in tqdm(range(0, n, batch_size), desc="score", leave=False):
@@ -780,9 +1040,19 @@ def _score_dataset(ds: LookupDataset, model, batch_size: int = 8192) -> np.ndarr
                 kw["cluster_ids"] = ds.cluster_ids[start:end].to(device)
             if has_nn:
                 kw["nn_feats"] = ds.nn_feats[start:end].to(device)
+            if accepts_meta and meta_override_template is not None:
+                B_chunk = end - start
+                kw["meta_override"] = {
+                    k: v.expand(B_chunk, -1).to(device).contiguous()
+                    for k, v in meta_override_template.items()
+                }
+            bc_chunk = (
+                bc_override[start:end] if bc_override is not None
+                else ds.bc_ids[start:end]
+            )
             logits = model(
                 subject_idx=ds.subject_ids[start:end].to(device),
-                bc_idx=ds.bc_ids[start:end].to(device),
+                bc_idx=bc_chunk.to(device),
                 item_emb=ds.item_emb[start:end].to(device),
                 subject_emb=None,
                 **kw,
@@ -791,23 +1061,176 @@ def _score_dataset(ds: LookupDataset, model, batch_size: int = 8192) -> np.ndarr
     return out
 
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-trained = _build_model_for_inf(MODEL_NAME, model_cfg)
-# attach_metadata_tables rebuilds the metadata embedding modules with
-# the correct cardinalities, so we MUST attach BEFORE loading the
-# checkpoint (otherwise the newly-built tables overwrite the trained
-# weights with random init).
-trained.attach_metadata_tables(meta_id_tables)
-ckpt = torch.load(result.checkpoint_path, map_location=device, weights_only=False)
-trained.load_state_dict(ckpt["model_state"])
-trained = trained.to(device).eval()
+# Re-instantiate Model A and load its weights. attach_metadata_tables
+# rebuilds the embedding modules with the right cardinalities, so we
+# MUST attach BEFORE loading the checkpoint.
+trained_a = _build_model_for_inf(MODEL_A_NAME, model_a_cfg)
+trained_a.attach_metadata_tables(meta_id_tables)
+ckpt_a = torch.load(result_a.checkpoint_path, map_location=device, weights_only=False)
+trained_a.load_state_dict(ckpt_a["model_state"])
+trained_a = trained_a.to(device).eval()
 
-print("Scoring train rows for residual table...")
-p_uncal_train = _score_dataset(train_ds, trained)
-print("Scoring val rows for calibrator fit...")
-p_uncal_val = _score_dataset(val_ds, trained)
+trained_b = _build_model_for_inf(MODEL_B_NAME, model_b_cfg)
+ckpt_b = torch.load(result_b.checkpoint_path, map_location=device, weights_only=False)
+trained_b.load_state_dict(ckpt_b["model_state"])
+trained_b = trained_b.to(device).eval()
 
-# (subject_id, training_item_row, label, p_uncal) -> CSR table.
+# Pick the synthetic cold-start subset: a deterministic random
+# selection of val benchmarks. Reproducible via SPLIT_SEED so re-runs
+# of this cell hit the same partition.
+val_bc_keys = primary.val["benchmark_condition_key"].astype(str).to_numpy()
+unique_val_bc = np.unique(val_bc_keys)
+_rng = np.random.default_rng(SPLIT_SEED + 7919)
+n_synth = max(
+    1,
+    int(round(
+        float(CFG["coverage_blend"]["synthetic_cold_start_frac"])
+        * len(unique_val_bc)
+    )),
+)
+synth_bc_set = set(_rng.choice(unique_val_bc, size=n_synth, replace=False).tolist())
+synth_mask = np.array(
+    [k in synth_bc_set for k in val_bc_keys],
+    dtype=bool,
+)
+print(
+    f"Synthetic cold-start: held out {len(synth_bc_set):,} of "
+    f"{len(unique_val_bc):,} val benchmarks  "
+    f"({synth_mask.sum():,}/{len(synth_mask):,} val rows masked)"
+)
+bench_present_val = (~synth_mask).astype(np.float32)
+
+# Build the bc_override and meta_override for the synthetic-cold rows.
+# For non-synth rows we keep the real bc_idx and let the model do
+# its normal buffer lookup (no meta override).
+val_bc_synth = val_ds.bc_ids.clone()
+val_bc_synth[torch.from_numpy(synth_mask)] = 0
+miss_row = {
+    "subj_cat": meta_id_tables.subject_cat_ids[0:1].clone(),
+    "subj_num": meta_id_tables.subject_num[0:1].clone(),
+    "bc_cat": meta_id_tables.bc_cat_ids[0:1].clone(),
+    "bc_num": meta_id_tables.bc_num[0:1].clone(),
+}
+
+# We need 4 score passes for blend tuning:
+#   p_a_present = Model A on (real bc, real meta)              -> rows where bench_present=1
+#   p_a_missing = Model A on (bc=0, meta=MISSING)              -> rows where bench_present=0
+#   p_b_present = Model B on (real bc)                          -> rows where bench_present=1
+#   p_b_missing = Model B on (bc=0)                             -> rows where bench_present=0
+# For each model we do TWO passes (one all-real, one all-missing) and
+# splice into a single per-row vector via synth_mask.
+print("Scoring Model A: real-meta pass...")
+p_a_real = _score_dataset(val_ds, trained_a)
+print("Scoring Model A: cold-start (bc=0, meta=MISSING) pass...")
+p_a_cold = _score_dataset(
+    val_ds, trained_a, bc_override=val_bc_synth, meta_override_template=miss_row
+)
+p_a_val = np.where(synth_mask, p_a_cold, p_a_real)
+
+print("Scoring Model B: real-bc pass...")
+p_b_real = _score_dataset(val_ds, trained_b)
+print("Scoring Model B: cold-start (bc=0) pass...")
+p_b_cold = _score_dataset(val_ds, trained_b, bc_override=val_bc_synth)
+p_b_val = np.where(synth_mask, p_b_cold, p_b_real)
+
+ylab_val = primary.val["label"].astype(float).to_numpy()
+
+
+def _logloss_blend(w: float, p_a: np.ndarray, p_b: np.ndarray, y: np.ndarray) -> float:
+    """Log-loss of ``w * p_a + (1 - w) * p_b`` clipped to safe range."""
+    eps = 1e-7
+    p = np.clip(w * p_a + (1.0 - w) * p_b, eps, 1.0 - eps)
+    return float(-(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)).mean())
+
+
+def _golden_section_min(f, lo: float, hi: float, tol: float = 1e-4, max_iter: int = 64) -> float:
+    """Golden-section search on a unimodal scalar f over [lo, hi]."""
+    phi = (np.sqrt(5.0) - 1.0) / 2.0
+    a, b = lo, hi
+    c = b - phi * (b - a)
+    d = a + phi * (b - a)
+    fc, fd = f(c), f(d)
+    for _ in range(max_iter):
+        if abs(b - a) < tol:
+            break
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - phi * (b - a)
+            fc = f(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + phi * (b - a)
+            fd = f(d)
+    return float((a + b) / 2.0)
+
+
+# Fit the two weights on disjoint slices of the val set.
+present_idx = np.where(~synth_mask)[0]
+missing_idx = np.where(synth_mask)[0]
+
+if len(present_idx) > 0:
+    w_present = _golden_section_min(
+        lambda w: _logloss_blend(
+            w, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]
+        ),
+        0.0, 1.0,
+    )
+else:
+    w_present = 0.5
+if len(missing_idx) > 0:
+    w_missing = _golden_section_min(
+        lambda w: _logloss_blend(
+            w, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]
+        ),
+        0.0, 1.0,
+    )
+else:
+    w_missing = 0.5
+
+ll_a_p = _logloss_blend(1.0, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]) if len(present_idx) else float("nan")
+ll_b_p = _logloss_blend(0.0, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]) if len(present_idx) else float("nan")
+ll_blend_p = _logloss_blend(w_present, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]) if len(present_idx) else float("nan")
+ll_a_m = _logloss_blend(1.0, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]) if len(missing_idx) else float("nan")
+ll_b_m = _logloss_blend(0.0, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]) if len(missing_idx) else float("nan")
+ll_blend_m = _logloss_blend(w_missing, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]) if len(missing_idx) else float("nan")
+print(
+    f"Blend weights:\n"
+    f"  bench_present=1: w_A={w_present:.3f}  "
+    f"ll_A={ll_a_p:.5f}  ll_B={ll_b_p:.5f}  ll_blend={ll_blend_p:.5f}\n"
+    f"  bench_present=0: w_A={w_missing:.3f}  "
+    f"ll_A={ll_a_m:.5f}  ll_B={ll_b_m:.5f}  ll_blend={ll_blend_m:.5f}"
+)
+
+BLEND_PRESENT = (float(w_present), float(1.0 - w_present))
+BLEND_MISSING = (float(w_missing), float(1.0 - w_missing))
+
+# Per-row blended val prediction (for the NN calibrator below).
+w_per_row = np.where(synth_mask, w_missing, w_present).astype(np.float32)
+p_blend_val = w_per_row * p_a_val + (1.0 - w_per_row) * p_b_val
+
+# %% [markdown]
+# ## 10. NN calibrator on the BLENDED predictions
+#
+# The runtime applies the NN calibrator AFTER the per-row blend, so
+# the residual table must store residuals computed against the same
+# blended `p_uncal` the runtime emits. We score Model A and Model B
+# on TRAIN (no synthetic cold-start: train-time we always use real
+# bc + real meta) and combine them with `w_present` (because train
+# rows are by construction NOT cold-start). The val side reuses the
+# blended predictions computed in cell 9.
+
+# %%
+from src.nn_calibration import NNCalibrator, SubjectResidualTable
+
+print("Scoring Model A on train (real meta)...")
+p_a_train = _score_dataset(train_ds, trained_a)
+print("Scoring Model B on train (real bc)...")
+p_b_train = _score_dataset(train_ds, trained_b)
+p_uncal_train_blend = (
+    BLEND_PRESENT[0] * p_a_train + BLEND_PRESENT[1] * p_b_train
+).astype(np.float32)
+
+# Build the residual table from blended train predictions.
 key_to_train_row = {k: i for i, k in enumerate(train_item_keys)}
 train_subj_ids = np.array(
     [indexer.subject_id(str(s)) for s in primary.train["subject_key"]],
@@ -822,7 +1245,7 @@ residual_table = SubjectResidualTable.from_rows(
     subject_ids=train_subj_ids[ok],
     training_item_rows=train_item_rows[ok],
     labels=primary.train["label"].astype(float).to_numpy()[ok],
-    uncal_probs=p_uncal_train[ok],
+    uncal_probs=p_uncal_train_blend[ok],
     n_subjects=indexer.n_subjects,
     n_training_items=len(train_item_keys),
 )
@@ -861,8 +1284,8 @@ calibrator = NNCalibrator.fit_alpha_on_val(
     val_subject_ids=val_subj_ids_np,
     val_neighbor_rows=val_neighbor_rows,
     val_neighbor_sims=val_neighbor_sims,
-    val_uncal_probs=p_uncal_val,
-    val_labels=primary.val["label"].astype(float).to_numpy(),
+    val_uncal_probs=p_blend_val,
+    val_labels=ylab_val,
     k=int(CFG["nn_calibration"]["k"]),
     similarity=str(CFG["nn_calibration"].get("similarity", "cosine")),
     temperature=float(CFG["nn_calibration"].get("temperature", 1.0)),
@@ -876,17 +1299,24 @@ residual_table.save(RESIDUAL_DIR)
 print(f"Residual table saved to {RESIDUAL_DIR}")
 
 # %% [markdown]
-# ## 10. Export submission (with NN cache + NN calibrator)
+# ## 11. Export coverage-blend ensemble bundle
+#
+# Single-call wrapper that packages both members + both blend weight
+# vectors into a Codabench-ready zip. The runtime's `_EnsembleModel`
+# loads the bundle, introspects each member's `forward` signature
+# to decide whether to forward `meta_override`, and uses the per-row
+# `bench_present` flag to route to `blend_weights` (present) or
+# `blend_weights_missing` (missing).
 
 # %%
 from src.export_submission import (
     bundle_training_cache,
     compute_train_counts,
-    export_run,
+    export_coverage_blend_run,
     make_submission_zip,
 )
 
-SUBMISSION_DIR = ROOT / "submission" / "qwen8b_minimalist"
+SUBMISSION_DIR = ROOT / "submission" / "qwen8b_minimalist_coverage_blend"
 TRAINING_CACHE_DIR = ROOT / "artifacts" / "training_cache"
 
 training_cache_result = bundle_training_cache(
@@ -906,10 +1336,24 @@ print(
     f"(soft cap {CFG['submission_cache'].get('max_bundle_size_mb', 200)} MB)"
 )
 
-sub_dir = export_run(
-    result=result,
+sub_dir = export_coverage_blend_run(
+    member_a_state_dict=ckpt_a["model_state"],
+    member_a_model_name=MODEL_A_NAME,
+    member_a_model_cfg=asdict(model_a_cfg),
+    member_a_config_id="meta_dropout",
+    member_b_state_dict=ckpt_b["model_state"],
+    member_b_model_name=MODEL_B_NAME,
+    member_b_model_cfg=asdict(model_b_cfg),
+    member_b_config_id="no_meta_bc_dropout",
+    blend_weights_present=BLEND_PRESENT,
+    blend_weights_missing=BLEND_MISSING,
+    indexer={
+        "subject_to_id": dict(indexer.subject_to_id),
+        "bc_to_id": dict(indexer.bc_to_id),
+    },
     encoder_cfg=CFG["encoder"],
     submission_dir=SUBMISSION_DIR,
+    representative_result=result_a,  # for runtime_meta cosmetics
     include_labeling=True,
     pool_stats_path=POOL_STATS_PATH,
     cluster_centroids_path=CENTROIDS_PATH,
