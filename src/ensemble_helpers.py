@@ -392,14 +392,34 @@ def run_predict_loop(
     caught and the row is filled with NaN (so the caller can decide whether
     to treat that as a model failure).
 
+    To make silent failures easy to spot, the first exception's full
+    traceback is recorded in ``stats["first_error"]`` and the first three
+    distinct exception types are echoed via ``tqdm.write`` (so they appear
+    above the progress bar instead of being lost in the log stream).
+
     ``use_tqdm`` adds a per-row progress bar (default).  ``log_every`` still
     emits an INFO-level checkpoint every N rows for log-only consumers (set
     it to 0, the default, when tqdm is doing the visual reporting).
     """
+    import traceback
+
+    try:
+        from tqdm.auto import tqdm as _tqdm  # for tqdm.write
+    except Exception:  # noqa: BLE001
+        _tqdm = None
+
+    def _emit(msg: str) -> None:
+        if _tqdm is not None:
+            _tqdm.write(msg)
+        else:
+            print(msg)
+
     n = len(inputs)
     preds = np.empty(n, dtype=np.float64)
     n_failed = 0
     n_default = 0
+    first_error: str | None = None
+    error_types_seen: set[str] = set()
     t0 = time.time()
     desc = f"predict[{label}]" if label else "predict"
     bar = _resolve_iter(range(n), use_tqdm=use_tqdm, desc=desc)
@@ -409,8 +429,18 @@ def run_predict_loop(
             p = model_module.predict(inp, labeled if labeled else None)
             pf = float(p)
         except Exception as e:  # noqa: BLE001
-            if n_failed < 5:
-                LOG.warning("predict failed at i=%d: %s", i, e)
+            tb_str = traceback.format_exc()
+            if first_error is None:
+                first_error = f"i={i}: {type(e).__name__}: {e}\n{tb_str}"
+            etype = type(e).__name__
+            if etype not in error_types_seen and len(error_types_seen) < 3:
+                error_types_seen.add(etype)
+                # Trim traceback to keep the bar usable but still informative.
+                trimmed = "\n".join(tb_str.splitlines()[-12:])
+                _emit(
+                    f"[{label or 'model'}] predict failed at i={i} "
+                    f"({etype}: {e}); traceback tail:\n{trimmed}"
+                )
             n_failed += 1
             pf = float("nan")
         if not np.isfinite(pf):
@@ -422,14 +452,58 @@ def run_predict_loop(
         if log_every and (i + 1) % log_every == 0:
             elapsed = time.time() - t0
             LOG.info("  %s predict: %d/%d in %.1fs", label or "model", i + 1, n, elapsed)
-    stats = {
+    stats: dict[str, Any] = {
         "n": n,
         "n_failed": n_failed,
         "n_default_05": n_default,
         "seconds": time.time() - t0,
     }
-    LOG.info("%s predict done: %s", label or "model", stats)
+    if first_error is not None:
+        # Truncate to keep the stats.json reasonable on disk.
+        stats["first_error"] = first_error[:4000]
+        # If almost every row failed, surface that loudly at the end too.
+        if n_failed >= max(1, int(0.5 * n)):
+            _emit(
+                f"[{label or 'model'}] WARNING: {n_failed}/{n} predictions "
+                f"failed; see stats['first_error']."
+            )
+    LOG.info("%s predict done: %s", label or "model", {k: v for k, v in stats.items() if k != "first_error"})
     return preds, stats
+
+
+def diagnose_predict(
+    model_module: ModuleType,
+    inp: dict[str, str],
+    labeled: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Run ``model_module.predict`` once with full traceback capture.
+
+    Returns a dict with ``ok``, ``value`` (or ``None``), ``error_type``,
+    ``error_message``, and ``traceback``.  Use this from the notebook to
+    figure out *why* a model is producing all-NaN predictions without
+    re-running the entire predict loop.
+    """
+    import traceback
+
+    try:
+        v = model_module.predict(inp, labeled if labeled else None)
+        return {
+            "ok": True,
+            "value": float(v) if v is not None else None,
+            "value_raw": v,
+            "error_type": None,
+            "error_message": None,
+            "traceback": None,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "value": None,
+            "value_raw": None,
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc(),
+        }
 
 
 # ---------------------------------------------------------------------------
