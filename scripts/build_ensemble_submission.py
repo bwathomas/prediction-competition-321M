@@ -104,6 +104,18 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
+# Reduce CUDA allocator fragmentation -- critical when 5 LLM encoders share
+# a single 80GB A100.  Must be set BEFORE the first torch import; idempotent.
+_alloc_cfg = os.environ.get("PYTORCH_ALLOC_CONF", "")
+if "expandable_segments" not in _alloc_cfg:
+    _new = "expandable_segments:True"
+    os.environ["PYTORCH_ALLOC_CONF"] = (_alloc_cfg + "," + _new).lstrip(",")
+# PyTorch < 2.4 reads PYTORCH_CUDA_ALLOC_CONF instead; set both for safety.
+_alloc_cfg = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+if "expandable_segments" not in _alloc_cfg:
+    _new = "expandable_segments:True"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (_alloc_cfg + "," + _new).lstrip(",")
+
 LOG = logging.getLogger("ensemble")
 
 HERE = Path(__file__).resolve().parent
@@ -298,6 +310,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 
 try:
     from model import SUBMODELS, SUBMODEL_NAMES, SUBMODEL_NAMES_LOADED  # type: ignore
@@ -309,6 +322,33 @@ except Exception:  # noqa: BLE001
 LOG = logging.getLogger("ensemble.labeling")
 
 _FRACTION_NEW_POOL = 0.95
+
+# How many distinct OOM warnings to emit per submodel before going silent.
+# (When 5 big encoders share 80GB the warning spam is enormous and hides
+# the actual signal in the logs.)
+_OOM_LOG_LIMIT = int(os.environ.get("ENSEMBLE_OOM_LOG_LIMIT", "3"))
+_OOM_COUNTS: dict[str, int] = {}
+
+
+def _is_oom(exc: BaseException) -> bool:
+    msg = str(exc)
+    return "out of memory" in msg.lower() or "OutOfMemory" in msg
+
+
+def _maybe_recover_oom() -> None:
+    """Free unused CUDA cache so the next enqueue has a fighting chance.
+
+    Cheap (microseconds) when there's nothing to free; expensive only after
+    a real OOM.  We deliberately do NOT call this on every enqueue -- only
+    after one already raised, since the happy-path cost would dominate.
+    """
+    try:
+        import torch  # imported here to keep labeling.py importable without torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _item_in_new_pool(item_content: str) -> bool:
@@ -324,7 +364,13 @@ def _stable_tiebreak(*parts: str) -> float:
 
 
 def _enqueue_into_all(input: dict) -> None:  # noqa: A002
-    """Side-channel: stream batches into every submodel's pending queues."""
+    """Side-channel: stream batches into every submodel's pending queues.
+
+    OOMs are caught per-submodel, logged only ``_OOM_LOG_LIMIT`` times each,
+    and trigger a ``torch.cuda.empty_cache()`` so the next submodel in the
+    iteration may succeed.  This keeps the acquisition phase healthy even
+    when memory headroom is tight.
+    """
     benchmark = str(input.get("benchmark", "") or "")
     condition = str(input.get("condition", "none") or "none")
     subject_content = str(input.get("subject_content", "") or "")
@@ -343,7 +389,25 @@ def _enqueue_into_all(input: dict) -> None:  # noqa: A002
                 item_content=item_content,
             )
         except Exception as e:  # noqa: BLE001
-            LOG.warning("enqueue(%s) raised: %s", name, e)
+            oom = _is_oom(e)
+            seen = _OOM_COUNTS.get(name, 0)
+            if seen < _OOM_LOG_LIMIT:
+                _OOM_COUNTS[name] = seen + 1
+                LOG.warning(
+                    "enqueue(%s) raised%s: %s",
+                    name,
+                    " [OOM]" if oom else "",
+                    str(e).splitlines()[0] if str(e) else type(e).__name__,
+                )
+                if seen + 1 == _OOM_LOG_LIMIT:
+                    LOG.warning(
+                        "enqueue(%s): further errors will be silenced "
+                        "(_OOM_LOG_LIMIT=%d)",
+                        name,
+                        _OOM_LOG_LIMIT,
+                    )
+            if oom:
+                _maybe_recover_oom()
 
 
 def acquisition_function(input: dict) -> float:  # noqa: A002
