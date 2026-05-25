@@ -386,12 +386,43 @@ print(f"Pool feature width: {len(POOL_FEATURE_NAMES_EXT)}  "
 # ## 6. Indexer + nearest-neighbor features (FAISS GPU; on by default)
 
 # %%
+import gc
+
 from src.models import Indexer
 from src.nn_features import (
     NNFeaturesConfig,
     TrainingNNIndex,
     build_passrate_table,
     compute_nn_features_streaming,
+)
+
+
+def _ram_gb() -> float:
+    """Return current process RSS in GiB (psutil falls back to 0.0)."""
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.Process().memory_info().rss) / (1024.0**3)
+    except Exception:
+        return 0.0
+
+
+def _log_ram(label: str) -> None:
+    rss = _ram_gb()
+    if rss > 0.0:
+        print(f"  [RAM] {label}: rss={rss:.2f} GiB")
+
+
+_log_ram("cell 6 start")
+
+# Estimate ``item_emb_lookup`` resident bytes so a future OOM can be
+# attributed quickly. The dict overhead itself is ~100 MB per million
+# keys; the dominant cost is the underlying float32 ndarrays.
+_lookup_n = len(item_emb_lookup)
+_lookup_bytes = _lookup_n * int(ITEM_EMB_DIM) * 4
+print(
+    f"item_emb_lookup: N={_lookup_n:,}  D={ITEM_EMB_DIM}  "
+    f"~{_lookup_bytes / (1024.0**3):.2f} GiB of float32 tensors"
 )
 
 # Single source of truth for subject_id / bc_id semantics. Reused below
@@ -401,19 +432,39 @@ indexer = Indexer.fit(
     bc_keys=primary.train["benchmark_condition_key"].tolist(),
 )
 print(f"Indexer: n_subjects={indexer.n_subjects}  n_bc={indexer.n_bc}")
+_log_ram("after Indexer.fit")
 
-nn_cfg = NNFeaturesConfig.from_dict(CFG["nn_features"])
+nn_cfg_dict = dict(CFG["nn_features"])
+# Force the FAISS-only memory-saving path: after the IndexFlat is built
+# we can drop ``self.embeddings`` (FAISS keeps its own internal copy)
+# and reclaim ``N * D * 4`` bytes of RSS. With Qwen3-Embedding-8B this
+# is ~1.6 GB per 100k training items.
+nn_cfg_dict.setdefault("free_embeddings_after_faiss", True)
+nn_cfg = NNFeaturesConfig.from_dict(nn_cfg_dict)
 NN_DIR = ROOT / nn_cfg.cache_dir / "training"
 NN_DIR.mkdir(parents=True, exist_ok=True)
 
 train_item_keys = sorted(set(primary.train["item_key"].astype(str)))
 train_item_keys = [k for k in train_item_keys if k in item_emb_lookup]
+
+n_train_items = len(train_item_keys)
+predicted_peak_gb = 2.0 * n_train_items * int(ITEM_EMB_DIM) * 4.0 / (1024.0**3)
+print(
+    f"NN index build: N={n_train_items:,}  D={ITEM_EMB_DIM}  "
+    f"predicted peak ~{predicted_peak_gb:.2f} GiB during cosine norm + FAISS add"
+)
+
+# Pass ``item_emb_lookup`` directly -- ``build_from_lookup`` only reads
+# the keys we list in ``item_keys``, so the previous dict-comprehension
+# subset was a wasteful temporary.
 nn_index = TrainingNNIndex.build_from_lookup(
-    item_emb_lookup={k: item_emb_lookup[k] for k in train_item_keys},
+    item_emb_lookup=item_emb_lookup,
     out_dir=NN_DIR,
     cfg=nn_cfg,
     item_keys=train_item_keys,
 )
+gc.collect()
+_log_ram("after TrainingNNIndex.build_from_lookup")
 nn_index_kind = type(nn_index._faiss_index).__name__ if nn_index._faiss_index is not None else "numpy"
 print(f"NN index: N={len(train_item_keys):,}  D={ITEM_EMB_DIM}  "
       f"backend={nn_index_kind}  similarity={nn_cfg.similarity}")
@@ -447,6 +498,7 @@ def _split_query(rows_df):
 train_keys_for_nn, train_sid = _split_query(primary.train)
 val_keys_for_nn, val_sid = _split_query(primary.val)
 
+_log_ram("before compute_nn_features_streaming(train)")
 nn_train_mat = compute_nn_features_streaming(
     query_item_keys=train_keys_for_nn,
     item_emb_lookup=item_emb_lookup,
@@ -458,6 +510,8 @@ nn_train_mat = compute_nn_features_streaming(
     exclude_self=True,
     query_chunk_size=NN_QUERY_CHUNK,
 )
+gc.collect()
+_log_ram("after compute_nn_features_streaming(train)")
 nn_val_mat = compute_nn_features_streaming(
     query_item_keys=val_keys_for_nn,
     item_emb_lookup=item_emb_lookup,
@@ -469,6 +523,8 @@ nn_val_mat = compute_nn_features_streaming(
     exclude_self=False,
     query_chunk_size=NN_QUERY_CHUNK,
 )
+gc.collect()
+_log_ram("after compute_nn_features_streaming(val)")
 print(f"NN feature matrices: train={nn_train_mat.shape}  val={nn_val_mat.shape}")
 
 # Sanity: passrate_mean must positively correlate with the val label,

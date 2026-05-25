@@ -143,6 +143,13 @@ nn_features:
   # ~70 MB of working set on a 12 GB Colab. Increase if you have RAM
   # headroom; lower if you hit OOM on the streaming path.
   query_chunk_size: 4096
+  # Drop ``self.embeddings`` after the FAISS IndexFlat is successfully
+  # built. FAISS keeps its own internal copy, so the duplicate is pure
+  # overhead -- saves ~N*D*4 bytes (1.6 GB per 100k items at D=4096).
+  # Disabled in the global default for backwards-compat with callers
+  # that may rely on the brute-force fallback; the qwen8b_minimalist
+  # notebook flips it on explicitly.
+  free_embeddings_after_faiss: false
 
 # ----------------------------------------------------------------------------
 # Centroid-distance features (embedding-derived pool-feature columns)

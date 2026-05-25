@@ -80,6 +80,14 @@ class NNFeaturesConfig:
     # not accept a GPU handle), so this only affects query-time speed.
     # Ignored on machines with no GPU / no faiss-gpu build.
     prefer_gpu: bool = True
+    # When True, drop ``self.embeddings`` after FAISS is successfully
+    # built. The FAISS IndexFlat keeps its own internal copy of the
+    # embeddings, so the duplicate is pure overhead -- saves ~N*D*4
+    # bytes (1.6 GB per 100k items at D=4096). The brute-force fallback
+    # in ``nearest()`` is unavailable while embeddings are dropped, so
+    # a FAISS-search failure becomes a hard error instead of silently
+    # falling back. Documented as opt-in for that reason.
+    free_embeddings_after_faiss: bool = False
 
     @classmethod
     def from_dict(cls, d: Mapping | None) -> "NNFeaturesConfig":
@@ -96,6 +104,9 @@ class NNFeaturesConfig:
             ),
             cache_dir=str(d.get("cache_dir", "artifacts/nn_features")),
             prefer_gpu=bool(d.get("prefer_gpu", True)),
+            free_embeddings_after_faiss=bool(
+                d.get("free_embeddings_after_faiss", False)
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -280,9 +291,27 @@ class TrainingNNIndex:
                 )
             emb[i] = v
         if cfg.similarity == "cosine":
-            norms = np.linalg.norm(emb, axis=1, keepdims=True)
-            norms = np.where(norms < 1e-12, 1.0, norms)
-            emb = (emb / norms).astype(np.float32)
+            # Chunked in-place L2-normalize. Row-wise norm + division is
+            # bit-identical regardless of how we slice rows, but doing it
+            # one chunk at a time avoids two transient [N, D] copies that
+            # the previous one-shot form generated:
+            #
+            #   1. ``np.linalg.norm`` materializes ``emb * emb`` internally
+            #      (size [N, D]).
+            #   2. ``emb = (emb / norms).astype(np.float32)`` allocates a
+            #      fresh [N, D] result before overwriting the binding.
+            #
+            # The chunked form bounds the transient peak to
+            # ``norm_chunk * D * 4`` bytes (~67 MB at chunk=4096, D=4096),
+            # which is what keeps Qwen3-Embedding-8B fitting on a 12 GB
+            # Colab.
+            norm_chunk = 4096
+            for _s in range(0, N, norm_chunk):
+                _e = min(_s + norm_chunk, N)
+                _row = emb[_s:_e]
+                _n = np.linalg.norm(_row, axis=1, keepdims=True)
+                _n[_n < 1e-12] = 1.0
+                _row /= _n.astype(np.float32, copy=False)
 
         np.save(out_dir / cls.EMBEDDINGS_FILE, emb)
         (out_dir / cls.KEYS_FILE).write_text(
@@ -307,6 +336,21 @@ class TrainingNNIndex:
         self.key_to_row = {k: i for i, k in enumerate(item_keys)}
         self.embeddings = emb
         self._try_build_faiss(out_dir)
+        # FAISS IndexFlat keeps its own internal copy of the [N, D]
+        # vectors, so the duplicate ``self.embeddings`` is overhead.
+        # The streaming + chunked query paths only need ``key_to_row``
+        # plus the FAISS index, so dropping ``self.embeddings`` here is
+        # safe whenever FAISS is available.
+        if (
+            bool(getattr(cfg, "free_embeddings_after_faiss", False))
+            and self._faiss_index is not None
+        ):
+            LOG.info(
+                "TrainingNNIndex: dropping self.embeddings after FAISS "
+                "build (saves ~%.2f GB)",
+                float(N) * float(D) * 4.0 / (1024.0**3),
+            )
+            self.embeddings = None
         return self
 
     @classmethod
@@ -471,9 +515,23 @@ class TrainingNNIndex:
             try:
                 sims, idx = self._faiss_index.search(q, kq)
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("FAISS search failed (%s); brute-force fallback", exc)
+                if self.embeddings is None:
+                    raise RuntimeError(
+                        "FAISS search failed and brute-force fallback is "
+                        "unavailable because self.embeddings was freed "
+                        "(free_embeddings_after_faiss=True). Original "
+                        f"error: {exc}"
+                    ) from exc
+                LOG.warning(
+                    "FAISS search failed (%s); brute-force fallback", exc
+                )
                 sims, idx = self._brute_force(q, kq)
         else:
+            if self.embeddings is None:
+                raise RuntimeError(
+                    "TrainingNNIndex.nearest: FAISS index unavailable and "
+                    "self.embeddings was freed; cannot search."
+                )
             sims, idx = self._brute_force(q, kq)
 
         if self.cfg.similarity == "l2":

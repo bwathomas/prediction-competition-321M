@@ -210,6 +210,87 @@ def test_streaming_chunk_size_invariance(tmp_path: Path) -> None:
     assert np.allclose(a, b, atol=1e-6)
 
 
+def test_free_embeddings_preserves_streaming_output(tmp_path: Path) -> None:
+    """Setting ``free_embeddings_after_faiss=True`` must produce the same
+    NN feature output as the default config. Streaming only uses
+    ``nn_index.nearest`` (FAISS-backed when available) plus
+    ``key_to_row`` for self-exclusion, so dropping ``self.embeddings``
+    is safe and just saves N*D*4 bytes of resident RAM.
+    """
+    rng = np.random.default_rng(42)
+    n_items, dim = 24, 12
+    item_keys = [f"i_{i:03d}" for i in range(n_items)]
+    lookup = {}
+    for k in item_keys:
+        v = rng.standard_normal(dim).astype(np.float32)
+        v /= max(1e-6, float(np.linalg.norm(v)))
+        lookup[k] = v
+
+    base_cfg = NNFeaturesConfig.from_dict(
+        {"enabled": True, "k": 4, "similarity": "cosine", "prefer_gpu": False}
+    )
+    free_cfg = NNFeaturesConfig.from_dict(
+        {
+            "enabled": True,
+            "k": 4,
+            "similarity": "cosine",
+            "prefer_gpu": False,
+            "free_embeddings_after_faiss": True,
+        }
+    )
+    base_dir = tmp_path / "base"
+    free_dir = tmp_path / "free"
+    base_index = TrainingNNIndex.build_from_lookup(
+        item_emb_lookup=lookup, out_dir=base_dir, cfg=base_cfg, item_keys=item_keys,
+    )
+    free_index = TrainingNNIndex.build_from_lookup(
+        item_emb_lookup=lookup, out_dir=free_dir, cfg=free_cfg, item_keys=item_keys,
+    )
+
+    if free_index._faiss_index is None:
+        pytest.skip("faiss not installed; free_embeddings_after_faiss is a no-op")
+
+    assert base_index.embeddings is not None
+    assert free_index.embeddings is None
+
+    rows = []
+    for s in range(6):
+        for k in rng.choice(item_keys, size=5, replace=True):
+            rows.append({"subject_key": f"s_{s}", "item_key": k, "label": int(rng.random() < 0.5)})
+    train_df = pd.DataFrame(rows)
+    pr, mk, subject_index_map = _build_passrate(item_keys, train_df)
+
+    qkeys = list(rng.choice(item_keys, size=20, replace=True))
+    sids = np.array(
+        [subject_index_map[f"s_{int(rng.integers(0, 6))}"] for _ in qkeys],
+        dtype=np.int64,
+    )
+
+    base_out = compute_nn_features_streaming(
+        query_item_keys=qkeys,
+        item_emb_lookup=lookup,
+        subject_ids=sids,
+        nn_index=base_index,
+        passrate_csr=pr,
+        passrate_mask_csr=mk,
+        cfg=base_cfg,
+        exclude_self=False,
+        query_chunk_size=8,
+    )
+    free_out = compute_nn_features_streaming(
+        query_item_keys=qkeys,
+        item_emb_lookup=lookup,
+        subject_ids=sids,
+        nn_index=free_index,
+        passrate_csr=pr,
+        passrate_mask_csr=mk,
+        cfg=free_cfg,
+        exclude_self=False,
+        query_chunk_size=8,
+    )
+    assert np.allclose(base_out, free_out, atol=1e-6)
+
+
 def test_streaming_validates_lengths(tmp_path: Path) -> None:
     index, lookup, cfg, item_keys = _build_index(tmp_path)
     train_df = _synthetic_train_rows(item_keys, n_subjects=4, seed=6)
