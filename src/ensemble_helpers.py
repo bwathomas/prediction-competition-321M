@@ -208,11 +208,30 @@ def df_to_labeled(df: pd.DataFrame) -> list[dict[str, Any]]:
     return out
 
 
+def _resolve_iter(seq, *, use_tqdm: bool, desc: str | None = None):
+    """Wrap ``seq`` with ``tqdm`` when ``use_tqdm`` and tqdm is importable.
+
+    Falls back to the bare iterable if tqdm isn't available so the helper
+    module stays usable in environments where tqdm wasn't installed.  We
+    prefer ``tqdm.auto`` so the bar renders correctly in Jupyter / Colab.
+    """
+    if not use_tqdm:
+        return iter(seq)
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(seq, desc=desc, total=len(seq) if hasattr(seq, "__len__") else None)
+    except Exception:  # noqa: BLE001
+        return iter(seq)
+
+
 def run_acquisition_pass(
     labeling_module: ModuleType | None,
     inputs: list[dict[str, str]],
     *,
     log_every: int = 1000,
+    use_tqdm: bool = True,
+    desc: str | None = "acquisition",
 ) -> tuple[np.ndarray, str | None]:
     """Score every candidate via ``labeling.acquisition_function``.
 
@@ -222,6 +241,9 @@ def run_acquisition_pass(
 
     Mirrors ``validation_harness/harness/rounds.py::_safe_acquisition`` but
     accepts ``labeling_module is None`` and treats it as random.
+
+    ``use_tqdm`` adds a per-row progress bar (default).  ``log_every`` still
+    emits an INFO-level summary every N rows for log-only consumers.
     """
     n = len(inputs)
     rng = np.random.default_rng(0)
@@ -231,9 +253,10 @@ def run_acquisition_pass(
     scores = np.empty(n, dtype=np.float64)
     t0 = time.time()
     err: str | None = None
-    for i, inp in enumerate(inputs):
+    bar = _resolve_iter(range(n), use_tqdm=use_tqdm, desc=desc)
+    for i in bar:
         try:
-            s = float(fn(inp))
+            s = float(fn(inputs[i]))
             if not np.isfinite(s):
                 err = f"non-finite at i={i}: {s!r}"
                 break
@@ -286,8 +309,9 @@ def run_predict_loop(
     inputs: list[dict[str, str]],
     labeled: list[dict[str, Any]] | None,
     *,
-    log_every: int = 500,
+    log_every: int = 0,
     label: str = "",
+    use_tqdm: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Call ``model_module.predict(input, labeled)`` for every input row.
 
@@ -295,13 +319,20 @@ def run_predict_loop(
     with timing / fallback counts.  Any exception inside ``predict()`` is
     caught and the row is filled with NaN (so the caller can decide whether
     to treat that as a model failure).
+
+    ``use_tqdm`` adds a per-row progress bar (default).  ``log_every`` still
+    emits an INFO-level checkpoint every N rows for log-only consumers (set
+    it to 0, the default, when tqdm is doing the visual reporting).
     """
     n = len(inputs)
     preds = np.empty(n, dtype=np.float64)
     n_failed = 0
     n_default = 0
     t0 = time.time()
-    for i, inp in enumerate(inputs):
+    desc = f"predict[{label}]" if label else "predict"
+    bar = _resolve_iter(range(n), use_tqdm=use_tqdm, desc=desc)
+    for i in bar:
+        inp = inputs[i]
         try:
             p = model_module.predict(inp, labeled if labeled else None)
             pf = float(p)
