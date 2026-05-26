@@ -1782,12 +1782,43 @@ from src.member_features import (
 #     is cached -- no extra ``torch.load`` round-trip.
 _ckpt_a_for_theta = ckpt_a_cached
 _state_a_for_theta = _ckpt_a_for_theta["model_state"]
-theta_s_per_subject = _state_a_for_theta["theta"].cpu().numpy().astype(np.float32)
-if "u" in _state_a_for_theta:
-    u_s_per_subject = _state_a_for_theta["u"].cpu().numpy().astype(np.float32)
-elif "U" in _state_a_for_theta:
-    u_s_per_subject = _state_a_for_theta["U"].cpu().numpy().astype(np.float32)
-else:
+
+
+def _lookup_param(state_dict, candidates: tuple[str, ...]):
+    """Return the first state-dict tensor matching one of ``candidates``.
+
+    ``MetaHybridIRTKFactorGatedMLP`` stores subject ability + factors as
+    ``nn.Embedding`` modules (``self.theta``, ``self.u``), so the
+    flattened state-dict keys are ``theta.weight`` / ``u.weight``, not
+    ``theta`` / ``u``. Older checkpoints used bare names. We try
+    ``.weight`` first to match the current model definition, then fall
+    back to bare names so an older bundle still works.
+    """
+    for k in candidates:
+        if k in state_dict:
+            return state_dict[k]
+    raise KeyError(
+        "Could not locate any of "
+        f"{list(candidates)} in checkpoint state dict. Keys present: "
+        f"{sorted(state_dict.keys())[:30]} ..."
+    )
+
+
+theta_tensor = _lookup_param(
+    _state_a_for_theta, ("theta.weight", "theta", "subject_theta.weight", "subject_theta")
+)
+theta_s_per_subject = theta_tensor.detach().cpu().numpy().astype(np.float32)
+# theta is shape [n_subjects, 1] when nn.Embedding(n_subjects, 1) is
+# used -- flatten to [n_subjects] so MemberSubjectTables is happy.
+if theta_s_per_subject.ndim == 2 and theta_s_per_subject.shape[1] == 1:
+    theta_s_per_subject = theta_s_per_subject[:, 0]
+
+try:
+    u_tensor = _lookup_param(
+        _state_a_for_theta, ("u.weight", "U.weight", "u", "U")
+    )
+    u_s_per_subject = u_tensor.detach().cpu().numpy().astype(np.float32)
+except KeyError:
     u_s_per_subject = np.zeros((indexer.n_subjects, K_LATENT), dtype=np.float32)
 if u_s_per_subject.ndim == 1:
     u_s_per_subject = u_s_per_subject[:, None]
