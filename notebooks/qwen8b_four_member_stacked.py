@@ -911,9 +911,19 @@ def _build(split_part, nn_mat):
     )
 
 
-train_ds = _build(primary.train, nn_train_mat)
-val_ds = _build(primary.val, nn_val_mat)
-print(f"train tensors: {len(train_ds)}  val tensors: {len(val_ds)}")
+# NOTE: We deliberately DO NOT build ``train_ds`` / ``val_ds`` here.
+# Cell 7b will rebuild them after recomputing ``nn_train_mat`` /
+# ``nn_val_mat`` with the conditional context, and ``_build`` materializes
+# a [N_rows, embedding_dim] per-row item embedding tensor via
+# ``stack_lookup`` -- at 5M rows x 4096 dims that's ~80 GB per copy. If
+# we built here AND in cell 7b, peak RAM doubles and we OOM on machines
+# that would otherwise comfortably hold one copy. The downstream cells
+# (training, scoring) all bind to the cell-7b versions.
+print(
+    f"NN feature matrices (legacy 0..14): "
+    f"train={nn_train_mat.shape}  val={nn_val_mat.shape}  "
+    f"(datasets will be built in cell 7b once cells 15..22 are populated)"
+)
 
 # Pin the schema explicitly so the metadata preprocessor's vocab + scaler
 # layout always matches the ModelConfig fields below. Without this, the
@@ -1325,11 +1335,32 @@ for _i, _name in enumerate(NN_FEATURE_NAMES):
     _frac = float(np.mean(np.abs(nn_train_mat[:, _i] - _FB) <= 1e-9))
     print(f"  cell[{_i:2d}] {_name:40s} fallback_frac={_frac:.3f}")
 
-# Rebuild train_ds / val_ds so the LookupDataset wraps the 23-column
-# matrix instead of the no-context 14-column matrix above.
+# Free intermediates that we no longer need before allocating the
+# heavy datasets. Tolerant of cell re-runs (the names may already be
+# gone from a previous pass).
+#
+# Why this matters: ``_build`` materializes a per-row [N,
+# embedding_dim] item embedding tensor via ``stack_lookup`` -- at 5M
+# rows x 4096 dims that's ~80 GB per copy. If we leave the old
+# ``train_ds`` / ``val_ds`` bound while ``_build`` runs, peak RAM
+# briefly doubles and we OOM on machines that would otherwise hold
+# one copy comfortably. The per-split query-metadata dicts also
+# carry ~80 MB on the train split each.
+for _stale_name in ("_train_qmeta", "_val_qmeta", "train_ds", "val_ds"):
+    if _stale_name in globals():
+        try:
+            del globals()[_stale_name]
+        except KeyError:
+            pass
+gc.collect()
+_log_ram("before _build (datasets, with cond cells)")
 train_ds = _build(primary.train, nn_train_mat)
+gc.collect()
+_log_ram("after _build(train)")
 val_ds = _build(primary.val, nn_val_mat)
-print(f"train tensors: {len(train_ds)}  val tensors: {len(val_ds)} (rebuilt with cond cells)")
+gc.collect()
+_log_ram("after _build(val)")
+print(f"train tensors: {len(train_ds)}  val tensors: {len(val_ds)} (built with 23-col NN matrix)")
 
 # %% [markdown]
 # ## 8a. Train Model A: metadata-aware + metadata dropout
