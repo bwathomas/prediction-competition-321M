@@ -311,6 +311,43 @@ class MetadataSchema:
             explicit_crosses=_tup("explicit_crosses", ("family__topic", "macro_family__topic")),
         )
 
+    def full_categorical_cross_grid(self) -> tuple[str, ...]:
+        """Cartesian product of every subject_categorical x benchmark_categorical pair.
+
+        Produces the locked ``"subject_field__benchmark_field"`` string format
+        consumed by :class:`ExplicitCrossEmbeddings`. Stable, deterministic
+        ordering: outer loop over ``subject_categorical`` in insertion order,
+        inner loop over ``benchmark_categorical`` in insertion order.
+
+        Returns an empty tuple when either side has no categorical fields.
+        """
+        if not self.subject_categorical or not self.benchmark_categorical:
+            return ()
+        return tuple(
+            f"{s}__{b}"
+            for s in self.subject_categorical
+            for b in self.benchmark_categorical
+        )
+
+    def with_full_categorical_cross_grid(self) -> "MetadataSchema":
+        """Return a copy of self whose ``explicit_crosses`` is the full
+        ``subject_categorical x benchmark_categorical`` Cartesian product.
+
+        Use this when you want the model to dedicate one
+        :class:`ExplicitCrossEmbeddings` table per (subject_trait,
+        benchmark_trait) categorical pair, rather than the default
+        hand-picked subset. The numeric fields are unchanged; numeric-side
+        interactions are still captured by the metadata tower MLP and
+        (for cat<->cat) by :class:`FactorizationMachineCross`.
+        """
+        return MetadataSchema(
+            subject_categorical=self.subject_categorical,
+            subject_numeric=self.subject_numeric,
+            benchmark_categorical=self.benchmark_categorical,
+            benchmark_numeric=self.benchmark_numeric,
+            explicit_crosses=self.full_categorical_cross_grid(),
+        )
+
 
 # ---------------------------------------------------------------------------
 # MetadataPreprocessor: fits vocabs + scalers, holds the joined lookup tables
@@ -847,27 +884,38 @@ class MetaTower(nn.Module):
 
 
 class FactorizationMachineCross(nn.Module):
-    """Pairwise-interaction head over (subject, bench-condition) embeddings.
+    """Pairwise-interaction head over (subject, bench-condition) traits.
+
+    Each *trait* is one of:
+        - a categorical field (per-field embedding of size ``d_field``),
+        - a numeric field (a 2-D ``(value, missing_mask)`` slice).
 
     Implementation:
-        Concatenate the per-field categorical embeddings on both sides
-        into a single ``(B, n_fields_total)`` *bag* by stacking each
-        field embedding as a separate latent vector in a shared FM
-        space. Then the standard FM pairwise sum identity gives
+        Concatenate one latent vector per trait on both sides into a
+        single ``(B, n_traits_total)`` *bag* in a shared FM space, then
+        apply the standard FM pairwise-sum identity
 
-            score = 0.5 * ( sum_i v_i )^2 - sum_i v_i^2
+            score = 0.5 * ( (sum_i v_i)^2 - sum_i v_i^2 )
 
-        applied along the field axis, summed over the FM latent dim.
+        along the field axis. The result is summed over the FM latent
+        dim and projected to a single scalar logit.
 
-    The trick: every per-field embedding is first projected through a
-    small ``Linear(d_field -> d_fm)`` into a shared FM space. The
-    pairwise interactions are then between all per-field FM-space
-    vectors, including subject<->subject and bench<->bench (cheap
-    parameter-wise but architecturally subsumed by the cross terms we
-    actually care about: subject_field <-> bench_field).
+    The pairwise interactions cover *every* unordered pair of traits,
+    including the cross-side pairs we actually care about (subject_trait
+    x benchmark_trait) AND same-side pairs (cheap parameter-wise; in
+    practice they are absorbed by the towers).
 
-    The output is a **single additive scalar logit**. Output head is
-    zero-initialized so the channel boots up inert.
+    Both sides accept categorical and numeric fields independently:
+
+        - Categorical: per-field ``Linear(d_field -> d_fm)`` projection
+          of the embedding bag entry.
+        - Numeric: per-field ``Linear(2 -> d_fm)`` projection of the
+          ``(value, missing_mask)`` pair. We project the missingness
+          flag into the same FM space so the FM channel can learn a
+          per-field "no info" embedding implicitly.
+
+    Output head is zero-initialized so the channel boots up inert
+    (parity-at-init is preserved when ``use_metadata_features=True``).
     """
 
     def __init__(
@@ -875,17 +923,39 @@ class FactorizationMachineCross(nn.Module):
         subject_field_dims: Sequence[int],
         benchmark_field_dims: Sequence[int],
         d_fm: int,
+        *,
+        subject_num_field_count: int = 0,
+        bench_num_field_count: int = 0,
     ):
         super().__init__()
         self.d_fm = int(d_fm)
         sd = list(int(x) for x in subject_field_dims)
         bd = list(int(x) for x in benchmark_field_dims)
+        self.subject_num_field_count = int(subject_num_field_count)
+        self.bench_num_field_count = int(bench_num_field_count)
         self.subj_projs = nn.ModuleList([nn.Linear(d, self.d_fm) for d in sd])
         self.bench_projs = nn.ModuleList([nn.Linear(d, self.d_fm) for d in bd])
+        # One Linear(2 -> d_fm) per numeric field per side. The 2 inputs
+        # are the z-scored value and its missingness mask (1.0 when the
+        # value is missing, 0.0 otherwise). Allowing missingness into
+        # the FM input lets the channel learn a per-field "missing"
+        # embedding without us having to splice in a sentinel value.
+        self.subj_num_projs = nn.ModuleList(
+            [nn.Linear(2, self.d_fm) for _ in range(self.subject_num_field_count)]
+        )
+        self.bench_num_projs = nn.ModuleList(
+            [nn.Linear(2, self.d_fm) for _ in range(self.bench_num_field_count)]
+        )
         for m in self.subj_projs:
             nn.init.normal_(m.weight, std=0.05)
             nn.init.zeros_(m.bias)
         for m in self.bench_projs:
+            nn.init.normal_(m.weight, std=0.05)
+            nn.init.zeros_(m.bias)
+        for m in self.subj_num_projs:
+            nn.init.normal_(m.weight, std=0.05)
+            nn.init.zeros_(m.bias)
+        for m in self.bench_num_projs:
             nn.init.normal_(m.weight, std=0.05)
             nn.init.zeros_(m.bias)
         # Output projection from FM latent dim -> scalar logit. Zero-init
@@ -894,28 +964,104 @@ class FactorizationMachineCross(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
+    @staticmethod
+    def _split_value_mask(
+        flat: torch.Tensor | None, n_fields: int
+    ) -> list[torch.Tensor]:
+        """Split a ``(B, 2*n_fields)`` interleaved ``[value, mask, value,
+        mask, ...]`` tensor into a list of ``n_fields`` tensors of shape
+        ``(B, 2)`` each. Returns an empty list when ``flat`` is None or
+        ``n_fields == 0``.
+
+        The caller provides the interleaved layout that the metadata
+        preprocessor / model buffers already use (see
+        :meth:`MetaHybridIRTKFactorGatedMLP._meta_lookup`'s
+        ``subj_num`` / ``bc_num`` returns).
+        """
+        if flat is None or n_fields == 0:
+            return []
+        if flat.dim() != 2 or flat.shape[1] != 2 * n_fields:
+            raise ValueError(
+                "FactorizationMachineCross._split_value_mask: expected "
+                f"(B, 2*n_fields={2 * n_fields}), got {tuple(flat.shape)}"
+            )
+        return [flat[:, 2 * j : 2 * j + 2] for j in range(n_fields)]
+
     def forward(
         self,
         subj_field_embs: Sequence[torch.Tensor],
         bench_field_embs: Sequence[torch.Tensor],
+        subj_num_features: torch.Tensor | None = None,
+        bench_num_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not subj_field_embs and not bench_field_embs:
-            return torch.zeros((0,), dtype=torch.float32)
-        bsz = (
-            subj_field_embs[0].shape[0]
-            if subj_field_embs
-            else bench_field_embs[0].shape[0]
+        """Compute the FM pairwise-interaction logit.
+
+        Args:
+            subj_field_embs: list of per-categorical-field embedding
+                tensors, each shape ``(B, d_field_i)``.
+            bench_field_embs: same for the benchmark categorical fields.
+            subj_num_features: optional ``(B, 2 * n_subj_num_fields)``
+                tensor of interleaved ``[value, mask]`` pairs from
+                :class:`MetadataIdTables`. If ``None`` and the cross
+                was constructed with ``subject_num_field_count > 0``,
+                the numeric subject side contributes nothing this step.
+            bench_num_features: same for the benchmark numeric side.
+
+        Returns:
+            ``(B,)`` float tensor (additive scalar logit).
+        """
+        n_cat_subj = len(subj_field_embs)
+        n_cat_bench = len(bench_field_embs)
+        n_num_subj_in = (
+            self.subject_num_field_count if subj_num_features is not None else 0
         )
-        # Project each field into the FM space and stack:
-        #   v: (B, n_fields_total, d_fm).
+        n_num_bench_in = (
+            self.bench_num_field_count if bench_num_features is not None else 0
+        )
+        n_traits = n_cat_subj + n_cat_bench + n_num_subj_in + n_num_bench_in
+        if n_traits == 0:
+            # No traits at all -> degenerate; return zeros if we can
+            # infer the batch size from any trait, else an empty tensor.
+            return torch.zeros((0,), dtype=torch.float32)
+        # Infer batch size from any provided tensor (categoricals or numerics).
+        if subj_field_embs:
+            bsz = subj_field_embs[0].shape[0]
+            device = subj_field_embs[0].device
+        elif bench_field_embs:
+            bsz = bench_field_embs[0].shape[0]
+            device = bench_field_embs[0].device
+        elif subj_num_features is not None:
+            bsz = subj_num_features.shape[0]
+            device = subj_num_features.device
+        elif bench_num_features is not None:
+            bsz = bench_num_features.shape[0]
+            device = bench_num_features.device
+        else:  # pragma: no cover -- guarded by n_traits == 0 above
+            return torch.zeros((0,), dtype=torch.float32)
+
+        # Project each trait into the FM space and stack:
+        #   v: (B, n_traits_total, d_fm).
         vs: list[torch.Tensor] = []
         for proj, e in zip(self.subj_projs, subj_field_embs):
             vs.append(proj(e))
         for proj, e in zip(self.bench_projs, bench_field_embs):
             vs.append(proj(e))
+        # Numerics on each side: split (B, 2*N) -> list of (B, 2) -> project.
+        if n_num_subj_in > 0:
+            for proj, vm in zip(
+                self.subj_num_projs,
+                self._split_value_mask(subj_num_features, n_num_subj_in),
+            ):
+                vs.append(proj(vm))
+        if n_num_bench_in > 0:
+            for proj, vm in zip(
+                self.bench_num_projs,
+                self._split_value_mask(bench_num_features, n_num_bench_in),
+            ):
+                vs.append(proj(vm))
         if not vs:
             return torch.zeros(bsz, dtype=torch.float32, device=self.head.weight.device)
-        v = torch.stack(vs, dim=1)               # (B, F, d_fm)
+        v = torch.stack(vs, dim=1)               # (B, n_traits, d_fm)
         sum_v = v.sum(dim=1)                     # (B, d_fm)
         sum_v_sq = (v * v).sum(dim=1)            # (B, d_fm)
         # Standard FM identity: sum_{i<j} <v_i, v_j>

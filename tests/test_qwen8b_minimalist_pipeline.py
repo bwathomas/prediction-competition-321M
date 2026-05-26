@@ -266,8 +266,10 @@ def test_full_minimalist_pipeline(tmp_path: Path, fake_metadata) -> None:
         cfg=nn_cfg,
         exclude_self=False,
     )
-    assert nn_train_mat.shape == (len(train_df), 8)
-    assert nn_val_mat.shape == (len(val_df), 8)
+    from src.nn_features import NN_FEATURE_DIM as _NN_DIM
+
+    assert nn_train_mat.shape == (len(train_df), _NN_DIM)
+    assert nn_val_mat.shape == (len(val_df), _NN_DIM)
 
     # ------------------------------------------------------------- training tensors
     def _pool_matrix(keys):

@@ -277,6 +277,25 @@ def cache_clear(prefix: str | None = None) -> int:
     return n
 
 
+def state_fingerprint(obj, n_chars: int = 16) -> str:
+    """Stable short hex fingerprint of any picklable object.
+
+    Used to discriminate cache entries by their *upstream* state so a
+    downstream cache (e.g. the NN calibrator) auto-invalidates whenever
+    a depended-upon state (Model A checkpoint, GBDT trees, kNN tables,
+    logreg weights, stacker weights, etc.) materially changes.
+
+    Pickle-serializing dataclasses + ndarray dicts is deterministic
+    enough across runs of the same Python interpreter that two
+    bit-identical objects yield identical fingerprints. We DO NOT
+    promise cross-Python-version stability -- a Python upgrade triggers
+    a one-time recompute, which is the safe direction.
+    """
+    h = hashlib.sha256()
+    h.update(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+    return h.hexdigest()[:n_chars]
+
+
 # %% [markdown]
 # ## 2. Configuration: Qwen8B + metadata + NN + centroid distances ON
 
@@ -342,6 +361,11 @@ CFG["kfold"]["enabled"] = False
 CFG.setdefault("submission", {})
 CFG["submission"]["ship_training_cache"] = True
 CFG["submission"]["ship_requirements_txt"] = False
+# Codabench accepts up to 1500 MB; we intentionally bump from the
+# default 65 MB cap so the bundle has room for the four-member
+# stacker artifacts (decoded train embeddings for kNN, GBDT trees,
+# meta-feature schema, residual table, ...).
+CFG["submission"]["max_zip_size_mb"] = 1500
 CFG.setdefault("nn_calibration", {})
 CFG["nn_calibration"]["enabled"] = True
 CFG["nn_calibration"]["k"] = 16
@@ -682,6 +706,7 @@ import gc
 
 from src.models import Indexer
 from src.nn_features import (
+    NN_FEATURE_DIM,
     NNFeaturesConfig,
     TrainingNNIndex,
     build_passrate_table,
@@ -903,6 +928,23 @@ _meta_schema = MetadataSchema(
     benchmark_numeric=tuple(META_SECTION.get("benchmark_numeric", ()) or ()),
     explicit_crosses=tuple(META_SECTION.get("explicit_crosses", ()) or ()),
 )
+# Always promote ``explicit_crosses`` to the FULL Cartesian product of
+# ``subject_categorical x benchmark_categorical`` so every (subject_trait,
+# benchmark_trait) categorical pair gets its own dedicated cross table
+# (rather than the hand-picked default subset). This costs at most
+# ``|subject_cat| * |benchmark_cat|`` extra small embedding tables --
+# tiny in absolute terms (e.g. for the default schema, 3 * 1 = 3 crosses)
+# but gives the model dedicated capacity for each pair instead of the
+# parameter-shared FM cross alone.
+_full_cross_grid = _meta_schema.full_categorical_cross_grid()
+if _meta_schema.explicit_crosses != _full_cross_grid:
+    print(
+        f"[Metadata] Promoting explicit_crosses to full cat x cat grid:\n"
+        f"  before ({len(_meta_schema.explicit_crosses)}): "
+        f"{list(_meta_schema.explicit_crosses)}\n"
+        f"  after  ({len(_full_cross_grid)}): {list(_full_cross_grid)}"
+    )
+_meta_schema = _meta_schema.with_full_categorical_cross_grid()
 meta_preprocessor, meta_id_tables = prepare_metadata_artifacts(
     primary.train, indexer, schema=_meta_schema,
 )
@@ -913,6 +955,246 @@ print(
     f"bench_cat={list(meta_preprocessor.benchmark_cat_vocabs)}  "
     f"bench_num={list(meta_preprocessor.benchmark_num_scalers)}"
 )
+
+# %% [markdown]
+# ## 7b. Conditional NN-feature context + recomputed NN matrices
+#
+# **What this cell does.** The first NN compute above produced cells
+# `[0..14]` of the locked 23-feature schema; cells `[15..22]` (the four
+# subject-trait-conditional passrates, the benchmark-conditional
+# passrate, the freshness diff, the distinct-subjects-in-neighborhood
+# count, and the cluster-conditional passrate) need the metadata
+# preprocessor's vocabularies + the per-train-item benchmark / cluster
+# arrays that only become available after Cell 7 has built
+# `meta_id_tables`. We therefore:
+#
+#   1. Pull the per-subject trait id arrays (family / macro_family /
+#      organization) out of `meta_id_tables.subject_cat_ids` using the
+#      current schema's field order.
+#   2. Materialize per-train-item arrays (benchmark id, benchmark age,
+#      cluster id) keyed by the same indexer the NN feature pipeline
+#      uses, so neighbor lookups land in the right namespace.
+#   3. Build a `ConditionalPassrateContext`. Stays in RAM (a few MB per
+#      ~50k items) and is reused at bundle export time.
+#   4. Build the per-row query metadata arrays for train + val (subject
+#      meta is never redacted at training time -- the model sees the
+#      same bench-redaction augmentation it would at runtime via
+#      `train_dropout` instead).
+#   5. Recompute `nn_train_mat` / `nn_val_mat` *with* the context so
+#      cells `[15..22]` have signal. We then rebuild `train_ds` / `val_ds`
+#      so the LookupDataset wraps the up-to-date 23-column matrix.
+#
+# Yes this re-runs the FAISS query pass once. The cost is a small
+# multiple of the first compute (~30 s on a 12 GB GPU for ~50k unique
+# items) and pays for itself the first time the conditional cells
+# move val log-loss.
+
+# %%
+from src.nn_features import (
+    MISSING_TRAIT_ID,
+    ConditionalPassrateContext,
+    build_conditional_passrate_context,
+)
+
+_subject_cat_fields = list(_meta_schema.subject_categorical)
+
+
+def _trait_id_array(trait_name: str) -> np.ndarray:
+    """Per-subject_id trait id array (length = indexer.n_subjects).
+
+    Returns all zeros if the schema doesn't include this trait, which
+    sends every row's trait through the MISSING fallback in the
+    aggregator.
+    """
+    if trait_name not in _subject_cat_fields:
+        return np.zeros(indexer.n_subjects, dtype=np.int32)
+    field_idx = _subject_cat_fields.index(trait_name)
+    return (
+        meta_id_tables.subject_cat_ids[:, field_idx]
+        .cpu()
+        .numpy()
+        .astype(np.int32)
+    )
+
+
+s2fam = _trait_id_array("family")
+s2macro = _trait_id_array("macro_family")
+s2org = _trait_id_array("organization")
+
+# Cardinalities from the preprocessor's vocabularies (n_tokens already
+# includes the reserved MISSING / UNK rows).
+def _vocab_size(name: str) -> int:
+    v = meta_preprocessor.subject_cat_vocabs.get(name)
+    return int(v.n_tokens) if v is not None else 1
+
+
+N_FAMILIES = _vocab_size("family")
+N_MACRO_FAMILIES = _vocab_size("macro_family")
+N_ORGANIZATIONS = _vocab_size("organization")
+N_CLUSTERS_CTX = int(CFG["clustering"]["k"])
+
+# Per-train-item arrays keyed by the SAME index map used by the NN
+# pipeline. ``train_item_keys`` was built upstream and is the canonical
+# row-index source.
+item_keys_arr = np.asarray(train_item_keys)
+item_to_bc = (
+    primary.train.assign(_k=primary.train["item_key"].astype(str))
+    .groupby("_k", sort=False)["benchmark_condition_key"]
+    .first()
+    .to_dict()
+)
+item_benchmark_id_arr = np.full(len(train_item_keys), -1, dtype=np.int32)
+for i, k in enumerate(train_item_keys):
+    bck = item_to_bc.get(str(k))
+    if bck is not None:
+        bc = indexer.bc_id(str(bck))
+        if bc >= 0:
+            item_benchmark_id_arr[i] = int(bc)
+
+# Benchmark age extraction. ``meta_id_tables.bc_meta_num`` has shape
+# ``[n_bc, 2 * n_bench_numeric]`` with each numeric field encoded as
+# (value, mask) pairs; if the mask is 0 the value is "unknown" and we
+# emit NaN so the aggregator's redaction kicks in.
+_bench_num_fields = list(_meta_schema.benchmark_numeric)
+if "benchmark_age" in _bench_num_fields:
+    age_idx = _bench_num_fields.index("benchmark_age")
+    bc_meta_num_np = meta_id_tables.bc_meta_num.cpu().numpy().astype(np.float32)
+    bc_id_to_age_arr = np.where(
+        bc_meta_num_np[:, 2 * age_idx + 1] > 0.5,
+        bc_meta_num_np[:, 2 * age_idx],
+        np.nan,
+    ).astype(np.float32)
+else:
+    bc_id_to_age_arr = np.full(indexer.n_bc, np.nan, dtype=np.float32)
+item_benchmark_age_arr = np.full(len(train_item_keys), np.nan, dtype=np.float32)
+_valid_bid = item_benchmark_id_arr >= 0
+item_benchmark_age_arr[_valid_bid] = bc_id_to_age_arr[
+    item_benchmark_id_arr[_valid_bid]
+]
+
+# Cluster id per train item (already 0-indexed; -1 if unassigned).
+item_cluster_id_arr = np.array(
+    [int(cluster_assignments.get(str(k), -1)) for k in train_item_keys],
+    dtype=np.int32,
+)
+
+cond_context = build_conditional_passrate_context(
+    train_df=primary.train,
+    item_index_map=nn_item_index_map,
+    subject_index_map=indexer.subject_to_id,
+    subject_to_family_id=s2fam,
+    subject_to_macro_family_id=s2macro,
+    subject_to_organization_id=s2org,
+    item_benchmark_id=item_benchmark_id_arr,
+    item_benchmark_age=item_benchmark_age_arr,
+    item_cluster_id=item_cluster_id_arr,
+    n_families=N_FAMILIES,
+    n_macro_families=N_MACRO_FAMILIES,
+    n_organizations=N_ORGANIZATIONS,
+    n_clusters=N_CLUSTERS_CTX,
+)
+cond_context.assert_shapes()
+print(
+    f"ConditionalPassrateContext: "
+    f"n_subjects={cond_context.n_subjects}  n_items={cond_context.n_items}  "
+    f"n_fam={cond_context.n_families}  n_macro={cond_context.n_macro_families}  "
+    f"n_org={cond_context.n_organizations}  n_clusters={cond_context.n_clusters}  "
+    f"family_nnz={cond_context.family_passrate_csr.nnz}  "
+    f"cluster_subject_nnz={cond_context.cluster_subject_passrate_csr.nnz}"
+)
+
+
+def _query_meta_for_split(rows_df) -> dict:
+    """Per-row query metadata arrays for ``compute_nn_features_streaming``.
+
+    Returned dict: bench_ids (int32 -1 for UNK), bench_age (float32 NaN
+    for unknown), cluster_ids (int32 -1 for UNK), subject_meta_redacted
+    (int32, 0 at training time -- bench-side redaction augmentation is
+    performed by the train-time dropout hook, not here).
+    """
+    bench_ids = np.array(
+        [int(indexer.bc_id(str(k))) for k in rows_df["benchmark_condition_key"]],
+        dtype=np.int32,
+    )
+    bench_age = np.full(len(rows_df), np.nan, dtype=np.float32)
+    valid = bench_ids >= 0
+    bench_age[valid] = bc_id_to_age_arr[bench_ids[valid]]
+    cluster_ids = np.array(
+        [int(cluster_assignments.get(str(k), -1)) for k in rows_df["item_key"]],
+        dtype=np.int32,
+    )
+    return {
+        "query_benchmark_ids": bench_ids,
+        "query_benchmark_age": bench_age,
+        "query_cluster_ids": cluster_ids,
+        "subject_meta_redacted": np.zeros(len(rows_df), dtype=np.int32),
+    }
+
+
+_train_qmeta = _query_meta_for_split(primary.train)
+_val_qmeta = _query_meta_for_split(primary.val)
+print(
+    f"Query metadata (train): bench_known="
+    f"{int((_train_qmeta['query_benchmark_ids'] >= 0).sum())}/{len(primary.train):,}  "
+    f"age_known={int(np.isfinite(_train_qmeta['query_benchmark_age']).sum())}/{len(primary.train):,}  "
+    f"cluster_known={int((_train_qmeta['query_cluster_ids'] >= 0).sum())}/{len(primary.train):,}"
+)
+
+# Recompute NN matrices WITH the conditional context. We reuse the
+# already-built ``nn_index`` and ``nn_passrate_csr`` so this is a single
+# additional FAISS pass plus the in-memory conditional lookups (cheap).
+_log_ram("before compute_nn_features_streaming(train, with cond context)")
+nn_train_mat = compute_nn_features_streaming(
+    query_item_keys=train_keys_for_nn,
+    item_emb_lookup=item_emb_lookup,
+    subject_ids=train_sid,
+    nn_index=nn_index,
+    passrate_csr=nn_passrate_csr,
+    passrate_mask_csr=nn_passrate_mask_csr,
+    cfg=nn_cfg,
+    exclude_self=True,
+    query_chunk_size=NN_QUERY_CHUNK,
+    conditional_context=cond_context,
+    **_train_qmeta,
+)
+gc.collect()
+_log_ram("after compute_nn_features_streaming(train, with cond context)")
+nn_val_mat = compute_nn_features_streaming(
+    query_item_keys=val_keys_for_nn,
+    item_emb_lookup=item_emb_lookup,
+    subject_ids=val_sid,
+    nn_index=nn_index,
+    passrate_csr=nn_passrate_csr,
+    passrate_mask_csr=nn_passrate_mask_csr,
+    cfg=nn_cfg,
+    exclude_self=False,
+    query_chunk_size=NN_QUERY_CHUNK,
+    conditional_context=cond_context,
+    **_val_qmeta,
+)
+gc.collect()
+_log_ram("after compute_nn_features_streaming(val, with cond context)")
+print(
+    f"NN feature matrices (with conditional cells): "
+    f"train={nn_train_mat.shape}  val={nn_val_mat.shape}"
+)
+
+# Diagnostic: how often does each conditional cell go to fallback at
+# training time? (This proxies how often the corresponding redaction
+# / missing-data path fires; values close to 1.0 mean the cell is mostly
+# noise on this split and should be considered for removal.)
+_FB = float(nn_cfg.fallback_value)
+for _i, _name in enumerate(NN_FEATURE_NAMES):
+    if _i < 15:
+        continue
+    _frac = float(np.mean(np.abs(nn_train_mat[:, _i] - _FB) <= 1e-9))
+    print(f"  cell[{_i:2d}] {_name:40s} fallback_frac={_frac:.3f}")
+
+# Rebuild train_ds / val_ds so the LookupDataset wraps the 23-column
+# matrix instead of the no-context 14-column matrix above.
+train_ds = _build(primary.train, nn_train_mat)
+val_ds = _build(primary.val, nn_val_mat)
+print(f"train tensors: {len(train_ds)}  val tensors: {len(val_ds)} (rebuilt with cond cells)")
 
 # %% [markdown]
 # ## 8a. Train Model A: metadata-aware + metadata dropout
@@ -946,22 +1228,19 @@ CKPT_DIR = ROOT / "artifacts" / "checkpoints" / "qwen8b_minimalist"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 K_LATENT = int((CFG["train"].get("k_factors") or [16])[0])
-# Both members use the metadata-aware variant. Member B's bench-side
-# pathway is rendered unused at inference via force_bench_missing
-# (see cell 11), and at training is starved of gradient by p_bench=1.0.
+# Member 1 of the stacker is the metadata-aware IRT-MLP variant
+# trained for 3 epochs with metadata-dropout regularization. Model B
+# (the no-meta companion that previously formed a coverage-conditional
+# blend) has been dropped: the stacker provides the diversity that
+# the coverage blend used to provide, so a second IRT head is
+# redundant and only inflates the bundle.
 MODEL_A_NAME = "meta_hybrid_irt_kfactor_gated_mlp"
-MODEL_B_NAME = "meta_hybrid_irt_kfactor_gated_mlp"
 
 SPLIT_SEED = SEED
 MODEL_A_SEED = SEED + int(CFG["coverage_blend"]["model_a_seed_offset"])
-MODEL_B_SEED = SEED + int(CFG["coverage_blend"]["model_b_seed_offset"])
-print(
-    f"Seeds: SPLIT={SPLIT_SEED}  MODEL_A={MODEL_A_SEED}  "
-    f"MODEL_B={MODEL_B_SEED}"
-)
+print(f"Seeds: SPLIT={SPLIT_SEED}  MODEL_A={MODEL_A_SEED}")
 
-# Common ModelConfig fields shared between A and B. Only the metadata
-# block + the model variant differs across the two members.
+# Common ModelConfig fields for Member 1.
 _common_kwargs = dict(
     k=K_LATENT,
     item_embed_dim=ITEM_EMB_DIM,
@@ -1049,46 +1328,136 @@ def _build_with_overrides(name, cfg):
     return m
 
 
-train_mod.build_model = _build_with_overrides
-try:
-    a_drop = TrainDropoutConfig(
-        p_bench=float(CFG["coverage_blend"]["model_a"]["p_bench"]),
-        p_subj=float(CFG["coverage_blend"]["model_a"]["p_subj"]),
-        q_bc=float(CFG["coverage_blend"]["model_a"]["q_bc"]),
-        seed=MODEL_A_SEED,
-    )
-    _active_dropout_cfg["cfg"] = a_drop
-    _active_dropout_cfg["name"] = MODEL_A_NAME
-    _active_dropout_cfg["installed_handles"] = []
-    result_a = train_one(
-        model_name=MODEL_A_NAME,
-        model_cfg=model_a_cfg,
-        train_cfg=train_cfg,
-        train_ds=train_ds,
-        val_ds=val_ds,
-        indexer=indexer,
-        seed=MODEL_A_SEED,
-        run_id="qwen8b_minimalist_A_meta_dropout",
-        checkpoint_dir=CKPT_DIR,
-        extra_metadata={
-            "encoder_model_id": CFG["encoder"]["model_id"],
-            "use_metadata_features": True,
-            "use_nn_features": True,
-            "centroid_distances_top_m": int(top_m),
-            "meta_dropout": asdict(a_drop),
-        },
-    )
-    for h in _active_dropout_cfg["installed_handles"]:
-        print(
-            f"  Model A dropout stats: train_calls={h.n_train_calls}  "
-            f"rows={h.n_rows_seen}  bench_masked={h.n_rows_bench_masked}  "
-            f"subj_masked={h.n_rows_subj_masked}  "
-            f"bc_idx_masked={h.n_rows_bc_idx_masked}"
+a_drop = TrainDropoutConfig(
+    p_bench=float(CFG["coverage_blend"]["model_a"]["p_bench"]),
+    p_subj=float(CFG["coverage_blend"]["model_a"]["p_subj"]),
+    q_bc=float(CFG["coverage_blend"]["model_a"]["q_bc"]),
+    seed=MODEL_A_SEED,
+)
+
+
+def _train_model_a():
+    """Train Model A and return a picklable bundle.
+
+    Returns a dict with:
+      * ``train_result``: the :class:`TrainResult` (dataclass, picklable)
+        emitted by ``train_one``.
+      * ``ckpt``: the loaded checkpoint dict (``{"model_state": ..., ...}``)
+        so cache hits don't have to re-read the file off disk (and so we
+        can recreate the checkpoint file when the original was reaped).
+      * ``dropout_stats``: per-row hook counters for diagnostics.
+
+    The monkey-patched ``train_mod.build_model`` is restored on every
+    exit path; the dropout hook is removed before pickling. We never
+    pickle live ``torch.utils.hooks.RemovableHandle`` objects.
+    """
+    train_mod.build_model = _build_with_overrides
+    stats: list[dict] = []
+    try:
+        _active_dropout_cfg["cfg"] = a_drop
+        _active_dropout_cfg["name"] = MODEL_A_NAME
+        _active_dropout_cfg["installed_handles"] = []
+        _result = train_one(
+            model_name=MODEL_A_NAME,
+            model_cfg=model_a_cfg,
+            train_cfg=train_cfg,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            indexer=indexer,
+            seed=MODEL_A_SEED,
+            run_id="qwen8b_minimalist_A_meta_dropout",
+            checkpoint_dir=CKPT_DIR,
+            extra_metadata={
+                "encoder_model_id": CFG["encoder"]["model_id"],
+                "use_metadata_features": True,
+                "use_nn_features": True,
+                "centroid_distances_top_m": int(top_m),
+                "meta_dropout": asdict(a_drop),
+            },
         )
-        h.remove()
-finally:
-    _active_dropout_cfg["cfg"] = None
-    _active_dropout_cfg["name"] = None
+        for h in _active_dropout_cfg["installed_handles"]:
+            stats.append(
+                {
+                    "train_calls": int(h.n_train_calls),
+                    "rows": int(h.n_rows_seen),
+                    "bench_masked": int(h.n_rows_bench_masked),
+                    "subj_masked": int(h.n_rows_subj_masked),
+                    "bc_idx_masked": int(h.n_rows_bc_idx_masked),
+                }
+            )
+            h.remove()
+        _ckpt = torch.load(_result.checkpoint_path, map_location="cpu", weights_only=False)
+        return {
+            "train_result": _result,
+            "ckpt": _ckpt,
+            "dropout_stats": stats,
+        }
+    finally:
+        _active_dropout_cfg["cfg"] = None
+        _active_dropout_cfg["name"] = None
+        train_mod.build_model = _orig_build_model
+
+
+# Cache key for Model A. Anything that materially affects the trained
+# weights MUST be in here; otherwise a stale checkpoint will silently
+# survive a hyperparameter change. We hash the ModelConfig + TrainConfig
+# + TrainDropoutConfig as JSON strings, plus the dataset / indexer
+# fingerprints (n_train, n_val, n_subjects, n_bc) and the NN feature
+# schema dim (which is now 15 -- bumping that auto-invalidates older
+# caches keyed under nn_feature_dim=8).
+import torch  # noqa: E402  -- imported here so the cache fn can torch.load
+from src.nn_features import NN_FEATURE_DIM as _NN_FEATURE_DIM_CACHE_TAG
+
+MODEL_A_KEY_INPUTS = (
+    "model_a_v4_cond23",                      # bump this on schema changes
+    MODEL_A_NAME,
+    int(MODEL_A_SEED),
+    json.dumps(asdict(model_a_cfg), default=str, sort_keys=True),
+    json.dumps(asdict(train_cfg), default=str, sort_keys=True),
+    json.dumps(asdict(a_drop), default=str, sort_keys=True),
+    int(len(train_ds)),
+    int(len(val_ds)),
+    int(indexer.n_subjects),
+    int(indexer.n_bc),
+    int(_NN_FEATURE_DIM_CACHE_TAG),
+    # Pin the conditional NN-feature context cardinalities + presence
+    # so the cached Model A is forcibly re-trained whenever the
+    # conditional schema or the trait cardinalities change. We avoid
+    # hashing the full sparse tables here -- the build is deterministic
+    # given (train_df, indexer, schema), all of which are already
+    # captured by the keys above.
+    int(cond_context.n_families),
+    int(cond_context.n_macro_families),
+    int(cond_context.n_organizations),
+    int(cond_context.n_clusters),
+)
+print(f"[cache] Model A key inputs:\n  {[str(x)[:80] for x in MODEL_A_KEY_INPUTS]}")
+
+_model_a_bundle = cache_or_compute(
+    "model_a_trained",
+    key_inputs=MODEL_A_KEY_INPUTS,
+    compute_fn=_train_model_a,
+)
+result_a = _model_a_bundle["train_result"]
+ckpt_a_cached = _model_a_bundle["ckpt"]
+
+# When loading from cache, the file at ``result_a.checkpoint_path`` may
+# have been deleted between runs (Drive reap, fresh Colab, etc.) but
+# downstream cells assume that file exists. Re-create it idempotently
+# from the cached state dict so ``torch.load(result_a.checkpoint_path)``
+# below keeps working.
+_ckpt_path = Path(result_a.checkpoint_path)
+if not _ckpt_path.exists():
+    _ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(ckpt_a_cached, _ckpt_path)
+    print(f"[cache] Restored Model A checkpoint to {_ckpt_path}")
+
+for s in _model_a_bundle["dropout_stats"]:
+    print(
+        f"  Model A dropout stats: train_calls={s['train_calls']}  "
+        f"rows={s['rows']}  bench_masked={s['bench_masked']}  "
+        f"subj_masked={s['subj_masked']}  bc_idx_masked={s['bc_idx_masked']}"
+    )
 
 print(
     f"\nModel A best val log-loss: {result_a.best_val_log_loss:.6f}  "
@@ -1097,140 +1466,25 @@ print(
 )
 
 # %% [markdown]
-# ## 8b. Train Model B: subject-metadata-only + bc-dropout (3 epochs)
+# ## 8b. (Removed) Model B is no longer trained
 #
-# **Why bc-idx dropout?** Model B's `MetaHybridIRTKFactorGatedMLP`
-# predicts via `mu + beta[bc_idx] + alpha_i*(theta - beta_i) +
-# factor + meta_logit + residual`. At hosted-test time on a
-# cold-start benchmark, `bc_idx=0` (the UNK slot), so `beta[0]` is
-# the only piece of the per-bc bias channel the runtime sees.
-# Without dropout `beta[0]` receives no gradient during training
-# (no row uses bc_idx=0), so at test time it returns whatever the
-# random initializer gave us, plus the residual MLP has never had
-# to predict without a per-bc bias signal. With prob `q_bc=0.15`
-# we replace `bc_idx` with 0 during the forward pass, training
-# `beta[0]` to be a useful "average benchmark" prior and forcing
-# the MLP to learn bias-free predictions.
-#
-# **Why subject metadata only?** The user's ask: incorporate model
-# metadata (Claude family / org / release date / etc.) into the
-# second head while explicitly NOT using benchmark metadata.
-# Subject side stays usable because hosted-test models usually have
-# entries in `model_info.csv` (or are siblings of an entry whose
-# subject-tower output generalizes); benchmark side is unusable
-# because hosted-test benchmarks are often brand-new with no entry.
-# `p_bench=1.0` at training (via the dropout pre-hook) makes only
-# row 0 of the bench tables get gradient, and `force_bench_missing
-# =True` at export makes inference match by splicing row 0 into
-# every incoming meta_override before Member B's forward(). Net
-# effect: Member B uses subject metadata + bc_idx (with bc-dropout)
-# + pool / NN features, and ignores the bench tower entirely.
-#
-# **Why this still yields Jensen slack with Model A?** Member B's
-# meta channel has a different feature set than Member A (subject-
-# only vs subject+bench), and `Var(p_A - p_B)` is further amplified
-# by independent seeds, dropout RNG, and random batch order. We
-# don't need a fundamentally different architecture to get blend
-# benefit; we need a different effective feature subspace.
-
-# %%
-# Member B uses the SAME schema as Member A so both share one set of
-# metadata buffers and one preprocessor. The asymmetry is encoded
-# entirely via:
-#   * train-time ``p_bench=1.0`` (only the bench-side ``__MISSING__``
-#     embedding gets gradient signal),
-#   * inference-time ``force_bench_missing=True`` on the export side
-#     (the runtime ``_EnsembleModel`` swaps Member B's incoming
-#     bench fields for row 0 of its own ``bc_meta_*`` buffers
-#     before forward()).
-# This keeps the bundle layout uniform (one ``meta_preprocessor.json``,
-# one indexer, one set of buffer shapes) and the only difference
-# between A and B is the dropout schedule.
-model_b_cfg = ModelConfig(
-    use_metadata_features=True,
-    meta_subject_categorical=_meta_schema.subject_categorical,
-    meta_subject_numeric=_meta_schema.subject_numeric,
-    meta_benchmark_categorical=_meta_schema.benchmark_categorical,
-    meta_benchmark_numeric=_meta_schema.benchmark_numeric,
-    meta_explicit_crosses=_meta_schema.explicit_crosses,
-    **_common_kwargs,
-)
-print("Model B (subject-meta only via p_bench=1.0 + bc-dropout):")
-print(json.dumps(asdict(model_b_cfg), default=str, indent=2)[:1200])
-
-train_mod.build_model = _build_with_overrides
-try:
-    b_drop = TrainDropoutConfig(
-        p_bench=float(CFG["coverage_blend"]["model_b"]["p_bench"]),
-        p_subj=float(CFG["coverage_blend"]["model_b"]["p_subj"]),
-        q_bc=float(CFG["coverage_blend"]["model_b"]["q_bc"]),
-        seed=MODEL_B_SEED,
-    )
-    _active_dropout_cfg["cfg"] = b_drop
-    _active_dropout_cfg["name"] = MODEL_B_NAME
-    _active_dropout_cfg["installed_handles"] = []
-    result_b = train_one(
-        model_name=MODEL_B_NAME,
-        model_cfg=model_b_cfg,
-        train_cfg=train_cfg,
-        train_ds=train_ds,
-        val_ds=val_ds,
-        indexer=indexer,
-        seed=MODEL_B_SEED,
-        run_id="qwen8b_minimalist_B_subj_meta_bc_dropout",
-        checkpoint_dir=CKPT_DIR,
-        extra_metadata={
-            "encoder_model_id": CFG["encoder"]["model_id"],
-            # Model B keeps ``use_metadata_features=True`` (subject
-            # tower trains, bench tower starves at row 0) and is
-            # paired with ``force_bench_missing=True`` at export.
-            "use_metadata_features": True,
-            "use_nn_features": True,
-            "centroid_distances_top_m": int(top_m),
-            "subj_meta_dropout_and_bc_dropout": asdict(b_drop),
-            "force_bench_missing_at_inference": True,
-        },
-    )
-    for h in _active_dropout_cfg["installed_handles"]:
-        print(
-            f"  Model B dropout stats: train_calls={h.n_train_calls}  "
-            f"rows={h.n_rows_seen}  bc_idx_masked={h.n_rows_bc_idx_masked}"
-        )
-        h.remove()
-finally:
-    _active_dropout_cfg["cfg"] = None
-    _active_dropout_cfg["name"] = None
-    train_mod.build_model = _orig_build_model
-
-print(
-    f"\nModel B best val log-loss: {result_b.best_val_log_loss:.6f}  "
-    f"brier: {result_b.best_val_brier:.6f}  "
-    f"epoch_best: {result_b.epoch_best}"
-)
+# Earlier revisions of this notebook trained a second IRT-MLP head
+# ("Model B") with `p_bench=1.0` + `q_bc=0.15` and combined it with
+# Model A through a coverage-conditional blend. The four-member
+# stacker downstream now provides cross-architecture diversity
+# (LightGBM, kNN-similarity, logistic regression on top of Model A),
+# so a second IRT head is redundant and only inflates the bundle.
+# Member 1 of the stacker is therefore Model A directly.
 
 # %% [markdown]
-# ## 9. Score both models + fit per-coverage blend weights
+# ## 9. Score Model A on val (Member 1 prediction vector)
 #
-# **Blend tuning needs a benchmark-cold-start val signal.** Our val
-# split is item-cold-start (item-disjoint from train), but every val
-# row's benchmark IS in `_BC_TO_ID`. Naive blend tuning would push
-# `w_present == w_missing` because we never measure log-loss on
-# rows where `bench_present=0`.
+# Member 1's contribution to the stacker is just Model A's
+# uncalibrated probability on every val row. We previously scored
+# Model A twice (real-meta + synthetic-cold-start) to fit a
+# coverage-conditional blend against Model B; with B gone, that
+# blend is degenerate and we only need the real-meta pass.
 #
-# We synthesize cold-start at scoring time: pick a random
-# `synthetic_cold_start_frac` of val benchmarks, and for those
-# benchmarks' val rows force `bc_idx -> 0` AND `meta_override`
-# to all-MISSING when scoring Model A. The model has actually seen
-# those benchmarks during training, so beta[that_bc] is well-tuned;
-# at scoring time we strip both signals to simulate the test-time
-# regime. Remaining (1 - frac) of val rows use real bc_idx + real
-# metadata. Now we have two predictions per row + a `bench_present`
-# flag, and can fit `w_present` on present rows + `w_missing` on
-# missing rows independently.
-#
-# Each is a 1D convex log-loss minimization. We solve it via golden-
-# section search over [0, 1].
-
 # %%
 import torch
 from tqdm.auto import tqdm
@@ -1244,37 +1498,18 @@ def _score_dataset(
     ds: LookupDataset,
     model,
     *,
-    bc_override: torch.Tensor | None = None,
-    meta_override_template: dict | None = None,
-    bench_missing_real_subject: bool = False,
     batch_size: int = 8192,
 ) -> np.ndarray:
     """Run ``model`` over ``ds`` and return per-row uncalibrated
-    probabilities.
-
-    ``bc_override`` (when not None) is a (N,) int64 tensor that
-    replaces ``ds.bc_ids`` for this scoring pass -- used to force
-    `bc_idx -> 0` on the synthetic cold-start slice.
-
-    ``meta_override_template`` (when not None) is a dict with the
-    same keys as ``MetadataIdTables.row(0)``; the same row is
-    broadcast to every row of every batch. Use this for the
-    "all-MISSING" pattern (synthetic cold-start, Model A).
-
-    ``bench_missing_real_subject`` is the pattern Member B was
-    trained on: for each batch, look up REAL subject metadata via
-    the model's own ``subject_meta_*[subject_idx]`` buffers and
-    splice in row-0 (MISSING) for the bench fields. Mutually
-    exclusive with ``meta_override_template`` -- if both are set,
-    ``meta_override_template`` wins (so Member A's all-MISSING
-    pattern still works for synthetic-cold-start scoring).
+    probabilities. Model A always uses real metadata + real bc_idx
+    at scoring time; the dropout pre-hook only fires under
+    ``model.training``, which we explicitly disable below.
     """
     n = len(ds)
     out = np.zeros(n, dtype=np.float32)
     has_pool = ds.pool_feats.shape[-1] > 0
     has_cluster = bool(getattr(model.cfg, "has_cluster_embedding", False))
     has_nn = ds.nn_feats.shape[-1] > 0
-    accepts_meta = bool(getattr(model.cfg, "use_metadata_features", False))
     model.eval()
     with torch.no_grad():
         for start in tqdm(range(0, n, batch_size), desc="score", leave=False):
@@ -1286,43 +1521,9 @@ def _score_dataset(
                 kw["cluster_ids"] = ds.cluster_ids[start:end].to(device)
             if has_nn:
                 kw["nn_feats"] = ds.nn_feats[start:end].to(device)
-            if accepts_meta and meta_override_template is not None:
-                B_chunk = end - start
-                kw["meta_override"] = {
-                    k: v.expand(B_chunk, -1).to(device).contiguous()
-                    for k, v in meta_override_template.items()
-                }
-            elif accepts_meta and bench_missing_real_subject:
-                B_chunk = end - start
-                sub_idx_chunk = ds.subject_ids[start:end].to(device)
-                # Real subject lookup from the model's buffers, MISSING
-                # bench from row 0 of the same buffers. Matches what
-                # the dropout pre-hook produced at training time.
-                real_sub_cat = model.subject_meta_cat_ids[sub_idx_chunk]
-                real_sub_num = model.subject_meta_num[sub_idx_chunk]
-                miss_bc_cat = (
-                    model.bc_meta_cat_ids[0:1]
-                    .expand(B_chunk, -1)
-                    .contiguous()
-                )
-                miss_bc_num = (
-                    model.bc_meta_num[0:1]
-                    .expand(B_chunk, -1)
-                    .contiguous()
-                )
-                kw["meta_override"] = {
-                    "subj_cat": real_sub_cat,
-                    "subj_num": real_sub_num,
-                    "bc_cat": miss_bc_cat,
-                    "bc_num": miss_bc_num,
-                }
-            bc_chunk = (
-                bc_override[start:end] if bc_override is not None
-                else ds.bc_ids[start:end]
-            )
             logits = model(
                 subject_idx=ds.subject_ids[start:end].to(device),
-                bc_idx=bc_chunk.to(device),
+                bc_idx=ds.bc_ids[start:end].to(device),
                 item_emb=ds.item_emb[start:end].to(device),
                 subject_emb=None,
                 **kw,
@@ -1336,165 +1537,37 @@ def _score_dataset(
 # MUST attach BEFORE loading the checkpoint.
 trained_a = _build_model_for_inf(MODEL_A_NAME, model_a_cfg)
 trained_a.attach_metadata_tables(meta_id_tables)
-ckpt_a = torch.load(result_a.checkpoint_path, map_location=device, weights_only=False)
+# Use the cached checkpoint dict directly (avoids a duplicate disk
+# read; the cached object is bit-identical to ``torch.load`` of the
+# checkpoint file).
+ckpt_a = ckpt_a_cached
 trained_a.load_state_dict(ckpt_a["model_state"])
 trained_a = trained_a.to(device).eval()
 
-trained_b = _build_model_for_inf(MODEL_B_NAME, model_b_cfg)
-# Member B also uses the meta-aware variant -- attach the same id
-# tables before loading its state dict, just like Member A.
-trained_b.attach_metadata_tables(meta_id_tables)
-ckpt_b = torch.load(result_b.checkpoint_path, map_location=device, weights_only=False)
-trained_b.load_state_dict(ckpt_b["model_state"])
-trained_b = trained_b.to(device).eval()
-
-# Pick the synthetic cold-start subset: a deterministic random
-# selection of val benchmarks. Reproducible via SPLIT_SEED so re-runs
-# of this cell hit the same partition.
-val_bc_keys = primary.val["benchmark_condition_key"].astype(str).to_numpy()
-unique_val_bc = np.unique(val_bc_keys)
-_rng = np.random.default_rng(SPLIT_SEED + 7919)
-n_synth = max(
-    1,
-    int(round(
-        float(CFG["coverage_blend"]["synthetic_cold_start_frac"])
-        * len(unique_val_bc)
-    )),
-)
-synth_bc_set = set(_rng.choice(unique_val_bc, size=n_synth, replace=False).tolist())
-synth_mask = np.array(
-    [k in synth_bc_set for k in val_bc_keys],
-    dtype=bool,
-)
-print(
-    f"Synthetic cold-start: held out {len(synth_bc_set):,} of "
-    f"{len(unique_val_bc):,} val benchmarks  "
-    f"({synth_mask.sum():,}/{len(synth_mask):,} val rows masked)"
-)
-bench_present_val = (~synth_mask).astype(np.float32)
-
-# Build the bc_override and meta_override for the synthetic-cold rows.
-# For non-synth rows we keep the real bc_idx and let the model do
-# its normal buffer lookup (no meta override).
-val_bc_synth = val_ds.bc_ids.clone()
-val_bc_synth[torch.from_numpy(synth_mask)] = 0
-miss_row = {
-    "subj_cat": meta_id_tables.subject_cat_ids[0:1].clone(),
-    "subj_num": meta_id_tables.subject_num[0:1].clone(),
-    "bc_cat": meta_id_tables.bc_cat_ids[0:1].clone(),
-    "bc_num": meta_id_tables.bc_num[0:1].clone(),
-}
-
-# We need 4 score passes for blend tuning:
-#   p_a_present = Model A on (real bc, real meta)              -> rows where bench_present=1
-#   p_a_missing = Model A on (bc=0, meta=MISSING)              -> rows where bench_present=0
-#   p_b_present = Model B on (real bc)                          -> rows where bench_present=1
-#   p_b_missing = Model B on (bc=0)                             -> rows where bench_present=0
-# For each model we do TWO passes (one all-real, one all-missing) and
-# splice into a single per-row vector via synth_mask.
-print("Scoring Model A: real-meta pass...")
-p_a_real = _score_dataset(val_ds, trained_a)
-print("Scoring Model A: cold-start (bc=0, meta=MISSING) pass...")
-p_a_cold = _score_dataset(
-    val_ds, trained_a, bc_override=val_bc_synth, meta_override_template=miss_row
-)
-p_a_val = np.where(synth_mask, p_a_cold, p_a_real)
-
-# Member B was trained with p_bench=1.0 + p_subj=0.10, so its bench-
-# side parameters only ever saw row-0 (MISSING) bench input while
-# its subject-side parameters trained on REAL subject metadata
-# (with row 0 mixed in 10% of the time). We MUST score it with the
-# matching pattern -- real subject + MISSING bench -- otherwise the
-# real-bench embeddings (untrained random init) emit noise. The
-# synthetic-cold-start subset additionally forces ``bc_idx -> 0``
-# to simulate the per-bc-bias-missing test-time regime.
-print("Scoring Model B: real-bc + real-subj-meta + MISSING-bench-meta pass...")
-p_b_real = _score_dataset(val_ds, trained_b, bench_missing_real_subject=True)
-print("Scoring Model B: cold-start (bc=0 + same meta pattern) pass...")
-p_b_cold = _score_dataset(
-    val_ds, trained_b, bc_override=val_bc_synth, bench_missing_real_subject=True
-)
-p_b_val = np.where(synth_mask, p_b_cold, p_b_real)
+print("Scoring Model A on val...")
+p_a_val = _score_dataset(val_ds, trained_a)
 
 ylab_val = primary.val["label"].astype(float).to_numpy()
+val_bc_keys = primary.val["benchmark_condition_key"].astype(str).to_numpy()
 
+# With Model B removed, ``synth_mask`` and ``bench_present_val`` are
+# vestigial: every val row's benchmark IS in the trained indexer
+# (item-cold-start val), so coverage on val is uniformly 1. We keep
+# them defined so the stacker / calibrator cells don't need a
+# downstream rewrite. ``BLEND_PRESENT`` / ``BLEND_MISSING`` are only
+# used as runtime-meta breadcrumbs in a couple of places below; the
+# degenerate (1.0, 0.0) values reflect "Member 1 is Model A only".
+synth_mask = np.zeros(len(p_a_val), dtype=bool)
+bench_present_val = np.ones(len(p_a_val), dtype=np.float32)
+BLEND_PRESENT = (1.0, 0.0)
+BLEND_MISSING = (1.0, 0.0)
 
-def _logloss_blend(w: float, p_a: np.ndarray, p_b: np.ndarray, y: np.ndarray) -> float:
-    """Log-loss of ``w * p_a + (1 - w) * p_b`` clipped to safe range."""
-    eps = 1e-7
-    p = np.clip(w * p_a + (1.0 - w) * p_b, eps, 1.0 - eps)
-    return float(-(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)).mean())
-
-
-def _golden_section_min(f, lo: float, hi: float, tol: float = 1e-4, max_iter: int = 64) -> float:
-    """Golden-section search on a unimodal scalar f over [lo, hi]."""
-    phi = (np.sqrt(5.0) - 1.0) / 2.0
-    a, b = lo, hi
-    c = b - phi * (b - a)
-    d = a + phi * (b - a)
-    fc, fd = f(c), f(d)
-    for _ in range(max_iter):
-        if abs(b - a) < tol:
-            break
-        if fc < fd:
-            b, d, fd = d, c, fc
-            c = b - phi * (b - a)
-            fc = f(c)
-        else:
-            a, c, fc = c, d, fd
-            d = a + phi * (b - a)
-            fd = f(d)
-    return float((a + b) / 2.0)
-
-
-# Fit the two weights on disjoint slices of the val set.
-present_idx = np.where(~synth_mask)[0]
-missing_idx = np.where(synth_mask)[0]
-
-if len(present_idx) > 0:
-    w_present = _golden_section_min(
-        lambda w: _logloss_blend(
-            w, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]
-        ),
-        0.0, 1.0,
-    )
-else:
-    w_present = 0.5
-if len(missing_idx) > 0:
-    w_missing = _golden_section_min(
-        lambda w: _logloss_blend(
-            w, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]
-        ),
-        0.0, 1.0,
-    )
-else:
-    w_missing = 0.5
-
-ll_a_p = _logloss_blend(1.0, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]) if len(present_idx) else float("nan")
-ll_b_p = _logloss_blend(0.0, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]) if len(present_idx) else float("nan")
-ll_blend_p = _logloss_blend(w_present, p_a_val[present_idx], p_b_val[present_idx], ylab_val[present_idx]) if len(present_idx) else float("nan")
-ll_a_m = _logloss_blend(1.0, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]) if len(missing_idx) else float("nan")
-ll_b_m = _logloss_blend(0.0, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]) if len(missing_idx) else float("nan")
-ll_blend_m = _logloss_blend(w_missing, p_a_val[missing_idx], p_b_val[missing_idx], ylab_val[missing_idx]) if len(missing_idx) else float("nan")
-print(
-    f"Blend weights:\n"
-    f"  bench_present=1: w_A={w_present:.3f}  "
-    f"ll_A={ll_a_p:.5f}  ll_B={ll_b_p:.5f}  ll_blend={ll_blend_p:.5f}\n"
-    f"  bench_present=0: w_A={w_missing:.3f}  "
-    f"ll_A={ll_a_m:.5f}  ll_B={ll_b_m:.5f}  ll_blend={ll_blend_m:.5f}"
-)
-
-BLEND_PRESENT = (float(w_present), float(1.0 - w_present))
-BLEND_MISSING = (float(w_missing), float(1.0 - w_missing))
-
-# Per-row blended val prediction. This is **Member 1**'s contribution
-# to the four-member stacker below.
-w_per_row = np.where(synth_mask, w_missing, w_present).astype(np.float32)
-p_blend_val = w_per_row * p_a_val + (1.0 - w_per_row) * p_b_val
-print(
-    f"[Member 1] coverage-blend val log-loss: "
-    f"{-(ylab_val * np.log(np.clip(p_blend_val, 1e-6, 1 - 1e-6)) + (1 - ylab_val) * np.log(1 - np.clip(p_blend_val, 1e-6, 1 - 1e-6))).mean():.6f}"
-)
+eps = 1e-7
+ll_member1 = -(
+    ylab_val * np.log(np.clip(p_a_val, eps, 1.0 - eps))
+    + (1.0 - ylab_val) * np.log(np.clip(1.0 - p_a_val, eps, 1.0 - eps))
+).mean()
+print(f"[Member 1] Model A val log-loss: {ll_member1:.6f}")
 
 # %% [markdown]
 # ## 9b. Build dense feature matrix for Members 2 + 4
@@ -1521,8 +1594,10 @@ from src.member_features import (
 )
 
 # --- Subject side: pull theta + u from Member A's checkpoint, build
-#     subject_cat_ids / subject_num from meta_id_tables.
-_ckpt_a_for_theta = torch.load(result_a.checkpoint_path, map_location="cpu")
+#     subject_cat_ids / subject_num from meta_id_tables. We reuse the
+#     cached bundle here so this cell short-circuits as soon as Model A
+#     is cached -- no extra ``torch.load`` round-trip.
+_ckpt_a_for_theta = ckpt_a_cached
 _state_a_for_theta = _ckpt_a_for_theta["model_state"]
 theta_s_per_subject = _state_a_for_theta["theta"].cpu().numpy().astype(np.float32)
 if "u" in _state_a_for_theta:
@@ -1861,7 +1936,7 @@ else:
     val_centroid_dist = np.full(len(primary.val), 0.5, dtype=np.float32)
 
 stacker_member_probs_val = np.stack(
-    [p_blend_val, p_member2_val, p_member3_val, p_member4_val], axis=1
+    [p_a_val, p_member2_val, p_member3_val, p_member4_val], axis=1
 ).astype(np.float32)
 
 stacker_X_val = build_stacker_features(
@@ -1901,7 +1976,7 @@ nll_stack = float(-(ylab_val * np.log(np.clip(p_stacker_val, 1e-6, 1 - 1e-6))
 nll_uniform = float(-(ylab_val * np.log(np.clip(stacker_member_probs_val.mean(axis=1), 1e-6, 1 - 1e-6))
                     + (1 - ylab_val) * np.log(1 - np.clip(stacker_member_probs_val.mean(axis=1), 1e-6, 1 - 1e-6))).mean())
 print(f"\n[Stacker] val log-loss summary:")
-print(f"  Member 1 (IRT-MLP blend):  {-(ylab_val * np.log(np.clip(p_blend_val, 1e-6, 1 - 1e-6)) + (1 - ylab_val) * np.log(1 - np.clip(p_blend_val, 1e-6, 1 - 1e-6))).mean():.6f}")
+print(f"  Member 1 (Model A IRT-MLP):{-(ylab_val * np.log(np.clip(p_a_val, 1e-6, 1 - 1e-6)) + (1 - ylab_val) * np.log(1 - np.clip(p_a_val, 1e-6, 1 - 1e-6))).mean():.6f}")
 print(f"  Member 2 (LightGBM):       {nll_m2:.6f}")
 print(f"  Member 3 (kNN-similarity): {nll_m3:.6f}")
 print(f"  Member 4 (LogReg):         {nll_m4:.6f}")
@@ -1917,143 +1992,210 @@ if nll_stack > nll_uniform + 1e-3:
 # %% [markdown]
 # ## 10. NN calibrator on the STACKED predictions (post-stacker)
 #
-# The runtime applies the NN calibrator AFTER the per-row blend, so
-# the residual table must store residuals computed against the same
-# blended `p_uncal` the runtime emits. We score Model A and Model B
-# on TRAIN (no synthetic cold-start: train-time we always use real
-# bc + real meta) and combine them with `w_present` (because train
-# rows are by construction NOT cold-start). The val side reuses the
-# blended predictions computed in cell 9.
+# The runtime applies the NN calibrator AFTER the stacker, so the
+# residual table must store residuals computed against the same
+# `p_uncal` the runtime emits at inference (the stacked output, not
+# Member 1 alone). We score all four members on TRAIN, run them
+# through the same stacker we trained on val, and store residuals
+# of (label - p_stacker_train) keyed by (subject, training_item_row).
 
 # %%
 from src.nn_calibration import NNCalibrator, SubjectResidualTable
 
-# --- Build train-side predictions for ALL FOUR members so the
-#     residual table holds residuals against the same p_uncal that
-#     the runtime will produce after stacking.
-print("[Calibrator] Member 1 (IRT-MLP coverage blend) on train...")
-p_a_train = _score_dataset(train_ds, trained_a)
-p_b_train = _score_dataset(
-    train_ds, trained_b, bench_missing_real_subject=True
-)
-p1_train = (BLEND_PRESENT[0] * p_a_train + BLEND_PRESENT[1] * p_b_train).astype(np.float32)
-print(f"[Calibrator] p1_train: shape={p1_train.shape}  "
-      f"log-loss={-(y_train * np.log(np.clip(p1_train, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p1_train, 1e-6, 1 - 1e-6))).mean():.6f}")
 
-print("[Calibrator] Member 2 (GBDT) on train...")
-p2_train = gbdt_apply_batch(gbdt_state, X_train_dense)
+def _fit_nn_calibrator():
+    """Fit the post-stacker NN-residual calibrator end-to-end.
 
-print("[Calibrator] Member 3 (kNN) on train...")
-train_item_emb = np.stack(
-    [item_emb_lookup[k] for k in primary.train["item_key"]], axis=0
-).astype(np.float32)
-train_subj_keys_for_knn = [str(s) for s in primary.train["subject_key"]]
-p3_train = knn_apply_batch(knn_state, train_item_emb, train_subj_keys_for_knn)
+    Heavy enough to want caching: scoring all four members on TRAIN +
+    deduped val NN search + the (alpha, shrinkage_tau) grid sweep.
+    Returns a picklable bundle so a cached run produces bit-identical
+    downstream values without re-scoring or re-searching.
+    """
+    print("[Calibrator] Member 1 (Model A IRT-MLP) on train...")
+    p_a_train_local = _score_dataset(train_ds, trained_a)
+    p1_train_local = p_a_train_local.astype(np.float32)
+    print(f"[Calibrator] p1_train: shape={p1_train_local.shape}  "
+          f"log-loss={-(y_train * np.log(np.clip(p1_train_local, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p1_train_local, 1e-6, 1 - 1e-6))).mean():.6f}")
 
-print("[Calibrator] Member 4 (LogReg) on train...")
-p4_train = logreg_apply_state_batch(logreg_state, X_train_dense)
+    print("[Calibrator] Member 2 (GBDT) on train...")
+    p2_train_local = gbdt_apply_batch(gbdt_state, X_train_dense)
 
-# Train-side stacker features (matching the same builder used on val).
-train_bench_present = np.array(
-    [
-        1.0 if str(b) in indexer.bc_to_id else 0.0
-        for b in primary.train["benchmark_condition_key"]
-    ],
-    dtype=np.float32,
-)
-train_nn_mean_sim = nn_train_mat[:, 1].astype(np.float32)
-train_nn_support = nn_train_mat[:, 2].astype(np.float32)
-if _centroid_cols_in_pool:
-    train_pool_idx = pool_features_z.set_index("item_key").reindex(
-        primary.train["item_key"].astype(str)
+    print("[Calibrator] Member 3 (kNN) on train...")
+    train_item_emb_local = np.stack(
+        [item_emb_lookup[k] for k in primary.train["item_key"]], axis=0
+    ).astype(np.float32)
+    train_subj_keys_for_knn_local = [str(s) for s in primary.train["subject_key"]]
+    p3_train_local = knn_apply_batch(knn_state, train_item_emb_local, train_subj_keys_for_knn_local)
+
+    print("[Calibrator] Member 4 (LogReg) on train...")
+    p4_train_local = logreg_apply_state_batch(logreg_state, X_train_dense)
+
+    # Train-side stacker features (matching the same builder used on val).
+    train_bench_present_local = np.array(
+        [
+            1.0 if str(b) in indexer.bc_to_id else 0.0
+            for b in primary.train["benchmark_condition_key"]
+        ],
+        dtype=np.float32,
     )
-    train_centroid_dist = train_pool_idx[_centroid_cols_in_pool].astype(np.float32).min(axis=1).to_numpy()
-else:
-    train_centroid_dist = np.full(len(primary.train), 0.5, dtype=np.float32)
+    train_nn_mean_sim_local = nn_train_mat[:, 1].astype(np.float32)
+    train_nn_support_local = nn_train_mat[:, 2].astype(np.float32)
+    if _centroid_cols_in_pool:
+        train_pool_idx_local = pool_features_z.set_index("item_key").reindex(
+            primary.train["item_key"].astype(str)
+        )
+        train_centroid_dist_local = train_pool_idx_local[_centroid_cols_in_pool].astype(np.float32).min(axis=1).to_numpy()
+    else:
+        train_centroid_dist_local = np.full(len(primary.train), 0.5, dtype=np.float32)
 
-train_stacker_feats = build_stacker_features(
-    member_probs=np.stack([p1_train, p2_train, p3_train, p4_train], axis=1).astype(np.float32),
-    bench_present=train_bench_present,
-    nn_neighbor_support=train_nn_support,
-    nn_mean_similarity=train_nn_mean_sim,
-    centroid_distance=train_centroid_dist,
-)
-p_uncal_train_stacker = stacker_apply_batch(stacker_state, train_stacker_feats)
-print(f"[Calibrator] p_uncal_train_stacker: shape={p_uncal_train_stacker.shape}  "
-      f"log-loss={-(y_train * np.log(np.clip(p_uncal_train_stacker, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p_uncal_train_stacker, 1e-6, 1 - 1e-6))).mean():.6f}")
-
-# --- Build the residual table from the STACKED train predictions.
-key_to_train_row = {k: i for i, k in enumerate(train_item_keys)}
-train_subj_ids = np.array(
-    [indexer.subject_id(str(s)) for s in primary.train["subject_key"]],
-    dtype=np.int64,
-)
-train_item_rows = np.array(
-    [key_to_train_row.get(str(k), -1) for k in primary.train["item_key"]],
-    dtype=np.int64,
-)
-ok = train_item_rows >= 0
-residual_table = SubjectResidualTable.from_rows(
-    subject_ids=train_subj_ids[ok],
-    training_item_rows=train_item_rows[ok],
-    labels=primary.train["label"].astype(float).to_numpy()[ok],
-    uncal_probs=p_uncal_train_stacker[ok],
-    n_subjects=indexer.n_subjects,
-    n_training_items=len(train_item_keys),
-)
-
-# --- Val-side neighbor lookup (deduped, chunked for memory).
-val_keys_arr = np.asarray([str(k) for k in primary.val["item_key"]])
-val_unique_keys, val_inverse = np.unique(val_keys_arr, return_inverse=True)
-K_CAL = int(CFG["nn_calibration"]["k"])
-val_uniq_idx = np.empty((len(val_unique_keys), K_CAL), dtype=np.int64)
-val_uniq_sims = np.empty((len(val_unique_keys), K_CAL), dtype=np.float32)
-for _s in tqdm(range(0, len(val_unique_keys), NN_QUERY_CHUNK),
-               desc="[Calibrator] val NN search"):
-    _e = min(_s + NN_QUERY_CHUNK, len(val_unique_keys))
-    _chunk_keys = list(val_unique_keys[_s:_e])
-    _chunk_emb = np.stack(
-        [item_emb_lookup[k] for k in _chunk_keys], axis=0
-    ).astype(np.float32, copy=False)
-    _idx, _sims = nn_index.nearest(
-        _chunk_emb, k=K_CAL, exclude_self=False, query_keys=_chunk_keys,
+    train_stacker_feats_local = build_stacker_features(
+        member_probs=np.stack([p1_train_local, p2_train_local, p3_train_local, p4_train_local], axis=1).astype(np.float32),
+        bench_present=train_bench_present_local,
+        nn_neighbor_support=train_nn_support_local,
+        nn_mean_similarity=train_nn_mean_sim_local,
+        centroid_distance=train_centroid_dist_local,
     )
-    val_uniq_idx[_s:_e] = _idx
-    val_uniq_sims[_s:_e] = _sims
-    del _chunk_emb, _idx, _sims
-val_neighbor_rows = val_uniq_idx[val_inverse]
-val_neighbor_sims = val_uniq_sims[val_inverse]
+    p_uncal_train_stacker_local = stacker_apply_batch(stacker_state, train_stacker_feats_local)
+    print(f"[Calibrator] p_uncal_train_stacker: shape={p_uncal_train_stacker_local.shape}  "
+          f"log-loss={-(y_train * np.log(np.clip(p_uncal_train_stacker_local, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p_uncal_train_stacker_local, 1e-6, 1 - 1e-6))).mean():.6f}")
 
-# Fit the calibrator on the STACKED val predictions with the
-# 2-D (alpha, shrinkage_tau) grid sweep.
-calibrator = NNCalibrator.fit_alpha_on_val(
-    residual_table=residual_table,
-    val_subject_ids=val_subj_ids_np,
-    val_neighbor_rows=val_neighbor_rows,
-    val_neighbor_sims=val_neighbor_sims,
-    val_uncal_probs=p_stacker_val,
-    val_labels=ylab_val,
-    k=int(CFG["nn_calibration"]["k"]),
-    similarity=str(CFG["nn_calibration"].get("similarity", "cosine")),
-    temperature=float(CFG["nn_calibration"].get("temperature", 1.0)),
-    shrinkage_taus=tuple(CFG["nn_calibration"].get("shrinkage_taus") or
-                         (0.0, 0.5, 1.0, 2.0, 5.0)),
-)
-print(f"[Calibrator] state: alpha={calibrator.state.alpha:.4f}  "
-      f"shrinkage_tau={calibrator.state.shrinkage_tau:.4f}  "
-      f"fit_method={calibrator.state.fit_method}")
+    # --- Build the residual table from the STACKED train predictions.
+    key_to_train_row_local = {k: i for i, k in enumerate(train_item_keys)}
+    train_subj_ids_local = np.array(
+        [indexer.subject_id(str(s)) for s in primary.train["subject_key"]],
+        dtype=np.int64,
+    )
+    train_item_rows_local = np.array(
+        [key_to_train_row_local.get(str(k), -1) for k in primary.train["item_key"]],
+        dtype=np.int64,
+    )
+    ok_local = train_item_rows_local >= 0
+    residual_table_local = SubjectResidualTable.from_rows(
+        subject_ids=train_subj_ids_local[ok_local],
+        training_item_rows=train_item_rows_local[ok_local],
+        labels=primary.train["label"].astype(float).to_numpy()[ok_local],
+        uncal_probs=p_uncal_train_stacker_local[ok_local],
+        n_subjects=indexer.n_subjects,
+        n_training_items=len(train_item_keys),
+    )
 
-p_final_val = calibrator.apply(
-    residual_table=residual_table,
-    subject_ids=val_subj_ids_np,
-    neighbor_rows=val_neighbor_rows,
-    neighbor_sims=val_neighbor_sims,
-    p_uncal=p_stacker_val,
+    # --- Val-side neighbor lookup (deduped, chunked for memory).
+    val_keys_arr_local = np.asarray([str(k) for k in primary.val["item_key"]])
+    val_unique_keys_local, val_inverse_local = np.unique(val_keys_arr_local, return_inverse=True)
+    K_CAL_local = int(CFG["nn_calibration"]["k"])
+    val_uniq_idx_local = np.empty((len(val_unique_keys_local), K_CAL_local), dtype=np.int64)
+    val_uniq_sims_local = np.empty((len(val_unique_keys_local), K_CAL_local), dtype=np.float32)
+    for _s in tqdm(range(0, len(val_unique_keys_local), NN_QUERY_CHUNK),
+                   desc="[Calibrator] val NN search"):
+        _e = min(_s + NN_QUERY_CHUNK, len(val_unique_keys_local))
+        _chunk_keys = list(val_unique_keys_local[_s:_e])
+        _chunk_emb = np.stack(
+            [item_emb_lookup[k] for k in _chunk_keys], axis=0
+        ).astype(np.float32, copy=False)
+        _idx, _sims = nn_index.nearest(
+            _chunk_emb, k=K_CAL_local, exclude_self=False, query_keys=_chunk_keys,
+        )
+        val_uniq_idx_local[_s:_e] = _idx
+        val_uniq_sims_local[_s:_e] = _sims
+        del _chunk_emb, _idx, _sims
+    val_neighbor_rows_local = val_uniq_idx_local[val_inverse_local]
+    val_neighbor_sims_local = val_uniq_sims_local[val_inverse_local]
+
+    # Fit the calibrator on the STACKED val predictions with the
+    # 2-D (alpha, shrinkage_tau) grid sweep.
+    calibrator_local = NNCalibrator.fit_alpha_on_val(
+        residual_table=residual_table_local,
+        val_subject_ids=val_subj_ids_np,
+        val_neighbor_rows=val_neighbor_rows_local,
+        val_neighbor_sims=val_neighbor_sims_local,
+        val_uncal_probs=p_stacker_val,
+        val_labels=ylab_val,
+        k=int(CFG["nn_calibration"]["k"]),
+        similarity=str(CFG["nn_calibration"].get("similarity", "cosine")),
+        temperature=float(CFG["nn_calibration"].get("temperature", 1.0)),
+        shrinkage_taus=tuple(CFG["nn_calibration"].get("shrinkage_taus") or
+                             (0.0, 0.5, 1.0, 2.0, 5.0)),
+    )
+    print(f"[Calibrator] state: alpha={calibrator_local.state.alpha:.4f}  "
+          f"shrinkage_tau={calibrator_local.state.shrinkage_tau:.4f}  "
+          f"fit_method={calibrator_local.state.fit_method}")
+
+    p_final_val_local = calibrator_local.apply(
+        residual_table=residual_table_local,
+        subject_ids=val_subj_ids_np,
+        neighbor_rows=val_neighbor_rows_local,
+        neighbor_sims=val_neighbor_sims_local,
+        p_uncal=p_stacker_val,
+    )
+    nll_final_local = float(-(ylab_val * np.log(np.clip(p_final_val_local, 1e-6, 1 - 1e-6))
+                              + (1 - ylab_val) * np.log(1 - np.clip(p_final_val_local, 1e-6, 1 - 1e-6))).mean())
+    print(f"\n[Calibrator] post-calibration val log-loss: {nll_final_local:.6f}  "
+          f"(stacker: {nll_stack:.6f}, delta: {nll_final_local - nll_stack:+.6f})")
+
+    return {
+        "calibrator_state": calibrator_local.state,
+        "residual_table": residual_table_local,
+        "p_uncal_train_stacker": p_uncal_train_stacker_local.astype(np.float32),
+        "p_final_val": p_final_val_local.astype(np.float32),
+        "val_neighbor_rows": val_neighbor_rows_local,
+        "val_neighbor_sims": val_neighbor_sims_local,
+        "nll_final": float(nll_final_local),
+        "p_a_train": p_a_train_local.astype(np.float32),
+        "p1_train": p1_train_local,
+        "p2_train": p2_train_local.astype(np.float32),
+        "p3_train": p3_train_local.astype(np.float32),
+        "p4_train": p4_train_local.astype(np.float32),
+    }
+
+
+# Cache key: include fingerprints of every upstream state the calibrator
+# depends on, plus the calibrator's own config. Any change in Model A
+# weights, GBDT trees, kNN tables, LogReg weights, stacker weights, or
+# the calibrator hyperparameters auto-invalidates the cache.
+CALIBRATOR_KEY_INPUTS = (
+    "nn_calibrator_v2",
+    state_fingerprint(ckpt_a_cached["model_state"]),
+    state_fingerprint(gbdt_state),
+    state_fingerprint(knn_state),
+    state_fingerprint(logreg_state),
+    state_fingerprint(stacker_state),
+    int(CFG["nn_calibration"]["k"]),
+    str(CFG["nn_calibration"].get("similarity", "cosine")),
+    float(CFG["nn_calibration"].get("temperature", 1.0)),
+    tuple(CFG["nn_calibration"].get("shrinkage_taus") or
+          (0.0, 0.5, 1.0, 2.0, 5.0)),
+    int(len(primary.train)),
+    int(len(primary.val)),
+    int(NN_FEATURE_DIM),
 )
-nll_final = float(-(ylab_val * np.log(np.clip(p_final_val, 1e-6, 1 - 1e-6))
-                    + (1 - ylab_val) * np.log(1 - np.clip(p_final_val, 1e-6, 1 - 1e-6))).mean())
-print(f"\n[Calibrator] post-calibration val log-loss: {nll_final:.6f}  "
-      f"(stacker: {nll_stack:.6f}, delta: {nll_final - nll_stack:+.6f})")
+print(f"[cache] Calibrator key prefix: {state_fingerprint(CALIBRATOR_KEY_INPUTS)}")
+
+_calibrator_bundle = cache_or_compute(
+    "nn_calibrator_stacked",
+    key_inputs=CALIBRATOR_KEY_INPUTS,
+    compute_fn=_fit_nn_calibrator,
+)
+
+# Re-hydrate the calibrator object from its picklable state.
+calibrator = NNCalibrator(state=_calibrator_bundle["calibrator_state"])
+residual_table = _calibrator_bundle["residual_table"]
+p_uncal_train_stacker = _calibrator_bundle["p_uncal_train_stacker"]
+p_final_val = _calibrator_bundle["p_final_val"]
+val_neighbor_rows = _calibrator_bundle["val_neighbor_rows"]
+val_neighbor_sims = _calibrator_bundle["val_neighbor_sims"]
+nll_final = _calibrator_bundle["nll_final"]
+p_a_train = _calibrator_bundle["p_a_train"]
+p1_train = _calibrator_bundle["p1_train"]
+p2_train = _calibrator_bundle["p2_train"]
+p3_train = _calibrator_bundle["p3_train"]
+p4_train = _calibrator_bundle["p4_train"]
+
+print(
+    f"[Calibrator] alpha={calibrator.state.alpha:.4f}  "
+    f"shrinkage_tau={calibrator.state.shrinkage_tau:.4f}  "
+    f"fit_method={calibrator.state.fit_method}  "
+    f"nll_final={nll_final:.6f} (stacker={nll_stack:.6f})"
+)
 
 RESIDUAL_DIR = ROOT / "artifacts" / "nn_calibration_stacked"
 RESIDUAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -2064,10 +2206,11 @@ print(f"[Calibrator] residual table saved to {RESIDUAL_DIR}")
 # ## 11. Export the four-member stacked bundle
 #
 # Two-step export:
-#   1. Build the Member 1 (IRT-MLP coverage-blend) bundle via the
-#      existing `export_coverage_blend_run`. This handles the heavy
-#      pieces (encoder, Indexer, model classes, pool/cluster/NN
-#      features, per-batch caching) that we don't want to rewrite.
+#   1. Build the Member 1 (Model A IRT-MLP) bundle via
+#      `export_ensemble_run` with a SINGLE member. We reuse the
+#      ensemble exporter (rather than the simpler `export_run`)
+#      because the four-member stacker downstream expects the
+#      bundle layout the ensemble exporter produces.
 #   2. Wrap the Member 1 bundle with `export_four_member_stacked_run`,
 #      which:
 #        - copies Members 2-4 + stacker + post-calibrator state into
@@ -2078,13 +2221,16 @@ print(f"[Calibrator] residual table saved to {RESIDUAL_DIR}")
 #          a stacker postprocessing block that reassigns ``predict``
 #          to the four-member orchestration,
 #        - audits the resulting bundle for forbidden imports and
-#          enforces the 65 MB ZIP cap.
+#          enforces the 1500 MB ZIP cap.
 
 # %%
+import shutil
+import tempfile
+
 from src.export_submission import (
     bundle_training_cache,
     compute_train_counts,
-    export_coverage_blend_run,
+    export_ensemble_run,
     make_submission_zip,
 )
 from src.export_stacked_submission import (
@@ -2097,7 +2243,7 @@ SUBMISSION_DIR_M1 = ROOT / "submission" / "qwen8b_4member_stacked_member1"
 SUBMISSION_DIR = ROOT / "submission" / "qwen8b_4member_stacked"
 TRAINING_CACHE_DIR = ROOT / "artifacts" / "training_cache"
 
-print("[Export] Step 1: building Member 1 (coverage-blend) bundle...")
+print("[Export] Step 1: building Member 1 (Model A only) bundle...")
 training_cache_result = bundle_training_cache(
     items_parquet_path=embedder.items_path,
     out_dir=TRAINING_CACHE_DIR,
@@ -2109,49 +2255,74 @@ training_cache_result = bundle_training_cache(
     train_df=primary.train,
     nn_features_cfg=nn_cfg.to_dict(),
     subject_to_id=indexer.subject_to_id,
+    # Ship the conditional NN-feature context (cells [15..22]) and the
+    # per-bc-id benchmark-age lookup so the runtime can reproduce the
+    # same 23-column NN feature vector training trained on. Both are
+    # numpy / scipy.sparse files; total disk overhead is typically
+    # a few MB on top of the existing nn cache.
+    conditional_context=cond_context,
+    bc_id_to_age=bc_id_to_age_arr,
 )
 print(
     f"[Export] training cache size: {training_cache_result.size_mb:.1f} MB  "
     f"(soft cap {CFG['submission_cache'].get('max_bundle_size_mb', 200)} MB)"
 )
 
-sub_dir_m1 = export_coverage_blend_run(
-    member_a_state_dict=ckpt_a["model_state"],
-    member_a_model_name=MODEL_A_NAME,
-    member_a_model_cfg=asdict(model_a_cfg),
-    member_a_config_id="meta_dropout",
-    member_b_state_dict=ckpt_b["model_state"],
-    member_b_model_name=MODEL_B_NAME,
-    member_b_model_cfg=asdict(model_b_cfg),
-    member_b_config_id="subj_meta_bc_dropout",
-    member_a_force_bench_missing=False,
-    member_b_force_bench_missing=True,
-    blend_weights_present=BLEND_PRESENT,
-    blend_weights_missing=BLEND_MISSING,
-    indexer={
-        "subject_to_id": dict(indexer.subject_to_id),
-        "bc_to_id": dict(indexer.bc_to_id),
-    },
-    encoder_cfg=CFG["encoder"],
-    submission_dir=SUBMISSION_DIR_M1,
-    representative_result=result_a,
-    include_labeling=True,
-    pool_stats_path=POOL_STATS_PATH,
-    cluster_centroids_path=CENTROIDS_PATH,
-    pool_feature_names=list(POOL_FEATURE_NAMES_EXT),
-    training_cache_dir=TRAINING_CACHE_DIR,
-    judge_cfg=None,
-    nn_features_cfg=nn_cfg.to_dict(),
-    ship_training_cache=True,
-    ship_requirements_txt=False,
-    train_counts=compute_train_counts(primary.train),
-    meta_preprocessor=meta_preprocessor,
-    # Note: we DON'T ship the legacy NN calibrator here -- the
-    # post-stacker calibrator below replaces it. Setting these to
-    # None is the legacy-bundle escape hatch.
-    nn_calibrator_state=None,
-    nn_calibrator_table_dir=None,
-)
+# Member 1 is Model A alone. We materialize its state_dict to a
+# temp checkpoint file (which is what ``export_ensemble_run``
+# expects to torch.load) and then call the ensemble exporter with
+# a single-element ``members`` list. blend_weights=[1.0] so the
+# runtime ensemble passes Model A's logits through unchanged.
+_export_tmp = Path(tempfile.mkdtemp(prefix="single_member_"))
+try:
+    _path_a = _export_tmp / "member_a.pt"
+    torch.save(
+        {
+            "model_state": dict(ckpt_a["model_state"]),
+            "model_cfg": asdict(model_a_cfg),
+            "model_name": MODEL_A_NAME,
+        },
+        _path_a,
+    )
+    sub_dir_m1 = export_ensemble_run(
+        members=[
+            {
+                "config_id": "meta_dropout",
+                "model_name": MODEL_A_NAME,
+                "model_cfg": asdict(model_a_cfg),
+                "fold_checkpoint_paths": [_path_a],
+            }
+        ],
+        blend_weights=[1.0],
+        blend_weights_missing=[1.0],
+        force_bench_missing=[False],
+        indexer={
+            "subject_to_id": dict(indexer.subject_to_id),
+            "bc_to_id": dict(indexer.bc_to_id),
+        },
+        encoder_cfg=CFG["encoder"],
+        fold_assignment_sha256="single_member_v1",
+        submission_dir=SUBMISSION_DIR_M1,
+        representative_result=result_a,
+        include_labeling=True,
+        pool_stats_path=POOL_STATS_PATH,
+        cluster_centroids_path=CENTROIDS_PATH,
+        pool_feature_names=list(POOL_FEATURE_NAMES_EXT),
+        training_cache_dir=TRAINING_CACHE_DIR,
+        judge_cfg=None,
+        nn_features_cfg=nn_cfg.to_dict(),
+        ship_training_cache=True,
+        ship_requirements_txt=False,
+        train_counts=compute_train_counts(primary.train),
+        meta_preprocessor=meta_preprocessor,
+        # Note: we DON'T ship the legacy NN calibrator here -- the
+        # post-stacker calibrator below replaces it. Setting these to
+        # None is the legacy-bundle escape hatch.
+        nn_calibrator_state=None,
+        nn_calibrator_table_dir=None,
+    )
+finally:
+    shutil.rmtree(_export_tmp, ignore_errors=True)
 print(f"[Export] Member 1 bundle: {sub_dir_m1}")
 
 # Save the schema + subject_tables so a future runtime feature
@@ -2201,7 +2372,7 @@ print("[Export] static import audit: PASS")
 bundle_bytes = measure_bundle_size_bytes(sub_dir)
 print(f"[Export] bundle size: {bundle_bytes / (1024 * 1024):.1f} MB")
 
-zip_cap_mb = float(CFG["submission"].get("max_zip_size_mb", 65))
+zip_cap_mb = float(CFG["submission"].get("max_zip_size_mb", 1500))
 zip_path = make_submission_zip(
     sub_dir,
     zip_path=sub_dir.with_suffix(".zip"),
@@ -2247,7 +2418,7 @@ def _ll(p):
     return float(-(_y * np.log(p) + (1 - _y) * np.log(1 - p)).mean())
 
 
-print(f"  Member 1 (IRT-MLP coverage blend) : {_ll(p_blend_val):.6f}")
+print(f"  Member 1 (Model A IRT-MLP)        : {_ll(p_a_val):.6f}")
 print(f"  Member 2 (LightGBM)               : {_ll(p_member2_val):.6f}")
 print(f"  Member 3 (kNN-similarity)         : {_ll(p_member3_val):.6f}")
 print(f"  Member 4 (LogReg)                 : {_ll(p_member4_val):.6f}")

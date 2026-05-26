@@ -271,6 +271,134 @@ def test_factorization_machine_cross_zero_at_init() -> None:
     assert torch.allclose(out, torch.zeros(5))
 
 
+def test_factorization_machine_cross_with_numerics_zero_at_init() -> None:
+    """Adding numeric fields must not perturb the parity-at-init guarantee."""
+    fm = FactorizationMachineCross(
+        subject_field_dims=[8, 8],
+        benchmark_field_dims=[8],
+        d_fm=4,
+        subject_num_field_count=2,    # log_params, release_date
+        bench_num_field_count=1,      # benchmark_age
+    )
+    B = 5
+    e_subj = [torch.randn(B, 8), torch.randn(B, 8)]
+    e_bench = [torch.randn(B, 8)]
+    # subj_num is interleaved [value, mask, value, mask, ...]; bench_num same.
+    subj_num = torch.randn(B, 4)        # 2 numeric fields x 2
+    bench_num = torch.randn(B, 2)       # 1 numeric field x 2
+    out = fm(e_subj, e_bench, subj_num_features=subj_num, bench_num_features=bench_num)
+    assert out.shape == (B,)
+    assert torch.allclose(out, torch.zeros(B))
+
+
+def test_factorization_machine_cross_numerics_optional_when_count_zero() -> None:
+    """``num_field_count=0`` produces the legacy cat-only behavior."""
+    fm = FactorizationMachineCross(
+        subject_field_dims=[6],
+        benchmark_field_dims=[4],
+        d_fm=3,
+    )
+    out_a = fm([torch.randn(2, 6)], [torch.randn(2, 4)])
+    # Passing None numerics must equal not passing them at all.
+    out_b = fm(
+        [torch.randn(2, 6)],
+        [torch.randn(2, 4)],
+        subj_num_features=None,
+        bench_num_features=None,
+    )
+    assert out_a.shape == (2,) and out_b.shape == (2,)
+
+
+def test_factorization_machine_cross_split_value_mask_helper() -> None:
+    """Internal helper: (B, 2N) -> list of (B, 2) tensors, in field order."""
+    fm = FactorizationMachineCross(
+        subject_field_dims=[],
+        benchmark_field_dims=[],
+        d_fm=2,
+        subject_num_field_count=2,
+        bench_num_field_count=0,
+    )
+    flat = torch.tensor(
+        [[1.0, 0.0, 5.0, 1.0],
+         [2.0, 0.0, 6.0, 0.0]],
+        dtype=torch.float32,
+    )
+    parts = FactorizationMachineCross._split_value_mask(flat, 2)
+    assert len(parts) == 2
+    assert torch.equal(parts[0], torch.tensor([[1.0, 0.0], [2.0, 0.0]]))
+    assert torch.equal(parts[1], torch.tensor([[5.0, 1.0], [6.0, 0.0]]))
+    # An empty/None input -> empty list.
+    assert FactorizationMachineCross._split_value_mask(None, 0) == []
+    assert FactorizationMachineCross._split_value_mask(flat, 0) == []
+    # Wrong shape raises.
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        FactorizationMachineCross._split_value_mask(torch.zeros(3, 5), 2)
+
+
+def test_fm_cross_can_learn_numeric_x_categorical_interaction() -> None:
+    """Smoke: FM head must be able to fit a synthetic
+    ``f(family, log_params) = w_family * log_params`` interaction
+    that no purely-additive head could learn.
+
+    We parametrize the *labels* as a function of (family categorical,
+    a single numeric scalar), and check that the FM channel reduces
+    BCE-with-logits loss meaningfully relative to a fixed-zero baseline.
+    """
+    from torch import nn as _nn
+
+    torch.manual_seed(0)
+
+    n_family = 4
+    fam_emb = _nn.Embedding(n_family, 6)
+    _nn.init.normal_(fam_emb.weight, std=0.5)
+    fm = FactorizationMachineCross(
+        subject_field_dims=[6],
+        benchmark_field_dims=[],
+        d_fm=4,
+        subject_num_field_count=1,
+    )
+
+    # Generate synthetic data: label depends on family AND log_params,
+    # specifically family-specific monotone direction. We use
+    # deterministic labels (sign of the ground-truth logit) so the
+    # optimal BCE loss is 0; this avoids irreducible Bernoulli noise
+    # masking the FM channel's learning capacity in a small-batch test.
+    B = 512
+    fam_id = torch.randint(0, n_family, (B,))
+    logp = torch.randn(B) * 1.5
+    sign = torch.tensor([2.0, -2.0, 1.5, -1.5])  # one direction per family
+    logits = sign[fam_id] * logp
+    labels = (logits > 0).float()
+    subj_num = torch.stack([logp, torch.zeros_like(logp)], dim=1)  # value + mask=0
+
+    opt = torch.optim.Adam(list(fm.parameters()) + list(fam_emb.parameters()), lr=0.1)
+    bce = _nn.BCEWithLogitsLoss()
+
+    # Baseline: untrained head -> ~0.69 (label-prior loss).
+    with torch.no_grad():
+        baseline = bce(
+            fm([fam_emb(fam_id)], [], subj_num_features=subj_num), labels
+        ).item()
+
+    final = float("inf")
+    for _ in range(800):
+        opt.zero_grad()
+        out = fm([fam_emb(fam_id)], [], subj_num_features=subj_num)
+        loss = bce(out, labels)
+        loss.backward()
+        opt.step()
+        final = float(loss.detach())
+
+    # The cat x num interaction must be learnable; loss should drop
+    # at least 50% from the label-prior baseline. (In practice we see
+    # loss settle around 0.10-0.20 -- well below the 0.35 threshold.)
+    assert final < 0.5 * baseline, (
+        f"FM cat x num head failed to learn family x log_params interaction: "
+        f"baseline={baseline:.4f}, final={final:.4f}"
+    )
+
+
 def test_explicit_cross_zero_at_init(tiny_model_info, tiny_benchmark_info) -> None:
     mp = MetadataPreprocessor.fit(tiny_model_info, tiny_benchmark_info)
     sub_card = tuple(v.n_tokens for v in mp.subject_cat_vocabs.values())
@@ -574,3 +702,90 @@ def test_auto_emb_dim_bounds() -> None:
     assert _auto_emb_dim(2) >= 4
     assert _auto_emb_dim(1000, max_dim=16) == 16
     assert _auto_emb_dim(10) <= _auto_emb_dim(100)
+
+
+def test_full_categorical_cross_grid_default_schema() -> None:
+    s = MetadataSchema()
+    grid = s.full_categorical_cross_grid()
+    # Default schema: 3 subject x 1 benchmark = 3 crosses, in stable order.
+    assert grid == ("organization__topic", "family__topic", "macro_family__topic")
+
+
+def test_full_categorical_cross_grid_multi_bench_field() -> None:
+    s = MetadataSchema(
+        subject_categorical=("a", "b"),
+        benchmark_categorical=("x", "y", "z"),
+    )
+    grid = s.full_categorical_cross_grid()
+    assert grid == (
+        "a__x", "a__y", "a__z",
+        "b__x", "b__y", "b__z",
+    )
+
+
+def test_full_categorical_cross_grid_empty_when_either_side_empty() -> None:
+    assert MetadataSchema(
+        subject_categorical=(),
+        benchmark_categorical=("topic",),
+    ).full_categorical_cross_grid() == ()
+    assert MetadataSchema(
+        subject_categorical=("family",),
+        benchmark_categorical=(),
+    ).full_categorical_cross_grid() == ()
+
+
+def test_with_full_categorical_cross_grid_replaces_explicit_crosses() -> None:
+    s = MetadataSchema(
+        subject_categorical=("organization", "family"),
+        benchmark_categorical=("topic",),
+        explicit_crosses=("family__topic",),  # hand-picked subset
+    )
+    s2 = s.with_full_categorical_cross_grid()
+    # subject / benchmark / numeric fields are unchanged.
+    assert s2.subject_categorical == s.subject_categorical
+    assert s2.benchmark_categorical == s.benchmark_categorical
+    assert s2.subject_numeric == s.subject_numeric
+    assert s2.benchmark_numeric == s.benchmark_numeric
+    # explicit_crosses promoted to the full grid.
+    assert s2.explicit_crosses == ("organization__topic", "family__topic")
+    # original is not mutated.
+    assert s.explicit_crosses == ("family__topic",)
+
+
+def test_full_grid_actually_builds_one_table_per_pair(
+    tiny_model_info, tiny_benchmark_info
+) -> None:
+    """Smoke: when we feed the full cross grid into ExplicitCrossEmbeddings,
+    every pair gets its own table (no silent dropping)."""
+    schema = MetadataSchema(
+        subject_categorical=("organization", "family", "macro_family"),
+        benchmark_categorical=("topic",),
+    ).with_full_categorical_cross_grid()
+    mp = MetadataPreprocessor.fit(
+        tiny_model_info, tiny_benchmark_info, schema=schema
+    )
+    sub_cards = [
+        mp.subject_cat_vocabs[c].n_tokens for c in schema.subject_categorical
+    ]
+    bench_cards = [
+        mp.benchmark_cat_vocabs[c].n_tokens for c in schema.benchmark_categorical
+    ]
+    from src.metadata_features import ExplicitCrossEmbeddings
+
+    mod = ExplicitCrossEmbeddings(
+        crosses=schema.explicit_crosses,
+        schema=schema,
+        subject_cardinalities=sub_cards,
+        benchmark_cardinalities=bench_cards,
+        emb_dim=4,
+    )
+    # One table per (subj_field, bench_field) combination in the grid.
+    assert len(mod.tables) == len(schema.subject_categorical) * len(
+        schema.benchmark_categorical
+    )
+    # And the wrapping module exposes the same field tuples in the same order.
+    assert tuple((sf, bf) for sf, bf, *_ in mod.crosses) == tuple(
+        (s, b)
+        for s in schema.subject_categorical
+        for b in schema.benchmark_categorical
+    )

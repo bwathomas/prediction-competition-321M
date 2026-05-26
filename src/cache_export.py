@@ -434,6 +434,8 @@ def export_item_cache(
     train_df: pd.DataFrame | None = None,
     nn_features_cfg: Mapping | None = None,
     subject_to_id: Mapping[str, int] | None = None,
+    conditional_context: object | None = None,
+    bc_id_to_age: object | None = None,
 ) -> CacheExportResult:
     """Build the submission-side training-item cache.
 
@@ -589,7 +591,7 @@ def export_item_cache(
                 "k": int(nn_cfg_dict.get("k", 16)),
                 "runtime_k": int(nn_cfg_dict.get("runtime_k", cfg.runtime_k)),
                 "similarity": str(nn_cfg_dict.get("similarity", "cosine")),
-                "feature_dim": int(nn_cfg_dict.get("feature_dim", 8)),
+                "feature_dim": int(nn_cfg_dict.get("feature_dim", 23)),
                 "fallback_value": float(nn_cfg_dict.get("fallback_value", 0.0)),
                 "top1_missing_sentinel": float(
                     nn_cfg_dict.get("top1_missing_sentinel", -1.0)
@@ -610,6 +612,36 @@ def export_item_cache(
         except Exception as exc:  # noqa: BLE001
             LOG.warning("NN-features cache export failed: %s", exc)
             nn_meta = {"enabled": False, "error": str(exc)}
+
+    # 6c. Conditional NN-feature context (cells [15..22] of NN_FEATURE_DIM).
+    #     Shipped alongside the existing NN cache when the caller built one
+    #     at training time. Each file is plain numpy / scipy.sparse so the
+    #     runtime does not pull a fresh torch / pandas import.
+    cond_meta: dict[str, object] = {"enabled": False}
+    if conditional_context is not None:
+        try:
+            saved_dir = conditional_context.save(out_dir)
+            n_files = sum(1 for _ in saved_dir.glob("*.np?"))
+            cond_meta = {
+                "enabled": True,
+                "n_subjects": int(getattr(conditional_context, "n_subjects", 0)),
+                "n_items": int(getattr(conditional_context, "n_items", 0)),
+                "n_families": int(getattr(conditional_context, "n_families", 0)),
+                "n_macro_families": int(getattr(conditional_context, "n_macro_families", 0)),
+                "n_organizations": int(getattr(conditional_context, "n_organizations", 0)),
+                "n_clusters": int(getattr(conditional_context, "n_clusters", 0)),
+                "files_written": int(n_files),
+            }
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("conditional NN context export failed: %s", exc)
+            cond_meta = {"enabled": False, "error": str(exc)}
+    if bc_id_to_age is not None:
+        try:
+            arr = np.asarray(bc_id_to_age, dtype=np.float32).reshape(-1)
+            np.save(out_dir / "bc_id_to_age.npy", arr)
+            cond_meta["bc_id_to_age_n"] = int(arr.shape[0])
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("bc_id_to_age export failed: %s", exc)
 
     # 7. cache_meta.json
     meta = {

@@ -17,7 +17,7 @@ Block layout (locked, written into ``feature_names`` once at fit time):
     [pool_feats z-scored, len(POOL_FEATURE_NAMES) = 9]
     [centroid_dist top_m raw squared L2]
     [cluster one-hot, n_clusters cols, indexed 1..n_clusters; idx 0 = UNK row]
-    [nn_feats raw, NN_FEATURE_DIM = 8]
+    [nn_feats raw, NN_FEATURE_DIM = 15]
     [condition one-hot, fitted at training time + UNK column]
 
 What this DOES NOT include (per user spec):

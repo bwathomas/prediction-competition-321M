@@ -193,7 +193,23 @@ ENCODER_RUNTIME_BATCH_SIZE: int = int(
 # n_labeled_neighbors features.
 NN_META: dict = dict(META.get("nn_features") or {})
 NN_ENABLED: bool = bool(NN_META.get("enabled", False))
-NN_FEATURE_DIM: int = int(NN_META.get("feature_dim", 8))
+# The training-time aggregator emits 23 features:
+#   * 8 legacy (cells [0..7]):  passrate_mean / weighted / std / coverage /
+#     top1_label / top1_similarity / mean_similarity / n_labeled_neighbors_log1p
+#   * 7 self-derived (cells [8..14]): effective_neighbor_count,
+#     top1_minus_topk_similarity, bootstrap_se_passrate, neighbor_label_entropy,
+#     top1_label_match, sim_distribution_skew, distance_to_kth_neighbor
+#   * 8 conditional / context (cells [15..22]): subject / family /
+#     macro_family / organization conditional passrates, benchmark match,
+#     freshness diff, distinct subjects in neighborhood, cluster-conditional
+#     passrate. These require the conditional cache shipped alongside the
+#     subject_passrate.npz; absent that cache, the runtime emits
+#     ``fallback_value`` for cells [15..22].
+# The runtime config always carries an explicit ``feature_dim`` so this
+# fallback should never fire in practice; we keep it as a defensive
+# default that matches the current schema rather than silently emitting
+# the wrong width.
+NN_FEATURE_DIM: int = int(NN_META.get("feature_dim", 23))
 NN_RUNTIME_K: int = int(NN_META.get("runtime_k", NN_META.get("k", 16)))
 NN_FALLBACK_VALUE: float = float(NN_META.get("fallback_value", 0.0))
 NN_TOP1_MISSING_SENTINEL: float = float(
@@ -511,6 +527,26 @@ def compute_pool_features_runtime(item_text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _aggregate_trait_conditional(passrates, masks, redact_row, fallback_value):
+    """Per-row mean over labeled neighbors with explicit redaction.
+
+    Mirrors ``src.nn_features._aggregate_trait_conditional``. Used for
+    cells [15..19] (subject / family / macro_family / organization /
+    benchmark-conditional passrates).
+    """
+    pr_safe = np.where(masks > 0, passrates, 0.0).astype(np.float32)
+    n_labeled = masks.sum(axis=1)
+    has_any = n_labeled > 0
+    pr_sum = pr_safe.sum(axis=1)
+    out = np.where(
+        has_any,
+        pr_sum / np.maximum(n_labeled, 1.0),
+        fallback_value,
+    ).astype(np.float32)
+    out = np.where(redact_row > 0, np.float32(fallback_value), out).astype(np.float32)
+    return out
+
+
 def _aggregate_nn_features(
     neighbor_passrates: np.ndarray,
     neighbor_masks: np.ndarray,
@@ -518,7 +554,24 @@ def _aggregate_nn_features(
     *,
     fallback_value: float,
     top1_missing_sentinel: float,
+    cond_inputs=None,
 ) -> np.ndarray:
+    """Mirror of ``src.nn_features._aggregate_nn_features`` -- 23 features.
+
+    ``cond_inputs`` is an optional dict carrying the per-row arrays that
+    drive cells [15..22]. When ``None``, those 8 cells fall back to
+    ``fallback_value``. When supplied, the keys must match the training
+    side exactly:
+
+      subject_passrates / subject_masks / subject_redact      -> cell 15
+      family_passrates / family_masks / family_redact         -> cell 16
+      macro_family_passrates / macro_family_masks / *_redact  -> cell 17
+      organization_passrates / organization_masks / *_redact  -> cell 18
+      bench_match_passrates / bench_match_masks / *_redact    -> cell 19
+      neighbor_freshness_diff / freshness_redact              -> cell 20
+      distinct_subj_per_neighbor                              -> cell 21
+      cluster_passrate_subject_query / cluster_redact         -> cell 22
+    """
     passrates = np.asarray(neighbor_passrates, dtype=np.float32)
     masks = np.asarray(neighbor_masks, dtype=np.float32)
     sims = np.asarray(similarities, dtype=np.float32)
@@ -564,6 +617,94 @@ def _aggregate_nn_features(
 
     n_labeled_log = np.log1p(n_labeled).astype(np.float32)
 
+    # Self-derived additions (mirror src/nn_features.py).
+    weight_sq_sum = (weights * weights).sum(axis=1)
+    eff_count = np.where(
+        weight_sq_sum > 1e-9,
+        (weight_sum * weight_sum) / np.maximum(weight_sq_sum, 1e-9),
+        0.0,
+    ).astype(np.float32)
+    top1_minus_topk = (top1_sim - mean_sim).astype(np.float32)
+    bootstrap_se = np.where(
+        n_labeled > 0,
+        pr_std / np.sqrt(np.maximum(n_labeled, 1.0)),
+        fallback_value,
+    ).astype(np.float32)
+    p_clip = np.clip(pr_mean, 1e-7, 1.0 - 1e-7)
+    entropy = -(p_clip * np.log(p_clip) + (1.0 - p_clip) * np.log(1.0 - p_clip))
+    entropy = np.where(has_any, entropy, 0.0).astype(np.float32)
+    top1_label_match = np.where(
+        top1_mask > 0,
+        (passrates[:, 0] > 0.5).astype(np.float32),
+        fallback_value,
+    ).astype(np.float32)
+    sim_min = sims.min(axis=1).astype(np.float32)
+    sim_median = np.median(sims, axis=1).astype(np.float32)
+    span = top1_sim - sim_min
+    sim_skew = np.where(
+        np.abs(span) > 1e-9,
+        (top1_sim - sim_median) / np.where(np.abs(span) > 1e-9, span, 1.0),
+        0.0,
+    ).astype(np.float32)
+    distance_to_kth = sims[:, -1].astype(np.float32)
+
+    # ----- Tier 2/3: conditional + context cells [15..22] -----
+    cond_inputs = dict(cond_inputs or {})
+    fb = np.float32(fallback_value)
+
+    def _cond_pair(pref):
+        pr = cond_inputs.get(pref + "_passrates")
+        mk = cond_inputs.get(pref + "_masks")
+        rd = cond_inputs.get(pref + "_redact")
+        if pr is None or mk is None:
+            return np.full(B, fb, dtype=np.float32)
+        rd_arr = (
+            np.asarray(rd, dtype=np.float32).reshape(-1)
+            if rd is not None
+            else np.zeros(B, dtype=np.float32)
+        )
+        return _aggregate_trait_conditional(
+            np.asarray(pr, dtype=np.float32),
+            np.asarray(mk, dtype=np.float32),
+            rd_arr,
+            float(fallback_value),
+        )
+
+    passrate_subject_cond = _cond_pair("subject")
+    passrate_family_cond = _cond_pair("family")
+    passrate_macro_family_cond = _cond_pair("macro_family")
+    passrate_organization_cond = _cond_pair("organization")
+    passrate_bench_cond = _cond_pair("bench_match")
+
+    fresh_val = cond_inputs.get("neighbor_freshness_diff")
+    fresh_redact = cond_inputs.get("freshness_redact")
+    if fresh_val is None:
+        freshness_diff = np.full(B, fb, dtype=np.float32)
+    else:
+        freshness_diff = np.asarray(fresh_val, dtype=np.float32).reshape(-1)
+        if fresh_redact is not None:
+            redact_arr = np.asarray(fresh_redact, dtype=np.float32).reshape(-1)
+            freshness_diff = np.where(redact_arr > 0, fb, freshness_diff).astype(np.float32)
+
+    distinct_per_neighbor = cond_inputs.get("distinct_subj_per_neighbor")
+    if distinct_per_neighbor is None:
+        n_distinct_subj = np.full(B, fb, dtype=np.float32)
+    else:
+        ds = np.asarray(distinct_per_neighbor, dtype=np.float32)
+        n_distinct_subj = np.log1p(ds.mean(axis=1)).astype(np.float32)
+
+    cps_val = cond_inputs.get("cluster_passrate_subject_query")
+    cps_redact = cond_inputs.get("cluster_redact")
+    if cps_val is None:
+        cluster_passrate_subj = np.full(B, fb, dtype=np.float32)
+    else:
+        cluster_passrate_subj = np.asarray(cps_val, dtype=np.float32).reshape(-1)
+        if cps_redact is not None:
+            redact_arr = np.asarray(cps_redact, dtype=np.float32).reshape(-1)
+            cluster_passrate_subj = np.where(
+                redact_arr > 0, fb, cluster_passrate_subj
+            ).astype(np.float32)
+
     out = np.stack(
         [
             pr_mean.astype(np.float32),
@@ -574,6 +715,21 @@ def _aggregate_nn_features(
             top1_sim,
             mean_sim,
             n_labeled_log,
+            eff_count,
+            top1_minus_topk,
+            bootstrap_se,
+            entropy,
+            top1_label_match,
+            sim_skew,
+            distance_to_kth,
+            passrate_subject_cond,
+            passrate_family_cond,
+            passrate_macro_family_cond,
+            passrate_organization_cond,
+            passrate_bench_cond,
+            freshness_diff,
+            n_distinct_subj,
+            cluster_passrate_subj,
         ],
         axis=1,
     ).astype(np.float32, copy=False)
@@ -581,6 +737,274 @@ def _aggregate_nn_features(
     if not np.all(np.isfinite(out)):
         out = np.nan_to_num(out, nan=fallback_value, posinf=0.0, neginf=0.0)
     return np.ascontiguousarray(out, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Conditional NN-feature resolver (mirror of
+# src.nn_features._lookup_csr_pairs / _resolve_conditional_inputs).
+# Same algorithm, single-row friendly.
+# ---------------------------------------------------------------------------
+
+
+_MISSING_TRAIT_ID = 0
+
+
+def _lookup_csr_pairs(row_ids, col_ids, pr_csr, mk_csr, *, row_lookup=None):
+    """Per-(row, col) lookup against two CSR matrices. Returns
+    (passrates, masks) of shape ``[B, K]``. ``row_ids`` are integer row
+    selectors of length B; ``col_ids`` are the column ids per row of
+    shape [B, K].
+
+    ``row_lookup`` is an optional callable
+    ``(csr_obj, row_id, return_vals) -> (sorted_cols, sorted_vals_or_None) | None``.
+    When provided, the per-row argsort is memoized by the caller, which
+    is critical for runtime cold-start latency: a single subject_id has
+    fixed (family, macro_family, organization) trait IDs, so the
+    expensive ``argsort`` over each trait's CSR row only needs to run
+    once per (subject, trait) pair across the full eval round.
+    """
+    if col_ids.ndim == 1:
+        col_ids = col_ids[None, :]
+    B, K = col_ids.shape
+    out_pr = np.zeros((B, K), dtype=np.float32)
+    out_mask = np.zeros((B, K), dtype=np.float32)
+    if pr_csr is None or mk_csr is None:
+        return out_pr, out_mask
+    n_rows = pr_csr.shape[0]
+    pr_indptr = pr_csr.indptr
+    pr_indices = pr_csr.indices
+    pr_data = pr_csr.data
+    mk_indptr = mk_csr.indptr
+    mk_indices = mk_csr.indices
+    rids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+    for s in np.unique(rids):
+        if s < 0 or s >= n_rows:
+            continue
+        rows_for = np.where(rids == s)[0]
+        cols_for = col_ids[rows_for]
+        # Passrate row.
+        sorted_cols = sorted_vals = None
+        if row_lookup is not None:
+            hit_pr = row_lookup(pr_csr, int(s), True)
+            if hit_pr is not None:
+                sorted_cols, sorted_vals = hit_pr
+        if sorted_cols is None:
+            start = pr_indptr[s]
+            end = pr_indptr[s + 1]
+            row_cols = pr_indices[start:end]
+            row_vals = pr_data[start:end]
+            if row_cols.size:
+                order = np.argsort(row_cols)
+                sorted_cols = row_cols[order]
+                sorted_vals = row_vals[order]
+        if sorted_cols is not None and sorted_cols.size and sorted_vals is not None:
+            pos = np.searchsorted(sorted_cols, cols_for)
+            pos_clipped = np.clip(pos, 0, sorted_cols.size - 1)
+            hit = (pos < sorted_cols.size) & (sorted_cols[pos_clipped] == cols_for)
+            out_pr[rows_for] = np.where(hit, sorted_vals[pos_clipped], 0.0)
+        # Mask row.
+        sorted_m = None
+        if row_lookup is not None:
+            hit_mk = row_lookup(mk_csr, int(s), False)
+            if hit_mk is not None:
+                sorted_m, _ = hit_mk
+        if sorted_m is None:
+            mstart = mk_indptr[s]
+            mend = mk_indptr[s + 1]
+            m_cols = mk_indices[mstart:mend]
+            if m_cols.size:
+                order = np.argsort(m_cols)
+                sorted_m = m_cols[order]
+        if sorted_m is not None and sorted_m.size:
+            pos = np.searchsorted(sorted_m, cols_for)
+            pos_clipped = np.clip(pos, 0, sorted_m.size - 1)
+            hit = (pos < sorted_m.size) & (sorted_m[pos_clipped] == cols_for)
+            out_mask[rows_for] = hit.astype(np.float32)
+    return out_pr, out_mask
+
+
+def _resolve_conditional_inputs_runtime(
+    *,
+    subject_id,
+    neighbor_idx,
+    query_benchmark_id,
+    query_benchmark_age,
+    query_cluster_id,
+    subject_meta_redacted,
+    # Conditional-context tables (each may be None if absent).
+    subject_passrate_csr,
+    subject_passrate_mask_csr,
+    family_passrate_csr,
+    family_passrate_mask_csr,
+    macro_family_passrate_csr,
+    macro_family_passrate_mask_csr,
+    organization_passrate_csr,
+    organization_passrate_mask_csr,
+    subject_to_family_id,
+    subject_to_macro_family_id,
+    subject_to_organization_id,
+    item_benchmark_id,
+    item_benchmark_age,
+    item_distinct_subj_count,
+    item_global_passrate,
+    item_global_passrate_mask,
+    cluster_subject_passrate_csr,
+    cluster_subject_passrate_mask_csr,
+    row_lookup=None,
+):
+    """Single-row mirror of ``_resolve_conditional_inputs`` from
+    ``src.nn_features``. Inputs are scalars (one query); outputs are the
+    same dict shape the training-time aggregator consumes via
+    ``cond_inputs``.
+
+    ``row_lookup`` is forwarded to ``_lookup_csr_pairs`` so the caller's
+    per-row argsort cache is reused across calls for the same
+    ``(subject, trait)`` pair.
+    """
+    n_subj = int(subject_to_family_id.shape[0]) if subject_to_family_id is not None else 0
+    if n_subj <= 0 or item_benchmark_id is None:
+        return {}
+
+    sids = np.array([int(subject_id)], dtype=np.int64)
+    nidx = np.asarray(neighbor_idx, dtype=np.int64).reshape(1, -1)
+    B, K = nidx.shape
+
+    subj_redact_full = bool(subject_meta_redacted) or sids[0] < 0 or sids[0] >= n_subj
+    safe_sids = np.clip(sids, 0, n_subj - 1)
+    fam_id = (
+        int(np.take(subject_to_family_id, safe_sids)[0])
+        if (sids[0] >= 0 and sids[0] < n_subj)
+        else _MISSING_TRAIT_ID
+    )
+    macro_id = (
+        int(np.take(subject_to_macro_family_id, safe_sids)[0])
+        if (sids[0] >= 0 and sids[0] < n_subj)
+        else _MISSING_TRAIT_ID
+    )
+    org_id = (
+        int(np.take(subject_to_organization_id, safe_sids)[0])
+        if (sids[0] >= 0 and sids[0] < n_subj)
+        else _MISSING_TRAIT_ID
+    )
+    fam_redact = subj_redact_full or fam_id == _MISSING_TRAIT_ID
+    macro_redact = subj_redact_full or macro_id == _MISSING_TRAIT_ID
+    org_redact = subj_redact_full or org_id == _MISSING_TRAIT_ID
+
+    n_items = int(item_benchmark_id.shape[0])
+    nbench = item_benchmark_id[np.clip(nidx, 0, max(n_items - 1, 0))]
+
+    subj_pr_kk, subj_mk_kk = _lookup_csr_pairs(
+        sids, nidx, subject_passrate_csr, subject_passrate_mask_csr,
+        row_lookup=row_lookup,
+    )
+    fam_pr_kk, fam_mk_kk = _lookup_csr_pairs(
+        np.array([fam_id], dtype=np.int64),
+        nidx,
+        family_passrate_csr,
+        family_passrate_mask_csr,
+        row_lookup=row_lookup,
+    )
+    macro_pr_kk, macro_mk_kk = _lookup_csr_pairs(
+        np.array([macro_id], dtype=np.int64),
+        nidx,
+        macro_family_passrate_csr,
+        macro_family_passrate_mask_csr,
+        row_lookup=row_lookup,
+    )
+    org_pr_kk, org_mk_kk = _lookup_csr_pairs(
+        np.array([org_id], dtype=np.int64),
+        nidx,
+        organization_passrate_csr,
+        organization_passrate_mask_csr,
+        row_lookup=row_lookup,
+    )
+
+    # Benchmark match.
+    bench_q = int(query_benchmark_id) if query_benchmark_id is not None else -1
+    bench_match = (nbench == bench_q) & (bench_q >= 0)
+    bench_pr = item_global_passrate[np.clip(nidx, 0, max(n_items - 1, 0))]
+    bench_mk_global = item_global_passrate_mask[np.clip(nidx, 0, max(n_items - 1, 0))]
+    bench_match_pr = np.where(bench_match, bench_pr, 0.0).astype(np.float32)
+    bench_match_mk = (bench_match.astype(np.float32) * bench_mk_global).astype(np.float32)
+    bench_redact = np.array([bench_q < 0], dtype=np.float32)
+
+    # Freshness.
+    nages = item_benchmark_age[np.clip(nidx, 0, max(n_items - 1, 0))]
+    nage_mask = (~np.isnan(nages)).astype(np.float32)
+    nage_safe = np.where(np.isnan(nages), 0.0, nages).astype(np.float32)
+    n_known = nage_mask.sum(axis=1)
+    mean_neighbor_age = np.where(
+        n_known > 0,
+        (nage_safe * nage_mask).sum(axis=1) / np.maximum(n_known, 1.0),
+        0.0,
+    ).astype(np.float32)
+    q_age = (
+        float(query_benchmark_age)
+        if (query_benchmark_age is not None and not (isinstance(query_benchmark_age, float) and np.isnan(query_benchmark_age)))
+        else float("nan")
+    )
+    q_age_arr = np.array([q_age], dtype=np.float32)
+    fresh_redact = np.isnan(q_age_arr) | (n_known == 0)
+    fresh_diff = np.where(
+        fresh_redact, 0.0, q_age_arr - mean_neighbor_age
+    ).astype(np.float32)
+
+    # Distinct subjects per neighbor.
+    distinct_per_neighbor = item_distinct_subj_count[
+        np.clip(nidx, 0, max(n_items - 1, 0))
+    ].astype(np.float32)
+
+    # Cluster subject passrate.
+    q_cluster = int(query_cluster_id) if query_cluster_id is not None else -1
+    cluster_redact = np.array(
+        [(q_cluster < 0) or (sids[0] < 0) or (sids[0] >= n_subj)], dtype=np.float32
+    )
+    cps = np.zeros(1, dtype=np.float32)
+    if (
+        cluster_subject_passrate_csr is not None
+        and q_cluster >= 0
+        and q_cluster < cluster_subject_passrate_csr.shape[0]
+        and sids[0] >= 0
+        and sids[0] < cluster_subject_passrate_csr.shape[1]
+    ):
+        sorted_pair = None
+        if row_lookup is not None:
+            sorted_pair = row_lookup(
+                cluster_subject_passrate_csr, int(q_cluster), True
+            )
+        if sorted_pair is None:
+            row = cluster_subject_passrate_csr.getrow(int(q_cluster))
+            if row.nnz > 0:
+                order = np.argsort(row.indices)
+                sorted_pair = (row.indices[order], row.data[order])
+        if sorted_pair is not None and sorted_pair[0].size and sorted_pair[1] is not None:
+            sc, sv = sorted_pair
+            pos = np.searchsorted(sc, sids[0])
+            if pos < sc.size and sc[pos] == sids[0]:
+                cps[0] = sv[pos]
+
+    return {
+        "subject_passrates": subj_pr_kk,
+        "subject_masks": subj_mk_kk,
+        "subject_redact": np.array([float(subj_redact_full)], dtype=np.float32),
+        "family_passrates": fam_pr_kk,
+        "family_masks": fam_mk_kk,
+        "family_redact": np.array([float(fam_redact)], dtype=np.float32),
+        "macro_family_passrates": macro_pr_kk,
+        "macro_family_masks": macro_mk_kk,
+        "macro_family_redact": np.array([float(macro_redact)], dtype=np.float32),
+        "organization_passrates": org_pr_kk,
+        "organization_masks": org_mk_kk,
+        "organization_redact": np.array([float(org_redact)], dtype=np.float32),
+        "bench_match_passrates": bench_match_pr,
+        "bench_match_masks": bench_match_mk,
+        "bench_match_redact": bench_redact.astype(np.float32),
+        "neighbor_freshness_diff": fresh_diff,
+        "freshness_redact": fresh_redact.astype(np.float32),
+        "distinct_subj_per_neighbor": distinct_per_neighbor,
+        "cluster_passrate_subject_query": cps,
+        "cluster_redact": cluster_redact.astype(np.float32),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1079,21 +1503,99 @@ class _RuntimeMetaTower(nn.Module):
 
 
 class _RuntimeFactorizationMachineCross(nn.Module):
-    def __init__(self, subject_field_dims, benchmark_field_dims, d_fm: int):
+    """Runtime mirror of ``src.metadata_features.FactorizationMachineCross``.
+
+    Includes the (subject, benchmark) categorical field embeddings PLUS
+    optional numeric-field projections (one ``Linear(2 -> d_fm)`` per
+    numeric field per side). The numeric inputs are passed in as flat
+    ``(B, 2*N)`` tensors of interleaved ``[value, mask, ...]`` pairs;
+    we split them into per-field ``(B, 2)`` slices inside ``forward``
+    and feed each through its own projection. Constructor and
+    state_dict layout match the training class so checkpoints load
+    bit-identically.
+    """
+
+    def __init__(
+        self,
+        subject_field_dims,
+        benchmark_field_dims,
+        d_fm: int,
+        subject_num_field_count: int = 0,
+        bench_num_field_count: int = 0,
+    ):
         super().__init__()
         self.d_fm = int(d_fm)
-        self.subj_projs = nn.ModuleList([nn.Linear(int(d), self.d_fm) for d in subject_field_dims])
-        self.bench_projs = nn.ModuleList([nn.Linear(int(d), self.d_fm) for d in benchmark_field_dims])
+        self.subject_num_field_count = int(subject_num_field_count)
+        self.bench_num_field_count = int(bench_num_field_count)
+        self.subj_projs = nn.ModuleList(
+            [nn.Linear(int(d), self.d_fm) for d in subject_field_dims]
+        )
+        self.bench_projs = nn.ModuleList(
+            [nn.Linear(int(d), self.d_fm) for d in benchmark_field_dims]
+        )
+        self.subj_num_projs = nn.ModuleList(
+            [nn.Linear(2, self.d_fm) for _ in range(self.subject_num_field_count)]
+        )
+        self.bench_num_projs = nn.ModuleList(
+            [nn.Linear(2, self.d_fm) for _ in range(self.bench_num_field_count)]
+        )
         self.head = nn.Linear(self.d_fm, 1)
 
-    def forward(self, subj_field_embs, bench_field_embs):
+    @staticmethod
+    def _split_value_mask(flat, n_fields: int):
+        if flat is None or n_fields == 0:
+            return []
+        return [flat[:, 2 * j : 2 * j + 2] for j in range(n_fields)]
+
+    def forward(
+        self,
+        subj_field_embs,
+        bench_field_embs,
+        subj_num_features=None,
+        bench_num_features=None,
+    ):
         vs = []
         for proj, e in zip(self.subj_projs, subj_field_embs):
             vs.append(proj(e))
         for proj, e in zip(self.bench_projs, bench_field_embs):
             vs.append(proj(e))
+        n_num_subj_in = (
+            self.subject_num_field_count if subj_num_features is not None else 0
+        )
+        n_num_bench_in = (
+            self.bench_num_field_count if bench_num_features is not None else 0
+        )
+        if n_num_subj_in > 0:
+            for proj, vm in zip(
+                self.subj_num_projs,
+                self._split_value_mask(subj_num_features, n_num_subj_in),
+            ):
+                vs.append(proj(vm))
+        if n_num_bench_in > 0:
+            for proj, vm in zip(
+                self.bench_num_projs,
+                self._split_value_mask(bench_num_features, n_num_bench_in),
+            ):
+                vs.append(proj(vm))
         if not vs:
-            return torch.zeros((subj_field_embs[0].shape[0] if subj_field_embs else 0,), dtype=torch.float32)
+            bsz = (
+                subj_field_embs[0].shape[0]
+                if subj_field_embs
+                else (
+                    bench_field_embs[0].shape[0]
+                    if bench_field_embs
+                    else (
+                        subj_num_features.shape[0]
+                        if subj_num_features is not None
+                        else (
+                            bench_num_features.shape[0]
+                            if bench_num_features is not None
+                            else 0
+                        )
+                    )
+                )
+            )
+            return torch.zeros((bsz,), dtype=torch.float32)
         v = torch.stack(vs, dim=1)
         sum_v = v.sum(dim=1)
         sum_v_sq = (v * v).sum(dim=1)
@@ -1219,6 +1721,8 @@ class _MetaHybridIRTKFactorGatedMLP(_IRTItemBase):
             subject_field_dims=self.subject_cat_embs.dims,
             benchmark_field_dims=self.benchmark_cat_embs.dims,
             d_fm=int(cfg.get("meta_fm_dim", 16)),
+            subject_num_field_count=len(schema_sub_num),
+            bench_num_field_count=len(schema_bench_num),
         )
 
         sub_index = {c: i for i, c in enumerate(schema_sub_cat)}
@@ -1337,6 +1841,8 @@ class _MetaHybridIRTKFactorGatedMLP(_IRTItemBase):
             subject_field_dims=self.subject_cat_embs.dims,
             benchmark_field_dims=self.benchmark_cat_embs.dims,
             d_fm=int(cfg.get("meta_fm_dim", 16)),
+            subject_num_field_count=len(self._schema_sub_num),
+            bench_num_field_count=len(self._schema_bench_num),
         )
         sub_index = {c: i for i, c in enumerate(self._schema_sub_cat)}
         bench_index = {c: i for i, c in enumerate(self._schema_bench_cat)}
@@ -1420,7 +1926,12 @@ class _MetaHybridIRTKFactorGatedMLP(_IRTItemBase):
         a_meta, u_meta = self.subject_meta_tower(subj_tower_in)
         b_meta, _ = self.bench_meta_tower(bench_tower_in)
         if cfg.get("meta_include_fm_cross", True):
-            eta_fm = self.fm_cross(subj_field_embs, bench_field_embs)
+            eta_fm = self.fm_cross(
+                subj_field_embs,
+                bench_field_embs,
+                subj_num_features=meta["subj_num"],
+                bench_num_features=meta["bc_num"],
+            )
         else:
             eta_fm = torch.zeros_like(a_meta)
         if cfg.get("meta_include_explicit_crosses", True) and self.explicit_cross.tables:
@@ -2382,7 +2893,36 @@ class _TrainingItemCache:
         self.nn_passrate_mask: object | None = None
         self.nn_cfg: dict = {}
         self.subject_key_to_id: dict[str, int] = {}
-        self._nn_feat_cache: dict[tuple[int, str], np.ndarray] = {}
+        # Final 23-D feature cache keyed by (subject, item, query meta).
+        self._nn_feat_cache: dict[tuple, np.ndarray] = {}
+        # Per-item neighbor cache: ``item_cache_key -> (indices, sims)``.
+        # Multiple subjects evaluating the same cold-start item now share
+        # a single FAISS search instead of re-running it per subject. The
+        # neighbor structure is a function of the query embedding alone,
+        # so this is byte-identical across subjects.
+        self._neighbor_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # Cap to bound memory in long-running eval sessions: ~500 KB per
+        # entry at K=16 / int64 idx + float32 sims, so 50k items fit in
+        # ~25 GB tops; we evict oldest at this cap to stay polite.
+        self._neighbor_cache_cap: int = int(os.environ.get(
+            "RUNTIME_NEIGHBOR_CACHE_CAP", "100000"
+        ))
+        # Per-CSR-row sorted-index cache. The training-time aggregator
+        # rebuilds ``argsort(row_indices)`` on every lookup; for the
+        # NN passrate row that's done once per (subject_id) call which
+        # is fine, but for the conditional context we look up four
+        # subject-trait CSRs PLUS the item-side CSR PLUS the cluster-by-
+        # subject CSR for every predict(), and each row has dozens to
+        # thousands of entries. Caching the sorted view per (csr_id,
+        # row_id) cuts per-call work to a single binary search.
+        # Key: (id(csr), int(row)) -> (sorted_cols, sorted_vals_or_None).
+        self._csr_row_cache: dict[
+            tuple[int, int],
+            tuple[np.ndarray, np.ndarray | None],
+        ] = {}
+        self._csr_row_cache_cap: int = int(os.environ.get(
+            "RUNTIME_CSR_ROW_CACHE_CAP", "200000"
+        ))
         nn_pr_path = self.cache_dir / "subject_passrate.npz"
         nn_mask_path = self.cache_dir / "subject_passrate_mask.npz"
         nn_cfg_path = self.cache_dir / "nn_features_config.json"
@@ -2413,6 +2953,80 @@ class _TrainingItemCache:
             except Exception:
                 self.subject_key_to_id = {}
 
+        # Conditional NN-feature context (cells [15..22]). Loaded best-
+        # effort: if any file is missing the corresponding cell falls
+        # back to ``fallback_value`` via the aggregator's redaction
+        # path. We tolerate a partial bag (e.g. cluster files missing)
+        # to keep the runtime forward-compatible with smaller bundles.
+        self.cond_context_loaded: bool = False
+        self.cond_subject_passrate_csr = None
+        self.cond_subject_passrate_mask_csr = None
+        self.cond_family_passrate_csr = None
+        self.cond_family_passrate_mask_csr = None
+        self.cond_macro_family_passrate_csr = None
+        self.cond_macro_family_passrate_mask_csr = None
+        self.cond_organization_passrate_csr = None
+        self.cond_organization_passrate_mask_csr = None
+        self.cond_subject_to_family_id = None
+        self.cond_subject_to_macro_family_id = None
+        self.cond_subject_to_organization_id = None
+        self.cond_item_benchmark_id = None
+        self.cond_item_benchmark_age = None
+        self.cond_item_distinct_subj_count = None
+        self.cond_item_global_passrate = None
+        self.cond_item_global_passrate_mask = None
+        self.cond_item_cluster_id = None
+        self.cond_cluster_subject_passrate_csr = None
+        self.cond_cluster_subject_passrate_mask_csr = None
+        self.cond_bc_id_to_age = None
+        cond_meta_path = self.cache_dir / "conditional_meta.json"
+        if cond_meta_path.exists():
+            try:
+                from scipy import sparse as _sparse  # type: ignore
+
+                def _try_load_npz(name: str):
+                    p = self.cache_dir / name
+                    return _sparse.load_npz(p) if p.exists() else None
+
+                def _try_load_npy(name: str):
+                    p = self.cache_dir / name
+                    return np.load(p) if p.exists() else None
+
+                # Subject passrate is identical to nn_passrate above; reuse
+                # the loaded matrix to halve the memory footprint.
+                self.cond_subject_passrate_csr = (
+                    self.nn_passrate
+                    if self.nn_passrate is not None
+                    else _try_load_npz("subject_passrate.npz")
+                )
+                self.cond_subject_passrate_mask_csr = (
+                    self.nn_passrate_mask
+                    if self.nn_passrate_mask is not None
+                    else _try_load_npz("subject_passrate_mask.npz")
+                )
+                self.cond_family_passrate_csr = _try_load_npz("family_passrate.npz")
+                self.cond_family_passrate_mask_csr = _try_load_npz("family_passrate_mask.npz")
+                self.cond_macro_family_passrate_csr = _try_load_npz("macro_family_passrate.npz")
+                self.cond_macro_family_passrate_mask_csr = _try_load_npz("macro_family_passrate_mask.npz")
+                self.cond_organization_passrate_csr = _try_load_npz("organization_passrate.npz")
+                self.cond_organization_passrate_mask_csr = _try_load_npz("organization_passrate_mask.npz")
+                self.cond_subject_to_family_id = _try_load_npy("subject_to_family_id.npy")
+                self.cond_subject_to_macro_family_id = _try_load_npy("subject_to_macro_family_id.npy")
+                self.cond_subject_to_organization_id = _try_load_npy("subject_to_organization_id.npy")
+                self.cond_item_benchmark_id = _try_load_npy("item_benchmark_id.npy")
+                self.cond_item_benchmark_age = _try_load_npy("item_benchmark_age.npy")
+                self.cond_item_distinct_subj_count = _try_load_npy("item_distinct_subj_count.npy")
+                self.cond_item_global_passrate = _try_load_npy("item_global_passrate.npy")
+                self.cond_item_global_passrate_mask = _try_load_npy("item_global_passrate_mask.npy")
+                self.cond_item_cluster_id = _try_load_npy("item_cluster_id.npy")
+                self.cond_cluster_subject_passrate_csr = _try_load_npz("cluster_subject_passrate.npz")
+                self.cond_cluster_subject_passrate_mask_csr = _try_load_npz("cluster_subject_passrate_mask.npz")
+                self.cond_bc_id_to_age = _try_load_npy("bc_id_to_age.npy")
+                self.cond_context_loaded = True
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("Conditional NN context load failed: %s", exc)
+                self.cond_context_loaded = False
+
     def _ensure_index(self) -> None:
         if self._index is not None:
             return
@@ -2439,26 +3053,114 @@ class _TrainingItemCache:
             self._dequant_cache = self.embeddings_q.astype(np.float32) * self.scales[:, None]
         return self._dequant_cache
 
-    def nearest(self, query_embed: np.ndarray, k: int = 10) -> tuple[np.ndarray, np.ndarray]:
+    def nearest(
+        self,
+        query_embed: np.ndarray,
+        k: int = 10,
+        *,
+        item_cache_key: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return (indices, scores). Higher score = more similar (inner product).
 
         The query is the *raw* fp32/fp16 encoder output. We apply the same
         projection used at export time before lookup.
+
+        ``item_cache_key`` enables per-item neighbor memoization: when
+        provided AND we have a cached ``(idx, sims)`` for that key with
+        at least ``k`` neighbors, we slice-and-return without touching
+        FAISS. Cold-start items where many subjects ask about the same
+        item now run FAISS exactly once -- typical Codabench rounds
+        evaluate every subject against every item, so this cuts
+        per-round FAISS load by ``n_subjects``-fold (typical ~1000x).
         """
+        if item_cache_key is not None:
+            hit = self._neighbor_cache.get(item_cache_key)
+            if hit is not None and hit[0].shape[0] >= int(k):
+                return hit[0][: int(k)], hit[1][: int(k)]
+
         q = self.project(query_embed).reshape(1, -1)
         self._ensure_index()
+        kk = int(k)
+        idx_arr: np.ndarray
+        sim_arr: np.ndarray
         if self._index is not None:
             try:
-                D, I = self._index.search(np.ascontiguousarray(q, dtype=np.float32), int(k))
-                return I[0].astype(np.int64), D[0].astype(np.float32)
+                D, I = self._index.search(
+                    np.ascontiguousarray(q, dtype=np.float32), kk
+                )
+                idx_arr = I[0].astype(np.int64)
+                sim_arr = D[0].astype(np.float32)
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("FAISS search failed (%s); brute-force fallback", exc)
-        recon = self._dequantized()
-        sims = recon @ q[0]
-        kk = min(int(k), recon.shape[0])
-        topk = np.argpartition(-sims, kk - 1)[:kk] if kk < recon.shape[0] else np.arange(recon.shape[0])
-        order = np.argsort(-sims[topk])
-        return topk[order].astype(np.int64), sims[topk][order].astype(np.float32)
+                idx_arr = sim_arr = None  # type: ignore[assignment]
+        else:
+            idx_arr = sim_arr = None  # type: ignore[assignment]
+        if idx_arr is None or sim_arr is None:
+            recon = self._dequantized()
+            sims = recon @ q[0]
+            kk_eff = min(kk, recon.shape[0])
+            topk = (
+                np.argpartition(-sims, kk_eff - 1)[:kk_eff]
+                if kk_eff < recon.shape[0]
+                else np.arange(recon.shape[0])
+            )
+            order = np.argsort(-sims[topk])
+            idx_arr = topk[order].astype(np.int64)
+            sim_arr = sims[topk][order].astype(np.float32)
+
+        if item_cache_key is not None:
+            if len(self._neighbor_cache) >= self._neighbor_cache_cap:
+                # Evict an arbitrary entry; dict insertion order makes
+                # this approximate-FIFO at no extra bookkeeping cost.
+                try:
+                    self._neighbor_cache.pop(next(iter(self._neighbor_cache)))
+                except StopIteration:
+                    pass
+            self._neighbor_cache[item_cache_key] = (idx_arr, sim_arr)
+        return idx_arr, sim_arr
+
+    def _csr_row_sorted(
+        self, csr_obj, row_id: int, return_vals: bool
+    ) -> tuple[np.ndarray, np.ndarray | None] | None:
+        """Return (sorted_indices, sorted_data_or_None) for one CSR row.
+
+        Memoized by (id(csr_obj), row_id). Returns ``None`` when the row
+        has no entries so callers can skip the lookup. Caching the
+        argsort here is critical for cold-start latency: a single
+        ``compute_nn_features`` call performs five CSR row reads
+        (subject, family, macro_family, organization, cluster) and
+        re-running ``argsort`` per call costs ~tens of microseconds
+        per row -- non-trivial when scaled across thousands of
+        predict() calls.
+        """
+        if csr_obj is None:
+            return None
+        key = (id(csr_obj), int(row_id))
+        hit = self._csr_row_cache.get(key)
+        if hit is not None:
+            return hit
+        n_rows = csr_obj.shape[0]
+        if row_id < 0 or row_id >= n_rows:
+            return None
+        s = csr_obj.indptr[row_id]
+        e = csr_obj.indptr[row_id + 1]
+        cols = csr_obj.indices[s:e]
+        if cols.size == 0:
+            return (cols, None)
+        order = np.argsort(cols)
+        sorted_cols = cols[order].astype(np.int64, copy=False)
+        sorted_vals = (
+            csr_obj.data[s:e][order].astype(np.float32, copy=False)
+            if return_vals
+            else None
+        )
+        if len(self._csr_row_cache) >= self._csr_row_cache_cap:
+            try:
+                self._csr_row_cache.pop(next(iter(self._csr_row_cache)))
+            except StopIteration:
+                pass
+        self._csr_row_cache[key] = (sorted_cols, sorted_vals)
+        return self._csr_row_cache[key]
 
     def compute_nn_features(
         self,
@@ -2466,15 +3168,26 @@ class _TrainingItemCache:
         subject_id: int,
         *,
         k: int | None = None,
+        query_benchmark_id: int | None = None,
+        query_benchmark_age: float | None = None,
+        query_cluster_id: int | None = None,
+        subject_meta_redacted: bool = False,
+        item_cache_key: str | None = None,
     ) -> np.ndarray:
-        """Return the locked 8-scalar NN feature vector for a (subject, item).
+        """Return the locked NN feature vector for a (subject, item).
+
+        Conditional inputs (``query_benchmark_id`` etc.) drive cells
+        [15..22]; when the caller doesn't pass them OR when the
+        conditional cache isn't loaded, those cells fall back to
+        ``NN_FALLBACK_VALUE``.
 
         Steps:
         1. Apply the cache's PCA projection (no-op if PCA missing).
         2. Query the nearest neighbors via FAISS / brute-force.
         3. Look up per-(subject, neighbor) passrate + mask from the sparse
            matrices shipped with the cache.
-        4. Aggregate via the same ``_aggregate_nn_features`` helper used at
+        4. (Optional) Resolve the conditional context inputs.
+        5. Aggregate via the same ``_aggregate_nn_features`` helper used at
            training time (the function is copied verbatim into this file
            by ``src/export_submission.py``; if you change one, change both).
         """
@@ -2489,45 +3202,92 @@ class _TrainingItemCache:
         kk = int(k or NN_RUNTIME_K)
         if kk < 1:
             return np.zeros(dim, dtype=np.float32)
-        idx, sims = self.nearest(query_embed, k=kk)
+        idx, sims = self.nearest(
+            query_embed, k=kk, item_cache_key=item_cache_key
+        )
         if idx.size == 0:
             return np.zeros(dim, dtype=np.float32)
         n_rows = self.nn_passrate.shape[0]
         if subject_id >= n_rows:
             return np.zeros(dim, dtype=np.float32)
-        row_pr = self.nn_passrate.getrow(int(subject_id))
-        row_mk = self.nn_passrate_mask.getrow(int(subject_id))
         n_items = int(self.nn_passrate.shape[1])
         passrates = np.zeros(kk, dtype=np.float32)
         masks = np.zeros(kk, dtype=np.float32)
-        if row_pr.nnz > 0:
-            cols = row_pr.indices
-            vals = row_pr.data
-            order = np.argsort(cols)
-            sorted_cols = cols[order]
-            sorted_vals = vals[order]
-            valid_idx = np.clip(idx, 0, n_items - 1)
-            pos = np.searchsorted(sorted_cols, valid_idx)
-            pos_clipped = np.clip(pos, 0, sorted_cols.size - 1)
-            hit = (pos < sorted_cols.size) & (sorted_cols[pos_clipped] == valid_idx)
-            passrates = np.where(hit, sorted_vals[pos_clipped], 0.0).astype(
-                np.float32
-            )
-        if row_mk.nnz > 0:
-            mcols = row_mk.indices
-            order = np.argsort(mcols)
-            sorted_m = mcols[order]
-            valid_idx = np.clip(idx, 0, n_items - 1)
-            pos = np.searchsorted(sorted_m, valid_idx)
-            pos_clipped = np.clip(pos, 0, sorted_m.size - 1)
-            hit = (pos < sorted_m.size) & (sorted_m[pos_clipped] == valid_idx)
-            masks = hit.astype(np.float32)
+        # Sorted-row cache shared across calls: argsort happens once per
+        # (subject_id, csr_id) pair, not on every predict().
+        pr_row = self._csr_row_sorted(
+            self.nn_passrate, int(subject_id), return_vals=True
+        )
+        if pr_row is not None:
+            sorted_cols, sorted_vals = pr_row
+            if sorted_cols.size > 0 and sorted_vals is not None:
+                valid_idx = np.clip(idx, 0, n_items - 1)
+                pos = np.searchsorted(sorted_cols, valid_idx)
+                pos_clipped = np.clip(pos, 0, sorted_cols.size - 1)
+                hit = (pos < sorted_cols.size) & (
+                    sorted_cols[pos_clipped] == valid_idx
+                )
+                passrates = np.where(hit, sorted_vals[pos_clipped], 0.0).astype(
+                    np.float32
+                )
+        mk_row = self._csr_row_sorted(
+            self.nn_passrate_mask, int(subject_id), return_vals=False
+        )
+        if mk_row is not None:
+            sorted_m, _ = mk_row
+            if sorted_m.size > 0:
+                valid_idx = np.clip(idx, 0, n_items - 1)
+                pos = np.searchsorted(sorted_m, valid_idx)
+                pos_clipped = np.clip(pos, 0, sorted_m.size - 1)
+                hit = (pos < sorted_m.size) & (
+                    sorted_m[pos_clipped] == valid_idx
+                )
+                masks = hit.astype(np.float32)
+
+        # Resolve conditional cells [15..22]. If the conditional context
+        # isn't loaded OR the caller passed nothing, _resolve... returns
+        # an empty dict and the aggregator falls back per cell.
+        cond_inputs = {}
+        if self.cond_context_loaded:
+            try:
+                cond_inputs = _resolve_conditional_inputs_runtime(
+                    subject_id=int(subject_id),
+                    neighbor_idx=idx,
+                    query_benchmark_id=query_benchmark_id,
+                    query_benchmark_age=query_benchmark_age,
+                    query_cluster_id=query_cluster_id,
+                    subject_meta_redacted=bool(subject_meta_redacted),
+                    subject_passrate_csr=self.cond_subject_passrate_csr,
+                    subject_passrate_mask_csr=self.cond_subject_passrate_mask_csr,
+                    family_passrate_csr=self.cond_family_passrate_csr,
+                    family_passrate_mask_csr=self.cond_family_passrate_mask_csr,
+                    macro_family_passrate_csr=self.cond_macro_family_passrate_csr,
+                    macro_family_passrate_mask_csr=self.cond_macro_family_passrate_mask_csr,
+                    organization_passrate_csr=self.cond_organization_passrate_csr,
+                    organization_passrate_mask_csr=self.cond_organization_passrate_mask_csr,
+                    subject_to_family_id=self.cond_subject_to_family_id,
+                    subject_to_macro_family_id=self.cond_subject_to_macro_family_id,
+                    subject_to_organization_id=self.cond_subject_to_organization_id,
+                    item_benchmark_id=self.cond_item_benchmark_id,
+                    item_benchmark_age=self.cond_item_benchmark_age,
+                    item_distinct_subj_count=self.cond_item_distinct_subj_count,
+                    item_global_passrate=self.cond_item_global_passrate,
+                    item_global_passrate_mask=self.cond_item_global_passrate_mask,
+                    cluster_subject_passrate_csr=self.cond_cluster_subject_passrate_csr,
+                    cluster_subject_passrate_mask_csr=self.cond_cluster_subject_passrate_mask_csr,
+                    row_lookup=self._csr_row_sorted,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("conditional NN resolver failed (%s); falling back", exc)
+                cond_inputs = {}
+
         feats = _aggregate_nn_features(
             passrates,
             masks,
             sims.astype(np.float32),
             fallback_value=NN_FALLBACK_VALUE,
             top1_missing_sentinel=NN_TOP1_MISSING_SENTINEL,
+            cond_inputs=cond_inputs,
         )
         return feats.reshape(-1)[:dim].astype(np.float32, copy=False)
 
@@ -3678,14 +4438,22 @@ def _assign_cluster_id(item_emb: np.ndarray) -> int:
 
 
 def _get_nn_features(
-    subject_id: int, item_emb: np.ndarray, item_cache_key: str
+    subject_id: int,
+    item_emb: np.ndarray,
+    item_cache_key: str,
+    *,
+    query_benchmark_id: int | None = None,
+    query_benchmark_age: float | None = None,
+    query_cluster_id: int | None = None,
+    subject_meta_redacted: bool = False,
 ) -> np.ndarray:
-    """Return the locked 8-scalar NN feature vector for this (subject, item).
+    """Return the locked NN feature vector for this (subject, item).
 
-    Caches results by ``(subject_id, item_cache_key)`` so the same pair is
-    only computed once per round. Falls back to zeros if NN features were
-    not declared at training time, the cache failed to load, or the subject
-    is unseen at runtime (mirrors how the trainer handles UNK subjects).
+    Caches results by ``(subject_id, item_cache_key, bc_id, cid, age,
+    subj_redact)`` so the same pair is only computed once per round.
+    Falls back to zeros if NN features were not declared at training
+    time, the cache failed to load, or the subject is unseen at runtime
+    (mirrors how the trainer handles UNK subjects).
     """
     if not _MODEL_CFG.get("use_nn_features"):
         return np.zeros(0, dtype=np.float32)
@@ -3697,7 +4465,19 @@ def _get_nn_features(
     if subject_id is None or int(subject_id) < 0:
         return np.zeros(dim, dtype=np.float32)
     cache = TRAINING_CACHE._nn_feat_cache
-    key = (int(subject_id), str(item_cache_key))
+    age_key = (
+        round(float(query_benchmark_age), 4)
+        if (query_benchmark_age is not None and not (isinstance(query_benchmark_age, float) and np.isnan(query_benchmark_age)))
+        else None
+    )
+    key = (
+        int(subject_id),
+        str(item_cache_key),
+        int(query_benchmark_id) if query_benchmark_id is not None else None,
+        int(query_cluster_id) if query_cluster_id is not None else None,
+        age_key,
+        bool(subject_meta_redacted),
+    )
     hit = cache.get(key)
     if hit is not None:
         return hit
@@ -3706,6 +4486,11 @@ def _get_nn_features(
             query_embed=item_emb,
             subject_id=int(subject_id),
             k=NN_RUNTIME_K,
+            query_benchmark_id=query_benchmark_id,
+            query_benchmark_age=query_benchmark_age,
+            query_cluster_id=query_cluster_id,
+            subject_meta_redacted=bool(subject_meta_redacted),
+            item_cache_key=str(item_cache_key),
         )
     except Exception:
         LOG.exception("TRAINING_CACHE.compute_nn_features failed; returning zeros")
@@ -3789,7 +4574,40 @@ def _predict_uncalibrated(
         subject_nn_id = int(TRAINING_CACHE.subject_key_to_id.get(subject_key, -1))
     elif s_id > 0:
         subject_nn_id = int(s_id)
-    nn_vec = _get_nn_features(subject_nn_id, item_emb, item_cache_key)
+
+    # Resolve query metadata for the conditional NN-feature cells [15..22].
+    # Each value is None / NaN / -1 when the corresponding metadata is
+    # unavailable; the resolver inside ``compute_nn_features`` then
+    # redacts the relevant cell to ``NN_FALLBACK_VALUE``.
+    cond_query_bench_id = int(bc_id) if (bc_id is not None and bc_id > 0) else -1
+    # Cluster id from ``_assign_cluster_id`` is 1-indexed (0 = UNK);
+    # the conditional context uses 0-indexed cluster ids, so we drop
+    # back to -1 when UNK and otherwise subtract 1.
+    cond_query_cluster_id = (cluster_id - 1) if cluster_id > 0 else -1
+    cond_subject_meta_redacted = bool(
+        _MODEL_CFG.get("force_subject_missing")
+        or False
+    )
+    if (
+        TRAINING_CACHE is not None
+        and getattr(TRAINING_CACHE, "cond_bc_id_to_age", None) is not None
+        and bc_id is not None
+        and 0 <= int(bc_id) < int(TRAINING_CACHE.cond_bc_id_to_age.shape[0])
+    ):
+        v = float(TRAINING_CACHE.cond_bc_id_to_age[int(bc_id)])
+        cond_query_bench_age = v if not math.isnan(v) else None
+    else:
+        cond_query_bench_age = None
+
+    nn_vec = _get_nn_features(
+        subject_nn_id,
+        item_emb,
+        item_cache_key,
+        query_benchmark_id=cond_query_bench_id,
+        query_benchmark_age=cond_query_bench_age,
+        query_cluster_id=cond_query_cluster_id,
+        subject_meta_redacted=cond_subject_meta_redacted,
+    )
 
     ie = torch.from_numpy(item_emb).to(_DEVICE).unsqueeze(0)
     se = torch.from_numpy(subject_emb).to(_DEVICE).unsqueeze(0) if subject_emb.size > 0 else None
@@ -4834,7 +5652,7 @@ def export_run(
             ),
             "feature_dim": int(
                 (nn_features_cfg or {}).get(
-                    "feature_dim", ckpt_nn_feature_dim or 8
+                    "feature_dim", ckpt_nn_feature_dim or 15
                 )
             ),
             "fallback_value": float(
@@ -5003,6 +5821,8 @@ def bundle_training_cache(
     train_df=None,
     nn_features_cfg: Mapping | None = None,
     subject_to_id: Mapping[str, int] | None = None,
+    conditional_context: object | None = None,
+    bc_id_to_age: object | None = None,
 ) -> CacheExportResult:
     """Build the int8 / PCA / FAISS training-item cache.
 
@@ -5062,6 +5882,8 @@ def bundle_training_cache(
         train_df=train_df,
         nn_features_cfg=nn_cfg_for_export,
         subject_to_id=subject_to_id,
+        conditional_context=conditional_context,
+        bc_id_to_age=bc_id_to_age,
     )
     if result.failed:
         raise RuntimeError(result.error or "submission cache export failed")
@@ -5573,7 +6395,7 @@ def export_ensemble_run(
             "similarity": str((nn_features_cfg or {}).get("similarity", "cosine")),
             "feature_dim": int(
                 (nn_features_cfg or {}).get(
-                    "feature_dim", ckpt_nn_feature_dim or 8
+                    "feature_dim", ckpt_nn_feature_dim or 15
                 )
             ),
             "fallback_value": float(

@@ -134,7 +134,7 @@ class ModelConfig:
     # not user-tunable. See ``src.nn_features._aggregate_nn_features`` for
     # the exact ordering.
     use_nn_features: bool = False
-    nn_feature_dim: int = 8
+    nn_feature_dim: int = 15
 
     # --- Structured-metadata features (subject + benchmark-condition) ---
     # When True, the model gains two metadata MLP "towers", a
@@ -1603,13 +1603,18 @@ class MetaHybridIRTKFactorGatedMLP(nn.Module):
             num_layers=cfg.meta_tower_num_layers,
         )
 
-        # Factorization-machine cross head over the per-field embedding
-        # bag. Uses one ``Linear(d_field -> d_fm)`` per field on each
-        # side.
+        # Factorization-machine cross head over every metadata trait
+        # (categorical + numeric on both sides). Each numeric field is
+        # encoded as the ``(value, mask)`` pair via a per-field
+        # ``Linear(2 -> d_fm)`` projection, so the FM bag covers every
+        # pairwise interaction including subject_cat x bench_num,
+        # subject_num x bench_cat, and subject_num x bench_num.
         self.fm_cross = FactorizationMachineCross(
             subject_field_dims=self.subject_cat_embs.dims,
             benchmark_field_dims=self.benchmark_cat_embs.dims,
             d_fm=cfg.meta_fm_dim,
+            subject_num_field_count=len(schema.subject_numeric),
+            bench_num_field_count=len(schema.benchmark_numeric),
         )
 
         # Explicit per-pair cross embeddings (one table per named cross).
@@ -1788,6 +1793,8 @@ class MetaHybridIRTKFactorGatedMLP(nn.Module):
             subject_field_dims=self.subject_cat_embs.dims,
             benchmark_field_dims=self.benchmark_cat_embs.dims,
             d_fm=cfg.meta_fm_dim,
+            subject_num_field_count=len(schema.subject_numeric),
+            bench_num_field_count=len(schema.benchmark_numeric),
         )
         self.explicit_cross = ExplicitCrossEmbeddings(
             crosses=tuple(cfg.meta_explicit_crosses),
@@ -1910,9 +1917,18 @@ class MetaHybridIRTKFactorGatedMLP(nn.Module):
         a_meta, u_meta = self.subject_meta_tower(subj_tower_in)
         b_meta, _bench_vec_unused = self.bench_meta_tower(bench_tower_in)
 
-        # FM cross (over the per-field embedding lists)
+        # FM cross over every metadata trait: per-field categorical
+        # embeddings on both sides PLUS the (value, mask) numeric pairs
+        # on both sides. Passing ``subj_num`` / ``bc_num`` lets the FM
+        # head compute pairwise interactions that involve numerics
+        # (cat x num, num x cat, num x num) -- not just cat x cat.
         if cfg.meta_include_fm_cross:
-            eta_fm = self.fm_cross(subj_field_embs, bench_field_embs)
+            eta_fm = self.fm_cross(
+                subj_field_embs,
+                bench_field_embs,
+                subj_num_features=meta["subj_num"],
+                bench_num_features=meta["bc_num"],
+            )
         else:
             eta_fm = torch.zeros_like(a_meta)
         # Explicit crosses
