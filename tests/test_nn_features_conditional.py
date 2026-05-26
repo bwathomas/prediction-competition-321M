@@ -486,3 +486,98 @@ def test_resolve_with_none_context_returns_empty_dict() -> None:
         subject_meta_redacted=None,
     )
     assert out == {}
+
+
+# ---------------------------------------------------------------------------
+# Defensive auto-grow when callers under-declare cardinalities
+#
+# Real-world failure mode: the notebook reads ``CFG["clustering"]["k"]``
+# but the upstream FAISS pipeline used a different K, so the cluster
+# IDs in ``item_cluster_id`` exceed the declared ``n_clusters``. The
+# same risk applies to trait IDs when a subject's encoded family /
+# macro_family / organization id slips above ``vocab.n_tokens``.
+# ``build_conditional_passrate_context`` must not raise -- it auto-grows
+# the matrix dimension and records the effective cardinality.
+# ---------------------------------------------------------------------------
+
+
+def _build_ctx_with_overrides(
+    *,
+    s2fam: np.ndarray | None = None,
+    s2macro: np.ndarray | None = None,
+    s2org: np.ndarray | None = None,
+    item_cluster_id: np.ndarray | None = None,
+    n_families: int = 3,
+    n_macro_families: int = 3,
+    n_organizations: int = 3,
+    n_clusters: int = 2,
+):
+    df = pd.DataFrame(
+        {
+            "subject_key": ["s0", "s0", "s1", "s1", "s2"],
+            "item_key":    ["i0", "i1", "i0", "i2", "i3"],
+            "label":       [1.0, 0.0, 0.5, 1.0, 0.0],
+        }
+    )
+    return build_conditional_passrate_context(
+        train_df=df,
+        item_index_map={"i0": 0, "i1": 1, "i2": 2, "i3": 3},
+        subject_index_map={"s0": 0, "s1": 1, "s2": 2},
+        subject_to_family_id=s2fam if s2fam is not None else np.array([1, 1, 2], dtype=np.int32),
+        subject_to_macro_family_id=s2macro if s2macro is not None else np.array([1, 1, 2], dtype=np.int32),
+        subject_to_organization_id=s2org if s2org is not None else np.array([1, 2, 2], dtype=np.int32),
+        item_benchmark_id=np.array([10, 10, 20, 20], dtype=np.int32),
+        item_benchmark_age=np.array([2.0, 3.0, 4.0, 5.0], dtype=np.float32),
+        item_cluster_id=item_cluster_id if item_cluster_id is not None else np.array([0, 0, 1, 1], dtype=np.int32),
+        n_families=n_families,
+        n_macro_families=n_macro_families,
+        n_organizations=n_organizations,
+        n_clusters=n_clusters,
+    )
+
+
+def test_context_builder_auto_grows_n_clusters_when_undersized() -> None:
+    """Reproduces the Codabench Colab failure: cluster ids reach 7 but
+    caller declared n_clusters=4. Builder must auto-grow, not raise."""
+    item_cluster_id = np.array([0, 3, 7, 5], dtype=np.int32)
+    ctx = _build_ctx_with_overrides(
+        item_cluster_id=item_cluster_id, n_clusters=4
+    )
+    ctx.assert_shapes()
+    assert ctx.cluster_subject_passrate_csr.shape[0] == 8, (
+        "expected matrix to grow to max_id+1 = 8, got "
+        f"{ctx.cluster_subject_passrate_csr.shape[0]}"
+    )
+    assert ctx.n_clusters == 8
+
+
+def test_context_builder_auto_grows_n_families_when_undersized() -> None:
+    """Same defensive path for trait cardinalities -- if a subject's
+    family id is above the declared vocab size, the matrix grows
+    rather than COO-asserting."""
+    s2fam = np.array([1, 5, 9], dtype=np.int32)  # max id 9, declared 3
+    ctx = _build_ctx_with_overrides(s2fam=s2fam, n_families=3)
+    ctx.assert_shapes()
+    assert ctx.family_passrate_csr.shape[0] == 10
+    assert ctx.n_families == 10
+
+
+def test_context_builder_keeps_declared_when_oversized() -> None:
+    """If the declared cardinality is already large enough, we honor it
+    so the CSR row count stays predictable for downstream consumers."""
+    ctx = _build_ctx_with_overrides(n_families=50, n_clusters=64)
+    assert ctx.family_passrate_csr.shape[0] == 50
+    assert ctx.cluster_subject_passrate_csr.shape[0] == 64
+    assert ctx.n_families == 50
+    assert ctx.n_clusters == 64
+
+
+def test_context_builder_handles_all_unassigned_clusters() -> None:
+    """If every train item has cluster_id == -1 we still get an empty
+    matrix sized to the declared (or default) n_clusters."""
+    item_cluster_id = np.full(4, -1, dtype=np.int32)
+    ctx = _build_ctx_with_overrides(
+        item_cluster_id=item_cluster_id, n_clusters=4
+    )
+    assert ctx.cluster_subject_passrate_csr.shape == (4, 3)
+    assert ctx.cluster_subject_passrate_csr.nnz == 0

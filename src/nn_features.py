@@ -1209,6 +1209,32 @@ def build_conditional_passrate_context(
     macro_ids = subject_to_macro_family_id[subj_ids]
     org_ids = subject_to_organization_id[subj_ids]
 
+    # Auto-grow trait cardinalities so an off-by-one in the caller's
+    # vocabulary count never blows up the COO assembly. The shipped
+    # context records the *effective* cardinality so the runtime sees a
+    # consistent shape.
+    def _effective_card(ids: np.ndarray, declared: int, *, name: str) -> int:
+        actual = int(ids.max()) + 1 if ids.size else 0
+        eff = max(int(declared), actual)
+        if actual > int(declared):
+            LOG.warning(
+                "build_conditional_passrate_context: %s cardinality "
+                "auto-grown from %d -> %d (max id observed: %d)",
+                name,
+                int(declared),
+                eff,
+                actual - 1,
+            )
+        return max(eff, 1)
+
+    n_families_eff = _effective_card(fam_ids, n_families, name="n_families")
+    n_macro_families_eff = _effective_card(
+        macro_ids, n_macro_families, name="n_macro_families"
+    )
+    n_organizations_eff = _effective_card(
+        org_ids, n_organizations, name="n_organizations"
+    )
+
     def _build_csr(
         rows: np.ndarray,
         n_rows: int,
@@ -1246,9 +1272,9 @@ def build_conditional_passrate_context(
         return pr, mk
 
     subj_pr, subj_mk = _build_csr(subj_ids, max(n_subjects, 1), skip_missing_row=False)
-    fam_pr, fam_mk = _build_csr(fam_ids, max(int(n_families), 1), skip_missing_row=True)
-    macro_pr, macro_mk = _build_csr(macro_ids, max(int(n_macro_families), 1), skip_missing_row=True)
-    org_pr, org_mk = _build_csr(org_ids, max(int(n_organizations), 1), skip_missing_row=True)
+    fam_pr, fam_mk = _build_csr(fam_ids, n_families_eff, skip_missing_row=True)
+    macro_pr, macro_mk = _build_csr(macro_ids, n_macro_families_eff, skip_missing_row=True)
+    org_pr, org_mk = _build_csr(org_ids, n_organizations_eff, skip_missing_row=True)
 
     # Per-item global passrate + observation mask. Mean label across
     # every training (subject, item) row regardless of subject trait.
@@ -1279,25 +1305,39 @@ def build_conditional_passrate_context(
             item_distinct[int(ridx)] = int(v)
 
     # Cluster-by-subject passrate. Aggregate (cluster_id, subject_id)
-    # mean labels across the train rows.
+    # mean labels across the train rows. We auto-grow ``n_clusters`` if
+    # the actual cluster IDs ever exceed the declared cardinality (which
+    # can happen when ``CFG["clustering"]["k"]`` and the upstream FAISS
+    # k-means K disagree).
+    n_clusters_eff = max(int(n_clusters), 1)
     if df.empty or n_clusters <= 0:
         cluster_pr = sparse.csr_matrix(
-            (max(int(n_clusters), 1), n_subjects), dtype=np.float32
+            (n_clusters_eff, n_subjects), dtype=np.float32
         )
         cluster_mk = cluster_pr.copy()
     else:
-        # cluster id of each row's item.
         cl_for_row = item_cluster_id[item_ids]
         keep = cl_for_row >= 0
         if not keep.any():
             cluster_pr = sparse.csr_matrix(
-                (int(n_clusters), n_subjects), dtype=np.float32
+                (n_clusters_eff, n_subjects), dtype=np.float32
             )
             cluster_mk = cluster_pr.copy()
         else:
+            cl_kept = cl_for_row[keep]
+            actual_cl = int(cl_kept.max()) + 1
+            if actual_cl > n_clusters_eff:
+                LOG.warning(
+                    "build_conditional_passrate_context: n_clusters auto-grown "
+                    "from %d -> %d (max cluster id observed: %d)",
+                    n_clusters_eff,
+                    actual_cl,
+                    actual_cl - 1,
+                )
+                n_clusters_eff = actual_cl
             cdf = pd.DataFrame(
                 {
-                    "row": cl_for_row[keep],
+                    "row": cl_kept,
                     "col": subj_ids[keep],
                     "y": labels[keep],
                 }
@@ -1308,12 +1348,12 @@ def build_conditional_passrate_context(
             vs = agg["y"].astype(np.float32).to_numpy()
             cluster_pr = sparse.csr_matrix(
                 (vs, (rs, cs)),
-                shape=(int(n_clusters), n_subjects),
+                shape=(n_clusters_eff, n_subjects),
                 dtype=np.float32,
             )
             cluster_mk = sparse.csr_matrix(
                 (np.ones_like(vs, dtype=np.float32), (rs, cs)),
-                shape=(int(n_clusters), n_subjects),
+                shape=(n_clusters_eff, n_subjects),
                 dtype=np.float32,
             )
 
@@ -1346,10 +1386,10 @@ def build_conditional_passrate_context(
         cluster_subject_passrate_mask_csr=cluster_mk,
         n_subjects=int(n_subjects),
         n_items=int(n_items),
-        n_families=int(n_families),
-        n_macro_families=int(n_macro_families),
-        n_organizations=int(n_organizations),
-        n_clusters=int(n_clusters),
+        n_families=int(n_families_eff),
+        n_macro_families=int(n_macro_families_eff),
+        n_organizations=int(n_organizations_eff),
+        n_clusters=int(n_clusters_eff),
     )
 
 
