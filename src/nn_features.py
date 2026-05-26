@@ -1799,6 +1799,57 @@ def compute_nn_features(
     )
 
 
+def conditional_redaction_diagnostics(
+    cond_inputs: Mapping[str, np.ndarray] | None,
+    *,
+    n_rows: int,
+) -> dict[str, int | dict[str, int]]:
+    """Honest per-cell redaction counts for the 23-cell NN feature schema.
+
+    Reads the redaction MASKS produced by :func:`_resolve_conditional_inputs`
+    and returns a dict that the caller can use as a diagnostic. This is the
+    correct way to answer "how often did cell X go to fallback?" -- the
+    naive '|x - fallback_value| <= eps' check confounds *legitimate* zeros
+    with redactions, especially for ``neighbor_freshness_diff`` whose
+    ``q_age - mean(neighbor_age)`` is exactly 0 whenever the query and
+    its neighbors share the same (z-scored) benchmark date.
+
+    Returns a dict with:
+        ``n_rows``: total rows aggregated.
+        ``per_cell``: mapping of NN_FEATURE_NAMES[i] -> redact count for
+            cells [15..22]. Cells 0..14 are not redacted (they're the
+            legacy + self-derived NN aggregates that always have a
+            value). Cell 21 (``n_distinct_subjects_in_neighborhood``)
+            has no redaction by design (per-item stat).
+
+    A None / empty ``cond_inputs`` (no conditional context) returns
+    ``per_cell`` with every redactable cell at ``n_rows`` (everything
+    falls back).
+    """
+    REDACTABLE = (
+        ("passrate_subject_conditional", "subject_redact"),
+        ("passrate_family_conditional", "family_redact"),
+        ("passrate_macro_family_conditional", "macro_family_redact"),
+        ("passrate_organization_conditional", "organization_redact"),
+        ("passrate_benchmark_conditional", "bench_match_redact"),
+        ("neighbor_freshness_diff", "freshness_redact"),
+        ("cluster_passrate_subject_query", "cluster_redact"),
+    )
+    out: dict[str, int] = {}
+    if not cond_inputs:
+        for cell_name, _ in REDACTABLE:
+            out[cell_name] = int(n_rows)
+        return {"n_rows": int(n_rows), "per_cell": out}
+    for cell_name, mask_key in REDACTABLE:
+        m = cond_inputs.get(mask_key)
+        if m is None:
+            out[cell_name] = int(n_rows)
+        else:
+            arr = np.asarray(m).reshape(-1)
+            out[cell_name] = int((arr > 0).sum())
+    return {"n_rows": int(n_rows), "per_cell": out}
+
+
 def compute_nn_features_streaming(
     *,
     query_item_keys: list[str],
@@ -1815,7 +1866,8 @@ def compute_nn_features_streaming(
     query_benchmark_age: np.ndarray | None = None,
     query_cluster_ids: np.ndarray | None = None,
     subject_meta_redacted: np.ndarray | None = None,
-) -> np.ndarray:
+    return_diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict]:
     """Memory-bounded equivalent of :func:`compute_nn_features`.
 
     Produces a bit-identical ``[B, NN_FEATURE_DIM]`` matrix to
@@ -1914,7 +1966,7 @@ def compute_nn_features_streaming(
         query_cluster_ids=query_cluster_ids,
         subject_meta_redacted=subject_meta_redacted,
     )
-    return _aggregate_nn_features(
+    feats = _aggregate_nn_features(
         passrates,
         masks,
         sims,
@@ -1922,6 +1974,39 @@ def compute_nn_features_streaming(
         top1_missing_sentinel=float(cfg.top1_missing_sentinel),
         cond_inputs=cond_inputs,
     )
+    if return_diagnostics:
+        # Aggregate honest redaction counts from the cond_inputs masks
+        # (NOT from naive '|x - fallback_value| <= eps' which confounds
+        # legitimate zeros with redactions). Also surface the n_known
+        # neighbor counts for ``neighbor_freshness_diff`` so the caller
+        # can localize whether missing-data lives on the query side or
+        # the neighbor side.
+        diag = conditional_redaction_diagnostics(
+            cond_inputs, n_rows=int(feats.shape[0])
+        )
+        if conditional_context is not None and query_benchmark_age is not None:
+            n_items = int(conditional_context.n_items)
+            nages = conditional_context.item_benchmark_age[
+                np.clip(neighbor_idx, 0, max(n_items - 1, 0))
+            ]
+            n_known_neighbors = (~np.isnan(nages)).sum(axis=1)
+            q_age = np.asarray(query_benchmark_age, dtype=np.float32).reshape(-1)
+            diag["freshness"] = {
+                "n_query_age_known": int(np.isfinite(q_age).sum()),
+                "n_query_total": int(q_age.shape[0]),
+                "mean_n_known_neighbors_per_row": float(n_known_neighbors.mean()),
+                "frac_rows_with_zero_known_neighbors": float(
+                    (n_known_neighbors == 0).mean()
+                ),
+                "n_train_items_with_known_age": int(
+                    np.isfinite(conditional_context.item_benchmark_age).sum()
+                ),
+                "n_train_items_total": int(
+                    conditional_context.item_benchmark_age.shape[0]
+                ),
+            }
+        return feats, diag
+    return feats
 
 
 __all__ = [
@@ -1939,4 +2024,5 @@ __all__ = [
     "build_conditional_passrate_context",
     "compute_nn_features",
     "compute_nn_features_streaming",
+    "conditional_redaction_diagnostics",
 ]

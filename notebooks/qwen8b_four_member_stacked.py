@@ -1305,8 +1305,21 @@ print(
 # Recompute NN matrices WITH the conditional context. We reuse the
 # already-built ``nn_index`` and ``nn_passrate_csr`` so this is a single
 # additional FAISS pass plus the in-memory conditional lookups (cheap).
+#
+# We pass ``return_diagnostics=True`` for the train side so the cell
+# below can print HONEST per-cell redaction counts. The previous
+# heuristic (``np.abs(nn_train_mat[:, i] - fallback_value) <= 1e-9``)
+# silently confounds:
+#   - genuine redaction (the cell's redact MASK was 1), with
+#   - legitimate exact-zero output (e.g. ``q_age == mean(neighbor_age)``
+#     when the query and its neighbors share a benchmark date -- very
+#     common for ``neighbor_freshness_diff``).
+# That's why ``neighbor_freshness_diff`` looked like 83% fallback when
+# the underlying redaction rate may be much smaller. ``return_diagnostics``
+# reads the redaction MASKS directly off ``_resolve_conditional_inputs``
+# and surfaces them as honest counts.
 _log_ram("before compute_nn_features_streaming(train, with cond context)")
-nn_train_mat = compute_nn_features_streaming(
+nn_train_mat, nn_train_diag = compute_nn_features_streaming(
     query_item_keys=train_keys_for_nn,
     item_emb_lookup=item_emb_lookup,
     subject_ids=train_sid,
@@ -1317,6 +1330,7 @@ nn_train_mat = compute_nn_features_streaming(
     exclude_self=True,
     query_chunk_size=NN_QUERY_CHUNK,
     conditional_context=cond_context,
+    return_diagnostics=True,
     **_train_qmeta,
 )
 gc.collect()
@@ -1341,16 +1355,54 @@ print(
     f"train={nn_train_mat.shape}  val={nn_val_mat.shape}"
 )
 
-# Diagnostic: how often does each conditional cell go to fallback at
-# training time? (This proxies how often the corresponding redaction
-# / missing-data path fires; values close to 1.0 mean the cell is mostly
-# noise on this split and should be considered for removal.)
+# Honest per-cell redaction diagnostic (reads the per-row redaction MASK
+# from `_resolve_conditional_inputs`, NOT the post-aggregation cell
+# value). For comparison we also keep the old "value matches fallback"
+# count so it's obvious when the two diverge -- a divergence like
+#   redact=0.04, value-at-fb=0.83
+# means the cell is genuinely well-covered but its valid output happens
+# to land at exactly 0 a lot (this is the freshness_diff case: many
+# items share a z-scored benchmark date, so q_age - mean(neighbor_age)
+# is exactly 0).
 _FB = float(nn_cfg.fallback_value)
+_total_train = int(nn_train_diag["n_rows"])
+print("Honest redaction diagnostic (cells [15..22]):")
+print(
+    f"  {'cell':40s}  {'redact_frac':>11s}  {'value-at-fb_frac':>17s}  notes"
+)
 for _i, _name in enumerate(NN_FEATURE_NAMES):
     if _i < 15:
         continue
-    _frac = float(np.mean(np.abs(nn_train_mat[:, _i] - _FB) <= 1e-9))
-    print(f"  cell[{_i:2d}] {_name:40s} fallback_frac={_frac:.3f}")
+    _value_at_fb = float(np.mean(np.abs(nn_train_mat[:, _i] - _FB) <= 1e-9))
+    _redact_count = nn_train_diag["per_cell"].get(_name, None)
+    if _redact_count is None:
+        _redact_str = "N/A (no mask)"
+    else:
+        _redact_str = f"{_redact_count / max(_total_train, 1):.3f}"
+    _notes = ""
+    if _redact_count is not None and _value_at_fb > _redact_count / max(_total_train, 1) + 0.05:
+        _notes = " <- value hits fb more often than redaction (legitimate zeros)"
+    print(
+        f"  cell[{_i:2d}] {_name:34s}  {_redact_str:>11s}  {_value_at_fb:>17.3f}{_notes}"
+    )
+
+# Localize freshness redactions: query-side vs neighbor-side. With z-
+# scored ages, exact-zero outputs are common and don't mean the feature
+# is broken; the numbers below tell us whether genuine missingness is
+# small (then the feature is fine, just noisy) or large (then we have
+# a coverage gap to chase).
+if "freshness" in nn_train_diag:
+    fr = nn_train_diag["freshness"]
+    print(
+        "  freshness localizer: "
+        f"q_age_known={fr['n_query_age_known']}/{fr['n_query_total']} "
+        f"({fr['n_query_age_known'] / max(fr['n_query_total'], 1):.3f}); "
+        f"item_age_known={fr['n_train_items_with_known_age']}/"
+        f"{fr['n_train_items_total']} "
+        f"({fr['n_train_items_with_known_age'] / max(fr['n_train_items_total'], 1):.3f}); "
+        f"mean_n_known_neighbors_per_row={fr['mean_n_known_neighbors_per_row']:.2f}; "
+        f"frac_rows_with_zero_known_neighbors={fr['frac_rows_with_zero_known_neighbors']:.3f}"
+    )
 
 # Free intermediates that we no longer need before allocating the
 # heavy datasets. Tolerant of cell re-runs (the names may already be
