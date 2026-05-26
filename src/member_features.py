@@ -163,6 +163,26 @@ class MemberFeatureSchema:
     # the condition-one-hot block. Index 0 is reserved for UNK.
     condition_to_col: dict[str, int]
 
+    # ---- BC block (optional, schema_version >= 2) ----
+    #
+    # When ``k_bc_factors > 0`` the dense vector ends with three
+    # bc-derived blocks. ``u_bc`` is the IRT-MLP per-bc factor
+    # (analog of ``u_s``), and the two cross-term blocks give the
+    # linear logreg member access to the (theta_s * u_s) and
+    # (theta_s * u_bc) products that the IRT model multiplies
+    # internally. Without those crosses the linear member can only
+    # see the marginals -- it is structurally unable to represent
+    # "subject_s is good at items they normally get right" without
+    # a polynomial expansion.
+    #
+    # When ``k_bc_factors == 0`` all offsets/sizes below are 0 and
+    # the schema reduces to the legacy layout (matches every existing
+    # serialized cache).
+    k_bc_factors: int = 0
+    offset_u_bc: int = 0
+    offset_cross_theta_u_s: int = 0
+    offset_cross_theta_u_bc: int = 0
+
     @classmethod
     def fit(
         cls,
@@ -179,6 +199,7 @@ class MemberFeatureSchema:
         train_conditions: Iterable[object],
         min_condition_count: int = 1,
         centroid_dist_names: Sequence[str] | None = None,
+        k_bc_factors: int = 0,
     ) -> "MemberFeatureSchema":
         """Build the schema from training-time statistics.
 
@@ -321,6 +342,22 @@ class MemberFeatureSchema:
         for col in range(n_condition_one_hot):
             names.append(f"cond__{cond_by_col[col]}")
 
+        # ---- Optional bc block (u_bc, cross_theta_u_s, cross_theta_u_bc) ----
+        kbc = int(k_bc_factors)
+        offset_u_bc = 0
+        offset_cross_theta_u_s = 0
+        offset_cross_theta_u_bc = 0
+        if kbc > 0:
+            offset_u_bc = len(names)
+            for i in range(kbc):
+                names.append(f"u_bc_{i}")
+            offset_cross_theta_u_s = len(names)
+            for i in range(int(k_factors)):
+                names.append(f"cross_theta_u_s_{i}")
+            offset_cross_theta_u_bc = len(names)
+            for i in range(kbc):
+                names.append(f"cross_theta_u_bc_{i}")
+
         return cls(
             feature_names=tuple(names),
             feature_dim=int(len(names)),
@@ -353,6 +390,10 @@ class MemberFeatureSchema:
             centroid_dist_names=centroid_dist_names,
             nn_feature_names=tuple(str(s) for s in nn_feature_names),
             condition_to_col=dict(condition_to_col),
+            k_bc_factors=int(kbc),
+            offset_u_bc=int(offset_u_bc),
+            offset_cross_theta_u_s=int(offset_cross_theta_u_s),
+            offset_cross_theta_u_bc=int(offset_cross_theta_u_bc),
         )
 
     # ---- serialization ----
@@ -387,7 +428,11 @@ class MemberFeatureSchema:
             "centroid_dist_names": list(self.centroid_dist_names),
             "nn_feature_names": list(self.nn_feature_names),
             "condition_to_col": dict(self.condition_to_col),
-            "schema_version": 1,
+            "k_bc_factors": int(self.k_bc_factors),
+            "offset_u_bc": int(self.offset_u_bc),
+            "offset_cross_theta_u_s": int(self.offset_cross_theta_u_s),
+            "offset_cross_theta_u_bc": int(self.offset_cross_theta_u_bc),
+            "schema_version": 2 if self.k_bc_factors > 0 else 1,
         }
 
     @classmethod
@@ -424,6 +469,10 @@ class MemberFeatureSchema:
             centroid_dist_names=tuple(str(x) for x in d["centroid_dist_names"]),
             nn_feature_names=tuple(str(x) for x in d["nn_feature_names"]),
             condition_to_col={str(k): int(v) for k, v in d["condition_to_col"].items()},
+            k_bc_factors=int(d.get("k_bc_factors", 0)),
+            offset_u_bc=int(d.get("offset_u_bc", 0)),
+            offset_cross_theta_u_s=int(d.get("offset_cross_theta_u_s", 0)),
+            offset_cross_theta_u_bc=int(d.get("offset_cross_theta_u_bc", 0)),
         )
 
 
@@ -510,12 +559,24 @@ def build_member_features(
     cluster_ids: np.ndarray,        # [N] int (0 = UNK, 1..K = real)
     nn_feats: np.ndarray,           # [N, n_nn] float32
     conditions: Sequence[object],   # [N] raw condition strings
+    bc_redacted: np.ndarray | None = None,   # [N] bool: zero cond one-hot
+    u_bc_per_row: np.ndarray | None = None,  # [N, k_bc_factors] float32
 ) -> np.ndarray:
     """Build the full ``[N, feature_dim]`` dense feature matrix (float32).
 
     All inputs are validated for shape; mismatches raise ``ValueError``
     immediately so you don't silently train a model on wrongly-keyed
     data.
+
+    ``bc_redacted`` (per-row bool): when True, the row's bc-derived
+    feature blocks are zeroed -- specifically the ``cond`` one-hot.
+    This simulates "benchmark unknown" for offline training, mirroring
+    the leaderboard cold-start regime where the runtime sees rows
+    whose benchmark identity is missing. The row's UNK-cond column
+    is *also left zero*; the model learns to read absence of any
+    cond signal as redaction (rather than asserting UNK explicitly,
+    which would conflate redacted-bc rows with rows whose cond was
+    just rare-and-coalesced into UNK).
     """
     N = int(subject_idx.shape[0])
 
@@ -536,6 +597,21 @@ def build_member_features(
         raise ValueError(f"nn_feats shape {nn_feats.shape} != ({N}, {schema.n_nn})")
     if int(len(conditions)) != N:
         raise ValueError(f"conditions length {len(conditions)} != {N}")
+    if bc_redacted is not None and bc_redacted.shape != (N,):
+        raise ValueError(
+            f"bc_redacted shape {bc_redacted.shape} != ({N},)"
+        )
+    if int(schema.k_bc_factors) > 0:
+        if u_bc_per_row is None:
+            raise ValueError(
+                f"schema.k_bc_factors={schema.k_bc_factors} requires "
+                "u_bc_per_row to be provided"
+            )
+        if u_bc_per_row.shape != (N, int(schema.k_bc_factors)):
+            raise ValueError(
+                f"u_bc_per_row shape {u_bc_per_row.shape} != "
+                f"({N}, {schema.k_bc_factors})"
+            )
 
     out = np.zeros((N, schema.feature_dim), dtype=np.float32)
 
@@ -596,9 +672,44 @@ def build_member_features(
     )
 
     # ---- condition one-hot ----
-    for i, c in enumerate(conditions):
-        col = schema.condition_to_col.get(_canonicalize_condition(c), 0)
-        out[i, schema.offset_cond + col] = 1.0
+    if bc_redacted is None:
+        for i, c in enumerate(conditions):
+            col = schema.condition_to_col.get(_canonicalize_condition(c), 0)
+            out[i, schema.offset_cond + col] = 1.0
+    else:
+        # Per-row redaction: redacted rows leave the entire cond block
+        # at zero; non-redacted rows light up their canonical column.
+        red = np.asarray(bc_redacted, dtype=bool)
+        for i, c in enumerate(conditions):
+            if bool(red[i]):
+                continue
+            col = schema.condition_to_col.get(_canonicalize_condition(c), 0)
+            out[i, schema.offset_cond + col] = 1.0
+
+    # ---- BC block (u_bc + crosses), schema_version >= 2 ----
+    if int(schema.k_bc_factors) > 0 and u_bc_per_row is not None:
+        kbc = int(schema.k_bc_factors)
+        kf = int(schema.k_factors)
+        u_bc_f32 = np.asarray(u_bc_per_row, dtype=np.float32)
+        # If the row is bc-redacted, zero u_bc and the cross_theta_u_bc
+        # block. cross_theta_u_s remains nonzero -- it depends only on
+        # subject-side state and is not affected by bc redaction.
+        if bc_redacted is not None:
+            u_bc_f32 = u_bc_f32 * (1.0 - red.astype(np.float32))[:, None]
+        out[:, schema.offset_u_bc : schema.offset_u_bc + kbc] = u_bc_f32
+
+        theta_col = out[:, schema.offset_theta : schema.offset_theta + 1]
+        u_s_block = out[:, schema.offset_u : schema.offset_u + kf]
+        out[
+            :,
+            schema.offset_cross_theta_u_s
+            : schema.offset_cross_theta_u_s + kf
+        ] = theta_col * u_s_block
+        out[
+            :,
+            schema.offset_cross_theta_u_bc
+            : schema.offset_cross_theta_u_bc + kbc
+        ] = theta_col * u_bc_f32
 
     # Belt-and-suspenders against NaN / Inf in any block.
     np.nan_to_num(out, copy=False, nan=0.0, posinf=_CENTROID_DIST_CLAMP, neginf=0.0)
@@ -617,12 +728,21 @@ def build_member_features_one(
     cluster_id: int,            # 0 = UNK
     nn_feats: np.ndarray,       # [n_nn] float32
     condition: object,
+    bc_redacted: bool = False,
+    u_bc: np.ndarray | None = None,   # [k_bc_factors] float32, required when schema enables bc block
 ) -> np.ndarray:
     """Build a single ``[feature_dim]`` row. Used by the runtime ``predict``.
 
     Same numerical contract as :func:`build_member_features` but
     optimized for the per-row hot path: no allocation of per-row
     auxiliary arrays.
+
+    ``bc_redacted=True`` zeroes the cond one-hot block AND the
+    bc-derived blocks (``u_bc`` and ``cross_theta_u_bc``), mirroring
+    :func:`build_member_features`.
+
+    ``u_bc`` is required when ``schema.k_bc_factors > 0``; pass an
+    all-zero vector for redacted / unknown bcs.
     """
     out = np.zeros(schema.feature_dim, dtype=np.float32)
 
@@ -664,8 +784,41 @@ def build_member_features_one(
         np.float32, copy=False
     )
 
-    col = schema.condition_to_col.get(_canonicalize_condition(condition), 0)
-    out[schema.offset_cond + col] = 1.0
+    if not bool(bc_redacted):
+        col = schema.condition_to_col.get(_canonicalize_condition(condition), 0)
+        out[schema.offset_cond + col] = 1.0
+    # else: cond block stays at all-zero (redacted bc).
+
+    # ---- BC block (u_bc + crosses), schema_version >= 2 ----
+    if int(schema.k_bc_factors) > 0:
+        if u_bc is None:
+            raise ValueError(
+                "schema.k_bc_factors > 0 requires u_bc to be provided "
+                "(pass an all-zero vector for redacted/unknown bcs)"
+            )
+        kbc = int(schema.k_bc_factors)
+        kf = int(schema.k_factors)
+        u_bc_f32 = np.asarray(u_bc, dtype=np.float32).reshape(-1)
+        if int(u_bc_f32.shape[0]) != kbc:
+            raise ValueError(
+                f"u_bc shape {u_bc_f32.shape} != ({kbc},)"
+            )
+        # Apply bc-redaction to u_bc and cross_theta_u_bc; cross_theta_u_s
+        # is subject-only and remains.
+        if bool(bc_redacted):
+            u_bc_use = np.zeros_like(u_bc_f32)
+        else:
+            u_bc_use = u_bc_f32
+        out[schema.offset_u_bc : schema.offset_u_bc + kbc] = u_bc_use
+        theta_val = float(theta_s)
+        out[
+            schema.offset_cross_theta_u_s
+            : schema.offset_cross_theta_u_s + kf
+        ] = theta_val * u_s.astype(np.float32, copy=False)
+        out[
+            schema.offset_cross_theta_u_bc
+            : schema.offset_cross_theta_u_bc + kbc
+        ] = theta_val * u_bc_use
 
     # Belt-and-suspenders.
     np.nan_to_num(out, copy=False, nan=0.0, posinf=_CENTROID_DIST_CLAMP, neginf=0.0)

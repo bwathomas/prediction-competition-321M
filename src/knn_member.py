@@ -113,6 +113,25 @@ class KNNMemberState:
     train_loss: float
     val_loss: float
 
+    # Item-side fallback tables (added in format_version=2). When a
+    # neighbor cell ``(s_q, i_k)`` is unobserved (subject_q never rated
+    # neighbor i_k), the apply path can fall back to the GLOBAL
+    # passrate of i_k -- "this item is hard for most subjects, so
+    # it's probably hard for s_q too" -- with a discounted weight.
+    # ``item_obs_count[i] == 0`` means no subject rated item i; in
+    # that case the fallback is unavailable for i and the cell
+    # remains masked-out.
+    #
+    # Defaulted to ``None`` so legacy callers / tests that construct
+    # ``KNNMemberState`` without the new fields keep working; the
+    # apply path uses the legacy "subject-mask only" path when these
+    # are None (or when item_fallback_weight is 0.0).
+    item_global_passrate: np.ndarray | None = None  # [N_items] fp32 or None
+    item_obs_count: np.ndarray | None = None        # [N_items] fp32 or None
+    # Item-global fallback weight. 0.0 = legacy behavior (only
+    # subject-rated neighbors contribute). Typical: 0.3-0.5.
+    item_fallback_weight: float = 0.0
+
     def __post_init__(self) -> None:
         N, P = int(self.embeddings_q.shape[0]), int(self.embeddings_q.shape[1])
         S = int(self.passrate_dense.shape[0])
@@ -180,6 +199,28 @@ class KNNMemberState:
             raise ValueError(
                 f"global_passrate {self.global_passrate} not in [0, 1]"
             )
+        # Item-side fallback: must be either both present (with shape
+        # [N_items]) or both None. Mixing is a programming error.
+        if (self.item_global_passrate is None) != (self.item_obs_count is None):
+            raise ValueError(
+                "item_global_passrate and item_obs_count must both be "
+                "set or both be None"
+            )
+        if self.item_global_passrate is not None:
+            if int(self.item_global_passrate.shape[0]) != N:
+                raise ValueError(
+                    f"item_global_passrate len "
+                    f"{self.item_global_passrate.shape[0]} != N {N}"
+                )
+            if int(self.item_obs_count.shape[0]) != N:  # type: ignore[union-attr]
+                raise ValueError(
+                    f"item_obs_count len "
+                    f"{self.item_obs_count.shape[0]} != N {N}"  # type: ignore[union-attr]
+                )
+        if not (0.0 <= float(self.item_fallback_weight) <= 1.0):
+            raise ValueError(
+                f"item_fallback_weight {self.item_fallback_weight} not in [0, 1]"
+            )
 
     # ---------------- Indexing helpers ----------------
 
@@ -224,6 +265,13 @@ class KNNMemberState:
             save_kwargs["embeddings_scale"] = self.embeddings_scale.astype(
                 np.float32
             )
+        if self.item_global_passrate is not None:
+            save_kwargs["item_global_passrate"] = (
+                self.item_global_passrate.astype(np.float32)
+            )
+            save_kwargs["item_obs_count"] = (
+                self.item_obs_count.astype(np.float32)  # type: ignore[union-attr]
+            )
         np.savez_compressed(out / "knn_state.npz", **save_kwargs)
         meta = {
             "global_passrate": float(self.global_passrate),
@@ -235,10 +283,12 @@ class KNNMemberState:
             "similarity": str(self.similarity),
             "tau_subject": float(self.tau_subject),
             "tau_global": float(self.tau_global),
+            "item_fallback_weight": float(self.item_fallback_weight),
+            "has_item_global": bool(self.item_global_passrate is not None),
             "n_train": int(self.n_train),
             "train_loss": float(self.train_loss),
             "val_loss": float(self.val_loss),
-            "format_version": 1,
+            "format_version": 2,
         }
         (out / "knn_meta.json").write_text(
             json.dumps(meta, indent=2), encoding="utf-8"
@@ -265,6 +315,16 @@ class KNNMemberState:
                 if "embeddings_scale" in npz.files
                 else None
             )
+            item_global_passrate = (
+                npz["item_global_passrate"].astype(np.float32, copy=False)
+                if "item_global_passrate" in npz.files
+                else None
+            )
+            item_obs_count = (
+                npz["item_obs_count"].astype(np.float32, copy=False)
+                if "item_obs_count" in npz.files
+                else None
+            )
         return cls(
             pca_basis=pca_basis,
             pca_mean=pca_mean,
@@ -274,6 +334,8 @@ class KNNMemberState:
             passrate_mask=passrate_mask,
             subject_obs_count=subject_obs_count,
             subject_global=subject_global,
+            item_global_passrate=item_global_passrate,
+            item_obs_count=item_obs_count,
             global_passrate=float(meta["global_passrate"]),
             item_keys=tuple(meta["item_keys"]),
             subject_keys=tuple(meta["subject_keys"]),
@@ -283,6 +345,7 @@ class KNNMemberState:
             similarity=str(meta.get("similarity", "cosine")),
             tau_subject=float(meta["tau_subject"]),
             tau_global=float(meta["tau_global"]),
+            item_fallback_weight=float(meta.get("item_fallback_weight", 0.0)),
             n_train=int(meta.get("n_train", 0)),
             train_loss=float(meta.get("train_loss", 0.0)),
             val_loss=float(meta.get("val_loss", 0.0)),
@@ -415,10 +478,38 @@ def apply_one(
     # that point AWAY from the query, not "weakly-similar". Without
     # this clip a single strongly-anti-correlated neighbor would
     # poison the weighted mean.
-    weights = np.clip(sim_top, 0.0, None) * masks_top
+    sim_clipped = np.clip(sim_top, 0.0, None)
+    weights = sim_clipped * masks_top
+    weighted_label_sum = (weights * labels_top).sum()
     n_eff = float(weights.sum())
+
+    # Item-global fallback: when neighbor cell (s_q, i_k) is unobserved
+    # but item i_k *has been rated by some other subject* (item_obs_count
+    # > 0), substitute the per-item global passrate with discounted
+    # weight ``item_fallback_weight``. Off by default; intended to
+    # rescue subjects with extreme sparsity at cold-start time.
+    if (
+        state.item_global_passrate is not None
+        and float(state.item_fallback_weight) > 0.0
+    ):
+        unobs_top = (1.0 - masks_top).astype(np.float32, copy=False)
+        item_global_top = state.item_global_passrate[top_idx].astype(
+            np.float32, copy=False
+        )
+        item_obs_top = state.item_obs_count[top_idx].astype(  # type: ignore[union-attr]
+            np.float32, copy=False
+        )
+        avail_top = (item_obs_top > 0.0).astype(np.float32, copy=False)
+        fb_weights = (
+            sim_clipped * unobs_top * avail_top * float(state.item_fallback_weight)
+        )
+        weighted_label_sum = weighted_label_sum + float(
+            (fb_weights * item_global_top).sum()
+        )
+        n_eff = n_eff + float(fb_weights.sum())
+
     if n_eff > 1.0e-9:
-        mu_neigh = float((weights * labels_top).sum() / n_eff)
+        mu_neigh = float(weighted_label_sum / n_eff)
     else:
         mu_neigh = 0.5  # placeholder; alpha_subject -> 0
 
@@ -674,13 +765,38 @@ def apply_batch(
     )
 
     # Cosine sims clipped at 0 then weighted by mask.
-    weights = np.clip(sim_top, 0.0, None) * masks_top  # [B, K]
-    n_eff = weights.sum(axis=1)                        # [B]
+    sim_clipped = np.clip(sim_top, 0.0, None).astype(np.float32, copy=False)
+    weights = sim_clipped * masks_top                   # [B, K]
+    weighted_label_sum = (weights * labels_top).sum(axis=1)
+    n_eff = weights.sum(axis=1)                         # [B]
+
+    # Item-global fallback: same semantics as apply_one. See that
+    # function for the full rationale.
+    if (
+        state.item_global_passrate is not None
+        and float(state.item_fallback_weight) > 0.0
+    ):
+        unobs_top = (1.0 - masks_top).astype(np.float32, copy=False)
+        item_global_top = state.item_global_passrate[top_idx].astype(
+            np.float32, copy=False
+        )
+        item_obs_top = state.item_obs_count[top_idx].astype(  # type: ignore[union-attr]
+            np.float32, copy=False
+        )
+        avail_top = (item_obs_top > 0.0).astype(np.float32, copy=False)
+        fb_weights = (
+            sim_clipped * unobs_top * avail_top * float(state.item_fallback_weight)
+        )
+        weighted_label_sum = weighted_label_sum + (fb_weights * item_global_top).sum(
+            axis=1
+        )
+        n_eff = n_eff + fb_weights.sum(axis=1)
+
     has_support = n_eff > 1.0e-9
     mu_neigh = np.where(
         has_support,
         np.divide(
-            (weights * labels_top).sum(axis=1),
+            weighted_label_sum,
             np.where(has_support, n_eff, 1.0),
         ),
         0.5,
@@ -859,9 +975,10 @@ def fit_knn_member(
     train_pairs: Sequence[tuple[str, str, float]] | None = None,
     pca_dim: int = 128,
     quantization: str = "fp16",
-    k: int = 16,
+    k: int = 128,
     tau_subject: float = 2.0,
     tau_global: float = 50.0,
+    item_fallback_weight: float = 0.0,
     seed: int = 0,
 ) -> KNNMemberState:
     """Build Member 3.
@@ -971,6 +1088,25 @@ def fit_knn_member(
     else:
         global_passrate = 0.5
 
+    # Per-ITEM stats: marginal passrate across all subjects who rated
+    # the item, plus the count of such subjects. These power the
+    # item-global fallback in apply_*: when a neighbor cell (s_q, i_k)
+    # is unobserved (subject_q never rated neighbor i_k), substitute
+    # ``item_global_passrate[i_k]`` with discounted weight
+    # ``item_fallback_weight``. Without these tables the apply path
+    # silently masks every unobserved cell out of the weighted mean,
+    # which collapses ``mu_neigh -> 0.5`` for cold-start subjects with
+    # extreme sparsity. (This is exactly the regime the leaderboard
+    # punishes.) Cost: 2 * N_items fp32 = ~2 MB for 300k items.
+    mask_f = passrate_mask_arr.astype(np.float32)
+    item_obs_count = mask_f.sum(axis=0).astype(np.float32)              # [N]
+    item_pos_sum = (passrate_dense_arr * mask_f).sum(axis=0).astype(np.float32)
+    item_global_passrate = np.where(
+        item_obs_count > 0.0,
+        item_pos_sum / np.maximum(item_obs_count, 1.0),
+        0.5,
+    ).astype(np.float32)
+
     state = KNNMemberState(
         pca_basis=basis,
         pca_mean=mean,
@@ -981,6 +1117,8 @@ def fit_knn_member(
         subject_obs_count=subject_obs_count,
         subject_global=subject_global,
         global_passrate=global_passrate,
+        item_global_passrate=item_global_passrate,
+        item_obs_count=item_obs_count,
         item_keys=tuple(item_keys_list),
         subject_keys=tuple(subject_keys_list),
         k=int(k),
@@ -989,15 +1127,20 @@ def fit_knn_member(
         similarity="cosine",
         tau_subject=float(tau_subject),
         tau_global=float(tau_global),
+        item_fallback_weight=float(item_fallback_weight),
         n_train=int(N),
         train_loss=0.0,
         val_loss=0.0,
     )
     LOG.info(
         "knn_member: built. global_passrate=%.4f, mean subject_obs=%.1f, "
+        "mean item_obs=%.1f, item_fallback_weight=%.3f, k=%d, "
         "embeddings dtype=%s shape=%s",
         state.global_passrate,
         float(subject_obs_count.mean()),
+        float(item_obs_count.mean()),
+        float(state.item_fallback_weight),
+        int(state.k),
         state.embeddings_q.dtype,
         tuple(state.embeddings_q.shape),
     )

@@ -352,6 +352,7 @@ def fit_logreg_member(
     sample_weights: np.ndarray | None = None,
     feature_names: Sequence[str],
     weight_decay: float = 1.0e-3,
+    l1_strength: float = 0.0,
     learning_rate: float = 1.0e-2,
     epochs: int = 200,
     batch_size: int = 16384,
@@ -361,6 +362,8 @@ def fit_logreg_member(
     device: str | None = None,
     standardize: bool = True,
     log_every: int = 10,
+    min_feature_std: float = 0.0,
+    holdout_group_id: np.ndarray | None = None,
 ) -> LogRegMemberState:
     """Fit a torch logistic regression with Adam + early stopping.
 
@@ -395,6 +398,26 @@ def fit_logreg_member(
     Pass ``standardize=False`` to keep the legacy un-scaled fit (only
     useful when ``X`` is already standardized upstream).
 
+    **L1 sparsity (``l1_strength``)**: when > 0, adds an L1 term on the
+    weights (NOT bias) to the loss, applied as a soft proximal step
+    after each Adam update via subgradient. ``L1`` shrinks low-signal
+    features toward zero and is the cleanest way to deal with the
+    member-feature schema's many sparse / near-zero one-hot cols
+    that survived ``min_condition_count``. Default 0.0 (disabled).
+
+    **``min_feature_std``**: when > 0, features whose train-slice std
+    is below this threshold (i.e. near-constant cols) are forcibly
+    zeroed in the saved weights post-fit. This avoids spurious
+    coefficients on rare one-hots (think: a cluster id that only
+    appears in 5 rows) that would otherwise inflate ``||w||`` without
+    contributing predictive signal. Default 0.0 (disabled).
+
+    **``holdout_group_id``**: per-row int array. When provided, the
+    internal train/val split holds out *whole groups* (typically
+    item ids) rather than random rows, mirroring Member 2's
+    cold-start internal split. Without this kwarg the legacy random
+    row split is preserved.
+
     Returns a :class:`LogRegMemberState` ready for :meth:`save`.
     """
 
@@ -420,10 +443,42 @@ def fit_logreg_member(
 
     rng = np.random.default_rng(int(seed))
     N = int(X.shape[0])
-    perm = rng.permutation(N)
-    n_val = max(64, int(round(val_fraction * N)))
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
+    if holdout_group_id is None:
+        perm = rng.permutation(N)
+        n_val = max(64, int(round(val_fraction * N)))
+        val_idx = perm[:n_val]
+        train_idx = perm[n_val:]
+    else:
+        if holdout_group_id.shape != (N,):
+            raise ValueError(
+                f"holdout_group_id shape {holdout_group_id.shape} != ({N},)"
+            )
+        gids = np.asarray(holdout_group_id).reshape(-1)
+        unique_groups = np.unique(gids)
+        n_groups = int(unique_groups.shape[0])
+        if n_groups < 2:
+            raise ValueError(
+                f"holdout_group_id has {n_groups} unique groups; need >=2"
+            )
+        n_val_groups = max(1, int(round(val_fraction * n_groups)))
+        held_groups = rng.choice(unique_groups, size=n_val_groups, replace=False)
+        held_set = set(int(g) for g in held_groups)
+        val_mask = np.fromiter(
+            (int(g) in held_set for g in gids), count=N, dtype=bool,
+        )
+        if int(val_mask.sum()) == 0 or int((~val_mask).sum()) == 0:
+            raise RuntimeError(
+                "Group-stratified split yielded an empty side. Increase "
+                "n_groups or val_fraction."
+            )
+        val_idx = np.where(val_mask)[0]
+        train_idx = np.where(~val_mask)[0]
+        LOG.info(
+            "logreg_member: group-stratified split "
+            "(%d groups -> %d held; %d train rows / %d val rows)",
+            n_groups, n_val_groups,
+            int(train_idx.shape[0]), int(val_idx.shape[0]),
+        )
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -468,6 +523,7 @@ def fit_logreg_member(
         )
     else:
         feat_mean = None
+        feat_std = None
         feat_std_safe = None
         # Even without standardization, allocate the float32 view
         # via chunked indexing so the path is symmetric and we don't
@@ -516,6 +572,14 @@ def fit_logreg_member(
             l = (per_row * w_).sum() / torch.clamp(w_.sum(), min=1e-9)
         # L2 on weights only (NOT bias).
         l = l + 0.5 * float(weight_decay) * (linear_.weight ** 2).sum()
+        # L1 on weights only (NOT bias). Implemented as a smooth term
+        # in the loss: torch.abs is autograd-friendly and gives the
+        # subgradient sign(w) at every step. For cleaner sparsity you
+        # could swap to a proximal soft-threshold step; this version
+        # is simpler and behaves correctly for the L1 strengths we
+        # care about (1e-3 .. 1e-2 range).
+        if float(l1_strength) > 0.0:
+            l = l + float(l1_strength) * linear_.weight.abs().sum()
         return l
 
     best_val = float("inf")
@@ -562,11 +626,15 @@ def fit_logreg_member(
             improved_marker = " "
 
         if int(log_every) > 0 and ((ep + 1) % int(log_every) == 0 or ep == 0):
+            with torch.no_grad():
+                w_norm = float(linear.weight.detach().norm().item())
+                w_nonzero = int((linear.weight.detach().abs() > 1e-6).sum().item())
             LOG.info(
                 "logreg_member: epoch %3d/%d  train=%.5f  val=%.5f  best=%.5f %s "
-                "(no-improve=%d/%d)",
+                "(no-improve=%d/%d)  ||w||=%.3f  nnz=%d/%d",
                 ep + 1, int(epochs), train_loss_ep, val_loss, best_val,
                 improved_marker, epochs_since_improve, int(early_stopping_patience),
+                w_norm, w_nonzero, int(linear.weight.numel()),
             )
 
         if epochs_since_improve >= int(early_stopping_patience):
@@ -604,6 +672,31 @@ def fit_logreg_member(
     else:
         w_final = w_std_arr.astype(np.float32)
         b_final = b_std_val
+
+    # Post-fit min-feature-std filter. Features with train-slice std
+    # below ``min_feature_std`` are near-constant; zero out their
+    # weights so they cannot contribute to ``||w||``. Bias is updated
+    # to absorb the (constant) value of those columns at the train
+    # mean -- i.e. ``b_final += sum(mu_i * w_final_i)`` for zeroed
+    # columns -- so predictions on the train mean are unchanged.
+    if (
+        float(min_feature_std) > 0.0
+        and feat_std is not None
+        and feat_mean is not None
+    ):
+        rare_mask = (feat_std < float(min_feature_std))
+        if int(rare_mask.sum()) > 0:
+            absorbed_bias = float(np.dot(feat_mean[rare_mask], w_final[rare_mask]))
+            w_final = w_final.copy()
+            w_final[rare_mask] = 0.0
+            b_final = float(b_final + absorbed_bias)
+            LOG.info(
+                "logreg_member: dropped %d/%d features below min_feature_std=%.4g  "
+                "absorbed_bias=%+.4f  ||w_final||=%.4f  b_final=%+.4f",
+                int(rare_mask.sum()), int(len(rare_mask)),
+                float(min_feature_std),
+                absorbed_bias, float(np.linalg.norm(w_final)), b_final,
+            )
 
     return LogRegMemberState(
         weights=w_final,

@@ -1996,7 +1996,72 @@ def _split_pool_and_centroids(item_keys_for_split):
     return pool_arr, cd_arr
 
 
-def _build_X(split_part, nn_mat):
+# ---------------------------------------------------------------------
+# bc-redaction masks: simulate "benchmark unknown" cold-start at TRAIN
+# AND VAL time. We pick ~``BC_REDACT_FRAC`` of the unique
+# (item_key, benchmark_condition_key) combos uniformly at random and
+# zero out their cond one-hot in the dense feature matrix. The
+# leaderboard sees rows where the benchmark identity is missing -- if
+# Members 2 & 4 only ever see fully-keyed rows during training, they
+# learn to lean on the cond signal and collapse on cold-start. Drawing
+# whole COMBOS (not random rows) is what the user asked for: it keeps
+# the redaction unit semantically meaningful (a "lost benchmark" looks
+# the same on every row of every item in that benchmark) and forces
+# the row-side learners to recover from the same loss the runtime
+# faces.
+#
+# Same fraction is applied to val so val_logloss reflects the
+# leaderboard distribution rather than a fully-keyed-bench best case.
+BC_REDACT_FRAC = float(CFG.get("bc_redaction", {}).get("fraction", 0.20))
+_bc_redact_seed = int(CFG.get("bc_redaction", {}).get("seed", SEED ^ 0xC01D5)) & 0xFFFFFFFF
+
+
+def _make_bc_redaction_mask(split_df, *, frac: float, seed: int) -> np.ndarray:
+    """Mark rows whose (item_key, bc_key) combo is in a randomly chosen
+    set of held-out combos. Returns a [N] bool array."""
+    if float(frac) <= 0.0:
+        return np.zeros(len(split_df), dtype=bool)
+    pairs_tuple = list(
+        zip(
+            split_df["item_key"].astype(str).tolist(),
+            split_df["benchmark_condition_key"].astype(str).tolist(),
+        )
+    )
+    unique_pairs = sorted(set(pairs_tuple))
+    n_pairs = len(unique_pairs)
+    n_redact = int(round(float(frac) * n_pairs))
+    if n_redact <= 0:
+        return np.zeros(len(split_df), dtype=bool)
+    rng = np.random.default_rng(int(seed))
+    held_idx = rng.choice(n_pairs, size=n_redact, replace=False)
+    held_set = set(unique_pairs[i] for i in held_idx)
+    out = np.fromiter(
+        (p in held_set for p in pairs_tuple),
+        count=len(pairs_tuple),
+        dtype=bool,
+    )
+    return out
+
+
+bc_redacted_train = _make_bc_redaction_mask(
+    primary.train, frac=BC_REDACT_FRAC, seed=_bc_redact_seed,
+)
+bc_redacted_val = _make_bc_redaction_mask(
+    primary.val, frac=BC_REDACT_FRAC, seed=_bc_redact_seed ^ 0xDEAD,
+)
+print(
+    f"[bc_redaction] train: redacted "
+    f"{int(bc_redacted_train.sum()):,} / {len(bc_redacted_train):,} rows "
+    f"({100.0 * bc_redacted_train.mean():.1f}%)"
+)
+print(
+    f"[bc_redaction] val:   redacted "
+    f"{int(bc_redacted_val.sum()):,} / {len(bc_redacted_val):,} rows "
+    f"({100.0 * bc_redacted_val.mean():.1f}%)"
+)
+
+
+def _build_X(split_part, nn_mat, redacted_mask):
     keys = split_part["item_key"].astype(str).tolist()
     pool_raw, cd_raw = _split_pool_and_centroids(keys)
     cl_ids = np.array(
@@ -2016,18 +2081,30 @@ def _build_X(split_part, nn_mat):
         cluster_ids=cl_ids,
         nn_feats=nn_mat.astype(np.float32),
         conditions=split_part["condition"].astype(str).tolist(),
+        bc_redacted=redacted_mask,
     )
 
 
+# ``redact_v1`` invalidates older X_*_dense caches that lacked the
+# bc-redaction zeroing of the cond one-hot (i.e. were trained with
+# fully-keyed bench conditions). Reusing those caches with the new
+# member fits would defeat the point of the redaction: Members 2 & 4
+# would still learn on the leak-prone signal.
 X_train_dense = cache_or_compute(
     "X_train_dense",
-    key_inputs=(member_feat_schema.feature_dim, len(primary.train)),
-    compute_fn=lambda: _build_X(primary.train, nn_train_mat),
+    key_inputs=(
+        member_feat_schema.feature_dim, len(primary.train),
+        "redact_v1", round(BC_REDACT_FRAC, 3), _bc_redact_seed,
+    ),
+    compute_fn=lambda: _build_X(primary.train, nn_train_mat, bc_redacted_train),
 )
 X_val_dense = cache_or_compute(
     "X_val_dense",
-    key_inputs=(member_feat_schema.feature_dim, len(primary.val)),
-    compute_fn=lambda: _build_X(primary.val, nn_val_mat),
+    key_inputs=(
+        member_feat_schema.feature_dim, len(primary.val),
+        "redact_v1", round(BC_REDACT_FRAC, 3), _bc_redact_seed,
+    ),
+    compute_fn=lambda: _build_X(primary.val, nn_val_mat, bc_redacted_val),
 )
 y_train = primary.train["label"].astype(float).to_numpy().astype(np.float32)
 print(f"[member_features] X_train: {X_train_dense.shape}  X_val: {X_val_dense.shape}")
@@ -2044,6 +2121,30 @@ print(f"[member_features] X_train: {X_train_dense.shape}  X_val: {X_val_dense.sh
 from src.gbdt_member import (
     apply_batch as gbdt_apply_batch,
     fit_gbdt_member,
+)
+
+
+# Per-row item_id for the cold-start internal val split. We map each
+# train row to the integer position of its item in ``train_item_keys``
+# (the kNN/Indexer's item ordering); items with no match get -1, which
+# lands in their own catch-all group. The split picks ~10% of distinct
+# items and routes EVERY row of those items to LightGBM's internal
+# val. Without this the booster's early stopping fires on rows from
+# items it has already memorized -- val NLL diverges from the actual
+# cold-start val NLL (the user observed 0.33 internal vs 0.65 reported,
+# i.e. 100% optimism).
+_item_to_train_idx = {str(k): i for i, k in enumerate(train_item_keys)}
+gbdt_train_item_id = np.fromiter(
+    (
+        _item_to_train_idx.get(str(k), -1)
+        for k in primary.train["item_key"].astype(str).tolist()
+    ),
+    count=len(primary.train),
+    dtype=np.int64,
+)
+print(
+    f"[Member 2] item-cold split groups: "
+    f"{int(np.unique(gbdt_train_item_id).size):,} unique items"
 )
 
 
@@ -2072,6 +2173,8 @@ def _fit_member2():
         force_col_wise=bool(CFG.get("member2_gbdt", {}).get("force_col_wise", True)),
         log_period=int(CFG.get("member2_gbdt", {}).get("log_period", 25)),
         num_threads=CFG.get("member2_gbdt", {}).get("num_threads", None),
+        # Item-stratified cold-start internal val split (see comment above).
+        holdout_group_id=gbdt_train_item_id,
     )
 
 
@@ -2090,8 +2193,19 @@ gbdt_state = cache_or_compute(
     # vs the actual mean cross-entropy of ``booster.predict()``).
     # The new state stores the manual NLL, so the stacker compares
     # apples to apples across members.
+    # ``coldsplit_v1`` invalidates entries trained with the legacy
+    # random-row internal val split. The new fit uses item-stratified
+    # holdout via ``gbdt_train_item_id`` so the booster's early-
+    # stopping val reflects cold-start generalization rather than
+    # item memorization (closes the 0.33 -> 0.65 internal/reported
+    # NLL gap the user observed).
+    # ``redact_v1`` ties the booster cache to the bc-redacted feature
+    # matrix so re-running with a different redaction fraction or
+    # seed forces a re-fit.
     key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED,
-                "speed_v1", "init_v2", "honest_loss_v1"),
+                "speed_v1", "init_v2", "honest_loss_v1",
+                "coldsplit_v1", "redact_v1",
+                round(BC_REDACT_FRAC, 3), _bc_redact_seed),
     compute_fn=_fit_member2,
 )
 p_member2_val = gbdt_apply_batch(gbdt_state, X_val_dense)
@@ -2195,9 +2309,21 @@ def _fit_member3():
         passrate_mask=m3_passrate_mask,
         pca_dim=int(_m3_cfg.get("pca_dim", 128)),
         quantization=str(_m3_cfg.get("quantization", "int8")),
-        k=int(_m3_cfg.get("k", 32)),
+        # k bumped 32 -> 128 (default in src/knn_member.py). With more
+        # neighbors, the per-row weighted mean has more mass on
+        # subject-rated cells AFTER the item-global fallback discounts
+        # unobserved cells. At k=32 a sparse subject's top-32 are mostly
+        # unobserved -> mu_neigh collapses to 0.5; k=128 spreads support
+        # across enough cells that the fallback can recover signal.
+        k=int(_m3_cfg.get("k", 128)),
         tau_subject=float(_m3_cfg.get("tau_subject", 5.0)),
         tau_global=float(_m3_cfg.get("tau_global", 200.0)),
+        # Item-global fallback weight: when subject_q hasn't rated a
+        # neighbor i_k, contribute item_global_passrate[i_k] * 0.5 *
+        # max(sim, 0) to the weighted mean. Stops cold-start subjects
+        # from collapsing to 0.5 mu_neigh on every query and recovers
+        # the "this item is universally hard" signal.
+        item_fallback_weight=float(_m3_cfg.get("item_fallback_weight", 0.5)),
     )
 
 
@@ -2207,14 +2333,18 @@ def _fit_member3():
 # unit tests) but the basis is sign-flipped per column. Quantization
 # noise dominates downstream cosine similarity, so the change is
 # mostly cosmetic -- but we bump the key to be safe.
+# ``itemfb_v1`` invalidates entries fit before the item-global
+# fallback infrastructure (per-item passrate + obs count tables) and
+# the K=32 -> K=128 default bump.
 knn_state: KNNMemberState = cache_or_compute(
     "knn_state",
     key_inputs=(
         len(train_item_keys),
         int(_m3_cfg.get("pca_dim", 128)),
         str(_m3_cfg.get("quantization", "int8")),
-        int(_m3_cfg.get("k", 32)),
-        "rsvd_v1",
+        int(_m3_cfg.get("k", 128)),
+        round(float(_m3_cfg.get("item_fallback_weight", 0.5)), 3),
+        "rsvd_v1", "itemfb_v1",
     ),
     compute_fn=_fit_member3,
 )
@@ -2281,10 +2411,31 @@ def _fit_member4():
         epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
         learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
         weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
+        # L1 sparsity: shrinks low-signal weights toward zero.
+        # The member_feat_schema includes ~hundreds of cond / subject_cat
+        # / cluster one-hots that fire on a few percent of rows; without
+        # an L1 term the LR puts a small but nonzero coefficient on
+        # every one of them and ||w|| inflates without commensurate val
+        # NLL improvement (the user observed ||w||=961 on the legacy
+        # fit). 1e-3 is a moderate strength; bump to 1e-2 if the
+        # sparse-feature filter still leaves too many active weights.
+        l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength", 1.0e-3)),
+        # min_feature_std: post-fit zero-out for near-constant feature
+        # cols (cluster ids that appear in <0.1% of rows, cond cols
+        # representing rare combos). A column with std < 1e-2 in the
+        # train slice is below the noise floor of the ~1.0 std signal
+        # cols; its baked weight is dominated by the data noise on
+        # those few rows. Zeroing it removes that noise.
+        min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
         early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
         seed=SEED,
         # Hold out 10% of train for early-stopping val.
         val_fraction=0.1,
+        # Item-stratified cold-start internal val split (mirrors
+        # Member 2). Without this, the LR's early-stopping val is
+        # row-level and overstates generalization just like the
+        # legacy GBDT internal val did.
+        holdout_group_id=gbdt_train_item_id,
     )
 
 
@@ -2296,9 +2447,19 @@ def _fit_member4():
 # than predicting the prior). The new fit z-scores on TRAIN
 # stats and bakes (mu, sigma) into the saved (weights, bias)
 # so the runtime path stays a pure x @ w + b matvec.
+# ``l1minfreq_v1`` invalidates entries fit without L1 + min_feature_std
+# (the legacy ||w||=961, val NLL ~0.49 fit).
+# ``coldsplit_v1`` ties the LR to its item-stratified internal val.
+# ``redact_v1`` ties the cache to the bc-redacted feature matrix.
 logreg_state = cache_or_compute(
     "logreg_state",
-    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED, "std_v1"),
+    key_inputs=(
+        member_feat_schema.feature_dim, len(primary.train), SEED,
+        "std_v1", "l1minfreq_v1", "coldsplit_v1", "redact_v1",
+        round(float(CFG.get("member4_logreg", {}).get("l1_strength", 1.0e-3)), 6),
+        round(float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)), 6),
+        round(BC_REDACT_FRAC, 3), _bc_redact_seed,
+    ),
     compute_fn=_fit_member4,
 )
 p_member4_val = logreg_apply_state_batch(logreg_state, X_val_dense)
@@ -2393,7 +2554,9 @@ def _fit_stacker():
 
 stacker_state = cache_or_compute(
     "stacker_state",
-    key_inputs=(stacker_X_val.shape[1], len(ylab_val), SEED),
+    # ``coldfb_v1`` invalidates older stackers trained on (member 2
+    # row-cold val, member 3 K=32, member 4 untrimmed) outputs.
+    key_inputs=(stacker_X_val.shape[1], len(ylab_val), SEED, "coldfb_v1"),
     compute_fn=_fit_stacker,
 )
 print(f"[Stacker] weights: {stacker_state.weights}")

@@ -631,6 +631,7 @@ def fit_gbdt_member(
     force_col_wise: bool = True,
     log_period: int = 25,
     num_threads: int | None = None,
+    holdout_group_id: np.ndarray | None = None,
 ) -> GBDTMemberState:
     """Train a LightGBM binary classifier and compile its trees to numpy.
 
@@ -660,6 +661,16 @@ def fit_gbdt_member(
 
     * ``num_threads=None`` lets LightGBM pick (defaults to all
       cores); pass an int to pin.
+
+    * ``holdout_group_id``: per-row int array. When provided, the
+      internal LightGBM train/val split holds out *whole groups*
+      (typically item ids) instead of random rows. This mirrors the
+      cold-start discipline of Model 1's outer val split: every row
+      of a held-out item lands on the same side of the split, so the
+      booster never sees rows from the same item on both sides and
+      its early-stopping val_logloss reflects actual cold-start
+      generalization rather than item memorization. Without this
+      kwarg the previous random-row behavior is preserved.
     """
     import lightgbm as lgb  # offline only
 
@@ -671,13 +682,64 @@ def fit_gbdt_member(
         raise ValueError(
             f"feature_names len {len(feature_names)} != X cols {X.shape[1]}"
         )
+    if holdout_group_id is not None:
+        if holdout_group_id.shape != (int(X.shape[0]),):
+            raise ValueError(
+                f"holdout_group_id shape {holdout_group_id.shape} != "
+                f"({X.shape[0]},)"
+            )
 
     rng = np.random.default_rng(int(seed))
     N = int(X.shape[0])
-    perm = rng.permutation(N)
-    n_val = max(64, int(round(val_fraction * N)))
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
+    if holdout_group_id is None:
+        # Legacy: random row split (kept so other callers don't break).
+        perm = rng.permutation(N)
+        n_val = max(64, int(round(val_fraction * N)))
+        val_idx = perm[:n_val]
+        train_idx = perm[n_val:]
+    else:
+        # Group-stratified holdout: pick ~val_fraction of distinct
+        # group ids, route ALL rows of those ids into val. Mirrors
+        # sklearn.model_selection.GroupShuffleSplit semantics.
+        gids = np.asarray(holdout_group_id).reshape(-1)
+        unique_groups = np.unique(gids)
+        n_groups = int(unique_groups.shape[0])
+        if n_groups < 2:
+            raise ValueError(
+                f"holdout_group_id has {n_groups} unique groups; need >=2 "
+                "for a meaningful train/val split."
+            )
+        n_val_groups = max(1, int(round(val_fraction * n_groups)))
+        # Sample without replacement deterministically.
+        held_groups = rng.choice(unique_groups, size=n_val_groups, replace=False)
+        held_set = set(int(g) for g in held_groups)
+        val_mask = np.fromiter(
+            (int(g) in held_set for g in gids),
+            count=N,
+            dtype=bool,
+        )
+        # Belt: ensure both sides are non-trivially populated.
+        if int(val_mask.sum()) == 0:
+            raise RuntimeError(
+                "Group-stratified split yielded zero val rows. Check that "
+                "holdout_group_id has multiple distinct groups."
+            )
+        if int((~val_mask).sum()) == 0:
+            raise RuntimeError(
+                "Group-stratified split yielded zero train rows. Check the "
+                "group cardinality and val_fraction."
+            )
+        val_idx = np.where(val_mask)[0]
+        train_idx = np.where(~val_mask)[0]
+        LOG.info(
+            "fit_gbdt_member: group-stratified split "
+            "(%d groups -> %d held; %d train rows / %d val rows; "
+            "val mean_y=%.4f, train mean_y=%.4f)",
+            n_groups, n_val_groups,
+            int(train_idx.shape[0]), int(val_idx.shape[0]),
+            float(y[val_idx].mean()) if val_idx.size else 0.0,
+            float(y[train_idx].mean()) if train_idx.size else 0.0,
+        )
 
     X_train = X[train_idx]
     y_train = y[train_idx]
