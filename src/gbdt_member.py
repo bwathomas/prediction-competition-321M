@@ -67,6 +67,48 @@ _EPS = 1.0e-6
 _LEAF_FEATURE_SENTINEL: int = -1
 
 
+# LightGBM rejects ``["\,\:\}\{\[\]]`` and any control char in feature
+# names (see ``lightgbm.basic._safe_feature_name``). Schema feature
+# names are mostly machine-emitted (``pool__centroid_dist_0``,
+# ``cluster__017``, ...) so they're already clean -- but raw
+# ``condition`` strings can include arbitrary punctuation. We sanitize
+# uniformly here so a future schema field that accidentally contains
+# a forbidden char doesn't blow up training. The map is stable: same
+# input always yields the same output, and collisions get a unique
+# numeric suffix so distinct columns don't fold into the same name.
+import re as _re
+
+# Matches the exact set LightGBM rejects in
+# ``LGBM_DatasetCreateFromMat`` -> "Do not support special JSON
+# characters in feature name". The C++ check is
+# ``fname.find_first_of("\"\\,:[]{}") != npos``.
+_LGBM_FORBIDDEN = _re.compile(r'["\\,:\[\]\{\}]')
+
+
+def _sanitize_for_lightgbm(names: Sequence[str]) -> list[str]:
+    """Return a copy of ``names`` with LightGBM-illegal chars replaced
+    by ``_`` and any post-replace duplicates disambiguated with a
+    numeric suffix."""
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for raw in names:
+        cleaned = _LGBM_FORBIDDEN.sub("_", str(raw))
+        # Empty names confuse LightGBM too. Substitute a placeholder.
+        if not cleaned:
+            cleaned = "feat"
+        if cleaned in seen:
+            seen[cleaned] += 1
+            cleaned_disamb = f"{cleaned}__dup{seen[cleaned]}"
+            # Edge: the disambiguated form might also collide with a
+            # later name -- rare, but track it too.
+            seen[cleaned_disamb] = 0
+            out.append(cleaned_disamb)
+        else:
+            seen[cleaned] = 0
+            out.append(cleaned)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Compiled tree structure (numpy arrays only)
 # ---------------------------------------------------------------------------
@@ -609,11 +651,20 @@ def fit_gbdt_member(
         w_train = None
         w_val = None
 
+    # LightGBM rejects feature names with special JSON chars (commas,
+    # brackets, colons, quotes, braces, control chars). Schema names
+    # are machine-emitted but raw condition strings can include any
+    # of these, so we sanitize uniformly. The booster only ever sees
+    # the sanitized names; the saved ``GBDTMemberState.feature_names``
+    # keeps the originals so downstream introspection / packaging is
+    # unaffected.
+    feature_names_for_lgbm = _sanitize_for_lightgbm(feature_names)
+
     train_set = lgb.Dataset(
         X_train,
         label=y_train,
         weight=w_train,
-        feature_name=list(feature_names),
+        feature_name=feature_names_for_lgbm,
         categorical_feature=[],
         free_raw_data=False,
     )
@@ -621,7 +672,7 @@ def fit_gbdt_member(
         X_val,
         label=y_val,
         weight=w_val,
-        feature_name=list(feature_names),
+        feature_name=feature_names_for_lgbm,
         categorical_feature=[],
         reference=train_set,
         free_raw_data=False,
