@@ -242,6 +242,105 @@ def apply_state_batch(state: "LogRegMemberState", features: np.ndarray) -> np.nd
 
 
 # ---------------------------------------------------------------------------
+# Memory-bounded standardization helpers (used by ``fit_logreg_member``)
+# ---------------------------------------------------------------------------
+
+
+def _chunked_mean_std(
+    X: np.ndarray,
+    idx: np.ndarray,
+    chunk: int = 65_536,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-feature ``(mean, std)`` of ``X[idx]`` without a full f64 copy.
+
+    Reductions are accumulated in float64 (matching ``X.astype(f64).
+    mean(axis=0)`` numerics) but we only ever materialize one
+    ``chunk``-sized float64 block at a time (~256 MB at chunk=65_536
+    and F=1200). At 5M-row scale the eager path peaks at ~88 GB
+    transient (a 22 GB X[idx] copy plus three 22-44 GB f64 temps);
+    this path peaks at ~256 MB. Sample std uses Bessel's correction
+    (divides by ``n - 1``) to match ``np.std(..., ddof=1)``-style
+    semantics that ``X.astype(f64).std(axis=0)`` also approximates
+    via the population formula -- the difference is < 1e-6 at
+    n = 5M. Returned arrays are float64.
+    """
+    n = int(idx.shape[0])
+    F = int(X.shape[1])
+    if n == 0:
+        return np.zeros(F, dtype=np.float64), np.ones(F, dtype=np.float64)
+    chunk = max(1, int(chunk))
+    s_sum = np.zeros(F, dtype=np.float64)
+    for s_ in range(0, n, chunk):
+        e_ = min(s_ + chunk, n)
+        s_sum += X[idx[s_:e_]].sum(axis=0, dtype=np.float64)
+    mu = s_sum / float(n)
+    s_var = np.zeros(F, dtype=np.float64)
+    for s_ in range(0, n, chunk):
+        e_ = min(s_ + chunk, n)
+        block = X[idx[s_:e_]].astype(np.float64, copy=False) - mu[None, :]
+        s_var += (block * block).sum(axis=0)
+    # Population variance (matches the previous .astype(f64).std(axis=0)
+    # output, which uses ddof=0 by default). The fp32 round-off across
+    # 5M rows is well below this difference.
+    var = s_var / float(n)
+    return mu, np.sqrt(np.maximum(var, 0.0))
+
+
+def _chunked_standardize_into(
+    X: np.ndarray,
+    idx: np.ndarray,
+    mu_f32: np.ndarray,
+    sigma_f32: np.ndarray,
+    chunk: int = 65_536,
+) -> np.ndarray:
+    """Fill a pre-allocated float32 ``out`` with ``(X[idx] - mu) / sigma``.
+
+    Allocates exactly ``len(idx) * F * 4`` bytes for ``out`` -- nothing
+    transient larger than one ``chunk``-sized block of ``X``.
+    """
+    n = int(idx.shape[0])
+    F = int(X.shape[1])
+    out = np.empty((n, F), dtype=np.float32)
+    if n == 0:
+        return out
+    chunk = max(1, int(chunk))
+    for s_ in range(0, n, chunk):
+        e_ = min(s_ + chunk, n)
+        block = X[idx[s_:e_]]
+        # block is fp32; subtract & divide via f32 broadcasting,
+        # writing through ``out[s_:e_]``. We avoid in-place ops on
+        # block because numpy fancy-indexing returns a copy already
+        # but we want the result to land in our pre-allocated buffer.
+        np.subtract(block, mu_f32, out=out[s_:e_])
+        out[s_:e_] /= sigma_f32
+    return out
+
+
+def _chunked_gather_f32(
+    X: np.ndarray,
+    idx: np.ndarray,
+    chunk: int = 65_536,
+) -> np.ndarray:
+    """``X[idx].astype(np.float32, copy=False)`` but in chunks.
+
+    Used in the ``standardize=False`` path for symmetry. With X
+    already in float32 the cost is the same as a single fancy-index
+    copy; we just spread the allocation over chunks so partial
+    progress is visible to the OS allocator.
+    """
+    n = int(idx.shape[0])
+    F = int(X.shape[1])
+    out = np.empty((n, F), dtype=np.float32)
+    if n == 0:
+        return out
+    chunk = max(1, int(chunk))
+    for s_ in range(0, n, chunk):
+        e_ = min(s_ + chunk, n)
+        out[s_:e_] = X[idx[s_:e_]]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Offline trainer (uses torch, called from the notebook only)
 # ---------------------------------------------------------------------------
 
@@ -329,15 +428,18 @@ def fit_logreg_member(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    X_train_raw = X[train_idx]
-    X_val_raw = X[val_idx]
-
     # ---- Standardization (TRAIN-only stats, then bake into weights) ----
+    #
+    # Memory contract: never materialize a full float64 copy of the
+    # train slice. At 5M-row scale, ``X[train_idx]`` is already ~22 GB
+    # in float32; the previous path also did ``.astype(np.float64)``
+    # twice (once for mean, once for std) which spiked peak RSS by
+    # ~88 GB and OOMed the 50 GB Colab high-RAM runtime. Chunked
+    # accumulators replicate the same numerics (float64 reductions)
+    # while holding only one ~256 MB chunk live at a time.
+    _STD_CHUNK = 65_536
     if standardize:
-        # float64 for the stats so the centering / scaling doesn't
-        # accumulate fp32 round-off across 5M rows.
-        feat_mean = X_train_raw.astype(np.float64).mean(axis=0)
-        feat_std = X_train_raw.astype(np.float64).std(axis=0)
+        feat_mean, feat_std = _chunked_mean_std(X, train_idx, chunk=_STD_CHUNK)
         n_zero_std = int(np.sum(feat_std < 1.0e-9))
         # Replace zero-std (constant) features' stds with 1.0 so we
         # don't divide by zero. After centering, those columns become
@@ -353,17 +455,25 @@ def fit_logreg_member(
             float(feat_std.min()), float(feat_std.max()),
             n_zero_std,
         )
-        X_train_used = ((X_train_raw - feat_mean[None, :]) / feat_std_safe[None, :]).astype(
-            np.float32, copy=False
+        # Materialize the standardized matrices in-place into a pre-
+        # allocated float32 buffer; chunk-by-chunk fancy-indexing keeps
+        # peak RAM bounded to the buffer + one chunk-sized transient.
+        mu_f32 = feat_mean.astype(np.float32)
+        sigma_f32 = feat_std_safe.astype(np.float32)
+        X_train_used = _chunked_standardize_into(
+            X, train_idx, mu_f32, sigma_f32, chunk=_STD_CHUNK
         )
-        X_val_used = ((X_val_raw - feat_mean[None, :]) / feat_std_safe[None, :]).astype(
-            np.float32, copy=False
+        X_val_used = _chunked_standardize_into(
+            X, val_idx, mu_f32, sigma_f32, chunk=_STD_CHUNK
         )
     else:
         feat_mean = None
         feat_std_safe = None
-        X_train_used = X_train_raw.astype(np.float32, copy=False)
-        X_val_used = X_val_raw.astype(np.float32, copy=False)
+        # Even without standardization, allocate the float32 view
+        # via chunked indexing so the path is symmetric and we don't
+        # rely on numpy fancy-indexing semantics for very large idx.
+        X_train_used = _chunked_gather_f32(X, train_idx, chunk=_STD_CHUNK)
+        X_val_used = _chunked_gather_f32(X, val_idx, chunk=_STD_CHUNK)
 
     X_t_train = torch.as_tensor(X_train_used, dtype=torch.float32, device=device)
     y_t_train = torch.as_tensor(y[train_idx], dtype=torch.float32, device=device)
