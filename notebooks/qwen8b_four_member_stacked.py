@@ -1051,19 +1051,24 @@ for i, k in enumerate(train_item_keys):
         if bc >= 0:
             item_benchmark_id_arr[i] = int(bc)
 
-# Benchmark age extraction. ``meta_id_tables.bc_meta_num`` has shape
+# Benchmark age extraction. ``meta_id_tables.bc_num`` has shape
 # ``[n_bc, 2 * n_bench_numeric]`` with each numeric field encoded as
 # (value, mask) pairs; if the mask is 0 the value is "unknown" and we
 # emit NaN so the aggregator's redaction kicks in.
 _bench_num_fields = list(_meta_schema.benchmark_numeric)
-if "benchmark_age" in _bench_num_fields:
+if "benchmark_age" in _bench_num_fields and getattr(
+    meta_id_tables, "bc_num", None
+) is not None:
     age_idx = _bench_num_fields.index("benchmark_age")
-    bc_meta_num_np = meta_id_tables.bc_meta_num.cpu().numpy().astype(np.float32)
-    bc_id_to_age_arr = np.where(
-        bc_meta_num_np[:, 2 * age_idx + 1] > 0.5,
-        bc_meta_num_np[:, 2 * age_idx],
-        np.nan,
-    ).astype(np.float32)
+    bc_num_np = meta_id_tables.bc_num.cpu().numpy().astype(np.float32)
+    if bc_num_np.shape[1] >= 2 * (age_idx + 1):
+        bc_id_to_age_arr = np.where(
+            bc_num_np[:, 2 * age_idx + 1] > 0.5,
+            bc_num_np[:, 2 * age_idx],
+            np.nan,
+        ).astype(np.float32)
+    else:
+        bc_id_to_age_arr = np.full(indexer.n_bc, np.nan, dtype=np.float32)
 else:
     bc_id_to_age_arr = np.full(indexer.n_bc, np.nan, dtype=np.float32)
 item_benchmark_age_arr = np.full(len(train_item_keys), np.nan, dtype=np.float32)
