@@ -803,6 +803,51 @@ def fit_gbdt_member(
             "the model has per-row init scores or the dump is malformed."
         )
 
+    # Compute MANUAL cross-entropy on the booster's own predictions.
+    # LightGBM's reported ``binary_logloss`` (in best_score / log
+    # callbacks) is empirically NOT equal to mean cross-entropy on
+    # ``booster.predict(X)`` -- we have observed gaps of 0.10 - 0.15
+    # nats on this codebase's 5M x 1200 feature shape, with reported
+    # < manual. Whatever LightGBM is reporting (likely something
+    # involving its internal score updater + bagging interaction in
+    # v4+), it is NOT the number we want to gate ensembling on.
+    #
+    # We therefore store the manual NLL as the canonical
+    # ``train_loss`` / ``val_loss`` and log the LGBM-reported numbers
+    # alongside so callers can spot the divergence themselves.
+    p_train_lgb = booster.predict(X_train).astype(np.float64)
+    p_val_lgb = booster.predict(X_val).astype(np.float64)
+    eps_clip = 1.0e-6
+    p_train_lgb = np.clip(p_train_lgb, eps_clip, 1.0 - eps_clip)
+    p_val_lgb = np.clip(p_val_lgb, eps_clip, 1.0 - eps_clip)
+    y_train_f = y_train.astype(np.float64)
+    y_val_f = y_val.astype(np.float64)
+    manual_train_nll = float(
+        -np.mean(y_train_f * np.log(p_train_lgb) + (1.0 - y_train_f) * np.log(1.0 - p_train_lgb))
+    )
+    manual_val_nll = float(
+        -np.mean(y_val_f * np.log(p_val_lgb) + (1.0 - y_val_f) * np.log(1.0 - p_val_lgb))
+    )
+    reported_train_nll = float(
+        booster.best_score.get("train", {}).get("binary_logloss", 0.0)
+    )
+    reported_val_nll = float(
+        booster.best_score.get("val", {}).get("binary_logloss", 0.0)
+    )
+    # If the reported and manual numbers disagree noticeably, surface
+    # a warning at fit time so we don't get fooled by a stale
+    # heuristic when comparing members in the stacker.
+    nll_gap = abs(manual_val_nll - reported_val_nll)
+    if nll_gap > 0.02:
+        LOG.warning(
+            "GBDT fit: LGBM-reported val_logloss=%.5f differs from manual "
+            "cross-entropy on booster.predict()=%.5f by %.4f nats. The "
+            "manual number (which matches the runtime walker) is what "
+            "this state will report as val_loss. The LGBM-reported value "
+            "is preserved as a side-channel diagnostic.",
+            reported_val_nll, manual_val_nll, nll_gap,
+        )
+
     # Build the final state with the recovered bias.
     final_state = GBDTMemberState(
         feature_concat=feat,
@@ -818,12 +863,8 @@ def fit_gbdt_member(
         n_train=int(N),
         n_pos=int(np.sum(y == 1.0)),
         n_trees=int(len(compiled)),
-        train_loss=float(
-            booster.best_score.get("train", {}).get("binary_logloss", 0.0)
-        ),
-        val_loss=float(
-            booster.best_score.get("val", {}).get("binary_logloss", 0.0)
-        ),
+        train_loss=float(manual_train_nll),
+        val_loss=float(manual_val_nll),
     )
 
     # ---- Parity check (FAIL-FAST) ----
@@ -859,12 +900,17 @@ def fit_gbdt_member(
             "recovery is broken; do not ship this state."
         )
     LOG.info(
-        "GBDT fit OK: n_trees=%d total_nodes=%d feature_dim=%d val_logloss=%.5f "
+        "GBDT fit OK: n_trees=%d total_nodes=%d feature_dim=%d "
+        "manual_train_nll=%.5f manual_val_nll=%.5f "
+        "lgbm_reported_train=%.5f lgbm_reported_val=%.5f "
         "parity_raw=%.2e parity_prob=%.2e bias=%.4f",
         final_state.n_trees,
         final_state.total_nodes,
         final_state.feature_dim,
-        final_state.val_loss,
+        manual_train_nll,
+        manual_val_nll,
+        reported_train_nll,
+        reported_val_nll,
         max_abs_err_raw,
         max_abs_err_prob,
         final_state.bias,

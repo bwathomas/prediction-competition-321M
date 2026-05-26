@@ -2032,13 +2032,30 @@ gbdt_state = cache_or_compute(
     # ``speed_v1`` invalidates entries trained with default LightGBM
     # params (max_bin=255, no force_col_wise) which took 5-10 min
     # at 5M-row scale.
-    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED, "speed_v1", "init_v2"),
+    # ``honest_loss_v1`` invalidates entries whose ``train_loss`` /
+    # ``val_loss`` were the LGBM-reported ``binary_logloss`` (which
+    # is empirically biased low by ~0.10 - 0.15 nats on this codebase
+    # vs the actual mean cross-entropy of ``booster.predict()``).
+    # The new state stores the manual NLL, so the stacker compares
+    # apples to apples across members.
+    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED,
+                "speed_v1", "init_v2", "honest_loss_v1"),
     compute_fn=_fit_member2,
 )
 p_member2_val = gbdt_apply_batch(gbdt_state, X_val_dense)
 nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
-print(f"[Member 2] val log-loss: {nll_m2:.6f}  n_trees={gbdt_state.n_trees}")
+# ``gbdt_state.val_loss`` is the manual cross-entropy on
+# ``booster.predict()`` over the booster's INTERNAL val split (10% of
+# train rows). ``nll_m2`` is the cross-entropy of the runtime walker
+# on the EXTERNAL cold-start ``primary.val``. The two should be close
+# (within ~0.01 nats on a healthy fit) and BOTH should reflect the
+# actual runtime predictions -- not LightGBM's optimistic internal
+# ``binary_logloss`` metric, which we no longer trust.
+print(f"[Member 2] val log-loss (cold-start primary.val):    {nll_m2:.6f}")
+print(f"[Member 2] val NLL stored in state (LGBM val split): {gbdt_state.val_loss:.6f}")
+print(f"[Member 2] train NLL stored in state (manual):       {gbdt_state.train_loss:.6f}")
+print(f"[Member 2] n_trees={gbdt_state.n_trees}  bias={gbdt_state.bias:+.4f}")
 
 # %% [markdown]
 # ## 9d. Train Member 3 (FAISS-free kNN-similarity)
