@@ -992,6 +992,7 @@ print(
 # %%
 from src.nn_features import (
     MISSING_TRAIT_ID,
+    NN_FEATURE_NAMES,
     ConditionalPassrateContext,
     build_conditional_passrate_context,
 )
