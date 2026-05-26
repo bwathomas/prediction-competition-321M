@@ -1193,8 +1193,15 @@ for i, k in enumerate(train_item_keys):
 
 # Benchmark age extraction. ``meta_id_tables.bc_num`` has shape
 # ``[n_bc, 2 * n_bench_numeric]`` with each numeric field encoded as
-# (value, mask) pairs; if the mask is 0 the value is "unknown" and we
-# emit NaN so the aggregator's redaction kicks in.
+# interleaved (scaled_value, missingness_mask) pairs. The mask
+# convention from ``NumericScaler.transform`` is:
+#
+#     mask < 0.5  ==  PRESENT (source value was finite)
+#     mask >= 0.5 ==  MISSING (NaN-imputed to the median)
+#
+# So we want the value when mask < 0.5 and NaN otherwise -- the
+# aggregator's redaction path triggers on NaN ages, not on the
+# imputed median, which would silently bias every conditional cell.
 _bench_num_fields = list(_meta_schema.benchmark_numeric)
 if "benchmark_age" in _bench_num_fields and getattr(
     meta_id_tables, "bc_num", None
@@ -1202,11 +1209,21 @@ if "benchmark_age" in _bench_num_fields and getattr(
     age_idx = _bench_num_fields.index("benchmark_age")
     bc_num_np = meta_id_tables.bc_num.cpu().numpy().astype(np.float32)
     if bc_num_np.shape[1] >= 2 * (age_idx + 1):
+        _age_value = bc_num_np[:, 2 * age_idx]
+        _age_mask = bc_num_np[:, 2 * age_idx + 1]
         bc_id_to_age_arr = np.where(
-            bc_num_np[:, 2 * age_idx + 1] > 0.5,
-            bc_num_np[:, 2 * age_idx],
-            np.nan,
+            _age_mask < 0.5,           # PRESENT in the source CSV
+            _age_value,                 # use the scaled value
+            np.nan,                     # else MISSING -> NaN -> redact
         ).astype(np.float32)
+        # Sanity probe: brief one-shot diagnostic on the BC table.
+        # Skips row 0 (UNK is MISSING by design).
+        _present_bc = int((_age_mask[1:] < 0.5).sum())
+        _total_bc = max(int(_age_mask.shape[0] - 1), 0)
+        print(
+            f"[bench_age] resolved {_present_bc}/{_total_bc} bc rows "
+            f"(non-UNK) to a finite age before the per-row mapping"
+        )
     else:
         bc_id_to_age_arr = np.full(indexer.n_bc, np.nan, dtype=np.float32)
 else:

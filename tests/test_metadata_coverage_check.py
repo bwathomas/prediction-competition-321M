@@ -208,3 +208,67 @@ def test_partial_coverage_above_threshold_passes() -> None:
     _, tables = _build_tables(**args)
     cov = _coverage_for(tables, args["schema"], side="bench_num", field="benchmark_age")
     assert cov == pytest.approx(1.0 / 3, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Mask-polarity regression: the notebook's bc_id_to_age extraction must
+# treat ``mask < 0.5`` as PRESENT (matching NumericScaler.transform).
+# Inversion silently produces an all-NaN ``bc_id_to_age_arr`` even when
+# every BC row has data, which causes ``neighbor_freshness_diff`` to run
+# 100% fallback. This test pins the convention end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def _extract_bc_id_to_age(tables, schema) -> np.ndarray:
+    """Mirror of the notebook's age-extraction expression in cell 7b."""
+    bench_num_fields = list(schema.benchmark_numeric)
+    age_idx = bench_num_fields.index("benchmark_age")
+    bc_num = tables.bc_num.cpu().numpy().astype(np.float32)
+    age_value = bc_num[:, 2 * age_idx]
+    age_mask = bc_num[:, 2 * age_idx + 1]
+    return np.where(age_mask < 0.5, age_value, np.nan).astype(np.float32)
+
+
+def test_bc_id_to_age_is_finite_when_csv_has_age() -> None:
+    """Fully-populated benchmark_info -> non-NaN ages for every real bc
+    (row 0 is UNK and stays NaN by design)."""
+    args = _good_inputs()
+    _, tables = _build_tables(**args)
+    arr = _extract_bc_id_to_age(tables, args["schema"])
+    real_rows = arr[1:]
+    assert np.all(np.isfinite(real_rows)), (
+        "bc_id_to_age must be finite for every populated benchmark; "
+        f"got {real_rows} (NaNs at indices {np.where(~np.isfinite(real_rows))[0]})"
+    )
+
+
+def test_bc_id_to_age_is_nan_when_age_column_missing() -> None:
+    """Drop the age column -> every real bc gets NaN (which downstream
+    forces the freshness-diff cell to fallback, as intended)."""
+    args = _good_inputs()
+    args["benchmark_info"] = args["benchmark_info"].drop(columns=["age"])
+    _, tables = _build_tables(**args)
+    arr = _extract_bc_id_to_age(tables, args["schema"])
+    assert np.all(np.isnan(arr[1:])), (
+        "expected every real bc row to be NaN when 'age' is missing; "
+        f"got {arr[1:]}"
+    )
+
+
+def test_bc_id_to_age_polarity_not_inverted() -> None:
+    """Strong regression: if the polarity ever flips back to
+    ``mask > 0.5``, every real bc would be NaN AND row 0 (UNK,
+    mask=1) would carry the imputed median value -- guaranteeing the
+    classic "0/N age_known" failure. We assert the opposite."""
+    args = _good_inputs()
+    _, tables = _build_tables(**args)
+    arr = _extract_bc_id_to_age(tables, args["schema"])
+    # UNK row 0: NaN. Real rows: finite. Inversion would swap these.
+    assert np.isnan(arr[0]), (
+        "row 0 (UNK) must be NaN; if it's finite the mask polarity "
+        "is inverted (mask>0.5 was treated as PRESENT)"
+    )
+    assert np.any(np.isfinite(arr[1:])), (
+        "no real bc has a finite age -- mask polarity is almost "
+        "certainly inverted"
+    )
