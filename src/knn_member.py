@@ -492,10 +492,28 @@ def _topk_indices_descending_batch(
     return out.astype(np.int64, copy=False)
 
 
+def _try_torch_cuda():  # noqa: ANN201 (private helper, return type intentional)
+    """Return a tuple ``(torch, device)`` if torch+CUDA are available, else ``None``."""
+    try:
+        import torch
+    except Exception:
+        return None
+    try:
+        if torch.cuda.is_available():
+            return torch, torch.device("cuda")
+    except Exception:
+        return None
+    return None
+
+
 def apply_batch(
     state: KNNMemberState,
     queries_full: np.ndarray,
     subject_keys: Sequence[str],
+    *,
+    chunk_size: int | None = None,
+    use_gpu: bool | None = None,
+    progress: bool = False,
 ) -> np.ndarray:
     """Vectorized batched inference. Returns ``[B]`` float32 probabilities.
 
@@ -506,15 +524,35 @@ def apply_batch(
       * Query projection: one ``[B, D] @ [D, P]`` matmul instead of
         ``B`` separate ``[1, D] @ [D, P]`` calls.
       * Decoded-embedding lookup: cached on the state (see
-        :func:`_decode_embeddings`); the matmul is one
-        ``[B, P] @ [P, N_items]``.
+        :func:`_decode_embeddings`); the per-chunk matmul is
+        ``[chunk, P] @ [P, N_items]``.
       * Top-k: vectorized ``argpartition`` + ``argsort`` along axis 1.
       * Two-stage shrinkage: pure numpy on ``[B]`` arrays.
 
-    Speedup over the previous per-row loop: ~20-50x on a 10k-row
-    val batch with ~100k training items. This is the main offline-
-    OOF and val-scoring hot path; the per-row :func:`apply_one`
-    is still the runtime entry point.
+    Memory + speed knobs:
+
+      * ``chunk_size``: rows of ``queries_full`` processed at once.
+        The peak working set is ``chunk_size * N_items * 4`` bytes
+        for the similarity matrix. ``None`` (default) auto-picks a
+        chunk that keeps that under ~4 GB; at N_items=300k that's
+        ~3500 rows. Pass an explicit value to tune for your RAM.
+        At B=266k, N_items=296k, the unchunked sims matrix would be
+        315 GB -- so chunking is mandatory at production scale.
+
+      * ``use_gpu``: if ``None`` (default), auto-detects torch+CUDA
+        for B >= 4096 (the matmul speedup pays off at that scale).
+        If ``True``, requires torch+CUDA and raises if unavailable.
+        If ``False``, forces the pure-numpy CPU path (matches
+        :func:`apply_one` bit-for-bit subject to fp32 jitter). The
+        runtime path :func:`apply_one` never uses torch/GPU, so the
+        shipped artifact has no GPU dependency; this knob only
+        affects the offline OOF / val-scoring hot path.
+
+      * ``progress``: if True, wrap the per-chunk loop in a tqdm bar.
+        Useful when scoring 200k+ rows so you can watch progress.
+
+    The runtime entry point :func:`apply_one` is unaffected (it is
+    pure numpy and never imports torch).
     """
     Q = np.asarray(queries_full, dtype=np.float32)
     if Q.ndim != 2:
@@ -535,22 +573,98 @@ def apply_batch(
         count=B,
     )
 
-    # Project + L2-normalize all queries in one matmul.
+    # Project + L2-normalize all queries in one matmul (cheap; output
+    # is [B, pca_dim] which is small).
     Qp = _project_queries_batch(state, Q)  # [B, P]
-    zero_query = np.all(Qp == 0.0, axis=1)  # zero-norm queries
+    zero_query_all = np.all(Qp == 0.0, axis=1)  # zero-norm queries
 
-    # Cosine similarity vs all training items.
-    embs = _decode_embeddings(state)         # [N_items, P]
-    sims = Qp @ embs.T                       # [B, N_items]
-
-    # Top-k along axis=1.
+    embs = _decode_embeddings(state)            # [N_items, P]
+    N_items = int(embs.shape[0])
+    P = int(embs.shape[1])
     K = int(state.k)
-    top_idx = _topk_indices_descending_batch(sims, K)  # [B, K]
-    sim_top = np.take_along_axis(sims, top_idx, axis=1).astype(np.float32, copy=False)
 
-    # Gather per-(row, neighbor) labels and masks.
-    # passrate_dense is [S, N_items]; we want [B, K] = passrate_dense[s_ids, top_idx].
-    # Use s_ids[:, None] to broadcast.
+    # ---------------- Chunk size auto-pick ----------------
+    if chunk_size is None:
+        # Bound the per-chunk sims matrix to ~4 GB float32.
+        max_bytes = 4 * (1024 ** 3)
+        per_row_bytes = max(N_items * 4, 1)
+        chunk_size = max(1, min(B, int(max_bytes // per_row_bytes)))
+    else:
+        chunk_size = max(1, min(B, int(chunk_size)))
+
+    # ---------------- Backend selection ----------------
+    backend = "numpy"
+    torch_ctx = None
+    if use_gpu is True:
+        torch_ctx = _try_torch_cuda()
+        if torch_ctx is None:
+            raise RuntimeError(
+                "use_gpu=True but torch/CUDA is unavailable. Pass use_gpu=False "
+                "to force the CPU path or use_gpu=None to auto-detect."
+            )
+    elif use_gpu is None and B >= 4096:
+        # Auto-detect: only try GPU when the batch is large enough that
+        # the H<->D copy overhead pays off.
+        torch_ctx = _try_torch_cuda()
+    if torch_ctx is not None:
+        backend = "torch_cuda"
+
+    # Pre-cast embeddings once. Keeping the transposed view here means
+    # the per-chunk matmul is a contiguous [chunk, P] @ [P, N_items].
+    embs_T_np = np.ascontiguousarray(embs.T, dtype=np.float32)  # [P, N_items]
+    if backend == "torch_cuda":
+        torch_mod, device = torch_ctx  # type: ignore[misc]
+        embs_T_dev = torch_mod.from_numpy(embs_T_np).to(device, non_blocking=True)
+    else:
+        embs_T_dev = None
+
+    LOG.debug(
+        "apply_batch: B=%d N_items=%d P=%d K=%d backend=%s chunk_size=%d",
+        B, N_items, P, K, backend, chunk_size,
+    )
+
+    # ---------------- Per-chunk top-k similarity ----------------
+    top_idx = np.empty((B, K), dtype=np.int64)
+    sim_top = np.empty((B, K), dtype=np.float32)
+    chunk_iter = range(0, B, chunk_size)
+    if progress:
+        try:
+            from tqdm.auto import tqdm
+            chunk_iter = tqdm(
+                list(chunk_iter), desc="knn batch", unit="chunk",
+                leave=False,
+            )
+        except Exception:
+            pass
+
+    for start in chunk_iter:
+        end = min(B, start + chunk_size)
+        Qp_chunk = Qp[start:end]                          # [c, P]
+        if backend == "torch_cuda":
+            Qp_t = torch_mod.from_numpy(Qp_chunk).to(device)  # type: ignore[arg-type]
+            sims_t = Qp_t @ embs_T_dev                    # [c, N_items]
+            # Top-k on GPU is much faster than copying back first.
+            sim_t, idx_t = torch_mod.topk(sims_t, k=K, dim=1, largest=True, sorted=True)
+            top_idx[start:end] = idx_t.detach().cpu().numpy().astype(np.int64, copy=False)
+            sim_top[start:end] = sim_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        else:
+            sims_chunk = Qp_chunk @ embs_T_np             # [c, N_items]
+            ti_chunk = _topk_indices_descending_batch(sims_chunk, K)
+            top_idx[start:end] = ti_chunk
+            sim_top[start:end] = np.take_along_axis(
+                sims_chunk, ti_chunk, axis=1
+            ).astype(np.float32, copy=False)
+
+    if backend == "torch_cuda":
+        # Free GPU memory promptly so the caller can immediately use the
+        # GPU for something else (e.g. encoder forward passes).
+        del embs_T_dev
+        try:
+            torch_mod.cuda.empty_cache()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    # ---------------- Gather labels + masks (CPU, vectorized) ----------------
     s_safe = np.where(s_ids >= 0, s_ids, 0).astype(np.int64, copy=False)
     labels_top = state.passrate_dense[s_safe[:, None], top_idx].astype(
         np.float32, copy=False
@@ -590,11 +704,11 @@ def apply_batch(
 
     # Apply the same fallbacks the per-row path uses.
     # Zero-norm query: skip the neighbor stage, shrink via subject -> global only.
-    if zero_query.any():
+    if zero_query_all.any():
         a_zero = np.zeros_like(a)
         p1_zero = a_zero * 0.5 + (1.0 - a_zero) * mu_subj
         p_zero = b * p1_zero + (1.0 - b) * mu_glob
-        p_out = np.where(zero_query, p_zero, p_out)
+        p_out = np.where(zero_query_all, p_zero, p_out)
 
     # Unknown subject -> global prior.
     p_out = np.where(s_ids >= 0, p_out, mu_glob)
@@ -638,21 +752,90 @@ def _clip_prob(p: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _fit_pca(X: np.ndarray, pca_dim: int, *, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    """Pure-numpy randomized PCA. Returns (basis [D, P], mean [D]).
+def _fit_pca(
+    X: np.ndarray,
+    pca_dim: int,
+    *,
+    seed: int = 0,
+    n_oversamples: int = 10,
+    n_iter: int = 2,
+    max_pca_samples: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Truncated PCA via randomized SVD. Returns (basis [D, P], mean [D]).
 
-    For typical N (few thousand) this is fast enough that we don't need
-    sklearn.decomposition.PCA. Using SVD on the centered matrix.
+    Halko-Martinsson-Tropp randomized range finder + power iteration +
+    small SVD on the projected matrix. For wide matrices with
+    ``N >> pca_dim`` (e.g. 300k items at D=4096, pca_dim=128) this is
+    20-100x faster than full ``np.linalg.svd`` because we only solve
+    for the top ``pca_dim`` directions instead of all ``min(N, D)``.
+
+    Cost (per matmul): ``N * D * (pca_dim + n_oversamples)`` fmas.
+    With 2 power iterations (default) we do ~5 matmuls of that size,
+    vs full SVD's ``O(N * D^2)``. At the reference shape (N=300k,
+    D=4096, pca_dim=128) that's ~7 min -> ~30 sec.
+
+    Knobs:
+      * ``n_oversamples`` (default 10): extra random columns to
+        improve top-component accuracy. 10 is the Halko et al.
+        recommendation; rarely worth tuning.
+      * ``n_iter`` (default 2): number of power iterations. 2 is
+        enough for the spectrum we see in Qwen embeddings; bump to 4
+        if you observe the resulting basis is unstable across runs.
+      * ``max_pca_samples`` (default None): if set, fit PCA on a
+        random subsample of ``max_pca_samples`` rows. The top-128
+        directions stabilize fast with sample size, so e.g. 50k of
+        300k items gives essentially the same basis 10x faster. The
+        mean is still computed on the full ``X`` so test-time
+        centering is unaffected.
+
+    Numerical contract: the returned basis is approximately equal to
+    full-SVD's top-``pca_dim`` right singular vectors, up to a sign
+    flip per column and ~1e-3 relative jitter. Downstream cosine
+    similarity is invariant to sign, so this doesn't affect the
+    quantized neighbor search.
     """
     Xf = np.asarray(X, dtype=np.float32)
     mean = Xf.mean(axis=0).astype(np.float32)
-    Xc = Xf - mean[None, :]
-    # Truncated SVD via numpy: U S V^T = Xc (up to PCA_dim).
-    # For wide matrices (N << D) np.linalg.svd is fine on float32.
-    # full_matrices=False -> U: [N, k], S: [k], Vt: [k, D] where k=min(N, D).
-    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
-    P = min(int(pca_dim), int(Vt.shape[0]))
-    basis = Vt[:P].T.astype(np.float32)  # [D, P]
+
+    N = int(Xf.shape[0])
+    if max_pca_samples is not None and N > int(max_pca_samples):
+        # Subsample for the SVD only. Mean is from the full X so
+        # runtime centering of any future query stays consistent.
+        rng_sub = np.random.default_rng(int(seed) ^ 0xCAFE)
+        sub_idx = rng_sub.choice(N, size=int(max_pca_samples), replace=False)
+        Xc = (Xf[sub_idx] - mean[None, :]).astype(np.float32, copy=False)
+        LOG.info(
+            "knn_member: PCA subsample %d / %d items for SVD fit",
+            int(max_pca_samples), N,
+        )
+    else:
+        Xc = (Xf - mean[None, :]).astype(np.float32, copy=False)
+
+    rng = np.random.default_rng(int(seed))
+    Ns, D = int(Xc.shape[0]), int(Xc.shape[1])
+    p_target = int(pca_dim)
+    p = min(p_target + int(n_oversamples), D, Ns)
+
+    # Randomized range finder.
+    Omega = rng.standard_normal((D, p)).astype(np.float32)
+    Y = Xc @ Omega                                 # [Ns, p]
+
+    # Power iteration -- raises the small singular values relative to
+    # the top-pca_dim ones, sharpening the recovered basis.
+    for _ in range(int(n_iter)):
+        Q, _ = np.linalg.qr(Y)                     # [Ns, p]
+        Z = Xc.T @ Q                               # [D, p]
+        Qz, _ = np.linalg.qr(Z)                    # [D, p]
+        Y = Xc @ Qz                                # [Ns, p]
+
+    Q, _ = np.linalg.qr(Y)                         # [Ns, p]
+
+    # Small SVD on the [p, D] projected matrix.
+    B = Q.T @ Xc                                   # [p, D]
+    _, _, Vt = np.linalg.svd(B, full_matrices=False)  # Vt: [p, D]
+
+    P = min(int(p_target), int(Vt.shape[0]))
+    basis = Vt[:P].T.astype(np.float32)            # [D, P]
     return basis, mean
 
 

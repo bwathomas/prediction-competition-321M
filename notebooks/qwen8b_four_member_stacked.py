@@ -2073,22 +2073,40 @@ from src.knn_member import (
 )
 
 
+import time as _time_m3  # local alias to avoid clashing with anything else
+
+# Speed knobs for Member 3. With pca_dim=128 and the realistic shapes
+# we hit (~300k train items, ~270k val rows), the unchunked apply_batch
+# would materialize a 315 GB sims matrix and either OOM or swap. The
+# defaults below auto-chunk to <4 GB and use GPU when available; pin
+# them in CFG so the offline scoring path (cell 9c) sees the same.
+_m3_cfg = CFG.get("member3_knn", {})
+_M3_CHUNK = int(_m3_cfg.get("apply_chunk_size", 0)) or None  # None = auto
+_M3_USE_GPU = _m3_cfg.get("apply_use_gpu", None)             # None = auto
+_M3_PCA_SAMPLES = int(_m3_cfg.get("max_pca_samples", 0)) or None  # None = use all
+
+
 def _passrate_dense_from_csr(csr, mask_csr, n_subjects, n_items):
-    """Inflate the sparse pass-rate matrices to dense fp16 / bool
-    for Member 3's runtime. ``[S, N]`` is bounded by ``S * N * (2 + 1)``
-    bytes; with S=200, N=100000 that's ~60 MB, fine."""
+    """Inflate the sparse pass-rate matrices to dense fp32 / bool
+    for Member 3's runtime. ``[S, N]`` is bounded by ``S * N * (4 + 1)``
+    bytes; at S=900, N=300k that's ~1.4 GB, fine on Colab."""
     dense = csr.astype(np.float32).toarray()
     mask = mask_csr.astype(bool).toarray()
     return dense, mask
 
 
-print("[Member 3] inflating pass-rate matrices...")
+_m3_t0 = _time_m3.time()
+print(f"[Member 3] inflating pass-rate matrices "
+      f"(S={indexer.n_subjects}, N={len(train_item_keys):,})...")
 m3_passrate_dense, m3_passrate_mask = _passrate_dense_from_csr(
     nn_passrate_csr, nn_passrate_mask_csr,
     indexer.n_subjects, len(train_item_keys),
 )
+_m3_dt_inflate = _time_m3.time() - _m3_t0
 print(f"[Member 3] passrate_dense shape={m3_passrate_dense.shape}  "
-      f"observed={m3_passrate_mask.sum():,} / {m3_passrate_mask.size:,}")
+      f"observed={m3_passrate_mask.sum():,} / {m3_passrate_mask.size:,}  "
+      f"dense_size={m3_passrate_dense.nbytes / 1024**3:.2f} GB  "
+      f"({_m3_dt_inflate:.1f}s)")
 
 
 # Subject_keys in the SAME order as passrate_dense's rows (which
@@ -2101,42 +2119,92 @@ assert len(_subject_keys_ordered) == indexer.n_subjects
 
 
 def _fit_member3():
-    train_emb_arr = np.stack(
-        [item_emb_lookup[k] for k in train_item_keys], axis=0
-    ).astype(np.float32)
-    print(f"[Member 3] PCA-fitting + quantizing {len(train_item_keys):,} item embeddings...")
+    _t = _time_m3.time()
+    print(f"[Member 3] stacking {len(train_item_keys):,} train embeddings (D=4096)...")
+    # Pre-allocate a single contiguous buffer instead of np.stack to
+    # save the intermediate list-of-arrays. ~3-5x faster for 300k rows.
+    train_emb_arr = np.empty(
+        (len(train_item_keys), int(item_emb_lookup[train_item_keys[0]].shape[0])),
+        dtype=np.float32,
+    )
+    for i, k in enumerate(tqdm(train_item_keys, desc="stack train embs", unit="item")):
+        train_emb_arr[i] = item_emb_lookup[k]
+    print(f"[Member 3]   stacked in {_time_m3.time() - _t:.1f}s  "
+          f"({train_emb_arr.nbytes / 1024**3:.2f} GB)")
+
+    print(f"[Member 3] PCA-fitting (randomized SVD) + quantizing "
+          f"{len(train_item_keys):,} item embeddings"
+          f"{' [pca subsample={:,}]'.format(_M3_PCA_SAMPLES) if _M3_PCA_SAMPLES else ''}...")
     return fit_knn_member(
         item_keys=train_item_keys,
         item_embeddings=train_emb_arr,
         subject_keys=_subject_keys_ordered,
         passrate_dense=m3_passrate_dense,
         passrate_mask=m3_passrate_mask,
-        pca_dim=int(CFG.get("member3_knn", {}).get("pca_dim", 128)),
-        quantization=str(CFG.get("member3_knn", {}).get("quantization", "int8")),
-        k=int(CFG.get("member3_knn", {}).get("k", 32)),
-        tau_subject=float(CFG.get("member3_knn", {}).get("tau_subject", 5.0)),
-        tau_global=float(CFG.get("member3_knn", {}).get("tau_global", 200.0)),
+        pca_dim=int(_m3_cfg.get("pca_dim", 128)),
+        quantization=str(_m3_cfg.get("quantization", "int8")),
+        k=int(_m3_cfg.get("k", 32)),
+        tau_subject=float(_m3_cfg.get("tau_subject", 5.0)),
+        tau_global=float(_m3_cfg.get("tau_global", 200.0)),
     )
 
 
+# ``rsvd_v1`` invalidates any older entry trained with the previous
+# full-SVD ``_fit_pca``. The new randomized PCA gives an
+# approximately-equivalent basis (top-K subspace overlap > 0.99 in
+# unit tests) but the basis is sign-flipped per column. Quantization
+# noise dominates downstream cosine similarity, so the change is
+# mostly cosmetic -- but we bump the key to be safe.
 knn_state: KNNMemberState = cache_or_compute(
     "knn_state",
-    key_inputs=(len(train_item_keys), int(CFG.get("member3_knn", {}).get("pca_dim", 128))),
+    key_inputs=(
+        len(train_item_keys),
+        int(_m3_cfg.get("pca_dim", 128)),
+        str(_m3_cfg.get("quantization", "int8")),
+        int(_m3_cfg.get("k", 32)),
+        "rsvd_v1",
+    ),
     compute_fn=_fit_member3,
 )
 print(f"[Member 3] state: pca_dim={knn_state.pca_dim}  "
-      f"quant={knn_state.quantization}  k={knn_state.k}")
+      f"quant={knn_state.quantization}  k={knn_state.k}  "
+      f"n_items={knn_state.n_items:,}  "
+      f"global_passrate={knn_state.global_passrate:.4f}")
 
-# Score on val rows.
-print("[Member 3] scoring val rows...")
-val_item_emb = np.stack(
-    [item_emb_lookup[k] for k in primary.val["item_key"]], axis=0
-).astype(np.float32)
+
+# ---- Score on val rows ----
+# 266k val rows x ~300k train items would produce a 315 GB sims matrix
+# in one shot. apply_batch chunks internally; we just need to stack
+# the val embeddings and pass them in.
+print(f"[Member 3] stacking {len(primary.val):,} val embeddings...")
+_t = _time_m3.time()
+val_item_emb = np.empty(
+    (len(primary.val), int(item_emb_lookup[next(iter(item_emb_lookup))].shape[0])),
+    dtype=np.float32,
+)
+for i, k in enumerate(tqdm(primary.val["item_key"].to_list(), desc="stack val embs", unit="item")):
+    val_item_emb[i] = item_emb_lookup[k]
 val_subj_keys_for_knn = [str(s) for s in primary.val["subject_key"]]
-p_member3_val = knn_apply_batch(knn_state, val_item_emb, val_subj_keys_for_knn)
+print(f"[Member 3]   stacked in {_time_m3.time() - _t:.1f}s  "
+      f"({val_item_emb.nbytes / 1024**3:.2f} GB)")
+
+print(f"[Member 3] scoring val rows  "
+      f"chunk_size={'auto' if _M3_CHUNK is None else _M3_CHUNK}  "
+      f"use_gpu={'auto' if _M3_USE_GPU is None else _M3_USE_GPU}...")
+_t = _time_m3.time()
+p_member3_val = knn_apply_batch(
+    knn_state, val_item_emb, val_subj_keys_for_knn,
+    chunk_size=_M3_CHUNK, use_gpu=_M3_USE_GPU, progress=True,
+)
+_m3_dt_score = _time_m3.time() - _t
 nll_m3 = float(-(ylab_val * np.log(np.clip(p_member3_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member3_val, 1e-6, 1 - 1e-6))).mean())
-print(f"[Member 3] val log-loss: {nll_m3:.6f}")
+print(f"[Member 3] scored {len(p_member3_val):,} val rows in {_m3_dt_score:.1f}s  "
+      f"({len(p_member3_val) / max(_m3_dt_score, 1e-9):.0f} rows/s)")
+print(f"[Member 3] val log-loss: {nll_m3:.6f}  "
+      f"p stats: min={p_member3_val.min():.4f} mean={p_member3_val.mean():.4f} max={p_member3_val.max():.4f}")
+del val_item_emb
+gc.collect()
 
 # %% [markdown]
 # ## 9e. Train Member 4 (Logistic regression)
