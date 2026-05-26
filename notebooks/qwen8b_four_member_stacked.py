@@ -1730,6 +1730,49 @@ trained_a = trained_a.to(device).eval()
 print("Scoring Model A on val...")
 p_a_val = _score_dataset(val_ds, trained_a)
 
+# Pre-score Model A on train ONCE here (cached). This lets us free
+# the heavy ``train_ds`` / ``val_ds`` item-embedding stacks (~84 GB
+# combined at 5M+260k rows x 4096 dims) before the
+# X_train_dense / X_val_dense build, which itself wants ~25 GB. The
+# downstream calibrator cell consumes ``p_a_train`` directly instead
+# of re-scoring, so this isn't a duplicate cost.
+print("Scoring Model A on train (cached so calibrator skips re-score)...")
+
+
+def _score_a_on_train():
+    return _score_dataset(train_ds, trained_a)
+
+
+p_a_train = cache_or_compute(
+    "p_a_train",
+    key_inputs=(
+        "v1",
+        int(len(primary.train)),
+        int(state_fingerprint(ckpt_a["model_state"])[:8], 16),
+    ),
+    compute_fn=_score_a_on_train,
+)
+print(f"[Member 1] p_a_train: shape={p_a_train.shape}  "
+      f"log-loss={-(primary.train['label'].astype(float).to_numpy() * np.log(np.clip(p_a_train, 1e-6, 1-1e-6)) + (1 - primary.train['label'].astype(float).to_numpy()) * np.log(1 - np.clip(p_a_train, 1e-6, 1-1e-6))).mean():.6f}")
+
+# Free the heavy item-embedding stacks now that Model A has produced
+# both train + val predictions. ``train_ds.item_emb`` alone is the
+# single largest object in scope (~80 GB at 5M rows x 4096 dims).
+# We leave the trained model itself bound (cheap) in case the
+# calibrator wants to score on additional rows; but per the cached
+# ``p_a_train`` / ``p_a_val`` we don't actually need it any more.
+trained_a = trained_a.to("cpu")
+for _stale_name in ("train_ds", "val_ds"):
+    if _stale_name in globals():
+        try:
+            del globals()[_stale_name]
+        except KeyError:
+            pass
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+_log_ram("after freeing train_ds / val_ds (post Model A scoring)")
+
 ylab_val = primary.val["label"].astype(float).to_numpy()
 val_bc_keys = primary.val["benchmark_condition_key"].astype(str).to_numpy()
 
@@ -2225,9 +2268,13 @@ def _fit_nn_calibrator():
     Returns a picklable bundle so a cached run produces bit-identical
     downstream values without re-scoring or re-searching.
     """
-    print("[Calibrator] Member 1 (Model A IRT-MLP) on train...")
-    p_a_train_local = _score_dataset(train_ds, trained_a)
-    p1_train_local = p_a_train_local.astype(np.float32)
+    print("[Calibrator] Member 1 (Model A IRT-MLP) on train (using cached p_a_train)...")
+    # ``train_ds`` was freed after Model A scored both train+val
+    # (cell 9) to make room for the dense X build. Reuse the cached
+    # ``p_a_train`` instead of re-allocating an 80 GB item-emb stack
+    # to re-score.
+    p_a_train_local = p_a_train.astype(np.float32)
+    p1_train_local = p_a_train_local
     print(f"[Calibrator] p1_train: shape={p1_train_local.shape}  "
           f"log-loss={-(y_train * np.log(np.clip(p1_train_local, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p1_train_local, 1e-6, 1 - 1e-6))).mean():.6f}")
 
@@ -2235,11 +2282,27 @@ def _fit_nn_calibrator():
     p2_train_local = gbdt_apply_batch(gbdt_state, X_train_dense)
 
     print("[Calibrator] Member 3 (kNN) on train...")
-    train_item_emb_local = np.stack(
-        [item_emb_lookup[k] for k in primary.train["item_key"]], axis=0
-    ).astype(np.float32)
-    train_subj_keys_for_knn_local = [str(s) for s in primary.train["subject_key"]]
-    p3_train_local = knn_apply_batch(knn_state, train_item_emb_local, train_subj_keys_for_knn_local)
+    # Score in chunks rather than materializing a single
+    # ``[N_train, embedding_dim]`` float32 buffer (~80 GB at 5M rows
+    # x 4096 dims). Each chunk is allocated, scored and discarded;
+    # peak overhead is ``CHUNK * D * 4`` bytes.
+    _train_item_keys_arr = primary.train["item_key"].astype(str).to_numpy()
+    _train_subj_keys_arr = [str(s) for s in primary.train["subject_key"]]
+    p3_train_local = np.empty(len(primary.train), dtype=np.float32)
+    _knn_chunk = int(CFG.get("calibrator", {}).get("knn_chunk_rows", 250_000))
+    for _start in range(0, len(primary.train), _knn_chunk):
+        _stop = min(_start + _knn_chunk, len(primary.train))
+        _chunk_emb = np.stack(
+            [item_emb_lookup[k] for k in _train_item_keys_arr[_start:_stop]],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        _chunk_subj = _train_subj_keys_arr[_start:_stop]
+        p3_train_local[_start:_stop] = knn_apply_batch(
+            knn_state, _chunk_emb, _chunk_subj
+        ).astype(np.float32, copy=False)
+        del _chunk_emb, _chunk_subj
+    del _train_item_keys_arr, _train_subj_keys_arr
+    gc.collect()
 
     print("[Calibrator] Member 4 (LogReg) on train...")
     p4_train_local = logreg_apply_state_batch(logreg_state, X_train_dense)
