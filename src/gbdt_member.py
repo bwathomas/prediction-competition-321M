@@ -470,17 +470,31 @@ def apply_batch(
 
 
 def predict_raw(state: GBDTMemberState, features_matrix: np.ndarray) -> np.ndarray:
-    """Vectorized raw scores (sum of leaves + bias). Used for parity."""
+    """Vectorized raw scores (sum of leaves + bias). Used for parity.
+
+    Returns ``[N]`` float64. Walks every tree once across all rows via
+    :func:`_walk_tree_batch`, then sums the leaf values and adds bias.
+    Numerically identical to looping :func:`_traverse_one_tree` per
+    row -- same NaN handling, same default_left direction, same per-row
+    feature lookup -- but ~50-100x faster on large val sets because the
+    inner loop is numpy ops on ``[N]`` arrays instead of N python calls.
+    """
     if features_matrix.ndim != 2:
         raise ValueError("features_matrix must be 2D")
+    if int(features_matrix.shape[1]) != int(state.feature_dim):
+        raise ValueError(
+            f"features_matrix dim {features_matrix.shape[1]} != "
+            f"state.feature_dim {state.feature_dim}"
+        )
     N = int(features_matrix.shape[0])
-    out = np.empty(N, dtype=np.float64)
-    for i in range(N):
-        raw = float(state.bias)
-        for t in range(int(state.n_trees)):
-            raw += _traverse_one_tree(state, t, features_matrix[i])
-        out[i] = raw
-    return out
+    if N == 0:
+        return np.empty(0, dtype=np.float64)
+
+    fm = np.ascontiguousarray(features_matrix, dtype=np.float64)
+    raw = np.full(N, float(state.bias), dtype=np.float64)
+    for t in range(int(state.n_trees)):
+        raw += _walk_tree_batch(state, t, fm)
+    return raw
 
 
 # ---------------------------------------------------------------------------
