@@ -956,6 +956,135 @@ print(
     f"bench_num={list(meta_preprocessor.benchmark_num_scalers)}"
 )
 
+
+# ---------------------------------------------------------------------------
+# Metadata coverage check.
+#
+# This catches the failure mode where the schema declares a field
+# (e.g. ``benchmark_age``) but the underlying CSV / join produced no
+# data for any entity, leaving the corresponding numeric channel at
+# ``mask=1`` (= MISSING) and the conditional NN cells (freshness etc.)
+# at fallback for every row. We RAISE on zero-coverage fields so the
+# run halts before we waste compute training on silently-missing data.
+# Mask convention (from ``NumericScaler.transform``): ``mask < 0.5``
+# means the value was present in the source CSV; ``mask >= 0.5`` means
+# missing / non-finite / "Unknown".
+# ---------------------------------------------------------------------------
+def _assert_metadata_coverage(
+    preprocessor,
+    id_tables,
+    schema,
+    *,
+    min_coverage: float = 0.01,
+    show_examples: int = 5,
+) -> None:
+    sub_cat = id_tables.subject_cat_ids.cpu().numpy()
+    sub_num = id_tables.subject_num.cpu().numpy()
+    bc_cat = id_tables.bc_cat_ids.cpu().numpy()
+    bc_num = id_tables.bc_num.cpu().numpy()
+
+    # Slice off row 0 -- it's the reserved UNK row, MISSING by design.
+    sub_cat_real = sub_cat[1:] if sub_cat.shape[0] > 1 else sub_cat
+    sub_num_real = sub_num[1:] if sub_num.shape[0] > 1 else sub_num
+    bc_cat_real = bc_cat[1:] if bc_cat.shape[0] > 1 else bc_cat
+    bc_num_real = bc_num[1:] if bc_num.shape[0] > 1 else bc_num
+
+    issues: list[str] = []
+    rows: list[tuple[str, str, int, int, float]] = []
+
+    def _record(side: str, field: str, present: int, total: int) -> None:
+        frac = float(present) / float(max(total, 1))
+        rows.append((side, field, int(present), int(total), frac))
+        if total == 0:
+            return
+        if frac < min_coverage:
+            issues.append(
+                f"  - [{side}] {field!r}: only {present}/{total} "
+                f"({frac:.2%}) entities have data (threshold "
+                f"{min_coverage:.0%})"
+            )
+
+    for j, field in enumerate(schema.subject_categorical):
+        if j >= sub_cat_real.shape[1]:
+            issues.append(f"  - [subject_cat] {field!r}: column missing from id table")
+            continue
+        col = sub_cat_real[:, j]
+        present = int((col != 0).sum())
+        _record("subject_cat", field, present, col.size)
+
+    for j, field in enumerate(schema.subject_numeric):
+        col_idx = 2 * j + 1
+        if col_idx >= sub_num_real.shape[1]:
+            issues.append(f"  - [subject_num] {field!r}: column missing from id table")
+            continue
+        present = int((sub_num_real[:, col_idx] < 0.5).sum())
+        _record("subject_num", field, present, sub_num_real.shape[0])
+
+    for j, field in enumerate(schema.benchmark_categorical):
+        if j >= bc_cat_real.shape[1]:
+            issues.append(f"  - [bench_cat] {field!r}: column missing from id table")
+            continue
+        col = bc_cat_real[:, j]
+        present = int((col != 0).sum())
+        _record("bench_cat", field, present, col.size)
+
+    for j, field in enumerate(schema.benchmark_numeric):
+        col_idx = 2 * j + 1
+        if col_idx >= bc_num_real.shape[1]:
+            issues.append(f"  - [bench_num] {field!r}: column missing from id table")
+            continue
+        present = int((bc_num_real[:, col_idx] < 0.5).sum())
+        _record("bench_num", field, present, bc_num_real.shape[0])
+
+    print("Metadata coverage (excluding row 0 = UNK):")
+    print(f"  {'side':<14s} {'field':<22s} {'present':>10s} / {'total':<10s}  {'frac':>7s}")
+    for side, field, p, t, f in rows:
+        flag = "" if f >= min_coverage else "  <-- LOW"
+        print(f"  {side:<14s} {field:<22s} {p:>10d} / {t:<10d}  {f:>7.2%}{flag}")
+
+    if issues:
+        # Probe the underlying preprocessor lookup tables to surface the
+        # most likely root cause (CSV column missing, normalization
+        # rename failed, or join key mismatch).
+        bench_keys = list(preprocessor._benchmark_by_id.keys())[: int(show_examples)]
+        model_keys = list(preprocessor._subject_by_name.keys())[: int(show_examples)]
+        bench_sample = [
+            (k, dict(preprocessor._benchmark_by_id[k]))
+            for k in bench_keys
+        ]
+        model_sample = [
+            (k, dict(preprocessor._subject_by_name[k]))
+            for k in model_keys
+        ]
+        msg_lines = [
+            "Metadata coverage check FAILED:",
+            *issues,
+            "",
+            "Hints:",
+            "  * For numeric fields: confirm the column exists in the source CSV "
+            "AND values are numeric (not 'Unknown' / blank). 'benchmark_age' is "
+            "renamed from 'age' inside _normalize_benchmark_info, but only if the "
+            "raw column name is exactly 'age'.",
+            "  * For categorical fields: confirm the join key matches. Subjects "
+            "join by display name extracted from subject_content; benchmarks "
+            "join by the leading segment before '::' in the bc key.",
+            "",
+            f"Sample benchmark_info rows ({len(bench_sample)} of "
+            f"{len(preprocessor._benchmark_by_id)}):",
+        ]
+        for k, row in bench_sample:
+            msg_lines.append(f"  benchmark={k!r}: {row}")
+        msg_lines.append(
+            f"Sample model_info rows ({len(model_sample)} of "
+            f"{len(preprocessor._subject_by_name)}):"
+        )
+        for k, row in model_sample:
+            msg_lines.append(f"  name={k!r}: {row}")
+        raise RuntimeError("\n".join(msg_lines))
+
+
+_assert_metadata_coverage(meta_preprocessor, meta_id_tables, _meta_schema)
+
 # %% [markdown]
 # ## 7b. Conditional NN-feature context + recomputed NN matrices
 #
