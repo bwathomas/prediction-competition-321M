@@ -2236,9 +2236,17 @@ def _fit_member4():
     )
 
 
+# ``std_v1`` invalidates any older entry that was fit WITHOUT
+# per-feature standardization. The member_feat_schema mixes 4
+# orders of magnitude in feature scale (theta vs centroid_dist
+# vs one-hots vs NN features); without z-scoring, Adam saturates
+# the sigmoid and the resulting logreg gets val NLL ~3 (worse
+# than predicting the prior). The new fit z-scores on TRAIN
+# stats and bakes (mu, sigma) into the saved (weights, bias)
+# so the runtime path stays a pure x @ w + b matvec.
 logreg_state = cache_or_compute(
     "logreg_state",
-    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED),
+    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED, "std_v1"),
     compute_fn=_fit_member4,
 )
 p_member4_val = logreg_apply_state_batch(logreg_state, X_val_dense)
@@ -2246,7 +2254,16 @@ nll_m4 = float(-(ylab_val * np.log(np.clip(p_member4_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member4_val, 1e-6, 1 - 1e-6))).mean())
 print(f"[Member 4] val log-loss: {nll_m4:.6f}  "
       f"weights||={float(np.linalg.norm(logreg_state.weights)):.3f}  "
-      f"bias={float(logreg_state.bias):.3f}")
+      f"bias={float(logreg_state.bias):.3f}  "
+      f"fit_method={logreg_state.fit_method}")
+# Sanity: if val NLL is worse than the prior, something's still wrong.
+_p_prior = float(np.clip(ylab_val.mean(), 1e-6, 1 - 1e-6))
+_nll_prior = -(_p_prior * np.log(_p_prior) + (1 - _p_prior) * np.log(1 - _p_prior))
+if nll_m4 > _nll_prior + 0.01:
+    print(f"  >>> WARNING: Member 4 val NLL {nll_m4:.4f} is worse than prior "
+          f"{_nll_prior:.4f}. Saturation likely. Check feature scales / lr.")
+else:
+    print(f"  [OK] beats prior NLL {_nll_prior:.4f} by {_nll_prior - nll_m4:+.4f} nats")
 
 # %% [markdown]
 # ## 9f. Train the stacker (ridge logistic regression on val predictions)

@@ -260,6 +260,8 @@ def fit_logreg_member(
     seed: int = 0,
     early_stopping_patience: int = 20,
     device: str | None = None,
+    standardize: bool = True,
+    log_every: int = 10,
 ) -> LogRegMemberState:
     """Fit a torch logistic regression with Adam + early stopping.
 
@@ -268,6 +270,31 @@ def fit_logreg_member(
     AND as the reported ``val_loss`` in the saved state. This is NOT
     the OOF stacker val -- the stacker does its own out-of-fold split
     when consuming Member 4's predictions.
+
+    **Standardization:** the member-feature schema mixes very different
+    scales (``theta`` in [-1, 1], centroid distances in [1e3, 1e4],
+    NN features in [0, 50], one-hot indicators in {0, 1}, ...). Logistic
+    regression is NOT scale-invariant -- without standardization, Adam's
+    per-parameter adaptive LR cannot compensate for the 4-orders-of-
+    magnitude scale spread, weights drift to ~70 in norm, sigmoid
+    saturates, and val NLL ends up around 3 nats (worse than predicting
+    the prior, which gets 0.62 at the typical class balance).
+
+    The fit therefore z-scores ``X`` (per-feature mean & std on the
+    TRAIN slice, no val leakage) before training, then BAKES the
+    standardization back into the final ``weights`` / ``bias`` so the
+    runtime path stays a pure ``x @ w + b`` matvec with no schema
+    change. Specifically, if the trained weights/bias are
+    ``(w_std, b_std)`` operating on ``(x - mu) / sigma``, the saved
+    weights are ``w_final = w_std / sigma`` and bias is
+    ``b_final = b_std - sum(mu * w_final)``. Inference identity:
+
+        z = (x - mu) / sigma @ w_std + b_std
+          = x @ (w_std / sigma) - mu @ (w_std / sigma) + b_std
+          = x @ w_final + b_final
+
+    Pass ``standardize=False`` to keep the legacy un-scaled fit (only
+    useful when ``X`` is already standardized upstream).
 
     Returns a :class:`LogRegMemberState` ready for :meth:`save`.
     """
@@ -302,9 +329,45 @@ def fit_logreg_member(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    X_t_train = torch.as_tensor(X[train_idx], dtype=torch.float32, device=device)
+    X_train_raw = X[train_idx]
+    X_val_raw = X[val_idx]
+
+    # ---- Standardization (TRAIN-only stats, then bake into weights) ----
+    if standardize:
+        # float64 for the stats so the centering / scaling doesn't
+        # accumulate fp32 round-off across 5M rows.
+        feat_mean = X_train_raw.astype(np.float64).mean(axis=0)
+        feat_std = X_train_raw.astype(np.float64).std(axis=0)
+        n_zero_std = int(np.sum(feat_std < 1.0e-9))
+        # Replace zero-std (constant) features' stds with 1.0 so we
+        # don't divide by zero. After centering, those columns become
+        # all-zero and contribute nothing to the predictor regardless
+        # of the fitted weight, which is exactly what we want.
+        feat_std_safe = np.where(feat_std < 1.0e-9, 1.0, feat_std)
+        LOG.info(
+            "logreg_member: standardizing %d features  "
+            "mean range=[%.4g, %.4g]  std range=[%.4g, %.4g]  "
+            "n_zero_std=%d",
+            int(X.shape[1]),
+            float(feat_mean.min()), float(feat_mean.max()),
+            float(feat_std.min()), float(feat_std.max()),
+            n_zero_std,
+        )
+        X_train_used = ((X_train_raw - feat_mean[None, :]) / feat_std_safe[None, :]).astype(
+            np.float32, copy=False
+        )
+        X_val_used = ((X_val_raw - feat_mean[None, :]) / feat_std_safe[None, :]).astype(
+            np.float32, copy=False
+        )
+    else:
+        feat_mean = None
+        feat_std_safe = None
+        X_train_used = X_train_raw.astype(np.float32, copy=False)
+        X_val_used = X_val_raw.astype(np.float32, copy=False)
+
+    X_t_train = torch.as_tensor(X_train_used, dtype=torch.float32, device=device)
     y_t_train = torch.as_tensor(y[train_idx], dtype=torch.float32, device=device)
-    X_t_val = torch.as_tensor(X[val_idx], dtype=torch.float32, device=device)
+    X_t_val = torch.as_tensor(X_val_used, dtype=torch.float32, device=device)
     y_t_val = torch.as_tensor(y[val_idx], dtype=torch.float32, device=device)
     if sample_weights is not None:
         w_t_train = torch.as_tensor(
@@ -320,7 +383,12 @@ def fit_logreg_member(
     F = int(X.shape[1])
     linear = nn.Linear(F, 1, bias=True).to(device)
     nn.init.zeros_(linear.weight)
-    nn.init.zeros_(linear.bias)
+    # Initialize bias at logit(mean(y)) so the model starts on the
+    # prior and only has to learn the residual; this saves ~10 epochs
+    # of "warm-up" where Adam moves the bias up from 0 to logit(p_mean).
+    p_init = float(np.clip(y[train_idx].mean(), 1e-6, 1.0 - 1e-6))
+    bias_init = float(math.log(p_init / (1.0 - p_init)))
+    nn.init.constant_(linear.bias, bias_init)
     opt = Adam(
         linear.parameters(), lr=float(learning_rate), weight_decay=0.0
     )
@@ -369,6 +437,7 @@ def fit_logreg_member(
         linear.eval()
         with torch.no_grad():
             val_loss = float(_loss(linear, X_t_val, y_t_val, w_t_val).item())
+            train_loss_ep = ep_loss / max(n_batches, 1)
 
         if val_loss < best_val - 1e-6:
             best_val = val_loss
@@ -377,14 +446,25 @@ def fit_logreg_member(
                 "bias": float(linear.bias.detach().cpu().item()),
             }
             epochs_since_improve = 0
+            improved_marker = "*"
         else:
             epochs_since_improve += 1
-            if epochs_since_improve >= int(early_stopping_patience):
-                LOG.info(
-                    "logreg_member: early stop at epoch %d/%d (best_val=%.5f)",
-                    ep + 1, int(epochs), best_val,
-                )
-                break
+            improved_marker = " "
+
+        if int(log_every) > 0 and ((ep + 1) % int(log_every) == 0 or ep == 0):
+            LOG.info(
+                "logreg_member: epoch %3d/%d  train=%.5f  val=%.5f  best=%.5f %s "
+                "(no-improve=%d/%d)",
+                ep + 1, int(epochs), train_loss_ep, val_loss, best_val,
+                improved_marker, epochs_since_improve, int(early_stopping_patience),
+            )
+
+        if epochs_since_improve >= int(early_stopping_patience):
+            LOG.info(
+                "logreg_member: early stop at epoch %d/%d (best_val=%.5f)",
+                ep + 1, int(epochs), best_val,
+            )
+            break
 
     if not best_state:
         # Should never happen but guard anyway.
@@ -395,12 +475,32 @@ def fit_logreg_member(
 
     final_train_loss = float(_loss(linear, X_t_train, y_t_train, w_t_train).item())
 
+    # ---- Bake standardization into the saved weights/bias ----
+    # See docstring for the algebra; the output (w_final, b_final) is
+    # the linear model in ORIGINAL feature space, equivalent to
+    # standardize-then-predict-with-(w_std, b_std).
+    w_std_arr = best_state["weights"].astype(np.float64)
+    b_std_val = float(best_state["bias"])
+    if standardize and feat_std_safe is not None and feat_mean is not None:
+        w_final = (w_std_arr / feat_std_safe).astype(np.float32)
+        b_final = float(b_std_val - float(np.dot(feat_mean, w_std_arr / feat_std_safe)))
+        LOG.info(
+            "logreg_member: baked standardization into weights  "
+            "||w_std||=%.4f  ||w_final||=%.4f  b_std=%+.4f  b_final=%+.4f",
+            float(np.linalg.norm(w_std_arr)),
+            float(np.linalg.norm(w_final)),
+            b_std_val, b_final,
+        )
+    else:
+        w_final = w_std_arr.astype(np.float32)
+        b_final = b_std_val
+
     return LogRegMemberState(
-        weights=best_state["weights"].astype(np.float32),
-        bias=float(best_state["bias"]),
+        weights=w_final,
+        bias=float(b_final),
         feature_dim=int(F),
         feature_names=tuple(str(s) for s in feature_names),
-        fit_method="adam",
+        fit_method="adam_std" if standardize else "adam",
         n_train=int(n_train),
         n_pos=int(np.sum(y == 1.0)),
         train_loss=final_train_loss,
