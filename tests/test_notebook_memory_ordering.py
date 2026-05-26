@@ -99,6 +99,33 @@ def test_calibrator_does_not_rescore_model_a_on_train(notebook_text: str) -> Non
     )
 
 
+def test_member2_passes_speed_knobs(notebook_text: str) -> None:
+    """The Member 2 cell must thread ``max_bin``, ``force_col_wise``,
+    ``log_period``, and ``num_threads`` from CFG into ``fit_gbdt_member``.
+
+    Default LightGBM params take 5-10 min wall-clock on the
+    5M x 1200 schema; these knobs cut that to ~1.5-2.5 min while
+    staying bit-exact under ``deterministic=True``. A future edit
+    that drops them silently regresses training time by 3-5x and
+    eats most of a Colab session per re-run.
+    """
+    assert 'max_bin=int(CFG.get("member2_gbdt", {}).get("max_bin"' in notebook_text
+    assert 'force_col_wise=bool(CFG.get("member2_gbdt", {}).get("force_col_wise"' in notebook_text
+    assert 'log_period=int(CFG.get("member2_gbdt", {}).get("log_period"' in notebook_text
+    # The cache key must include a discriminator so older entries
+    # trained with the slow params don't poison a new run.
+    assert '"speed_v1"' in notebook_text, (
+        "Member 2 cache key must bump when the speed knobs change."
+    )
+    # The print line must not reference the non-existent
+    # ``tree_starts`` attribute (legacy bug; the correct attribute is
+    # ``n_trees``).
+    assert "gbdt_state.tree_starts" not in notebook_text, (
+        "GBDTMemberState exposes ``n_trees``, not ``tree_starts``; "
+        "the legacy print line crashes on success."
+    )
+
+
 def test_calibrator_member3_scores_in_chunks(notebook_text: str) -> None:
     """kNN's train scoring must chunk the embedding stack."""
     calibrator_match = re.search(

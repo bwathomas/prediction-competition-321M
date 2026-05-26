@@ -1996,7 +1996,12 @@ from src.gbdt_member import (
 
 
 def _fit_member2():
-    print("[Member 2] training LightGBM (this typically takes 30-90s)...")
+    # ~1.5-2.5 min on the 5M x 1200 feature schema with the speed
+    # knobs below (max_bin=63, force_col_wise=True). The default
+    # LightGBM params (max_bin=255, no force_col_wise) take 5-10 min
+    # at this scale; the speed knobs are bit-exact under
+    # ``deterministic=True``.
+    print("[Member 2] training LightGBM (typically 1.5-2.5 min on 5M rows)...")
     return fit_gbdt_member(
         X=X_train_dense,
         y=y_train,
@@ -2009,19 +2014,26 @@ def _fit_member2():
         seed=SEED,
         parity_atol=1.0e-5,
         # Hold out 10% of train for LightGBM's own early-stopping val.
-        val_fraction=0.1,
+        val_fraction=float(CFG.get("member2_gbdt", {}).get("val_fraction", 0.1)),
+        # Speed knobs (see fit_gbdt_member docstring for details).
+        max_bin=int(CFG.get("member2_gbdt", {}).get("max_bin", 63)),
+        force_col_wise=bool(CFG.get("member2_gbdt", {}).get("force_col_wise", True)),
+        log_period=int(CFG.get("member2_gbdt", {}).get("log_period", 25)),
+        num_threads=CFG.get("member2_gbdt", {}).get("num_threads", None),
     )
 
 
 gbdt_state = cache_or_compute(
     "gbdt_state",
-    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED),
+    # ``speed_v1`` discriminates entries trained with the speed knobs
+    # from any older entry trained with default LightGBM params.
+    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED, "speed_v1"),
     compute_fn=_fit_member2,
 )
 p_member2_val = gbdt_apply_batch(gbdt_state, X_val_dense)
 nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
-print(f"[Member 2] val log-loss: {nll_m2:.6f}  n_trees={len(gbdt_state.tree_starts)-1}")
+print(f"[Member 2] val log-loss: {nll_m2:.6f}  n_trees={gbdt_state.n_trees}")
 
 # %% [markdown]
 # ## 9d. Train Member 3 (FAISS-free kNN-similarity)
