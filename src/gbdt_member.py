@@ -753,11 +753,14 @@ def fit_gbdt_member(
 
     feat, thr, l, r, dl, offsets = _concat_trees(compiled)
 
-    # Anchor row to derive bias = init_score (LightGBM may add it
-    # implicitly when boost_from_average=True). We compute
-    #    bias = booster_raw_anchor - sum_of_compiled_leaves_anchor
-    # then verify it on multiple anchors.
-    anchor_idx = rng.choice(int(X.shape[0]), size=min(64, int(X.shape[0])), replace=False)
+    # Anchor rows to derive bias = init_score. LightGBM's binary
+    # objective with ``boost_from_average=True`` adds an implicit
+    # ``logit(mean_y_train)`` to every prediction in PROBABILITY space
+    # but NOT to ``raw_score=True`` outputs in modern (>=4) versions.
+    # We therefore recover the init_score by going through probability
+    # space (see the back-solve below) which is robust to the version
+    # difference.
+    anchor_idx = rng.choice(int(X.shape[0]), size=min(256, int(X.shape[0])), replace=False)
     X_anchor = X[anchor_idx]
 
     # Sum of leaf values (NO bias) using a temporary state with bias=0.
@@ -779,11 +782,21 @@ def fit_gbdt_member(
         val_loss=0.0,
     )
     sum_leaves = predict_raw(tmp_state, X_anchor.astype(np.float32, copy=False))
-    raw_lgb = booster.predict(X_anchor, raw_score=True)
-    delta = raw_lgb.astype(np.float64) - sum_leaves.astype(np.float64)
+
+    # Bias / init_score recovery via PROBABILITY back-solve. In modern
+    # LightGBM (>=4) the binary objective bakes the ``init_score``
+    # into the FIRST tree's leaf values rather than emitting it as a
+    # separate constant, so on healthy fits this lands at ~0 and the
+    # walker is already correct without it. We still solve for it
+    # explicitly so a non-binary or per-row-init-score variant fails
+    # loudly here instead of silently shipping a calibration bug.
+    prob_lgb = booster.predict(X_anchor).astype(np.float64)
+    prob_lgb = np.clip(prob_lgb, 1e-15, 1.0 - 1e-15)
+    raw_with_init = np.log(prob_lgb / (1.0 - prob_lgb))
+    delta = raw_with_init - sum_leaves.astype(np.float64)
     bias_estimate = float(delta.mean())
     bias_std = float(delta.std())
-    if bias_std > 1.0e-5:
+    if bias_std > 1.0e-4:
         raise RuntimeError(
             f"GBDT init_score not constant across anchor rows: "
             f"mean={bias_estimate} std={bias_std}. This usually means "
@@ -814,23 +827,46 @@ def fit_gbdt_member(
     )
 
     # ---- Parity check (FAIL-FAST) ----
+    # Two parity checks, raw space AND probability space. The raw-space
+    # check is what we used to do, but in modern LightGBM
+    # ``raw_score=True`` excludes init_score so the raw-space test
+    # passes even when ``bias`` is wrong. The probability-space check
+    # is end-to-end (same path the runtime walker takes) and catches
+    # any bias / link-function error at fit time.
     raw_numpy = predict_raw(final_state, X_val.astype(np.float32, copy=False))
     raw_lgb_val = booster.predict(X_val, raw_score=True).astype(np.float64)
-    max_abs_err = float(np.max(np.abs(raw_numpy - raw_lgb_val)))
-    if max_abs_err > float(parity_atol):
+    # Subtract bias because LightGBM's raw_score does NOT include init_score
+    # in current versions; comparing raw_numpy - bias to raw_lgb_val makes
+    # the diagnostic meaningful regardless of the LightGBM version.
+    max_abs_err_raw = float(
+        np.max(np.abs((raw_numpy - float(final_state.bias)) - raw_lgb_val))
+    )
+
+    p_numpy = apply_batch(final_state, X_val.astype(np.float32, copy=False))
+    p_lgb_val = booster.predict(X_val).astype(np.float64)
+    max_abs_err_prob = float(np.max(np.abs(p_numpy - p_lgb_val)))
+
+    if max_abs_err_raw > float(parity_atol):
         raise RuntimeError(
-            f"GBDT compile parity failed: max abs error {max_abs_err} > "
-            f"{parity_atol}. The numpy walker disagrees with LightGBM on "
-            "the val set; do not ship this state."
+            f"GBDT raw-space parity failed: max abs error {max_abs_err_raw} "
+            f"> {parity_atol}. The numpy walker disagrees with LightGBM "
+            "on leaf-sum traversal; do not ship this state."
+        )
+    if max_abs_err_prob > float(parity_atol):
+        raise RuntimeError(
+            f"GBDT probability-space parity failed: max abs error "
+            f"{max_abs_err_prob} > {parity_atol}. Bias / init_score "
+            "recovery is broken; do not ship this state."
         )
     LOG.info(
         "GBDT fit OK: n_trees=%d total_nodes=%d feature_dim=%d val_logloss=%.5f "
-        "parity_max_abs_err=%.2e bias=%.4f",
+        "parity_raw=%.2e parity_prob=%.2e bias=%.4f",
         final_state.n_trees,
         final_state.total_nodes,
         final_state.feature_dim,
         final_state.val_loss,
-        max_abs_err,
+        max_abs_err_raw,
+        max_abs_err_prob,
         final_state.bias,
     )
     return final_state

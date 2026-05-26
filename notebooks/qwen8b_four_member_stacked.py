@@ -2025,9 +2025,14 @@ def _fit_member2():
 
 gbdt_state = cache_or_compute(
     "gbdt_state",
-    # ``speed_v1`` discriminates entries trained with the speed knobs
-    # from any older entry trained with default LightGBM params.
-    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED, "speed_v1"),
+    # ``init_v2`` invalidates any older entry that was packed with the
+    # broken init_score recovery (raw_score - sum_leaves landed on 0
+    # because LightGBM's raw_score excludes init_score in v4+, so the
+    # walker's predictions were systematically off by logit(mean_y)).
+    # ``speed_v1`` invalidates entries trained with default LightGBM
+    # params (max_bin=255, no force_col_wise) which took 5-10 min
+    # at 5M-row scale.
+    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED, "speed_v1", "init_v2"),
     compute_fn=_fit_member2,
 )
 p_member2_val = gbdt_apply_batch(gbdt_state, X_val_dense)
