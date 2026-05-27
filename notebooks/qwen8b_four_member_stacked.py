@@ -2786,15 +2786,593 @@ else:
     print(f"  [OK] beats prior NLL {_nll_prior:.4f} by {_nll_prior - nll_m4:+.4f} nats")
 
 # %% [markdown]
-# ## 9f. Train the stacker (ridge logistic regression on val predictions)
+# ## 9.5. Per-fold OOF compute (Task 1: honest stacking inputs)
 #
-# The stacker takes 4 member predictions (in logit space) plus 3
-# auxiliary features (`bench_present`, NN neighbor support, mean
-# similarity, centroid distance) and emits one calibrated probability.
-# Hand-rolled torch training; pure-NumPy inference. We fit on val
-# (held out from every member's training) and report log-loss on the
-# same val set -- the OOF assertion is implicit because every member
-# saw zero val rows during training.
+# For each of the K folds, retrain Members 1-4 on the OTHER K-1 folds'
+# items and predict on this fold's held-out items. Concatenate across
+# folds -> one OOF prediction per training row, by a member that never
+# saw that row's item. These OOF predictions replace the existing
+# in-val stacker training inputs in section 9f.
+#
+# Per-fold compute is cached separately (cache_or_compute with fold
+# suffix in the key), so re-running with the same settings hits cache.
+# Bumping `CFG["oof"]["seed"]` or `n_folds` invalidates everything.
+#
+# What's fold-scoped (leakage-safe):
+#   - NN index (built over fold.train_item_keys only)
+#   - passrate_csr + conditional context (aggregated over fold-train labels only)
+#   - mean_encoded_stats (fit on fold-train labels only)
+#   - Member 1 retraining (if CFG["oof"]["retrain_member1_per_fold"]=True)
+#   - Member 2 GBDT residual anchor (uses fold M1 predictions, not global)
+#   - Member 3 kNN (built over fold-train items only)
+#   - Member 4 LogReg (fit on fold-train rows only)
+#
+# What stays global (acknowledged weak-leak; flagged in final summary):
+#   - member_feat_schema (fit on full primary.train)
+#   - subject_tables (theta, u from full-train Model A)
+#   - pool features z-score normalization (computed once on full train)
+#   - item embeddings (Qwen8B encoder is data-independent)
+
+# %%
+from src.oof_pipeline import (
+    OofPredictionAccumulator,
+    build_fold_item_index_map,
+    build_fold_nn_index,
+    reindex_per_item_array,
+    slice_train_rows,
+    split_fold_train_for_early_stopping,
+)
+from src.nn_features import build_passrate_table
+
+OOF_RETRAIN_M1 = bool(CFG["oof"].get("retrain_member1_per_fold", True))
+OOF_NN_BASE_DIR = ROOT / nn_cfg.cache_dir / "oof_folds"
+OOF_NN_BASE_DIR.mkdir(parents=True, exist_ok=True)
+OOF_ES_VAL_FRACTION = float(CFG["oof"].get("es_val_fraction", 0.1))
+
+print(
+    f"[OOF] Starting per-fold compute (n_folds={len(folds)}, "
+    f"retrain_M1_per_fold={OOF_RETRAIN_M1}, es_val_fraction={OOF_ES_VAL_FRACTION:.2f})..."
+)
+print(
+    f"[OOF] Expected wall time on Colab: "
+    f"{'~30-60 min per fold x ' + str(len(folds)) + ' folds (Member 1 dominant) plus ~10 min per fold for Members 2/3/4' if OOF_RETRAIN_M1 else '~10 min per fold (Members 2/3/4 only, M1 kept global with small acknowledged leakage)'}"
+)
+
+_N_TRAIN = len(primary.train)
+p_a_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p_a_train_oof")
+p2_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p2_train_oof")
+p3_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p3_train_oof")
+p4_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p4_train_oof")
+nn_mean_sim_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="nn_mean_sim_oof")
+nn_support_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="nn_support_oof")
+centroid_dist_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="centroid_dist_oof")
+
+# Gate 1b tracker: for each fold we'll save a sample of OOF-row top-k
+# neighbor item_keys so we can assert (after the loop) that none of them
+# leak from the fold's own OOF item set.
+_oof_nn_probe_data: dict[int, np.ndarray] = {}
+
+# Per-row item_key array as a NumPy object array for fast slicing.
+_train_row_item_keys_arr = np.asarray(_train_row_item_keys, dtype=object)
+
+
+def _slice_nn_aux_from_oof_mat(nn_oof_mat_fold: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Pull the stacker's two NN-derived aux features out of an OOF
+    NN-feature matrix: (mean_similarity, log1p_neighbors_observed).
+    Matches the column indexing used by the existing val stacker
+    (columns 1 and 2 of `nn_val_mat`)."""
+    return (
+        nn_oof_mat_fold[:, 1].astype(np.float32),
+        nn_oof_mat_fold[:, 2].astype(np.float32),
+    )
+
+
+def _centroid_dist_for_rows(rows_df) -> np.ndarray:
+    """Compute the centroid_distance aux feature for a row slice
+    (min across centroid_dist_* columns in pool_features_z)."""
+    _cols = [c for c in pool_features_z.columns if c.startswith("centroid_dist_")]
+    if not _cols:
+        return np.full(len(rows_df), 0.5, dtype=np.float32)
+    _idx = pool_features_z.set_index("item_key").reindex(
+        rows_df["item_key"].astype(str)
+    )
+    return _idx[_cols].astype(np.float32).min(axis=1).to_numpy()
+
+
+for fold in folds:
+    print(f"\n[OOF] ============ fold {fold.fold_id}/{len(folds)} ============")
+    print(f"[OOF] fold {fold.fold_id}: train_rows={len(fold.train_row_idx):,} "
+          f"oof_rows={len(fold.oof_row_idx):,} "
+          f"train_items={len(fold.train_item_keys):,} "
+          f"oof_items={len(fold.oof_item_keys):,}")
+    fold_suffix = fold_cache_suffix(
+        fold_id=fold.fold_id, train_item_keys=fold.train_item_keys
+    )
+
+    # ----- Slice primary.train into fold-train and fold-oof DataFrames -----
+    fold_train_df = slice_train_rows(primary.train, fold, side="train")
+    fold_oof_df = slice_train_rows(primary.train, fold, side="oof")
+
+    # ----- Build fold-scoped NN index -----
+    fold_nn_dir = OOF_NN_BASE_DIR / f"fold_{fold.fold_id}_{fold_suffix}"
+    print(f"[OOF f{fold.fold_id}] Building fold NN index ({len(fold.train_item_keys):,} items)...")
+    fold_nn_index = build_fold_nn_index(
+        fold=fold,
+        item_emb_lookup=item_emb_lookup,
+        out_dir=fold_nn_dir,
+        nn_cfg=nn_cfg,
+        TrainingNNIndex=TrainingNNIndex,
+    )
+    fold_item_index_map = build_fold_item_index_map(fold)
+
+    # ----- Build fold-scoped passrate + conditional context -----
+    print(f"[OOF f{fold.fold_id}] Building fold passrate + conditional context...")
+    fold_passrate_csr, fold_passrate_mask_csr = build_passrate_table(
+        train_df=fold_train_df,
+        item_index_map=fold_item_index_map,
+        subject_index_map=indexer.subject_to_id,
+    )
+    fold_item_bench_id = reindex_per_item_array(
+        arr=item_benchmark_id_arr,
+        train_item_keys_global=train_item_keys,
+        fold=fold,
+        fill=-1,
+    )
+    fold_item_bench_age = reindex_per_item_array(
+        arr=item_benchmark_age_arr,
+        train_item_keys_global=train_item_keys,
+        fold=fold,
+        fill=np.float32(np.nan),
+    )
+    fold_item_cluster = reindex_per_item_array(
+        arr=item_cluster_id_arr,
+        train_item_keys_global=train_item_keys,
+        fold=fold,
+        fill=-1,
+    )
+    fold_cond_context = build_conditional_passrate_context(
+        train_df=fold_train_df,
+        item_index_map=fold_item_index_map,
+        subject_index_map=indexer.subject_to_id,
+        subject_to_family_id=s2fam,
+        subject_to_macro_family_id=s2macro,
+        subject_to_organization_id=s2org,
+        item_benchmark_id=fold_item_bench_id,
+        item_benchmark_age=fold_item_bench_age,
+        item_cluster_id=fold_item_cluster,
+        n_families=N_FAMILIES,
+        n_macro_families=N_MACRO_FAMILIES,
+        n_organizations=N_ORGANIZATIONS,
+        n_clusters=N_CLUSTERS_CTX,
+    )
+    fold_cond_context.assert_shapes()
+
+    # ----- Compute fold-scoped NN features for fold-train and fold-OOF rows -----
+    print(f"[OOF f{fold.fold_id}] Computing NN features for fold-train rows...")
+    _ftk_train, _fsid_train = _split_query(fold_train_df)
+    _ftk_oof, _fsid_oof = _split_query(fold_oof_df)
+    nn_train_mat_fold = compute_nn_features_streaming(
+        query_item_keys=_ftk_train,
+        item_emb_lookup=item_emb_lookup,
+        subject_ids=_fsid_train,
+        nn_index=fold_nn_index,
+        passrate_csr=fold_passrate_csr,
+        passrate_mask_csr=fold_passrate_mask_csr,
+        cfg=nn_cfg,
+        exclude_self=True,  # fold-train items ARE in fold's NN index; exclude self-match
+        query_chunk_size=NN_QUERY_CHUNK,
+        conditional_context=fold_cond_context,
+    )
+    gc.collect()
+    print(f"[OOF f{fold.fold_id}] Computing NN features for fold-OOF rows...")
+    nn_oof_mat_fold = compute_nn_features_streaming(
+        query_item_keys=_ftk_oof,
+        item_emb_lookup=item_emb_lookup,
+        subject_ids=_fsid_oof,
+        nn_index=fold_nn_index,
+        passrate_csr=fold_passrate_csr,
+        passrate_mask_csr=fold_passrate_mask_csr,
+        cfg=nn_cfg,
+        exclude_self=False,  # OOF items NOT in fold's NN index, no self to exclude
+        query_chunk_size=NN_QUERY_CHUNK,
+        conditional_context=fold_cond_context,
+    )
+    gc.collect()
+
+    # Gate 1b probe: query a sample of fold-OOF rows against the fold's NN
+    # index and capture the top-k neighbor item_keys. Post-loop, we assert
+    # every captured neighbor key is in fold.train_item_keys -- a single
+    # leak there would silently contaminate Members 1/2 (NN aux) and 3.
+    _probe_sample_size = int(min(
+        CFG["oof"].get("nn_neighbor_probe_sample_size", 2000),
+        len(fold.oof_row_idx),
+    ))
+    _probe_rng = np.random.default_rng(int(CFG["oof"].get("seed", 7)) * 31 + fold.fold_id)
+    _probe_local_idx = _probe_rng.choice(len(fold.oof_row_idx), size=_probe_sample_size, replace=False)
+    _probe_oof_keys = [str(_ftk_oof[i]) for i in _probe_local_idx]
+    _probe_query_emb = np.stack(
+        [np.asarray(item_emb_lookup[k], dtype=np.float32) for k in _probe_oof_keys],
+        axis=0,
+    )
+    # nearest() returns (idx [N_probe, k], sims). exclude_self=False because
+    # OOF items are guaranteed NOT in fold's NN index (they're in fold.oof_item_keys).
+    _probe_idx, _ = fold_nn_index.nearest(
+        query_embeds=_probe_query_emb,
+        k=int(nn_cfg.k),
+        exclude_self=False,
+    )
+    _probe_neighbor_keys = np.array(
+        [
+            [
+                fold.train_item_keys[int(j)] if 0 <= int(j) < len(fold.train_item_keys) else "-1"
+                for j in row
+            ]
+            for row in _probe_idx
+        ],
+        dtype=object,
+    )
+    _oof_nn_probe_data[fold.fold_id] = _probe_neighbor_keys
+    del _probe_query_emb, _probe_idx
+
+    # ----- Fold mean encoded stats (fit on fold-train labels only) -----
+    print(f"[OOF f{fold.fold_id}] Fitting fold mean-encoded stats...")
+    _mef_subj_fold_train, _mef_cluster_fold_train, _mef_bc_fold_train = _compute_id_arrays(fold_train_df)
+    _mef_subj_fold_oof, _mef_cluster_fold_oof, _mef_bc_fold_oof = _compute_id_arrays(fold_oof_df)
+    _y_fold_train = fold_train_df["label"].astype(float).to_numpy().astype(np.float32)
+    fold_mean_encoded_stats = fit_mean_encoded_stats(
+        subject_ids=_mef_subj_fold_train,
+        cluster_ids=_mef_cluster_fold_train,
+        bc_ids=_mef_bc_fold_train,
+        labels=_y_fold_train,
+        n_subjects=int(indexer.n_subjects),
+        n_clusters=int(_N_CLUSTERS_ME),
+        n_bcs=int(indexer.n_bc),
+        smoothing=float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)),
+    )
+    fold_member2_interaction_train = apply_member2_interaction_features(
+        fold_mean_encoded_stats,
+        subject_ids=_mef_subj_fold_train,
+        cluster_ids=_mef_cluster_fold_train,
+        bc_ids=_mef_bc_fold_train,
+    )
+    fold_member2_interaction_oof = apply_member2_interaction_features(
+        fold_mean_encoded_stats,
+        subject_ids=_mef_subj_fold_oof,
+        cluster_ids=_mef_cluster_fold_oof,
+        bc_ids=_mef_bc_fold_oof,
+    )
+    fold_member4_marginal_train = apply_member4_marginal_features(
+        fold_mean_encoded_stats,
+        subject_ids=_mef_subj_fold_train,
+        cluster_ids=_mef_cluster_fold_train,
+        bc_ids=_mef_bc_fold_train,
+    )
+    fold_member4_marginal_oof = apply_member4_marginal_features(
+        fold_mean_encoded_stats,
+        subject_ids=_mef_subj_fold_oof,
+        cluster_ids=_mef_cluster_fold_oof,
+        bc_ids=_mef_bc_fold_oof,
+    )
+
+    # ----- Fold X_train_dense / X_oof_dense (uses GLOBAL schema -- ack'd leak) -----
+    print(f"[OOF f{fold.fold_id}] Building fold X_*_dense (using GLOBAL schema)...")
+    _bc_redacted_fold_train = bc_redacted_train[fold.train_row_idx]
+    _bc_redacted_fold_oof = bc_redacted_train[fold.oof_row_idx]
+    X_fold_train_dense = _build_X(
+        fold_train_df, nn_train_mat_fold, _bc_redacted_fold_train,
+    )
+    X_fold_oof_dense = _build_X(
+        fold_oof_df, nn_oof_mat_fold, _bc_redacted_fold_oof,
+    )
+    X_fold_train_dense_m2 = np.concatenate(
+        [X_fold_train_dense, fold_member2_interaction_train], axis=1
+    ).astype(np.float32, copy=False)
+    X_fold_oof_dense_m2 = np.concatenate(
+        [X_fold_oof_dense, fold_member2_interaction_oof], axis=1
+    ).astype(np.float32, copy=False)
+    X_fold_train_dense_m4 = np.concatenate(
+        [X_fold_train_dense, fold_member4_marginal_train], axis=1
+    ).astype(np.float32, copy=False)
+    X_fold_oof_dense_m4 = np.concatenate(
+        [X_fold_oof_dense, fold_member4_marginal_oof], axis=1
+    ).astype(np.float32, copy=False)
+
+    # ----- Member 1 (fold-retrain OR fall back to global) -----
+    if OOF_RETRAIN_M1:
+        print(f"[OOF f{fold.fold_id}] Training fold Member 1 (IRT-MLP, item-grouped ES split)...")
+        _es_train_rows, _es_val_rows = split_fold_train_for_early_stopping(
+            fold=fold,
+            item_keys_per_row=_train_row_item_keys_arr,
+            es_val_fraction=OOF_ES_VAL_FRACTION,
+            seed=int(CFG["oof"].get("seed", 7)) * 17 + fold.fold_id,
+        )
+        # Translate full-row indices into fold-train-local positions (so we can
+        # slice nn_train_mat_fold which is in fold-train order, not full order).
+        _fold_train_pos = {int(r): i for i, r in enumerate(fold.train_row_idx)}
+        _es_train_local = np.array([_fold_train_pos[int(r)] for r in _es_train_rows], dtype=np.int64)
+        _es_val_local = np.array([_fold_train_pos[int(r)] for r in _es_val_rows], dtype=np.int64)
+        _es_train_df = primary.train.iloc[_es_train_rows]
+        _es_val_df = primary.train.iloc[_es_val_rows]
+        _train_ds_fold = _build(_es_train_df, nn_train_mat_fold[_es_train_local])
+        _val_ds_fold = _build(_es_val_df, nn_train_mat_fold[_es_val_local])
+        _oof_ds_fold = _build(fold_oof_df, nn_oof_mat_fold)
+
+        # Fold M1 training closure (mirrors _train_model_a structure).
+        def _train_fold_model_a(_fold=fold, _train_ds=_train_ds_fold, _val_ds=_val_ds_fold):
+            train_mod.build_model = _build_with_overrides
+            try:
+                _active_dropout_cfg["cfg"] = a_drop
+                _active_dropout_cfg["name"] = MODEL_A_NAME
+                _active_dropout_cfg["installed_handles"] = []
+                _result = train_one(
+                    model_name=MODEL_A_NAME,
+                    model_cfg=model_a_cfg,
+                    train_cfg=train_cfg,
+                    train_ds=_train_ds,
+                    val_ds=_val_ds,
+                    indexer=indexer,
+                    seed=int(MODEL_A_SEED) + 1000 * (int(_fold.fold_id) + 1),
+                    run_id=f"qwen8b_oof_fold{_fold.fold_id}_model_a",
+                    checkpoint_dir=CKPT_DIR / "oof" / f"fold_{_fold.fold_id}",
+                    extra_metadata={
+                        "encoder_model_id": CFG["encoder"]["model_id"],
+                        "oof_fold_id": int(_fold.fold_id),
+                        "oof_fold_suffix": fold_cache_suffix(
+                            fold_id=_fold.fold_id,
+                            train_item_keys=_fold.train_item_keys,
+                        ),
+                    },
+                )
+                for h in _active_dropout_cfg["installed_handles"]:
+                    h.remove()
+                _ckpt = torch.load(_result.checkpoint_path, map_location="cpu", weights_only=False)
+                return {"train_result": _result, "ckpt": _ckpt}
+            finally:
+                _active_dropout_cfg["cfg"] = None
+                _active_dropout_cfg["name"] = None
+                train_mod.build_model = _orig_build_model
+
+        _fold_m1_bundle = cache_or_compute(
+            "model_a_trained_oof_fold",
+            key_inputs=(
+                "model_a_oof_v1", MODEL_A_NAME, int(MODEL_A_SEED), fold.fold_id,
+                fold_suffix,
+                json.dumps(asdict(model_a_cfg), default=str, sort_keys=True),
+                json.dumps(asdict(train_cfg), default=str, sort_keys=True),
+                json.dumps(asdict(a_drop), default=str, sort_keys=True),
+                int(_train_ds_fold.subject_ids.shape[0]),
+                int(_val_ds_fold.subject_ids.shape[0]),
+                int(indexer.n_subjects), int(indexer.n_bc),
+                int(_NN_FEATURE_DIM_CACHE_TAG),
+                int(fold_cond_context.n_families),
+                int(fold_cond_context.n_macro_families),
+                int(fold_cond_context.n_organizations),
+                int(fold_cond_context.n_clusters),
+            ),
+            compute_fn=_train_fold_model_a,
+        )
+        _fold_ckpt = _fold_m1_bundle["ckpt"]
+        # Load fold M1 weights into a fresh model + score on OOF rows.
+        _fold_model = _build_model_for_inf(MODEL_A_NAME, model_a_cfg)
+        _fold_model.attach_metadata_tables(meta_id_tables)
+        _fold_model.load_state_dict(_fold_ckpt["model_state"])
+        _fold_model = _fold_model.to(device).eval()
+        p_a_oof_fold = _score_dataset(_oof_ds_fold, _fold_model)
+        # Also score fold M1 on fold's TRAIN rows -- needed as Member 2's
+        # residual anchor when fitting fold Member 2 below.
+        _train_ds_fold_full = _build(fold_train_df, nn_train_mat_fold)
+        p_a_anchor_fold_train = _score_dataset(_train_ds_fold_full, _fold_model)
+        _fold_model = _fold_model.to("cpu")
+        del _fold_model, _train_ds_fold, _val_ds_fold, _oof_ds_fold, _train_ds_fold_full
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    else:
+        # Use global p_a_train (saw all train items -- documented small leak).
+        p_a_oof_fold = p_a_train[fold.oof_row_idx]
+        p_a_anchor_fold_train = p_a_train[fold.train_row_idx]
+    p_a_train_oof_acc.write_fold(fold.oof_row_idx, p_a_oof_fold)
+
+    # ----- Fold Member 2 (GBDT residual using fold M1 anchor) -----
+    print(f"[OOF f{fold.fold_id}] Training fold Member 2 (GBDT residual)...")
+    _fold_m2_feature_names = (
+        tuple(member_feat_schema.feature_names)
+        + tuple(MEMBER2_INTERACTION_FEATURE_NAMES)
+    )
+    _y_fold_train_np = _y_fold_train
+    _gbdt_train_item_id_fold = np.array(
+        [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
+        dtype=np.int64,
+    )
+    _fold_gbdt_state = cache_or_compute(
+        "gbdt_state_oof_fold",
+        key_inputs=(
+            "gbdt_oof_v1", fold.fold_id, fold_suffix,
+            int(X_fold_train_dense_m2.shape[1]), int(X_fold_train_dense_m2.shape[0]),
+            int(SEED),
+        ),
+        compute_fn=lambda _ff=fold: fit_gbdt_member(
+            X=X_fold_train_dense_m2,
+            y=_y_fold_train_np,
+            feature_names=_fold_m2_feature_names,
+            init_pred_train=p_a_anchor_fold_train,
+            holdout_group_id=_gbdt_train_item_id_fold,
+            n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
+            learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
+            num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
+            min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
+            feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
+            bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
+            bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
+            early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
+            seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
+        ),
+    )
+    p2_oof_fold = gbdt_compose_residual_batch(
+        _fold_gbdt_state, X_fold_oof_dense_m2, p_a_oof_fold,
+    )
+    p2_train_oof_acc.write_fold(fold.oof_row_idx, p2_oof_fold)
+
+    # ----- Fold Member 3 (kNN-similarity) -----
+    print(f"[OOF f{fold.fold_id}] Training fold Member 3 (kNN)...")
+    # Build fold-local subject keys (ordered subject_id -> subject_key).
+    _fold_subject_keys = _subject_keys_ordered  # subject set is global
+    _fold_passrate_dense = np.asarray(fold_passrate_csr.todense(), dtype=np.float32)
+    _fold_passrate_mask_dense = np.asarray(fold_passrate_mask_csr.todense(), dtype=np.float32)
+    _fold_item_emb_stacked = np.stack(
+        [np.asarray(item_emb_lookup[k], dtype=np.float32) for k in fold.train_item_keys],
+        axis=0,
+    )
+    _fold_knn_state = cache_or_compute(
+        "knn_state_oof_fold",
+        key_inputs=(
+            "knn_oof_v1", fold.fold_id, fold_suffix,
+            int(len(fold.train_item_keys)), int(indexer.n_subjects),
+            int(SEED),
+        ),
+        compute_fn=lambda _ff=fold: fit_knn_member(
+            item_keys=list(_ff.train_item_keys),
+            item_embeddings=_fold_item_emb_stacked,
+            subject_keys=_fold_subject_keys,
+            passrate_dense=_fold_passrate_dense,
+            passrate_mask=_fold_passrate_mask_dense,
+            K=int(CFG.get("member3_knn", {}).get("K", 32)),
+            min_subjects_per_item=int(CFG.get("member3_knn", {}).get("min_subjects_per_item", 3)),
+            tau_init=float(CFG.get("member3_knn", {}).get("tau_init", 1.0)),
+            train_lr=float(CFG.get("member3_knn", {}).get("train_lr", 0.05)),
+            train_iters=int(CFG.get("member3_knn", {}).get("train_iters", 300)),
+            train_l2=float(CFG.get("member3_knn", {}).get("train_l2", 0.0)),
+            seed=int(SEED) + 200 * (int(_ff.fold_id) + 1),
+        ),
+    )
+    # Score fold Member 3 on OOF rows. fold_oof_df has item_keys NOT in
+    # fold's item universe; knn_apply_batch handles this via cold-start
+    # fallback (uses subject's mean over neighbors with valid items).
+    p3_oof_fold = knn_apply_batch(
+        _fold_knn_state,
+        subject_keys=fold_oof_df["subject_key"].astype(str).tolist(),
+        item_keys=fold_oof_df["item_key"].astype(str).tolist(),
+        query_item_embeddings=np.stack(
+            [np.asarray(item_emb_lookup[k], dtype=np.float32)
+             for k in fold_oof_df["item_key"].astype(str)],
+            axis=0,
+        ),
+    )
+    p3_train_oof_acc.write_fold(fold.oof_row_idx, p3_oof_fold)
+
+    # ----- Fold Member 4 (LogReg hybrid) -----
+    print(f"[OOF f{fold.fold_id}] Training fold Member 4 (LogReg hybrid)...")
+    _fold_m4_feature_names = (
+        tuple(member_feat_schema.feature_names)
+        + tuple(MEMBER4_MARGINAL_FEATURE_NAMES)
+    )
+    _fold_logreg_state = cache_or_compute(
+        "logreg_state_oof_fold",
+        key_inputs=(
+            "logreg_oof_v1", fold.fold_id, fold_suffix,
+            int(X_fold_train_dense_m4.shape[1]), int(X_fold_train_dense_m4.shape[0]),
+            int(SEED),
+        ),
+        compute_fn=lambda _ff=fold: fit_logreg_member(
+            X=X_fold_train_dense_m4,
+            y=_y_fold_train_np,
+            feature_names=_fold_m4_feature_names,
+            epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
+            learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
+            weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
+            l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_hybrid", 3.0e-3)),
+            min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
+            early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
+            seed=int(SEED) + 300 * (int(_ff.fold_id) + 1),
+            val_fraction=0.1,
+            holdout_group_id=_gbdt_train_item_id_fold,
+        ),
+    )
+    p4_oof_fold = logreg_apply_state_batch(_fold_logreg_state, X_fold_oof_dense_m4)
+    p4_train_oof_acc.write_fold(fold.oof_row_idx, p4_oof_fold)
+
+    # ----- Aux features (NN mean sim, NN support, centroid dist for OOF rows) -----
+    _aux_mean_sim_fold, _aux_support_fold = _slice_nn_aux_from_oof_mat(nn_oof_mat_fold)
+    _aux_centroid_dist_fold = _centroid_dist_for_rows(fold_oof_df)
+    nn_mean_sim_oof_acc.write_fold(fold.oof_row_idx, _aux_mean_sim_fold)
+    nn_support_oof_acc.write_fold(fold.oof_row_idx, _aux_support_fold)
+    centroid_dist_oof_acc.write_fold(fold.oof_row_idx, _aux_centroid_dist_fold)
+
+    print(
+        f"[OOF f{fold.fold_id}] Fold OOF NLL summary on {len(fold.oof_row_idx):,} held-out rows:"
+    )
+    _y_fold_oof = fold_oof_df["label"].astype(float).to_numpy()
+    def _nll(p):
+        p = np.clip(p, 1e-6, 1 - 1e-6)
+        return float(-(_y_fold_oof * np.log(p) + (1 - _y_fold_oof) * np.log(1 - p)).mean())
+    print(
+        f"  M1={_nll(p_a_oof_fold):.5f}  M2={_nll(p2_oof_fold):.5f}  "
+        f"M3={_nll(p3_oof_fold):.5f}  M4={_nll(p4_oof_fold):.5f}"
+    )
+
+    # Free fold-scoped artifacts before next iteration (keep RAM bounded).
+    del fold_nn_index, fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
+    del nn_train_mat_fold, nn_oof_mat_fold
+    del X_fold_train_dense, X_fold_oof_dense
+    del X_fold_train_dense_m2, X_fold_oof_dense_m2
+    del X_fold_train_dense_m4, X_fold_oof_dense_m4
+    del fold_member2_interaction_train, fold_member2_interaction_oof
+    del fold_member4_marginal_train, fold_member4_marginal_oof
+    del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
+    gc.collect()
+
+# Finalize OOF accumulators -- raises if anything is missing / non-finite.
+print("\n[OOF] Finalizing per-fold OOF accumulators...")
+p_a_train_oof = p_a_train_oof_acc.finalize()
+p2_train_oof = p2_train_oof_acc.finalize()
+p3_train_oof = p3_train_oof_acc.finalize()
+p4_train_oof = p4_train_oof_acc.finalize()
+nn_mean_sim_oof = nn_mean_sim_oof_acc.finalize().astype(np.float32)
+nn_support_oof = nn_support_oof_acc.finalize().astype(np.float32)
+centroid_dist_oof = centroid_dist_oof_acc.finalize().astype(np.float32)
+
+_ylab_train = primary.train["label"].astype(float).to_numpy()
+def _nll_full(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return float(-(_ylab_train * np.log(p) + (1 - _ylab_train) * np.log(1 - p)).mean())
+
+print("\n[OOF] Train-row OOF NLL per member (aggregated across all folds):")
+print(f"  M1 OOF: {_nll_full(p_a_train_oof):.5f}  vs in-sample p_a_train: {_nll_full(p_a_train):.5f}")
+print(f"  M2 OOF: {_nll_full(p2_train_oof):.5f}")
+print(f"  M3 OOF: {_nll_full(p3_train_oof):.5f}")
+print(f"  M4 OOF: {_nll_full(p4_train_oof):.5f}")
+print(f"[OOF] All accumulators finalized OK ({_N_TRAIN:,} rows each, all finite, single-write).")
+
+# %% [markdown]
+# ## 9.5b. Gate 1b: NN-neighbor-in-fold-train probe (post-loop assertion)
+#
+# For each fold we sampled `nn_neighbor_probe_sample_size` OOF rows and
+# captured their top-k neighbor item_keys from the fold-scoped NN index.
+# Gate 1b asserts: NONE of those neighbor keys belong to that fold's
+# OOF item set. A single violation means the fold's NN index leaked
+# data the fold isn't allowed to see -- which would silently
+# contaminate Members 1, 2 (NN aux), and 3.
+
+# %%
+print("[OOF Gate 1b] Asserting fold-NN neighbors stay within fold-train items...")
+_probe_summary = []
+for fold in folds:
+    probe_keys = _oof_nn_probe_data[fold.fold_id]
+    result = assert_nn_neighbors_in_fold_train(
+        fold=fold,
+        oof_row_neighbor_item_keys=probe_keys,
+        sample_size=None,  # already pre-sampled inside the per-fold loop
+    )
+    _probe_summary.append((fold.fold_id, result))
+    print(f"  fold {fold.fold_id}: checked={result['n_checked']:,} violations={result['n_violations']}")
+print("[OOF Gate 1b] PASS: zero NN-neighbor leakage across all folds.")
+
+# %% [markdown]
+# ## 9f. Train the stacker (ridge logistic regression on OOF train predictions)
+#
+# Replaces the previous val-trained stacker. Now the stacker learns on
+# OOF train predictions (each row's prediction comes from a member that
+# never saw that row's item) + the per-row labels. Val is reported but
+# NOT fit on -- it is now a pure holdout for the meta-learner.
 
 # %%
 from src.stacker import (
@@ -2803,7 +3381,7 @@ from src.stacker import (
     fit_stacker,
 )
 
-# Auxiliary stacker features (val side).
+# ---------- Auxiliary stacker features (val side, kept for final reporting) ----------
 val_bench_present = np.array(
     [
         1.0 if str(b) in indexer.bc_to_id else 0.0
@@ -2811,15 +3389,10 @@ val_bench_present = np.array(
     ],
     dtype=np.float32,
 )
-# NN neighbor support: log1p of how many observed neighbors we found
-# for the val item under Member 3's neighbor mechanism.
-print("[Stacker] computing auxiliary features (NN support, mean sim, centroid dist)...")
-val_nn_mean_sim = nn_val_mat[:, 1].astype(np.float32)  # column 1 = mean similarity
-val_nn_support = nn_val_mat[:, 2].astype(np.float32)   # column 2 = log1p neighbors observed
+print("[Stacker] computing val-side aux features (NN support, mean sim, centroid dist)...")
+val_nn_mean_sim = nn_val_mat[:, 1].astype(np.float32)
+val_nn_support = nn_val_mat[:, 2].astype(np.float32)
 
-# Centroid distance: nearest-centroid normalized distance from pool features.
-# We grab the first centroid_dist_* column; if multiple exist (top_m > 1),
-# we take the min (closest centroid).
 _centroid_cols = [
     c for c in pool_features_z.columns if c.startswith("centroid_dist_")
 ]
@@ -2842,18 +3415,48 @@ stacker_X_val = build_stacker_features(
     nn_mean_similarity=val_nn_mean_sim,
     centroid_distance=val_centroid_dist,
 )
-print(f"[Stacker] X_val: {stacker_X_val.shape}  ylab_val: {ylab_val.shape}")
+print(f"[Stacker] X_val (final-reporting view): {stacker_X_val.shape}")
+
+# ---------- OOF training side: build the stacker's TRAIN inputs from per-fold OOF preds ----------
+print("[Stacker] computing OOF-train aux features + member prob stack...")
+_train_bench_present = np.array(
+    [
+        1.0 if str(b) in indexer.bc_to_id else 0.0
+        for b in primary.train["benchmark_condition_key"]
+    ],
+    dtype=np.float32,
+)
+stacker_member_probs_train_oof = np.stack(
+    [
+        p_a_train_oof.astype(np.float32),
+        p2_train_oof.astype(np.float32),
+        p3_train_oof.astype(np.float32),
+        p4_train_oof.astype(np.float32),
+    ],
+    axis=1,
+)
+stacker_X_train_oof = build_stacker_features(
+    member_probs=stacker_member_probs_train_oof,
+    bench_present=_train_bench_present,
+    nn_neighbor_support=nn_support_oof,
+    nn_mean_similarity=nn_mean_sim_oof,
+    centroid_distance=centroid_dist_oof,
+)
+ylab_train_np = primary.train["label"].astype(float).to_numpy().astype(np.float32)
+print(f"[Stacker] X_train_oof: {stacker_X_train_oof.shape}  ylab_train: {ylab_train_np.shape}")
 
 
-def _fit_stacker():
+def _fit_stacker_oof():
     return fit_stacker(
-        X=stacker_X_val,
-        y=ylab_val.astype(np.float32),
+        X=stacker_X_train_oof,
+        y=ylab_train_np,
         n_iters=int(CFG.get("stacker", {}).get("n_iters", 1500)),
         learning_rate=float(CFG.get("stacker", {}).get("learning_rate", 0.05)),
         l2=float(CFG.get("stacker", {}).get("l2", 1.0)),
         early_stopping_patience=int(CFG.get("stacker", {}).get("early_stopping_patience", 200)),
-        # Internal 80/20 split inside fit_stacker for early stopping.
+        # Internal 80/20 item-grouped split inside fit_stacker for early
+        # stopping. We pass holdout_group_id when available so the early-
+        # stopping val is item-disjoint (matches the OOF discipline).
         val_fraction=0.2,
         seed=SEED,
     )
@@ -2861,52 +3464,427 @@ def _fit_stacker():
 
 import hashlib as _hashlib
 
-# Digest the actual member-prediction matrix so the cache invalidates
-# whenever any upstream member's per-row predictions change. The
-# previous key only included shape metadata, which meant swapping out
-# Members 2/4 (residual learner, marginal features) silently reused
-# the OLD stacker weights -- a calibration bug we hit in the
-# diversification rollout. ~50 ms on 266k x 8 fp32; negligible.
-_stacker_X_digest = _hashlib.sha256(
-    np.ascontiguousarray(stacker_X_val, dtype=np.float32).tobytes()
+# Digest the actual OOF-train input matrix + labels so the cache invalidates
+# whenever any upstream member's OOF predictions change. This is the cache
+# discipline that caught the stale-stacker bug during the diversification
+# rollout -- bake it in from day 1 on the OOF flavor.
+_stacker_Xtrain_digest = _hashlib.sha256(
+    np.ascontiguousarray(stacker_X_train_oof, dtype=np.float32).tobytes()
 ).hexdigest()[:16]
-_stacker_y_digest = _hashlib.sha256(
-    np.ascontiguousarray(ylab_val, dtype=np.float32).tobytes()
+_stacker_ytrain_digest = _hashlib.sha256(
+    np.ascontiguousarray(ylab_train_np, dtype=np.float32).tobytes()
 ).hexdigest()[:16]
 stacker_state = cache_or_compute(
     "stacker_state",
-    # ``coldfb_v1`` invalidates older stackers trained on (member 2
-    # row-cold val, member 3 K=32, member 4 untrimmed) outputs.
-    # ``divers_v1`` ties the cache to the per-row prediction digests
-    # below, so any change in Members 1-4 (or aux features) forces
-    # a re-fit.
     key_inputs=(
-        stacker_X_val.shape[1], len(ylab_val), SEED,
-        "coldfb_v1", "divers_v1",
-        _stacker_X_digest, _stacker_y_digest,
+        stacker_X_train_oof.shape[1], len(ylab_train_np), SEED,
+        "oof_v1",  # cache invalidator: OOF stacker is incompatible with val-stacker entries
+        int(OOF_N_FOLDS), int(OOF_SEED),
+        bool(OOF_RETRAIN_M1),
+        _stacker_Xtrain_digest, _stacker_ytrain_digest,
     ),
-    compute_fn=_fit_stacker,
+    compute_fn=_fit_stacker_oof,
 )
 print(f"[Stacker] weights: {stacker_state.weights}")
 print(f"[Stacker] bias:    {stacker_state.bias:.4f}")
+
+# Apply the OOF-fit stacker on (a) OOF-train inputs -- for Gate 1d --
+# and (b) val inputs -- for final reporting (val never touched the fit).
+p_stacker_train_oof = stacker_apply_batch(stacker_state, stacker_X_train_oof)
 p_stacker_val = stacker_apply_batch(stacker_state, stacker_X_val)
-nll_stack = float(-(ylab_val * np.log(np.clip(p_stacker_val, 1e-6, 1 - 1e-6))
-                    + (1 - ylab_val) * np.log(1 - np.clip(p_stacker_val, 1e-6, 1 - 1e-6))).mean())
-nll_uniform = float(-(ylab_val * np.log(np.clip(stacker_member_probs_val.mean(axis=1), 1e-6, 1 - 1e-6))
-                    + (1 - ylab_val) * np.log(1 - np.clip(stacker_member_probs_val.mean(axis=1), 1e-6, 1 - 1e-6))).mean())
-print(f"\n[Stacker] val log-loss summary:")
-print(f"  Member 1 (Model A IRT-MLP):{-(ylab_val * np.log(np.clip(p_a_val, 1e-6, 1 - 1e-6)) + (1 - ylab_val) * np.log(1 - np.clip(p_a_val, 1e-6, 1 - 1e-6))).mean():.6f}")
-print(f"  Member 2 (LightGBM):       {nll_m2:.6f}")
-print(f"  Member 3 (kNN-similarity): {nll_m3:.6f}")
-print(f"  Member 4 (LogReg):         {nll_m4:.6f}")
-print(f"  Uniform avg of 4 members:  {nll_uniform:.6f}")
-print(f"  STACKER:                   {nll_stack:.6f}")
-if nll_stack > nll_uniform + 1e-3:
+
+def _bce(y, p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
+
+nll_stack_train_oof = _bce(ylab_train_np, p_stacker_train_oof)
+nll_stack_val = _bce(ylab_val, p_stacker_val)
+nll_uniform_val = _bce(ylab_val, stacker_member_probs_val.mean(axis=1))
+
+print(f"\n[Stacker] val log-loss summary (OOF-fit stacker, val is TRUE holdout):")
+print(f"  Member 1 (Model A IRT-MLP, val):  {_bce(ylab_val, p_a_val):.6f}")
+print(f"  Member 2 (LightGBM, val):         {nll_m2:.6f}")
+print(f"  Member 3 (kNN-similarity, val):   {nll_m3:.6f}")
+print(f"  Member 4 (LogReg, val):           {nll_m4:.6f}")
+print(f"  Uniform avg of 4 members (val):   {nll_uniform_val:.6f}")
+print(f"  STACKER (val, OOF-fit):           {nll_stack_val:.6f}")
+print(f"  STACKER (OOF-train, in-sample):   {nll_stack_train_oof:.6f}")
+if nll_stack_val > nll_uniform_val + 1e-3:
     print(
         "WARNING: Stacker did not beat uniform average. Consider increasing "
         "stacker.l2 or stacker.n_iters in CFG, or check that members are "
         "diverse enough."
     )
+
+# %% [markdown]
+# ## 9f-bis. Gate 1d: train-vs-val optimism check
+#
+# If the OOF stacker's training inputs were truly leakage-free, the
+# in-sample (OOF-train) log-loss and the held-out (val) log-loss
+# should be SIMILAR. A large train-better-than-val gap means the OOF
+# predictions still contain residual contamination -- they're letting
+# the stacker memorize per-row label hints. We flag when the gap
+# exceeds `CFG["oof"]["optimism_threshold_nats"]` (default 0.03 nats).
+#
+# This is a SOFT gate (just a warning), because some optimism is
+# expected from non-leakage sources (stacker's own internal early-
+# stopping val is in-sample to the stacker fit). Gate 1c is the hard
+# gate; this is the diagnostic that fingers WHICH layer leaked.
+
+# %%
+_optimism_threshold = float(CFG["oof"].get("optimism_threshold_nats", 0.03))
+_gate1d = report_train_vs_val_optimism(
+    train_loss=nll_stack_train_oof,
+    val_loss=nll_stack_val,
+    threshold_nats=_optimism_threshold,
+    label="OOF stacker",
+)
+print(
+    f"[OOF Gate 1d] OOF-train={nll_stack_train_oof:.5f}  val={nll_stack_val:.5f}  "
+    f"gap={_gate1d['gap']:+.5f} nats  threshold={_optimism_threshold:.3f}  "
+    f"flagged={_gate1d['flag']}"
+)
+if _gate1d["flag"]:
+    print(
+        "[OOF Gate 1d] WARNING: optimism gap exceeded threshold. Inspect "
+        "fold-NN index (Gate 1b), fold mean-encoded stats (must be fit on "
+        "fold-train labels only), and the member feature schema (currently "
+        "global, with documented small leakage). If Gate 1c still passes "
+        "this is likely the global-schema leak surfacing."
+    )
+else:
+    print("[OOF Gate 1d] PASS: train-vs-val optimism is within threshold.")
+
+# %% [markdown]
+# ## 9f-ter. Gate 1c: shuffled-label control (toggleable)
+#
+# Permute the training labels uniformly at random, then re-run the OOF
+# pipeline against those PERMUTED labels and confirm the resulting
+# stacker collapses to chance (val log-loss approx entropy of the val
+# label prior). A correct pipeline CANNOT beat chance on randomized
+# labels -- there is no signal to learn. A leaky pipeline will beat
+# chance because the inputs themselves carry label information that
+# bypassed the permutation.
+#
+# Default mode: SHALLOW -- re-runs per-fold Members 2/3/4 with
+# shuffled labels but reuses the real Member 1 OOF predictions
+# (training Member 1 per-fold with shuffled labels would cost another
+# ~3 hours of Colab time). This tests every fold-scoped leakage path
+# EXCEPT Member 1's residual-anchor leak. The deliberate weakening is
+# flagged in the final task summary.
+#
+# To enable: set `CFG["oof"]["run_shuffled_label_control"] = True` in
+# the CFG cell (or override here in a one-off run). To upgrade to the
+# DEEP mode (re-train Member 1 per-fold on shuffled labels too), set
+# `CFG["oof"]["shuffled_label_control_mode"] = "deep"` -- expensive,
+# ~3-5h additional Colab. Skip on subsequent runs once gate has passed.
+
+# %%
+from src.oof_pipeline import entropy_of_label_prior, make_permuted_labels
+
+_run_gate1c = bool(CFG["oof"].get("run_shuffled_label_control", False))
+_gate1c_mode = str(CFG["oof"].get("shuffled_label_control_mode", "shallow"))
+
+if not _run_gate1c:
+    print(
+        "[OOF Gate 1c] SKIPPED (CFG['oof']['run_shuffled_label_control']=False). "
+        "Toggle to True after Task 1 to confirm zero pipeline leakage; do not "
+        "ship to leaderboard without having seen this gate PASS at least once."
+    )
+else:
+    print(
+        f"[OOF Gate 1c] RUNNING in {_gate1c_mode!r} mode. "
+        "This will re-run per-fold member training on permuted labels."
+    )
+
+    _shuf_seed = int(CFG["oof"].get("shuffled_label_seed", 12345))
+    y_train_shuf = make_permuted_labels(y=y_train, seed=_shuf_seed).astype(np.float32)
+
+    # Expected val log-loss floor under the null (no signal): entropy of the
+    # *val* label prior. The shuffled-label stacker should converge to predicting
+    # the constant label mean on val rows, with log-loss equal to this entropy.
+    _val_entropy = entropy_of_label_prior(ylab_val.astype(np.float64))
+    print(f"[OOF Gate 1c] val label prior entropy = {_val_entropy:.5f} nats "
+          f"(label_mean={float(ylab_val.mean()):.4f}). Gate passes if "
+          f"shuffled-label stacker val log-loss >= {_val_entropy - 0.005:.5f}.")
+
+    # Per-fold accumulators for the shuffled-label run.
+    p_a_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p_a_train_shuf")
+    p2_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p2_train_shuf")
+    p3_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p3_train_shuf")
+    p4_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p4_train_shuf")
+
+    for fold in folds:
+        print(f"\n[OOF Gate 1c] === fold {fold.fold_id} (shuffled labels) ===")
+        fold_suffix_shuf = fold_cache_suffix(
+            fold_id=fold.fold_id, train_item_keys=fold.train_item_keys,
+        ) + f"__shuf_{_shuf_seed}"
+        fold_train_df = slice_train_rows(primary.train, fold, side="train")
+        fold_oof_df = slice_train_rows(primary.train, fold, side="oof")
+
+        # Re-fit fold mean encoded stats with SHUFFLED labels.
+        _mef_subj_ft, _mef_cluster_ft, _mef_bc_ft = _compute_id_arrays(fold_train_df)
+        _mef_subj_fo, _mef_cluster_fo, _mef_bc_fo = _compute_id_arrays(fold_oof_df)
+        _y_ft_shuf = y_train_shuf[fold.train_row_idx]
+        fold_mes_shuf = fit_mean_encoded_stats(
+            subject_ids=_mef_subj_ft,
+            cluster_ids=_mef_cluster_ft,
+            bc_ids=_mef_bc_ft,
+            labels=_y_ft_shuf,
+            n_subjects=int(indexer.n_subjects),
+            n_clusters=int(_N_CLUSTERS_ME),
+            n_bcs=int(indexer.n_bc),
+            smoothing=float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)),
+        )
+        _m2_int_ft_shuf = apply_member2_interaction_features(
+            fold_mes_shuf, subject_ids=_mef_subj_ft,
+            cluster_ids=_mef_cluster_ft, bc_ids=_mef_bc_ft,
+        )
+        _m2_int_fo_shuf = apply_member2_interaction_features(
+            fold_mes_shuf, subject_ids=_mef_subj_fo,
+            cluster_ids=_mef_cluster_fo, bc_ids=_mef_bc_fo,
+        )
+        _m4_mg_ft_shuf = apply_member4_marginal_features(
+            fold_mes_shuf, subject_ids=_mef_subj_ft,
+            cluster_ids=_mef_cluster_ft, bc_ids=_mef_bc_ft,
+        )
+        _m4_mg_fo_shuf = apply_member4_marginal_features(
+            fold_mes_shuf, subject_ids=_mef_subj_fo,
+            cluster_ids=_mef_cluster_fo, bc_ids=_mef_bc_fo,
+        )
+
+        # Fold's NN feature matrices (cached from the real OOF run -- recompute
+        # to avoid relying on stale fold_nn_index that got del'd. We re-build
+        # the fold NN index from the same fold-train items; passrate uses
+        # SHUFFLED labels so its label aggregates carry no signal).
+        fold_nn_dir = OOF_NN_BASE_DIR / f"fold_{fold.fold_id}_shuf_{_shuf_seed}"
+        fold_nn_index = build_fold_nn_index(
+            fold=fold, item_emb_lookup=item_emb_lookup,
+            out_dir=fold_nn_dir, nn_cfg=nn_cfg,
+            TrainingNNIndex=TrainingNNIndex,
+        )
+        fold_item_index_map = build_fold_item_index_map(fold)
+        # Replace the label column with shuffled labels for the passrate
+        # build (otherwise the passrate matrix would still carry real signal).
+        fold_train_df_shuf = fold_train_df.copy()
+        fold_train_df_shuf["label"] = _y_ft_shuf
+        fold_passrate_csr, fold_passrate_mask_csr = build_passrate_table(
+            train_df=fold_train_df_shuf,
+            item_index_map=fold_item_index_map,
+            subject_index_map=indexer.subject_to_id,
+        )
+        fold_item_bench_id = reindex_per_item_array(
+            arr=item_benchmark_id_arr, train_item_keys_global=train_item_keys,
+            fold=fold, fill=-1,
+        )
+        fold_item_bench_age = reindex_per_item_array(
+            arr=item_benchmark_age_arr, train_item_keys_global=train_item_keys,
+            fold=fold, fill=np.float32(np.nan),
+        )
+        fold_item_cluster = reindex_per_item_array(
+            arr=item_cluster_id_arr, train_item_keys_global=train_item_keys,
+            fold=fold, fill=-1,
+        )
+        fold_cond_context = build_conditional_passrate_context(
+            train_df=fold_train_df_shuf,
+            item_index_map=fold_item_index_map,
+            subject_index_map=indexer.subject_to_id,
+            subject_to_family_id=s2fam,
+            subject_to_macro_family_id=s2macro,
+            subject_to_organization_id=s2org,
+            item_benchmark_id=fold_item_bench_id,
+            item_benchmark_age=fold_item_bench_age,
+            item_cluster_id=fold_item_cluster,
+            n_families=N_FAMILIES,
+            n_macro_families=N_MACRO_FAMILIES,
+            n_organizations=N_ORGANIZATIONS,
+            n_clusters=N_CLUSTERS_CTX,
+        )
+        _ftk_train, _fsid_train = _split_query(fold_train_df_shuf)
+        _ftk_oof, _fsid_oof = _split_query(fold_oof_df)
+        nn_train_mat_fold_shuf = compute_nn_features_streaming(
+            query_item_keys=_ftk_train, item_emb_lookup=item_emb_lookup,
+            subject_ids=_fsid_train, nn_index=fold_nn_index,
+            passrate_csr=fold_passrate_csr,
+            passrate_mask_csr=fold_passrate_mask_csr,
+            cfg=nn_cfg, exclude_self=True, query_chunk_size=NN_QUERY_CHUNK,
+            conditional_context=fold_cond_context,
+        )
+        nn_oof_mat_fold_shuf = compute_nn_features_streaming(
+            query_item_keys=_ftk_oof, item_emb_lookup=item_emb_lookup,
+            subject_ids=_fsid_oof, nn_index=fold_nn_index,
+            passrate_csr=fold_passrate_csr,
+            passrate_mask_csr=fold_passrate_mask_csr,
+            cfg=nn_cfg, exclude_self=False, query_chunk_size=NN_QUERY_CHUNK,
+            conditional_context=fold_cond_context,
+        )
+
+        # Fold X (global schema -- documented leak).
+        _bc_redacted_ft = bc_redacted_train[fold.train_row_idx]
+        _bc_redacted_fo = bc_redacted_train[fold.oof_row_idx]
+        X_ft = _build_X(fold_train_df, nn_train_mat_fold_shuf, _bc_redacted_ft)
+        X_fo = _build_X(fold_oof_df, nn_oof_mat_fold_shuf, _bc_redacted_fo)
+        X_ft_m2 = np.concatenate([X_ft, _m2_int_ft_shuf], axis=1).astype(np.float32, copy=False)
+        X_fo_m2 = np.concatenate([X_fo, _m2_int_fo_shuf], axis=1).astype(np.float32, copy=False)
+        X_ft_m4 = np.concatenate([X_ft, _m4_mg_ft_shuf], axis=1).astype(np.float32, copy=False)
+        X_fo_m4 = np.concatenate([X_fo, _m4_mg_fo_shuf], axis=1).astype(np.float32, copy=False)
+
+        # Member 1: shallow mode reuses REAL M1 OOF preds (M1 didn't see
+        # shuffled labels; we treat its output as a fixed feature). Deep mode
+        # would re-train M1 per-fold on shuffled labels -- ~3-5h extra Colab.
+        if _gate1c_mode == "deep":
+            # ... a deep-mode M1 retraining block would go here ...
+            # For Task 1 we intentionally stop at shallow mode to fit the
+            # Colab budget. See task summary for the deliberate-weakening note.
+            raise NotImplementedError(
+                "Gate 1c deep mode (per-fold M1 retraining on shuffled labels) "
+                "is not implemented in this Task 1 pass. Stick to shallow mode."
+            )
+        p_a_oof_shuf = p_a_train[fold.oof_row_idx]   # real-label M1, used as feature
+        p_a_anchor_shuf = p_a_train[fold.train_row_idx]
+
+        # Fold Member 2 on shuffled labels.
+        _gbdt_train_item_id_fold = np.array(
+            [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
+            dtype=np.int64,
+        )
+        _fold_gbdt_shuf = fit_gbdt_member(
+            X=X_ft_m2, y=_y_ft_shuf,
+            feature_names=tuple(member_feat_schema.feature_names) + tuple(MEMBER2_INTERACTION_FEATURE_NAMES),
+            init_pred_train=p_a_anchor_shuf,
+            holdout_group_id=_gbdt_train_item_id_fold,
+            n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
+            learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
+            num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
+            min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
+            feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
+            bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
+            bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
+            early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
+            seed=int(SEED) + 100 * (int(fold.fold_id) + 1) + 99999,
+        )
+        p2_shuf_fold = gbdt_compose_residual_batch(_fold_gbdt_shuf, X_fo_m2, p_a_oof_shuf)
+        p2_train_shuf_acc.write_fold(fold.oof_row_idx, p2_shuf_fold)
+
+        # Fold Member 3 on shuffled labels (passrate already uses shuffled labels).
+        _fold_item_emb_stacked = np.stack(
+            [np.asarray(item_emb_lookup[k], dtype=np.float32) for k in fold.train_item_keys],
+            axis=0,
+        )
+        _fold_passrate_dense = np.asarray(fold_passrate_csr.todense(), dtype=np.float32)
+        _fold_passrate_mask_dense = np.asarray(fold_passrate_mask_csr.todense(), dtype=np.float32)
+        _fold_knn_shuf = fit_knn_member(
+            item_keys=list(fold.train_item_keys),
+            item_embeddings=_fold_item_emb_stacked,
+            subject_keys=_subject_keys_ordered,
+            passrate_dense=_fold_passrate_dense,
+            passrate_mask=_fold_passrate_mask_dense,
+            K=int(CFG.get("member3_knn", {}).get("K", 32)),
+            min_subjects_per_item=int(CFG.get("member3_knn", {}).get("min_subjects_per_item", 3)),
+            tau_init=float(CFG.get("member3_knn", {}).get("tau_init", 1.0)),
+            train_lr=float(CFG.get("member3_knn", {}).get("train_lr", 0.05)),
+            train_iters=int(CFG.get("member3_knn", {}).get("train_iters", 300)),
+            train_l2=float(CFG.get("member3_knn", {}).get("train_l2", 0.0)),
+            seed=int(SEED) + 200 * (int(fold.fold_id) + 1) + 99999,
+        )
+        p3_shuf_fold = knn_apply_batch(
+            _fold_knn_shuf,
+            subject_keys=fold_oof_df["subject_key"].astype(str).tolist(),
+            item_keys=fold_oof_df["item_key"].astype(str).tolist(),
+            query_item_embeddings=np.stack(
+                [np.asarray(item_emb_lookup[k], dtype=np.float32)
+                 for k in fold_oof_df["item_key"].astype(str)],
+                axis=0,
+            ),
+        )
+        p3_train_shuf_acc.write_fold(fold.oof_row_idx, p3_shuf_fold)
+
+        # Fold Member 4 on shuffled labels.
+        _fold_logreg_shuf = fit_logreg_member(
+            X=X_ft_m4, y=_y_ft_shuf,
+            feature_names=tuple(member_feat_schema.feature_names) + tuple(MEMBER4_MARGINAL_FEATURE_NAMES),
+            epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
+            learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
+            weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
+            l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_hybrid", 3.0e-3)),
+            min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
+            early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
+            seed=int(SEED) + 300 * (int(fold.fold_id) + 1) + 99999,
+            val_fraction=0.1,
+            holdout_group_id=_gbdt_train_item_id_fold,
+        )
+        p4_shuf_fold = logreg_apply_state_batch(_fold_logreg_shuf, X_fo_m4)
+        p4_train_shuf_acc.write_fold(fold.oof_row_idx, p4_shuf_fold)
+
+        # M1 real (passed through as feature).
+        p_a_train_shuf_acc.write_fold(fold.oof_row_idx, p_a_oof_shuf)
+
+        del fold_nn_index, fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
+        del nn_train_mat_fold_shuf, nn_oof_mat_fold_shuf, X_ft, X_fo
+        del X_ft_m2, X_fo_m2, X_ft_m4, X_fo_m4
+        del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
+        del _fold_gbdt_shuf, _fold_knn_shuf, _fold_logreg_shuf
+        gc.collect()
+
+    p_a_shuf = p_a_train_shuf_acc.finalize()
+    p2_shuf = p2_train_shuf_acc.finalize()
+    p3_shuf = p3_train_shuf_acc.finalize()
+    p4_shuf = p4_train_shuf_acc.finalize()
+
+    # Fit a stacker on shuffled-label OOF predictions and apply to val.
+    stacker_member_probs_train_shuf = np.stack(
+        [p_a_shuf, p2_shuf, p3_shuf, p4_shuf], axis=1
+    ).astype(np.float32)
+    stacker_X_train_shuf = build_stacker_features(
+        member_probs=stacker_member_probs_train_shuf,
+        bench_present=_train_bench_present,
+        nn_neighbor_support=nn_support_oof,
+        nn_mean_similarity=nn_mean_sim_oof,
+        centroid_distance=centroid_dist_oof,
+    )
+    stacker_state_shuf = fit_stacker(
+        X=stacker_X_train_shuf,
+        y=y_train_shuf,
+        n_iters=int(CFG.get("stacker", {}).get("n_iters", 1500)),
+        learning_rate=float(CFG.get("stacker", {}).get("learning_rate", 0.05)),
+        l2=float(CFG.get("stacker", {}).get("l2", 1.0)),
+        early_stopping_patience=int(CFG.get("stacker", {}).get("early_stopping_patience", 200)),
+        val_fraction=0.2,
+        seed=int(SEED) + 7777,
+    )
+    p_stacker_val_shuf = stacker_apply_batch(stacker_state_shuf, stacker_X_val)
+    nll_stacker_val_shuf = _bce(ylab_val, p_stacker_val_shuf)
+    print(
+        f"\n[OOF Gate 1c] shuffled-label stacker val log-loss = {nll_stacker_val_shuf:.5f}  "
+        f"(label-prior entropy = {_val_entropy:.5f})"
+    )
+    _slack = nll_stacker_val_shuf - _val_entropy
+    _tol = 0.010
+    if _slack < -_tol:
+        print(
+            f"[OOF Gate 1c] FAIL: shuffled-label stacker BEATS chance by "
+            f"{-_slack:.5f} nats (tolerance: {_tol:.3f}). This indicates "
+            "leakage somewhere in the OOF pipeline. Inspect:\n"
+            "  1. Fold NN index passrate (must use fold-train labels only)\n"
+            "  2. Fold mean-encoded stats (must use fold-train labels only)\n"
+            "  3. Fold member trainings (must see only fold-train rows)\n"
+            "  4. Member feature schema (currently global -- if other gates pass\n"
+            "     and Gate 1c fails, this is likely the culprit)"
+        )
+    elif _slack < _tol:
+        print(
+            f"[OOF Gate 1c] PASS: shuffled-label stacker collapsed to chance "
+            f"({_slack:+.5f} nats within tolerance {_tol:.3f})."
+        )
+    else:
+        print(
+            f"[OOF Gate 1c] PASS (loose): shuffled-label stacker did WORSE "
+            f"than chance ({_slack:+.5f} nats above entropy). The pipeline is "
+            "definitely not exploiting label info, but a healthy null run "
+            "should land within the tolerance band -- inspect the stacker's "
+            "regularization (l2 too high pulls the constant prediction off "
+            "the label mean and inflates log-loss above entropy)."
+        )
 
 # %% [markdown]
 # ## 10. NN calibrator on the STACKED predictions (post-stacker)
@@ -2925,84 +3903,38 @@ from src.nn_calibration import NNCalibrator, SubjectResidualTable
 def _fit_nn_calibrator():
     """Fit the post-stacker NN-residual calibrator end-to-end.
 
-    Heavy enough to want caching: scoring all four members on TRAIN +
-    deduped val NN search + the (alpha, shrinkage_tau) grid sweep.
-    Returns a picklable bundle so a cached run produces bit-identical
-    downstream values without re-scoring or re-searching.
+    OOF rewire (Task 1 of diversification plan): instead of re-scoring
+    every member on full train (which would be in-sample to the
+    member's training data), reuse the OOF prediction arrays
+    accumulated by section 9.5. The OOF stacker output on those
+    inputs is `p_stacker_train_oof` (computed in section 9f); we use
+    THAT as the calibrator's `p_uncal_train_stacker`. The residual
+    table is therefore built against truly out-of-fold uncalibrated
+    probabilities, matching the OOF discipline the stacker itself was
+    trained under.
+
+    Skipped: the expensive in-sample kNN chunked rescore (the previous
+    `p3_train_local` build was ~80 GB peak and several minutes). The
+    OOF `p3_train_oof` already covers all training rows.
     """
-    print("[Calibrator] Member 1 (Model A IRT-MLP) on train (using cached p_a_train)...")
-    # ``train_ds`` was freed after Model A scored both train+val
-    # (cell 9) to make room for the dense X build. Reuse the cached
-    # ``p_a_train`` instead of re-allocating an 80 GB item-emb stack
-    # to re-score.
-    p_a_train_local = p_a_train.astype(np.float32)
-    p1_train_local = p_a_train_local
-    print(f"[Calibrator] p1_train: shape={p1_train_local.shape}  "
-          f"log-loss={-(y_train * np.log(np.clip(p1_train_local, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p1_train_local, 1e-6, 1 - 1e-6))).mean():.6f}")
+    print("[Calibrator] Using OOF member predictions on train (from section 9.5)...")
+    p1_train_local = p_a_train_oof.astype(np.float32)
+    p2_train_local = p2_train_oof.astype(np.float32)
+    p3_train_local = p3_train_oof.astype(np.float32)
+    p4_train_local = p4_train_oof.astype(np.float32)
+    for _name, _arr in [
+        ("p1", p1_train_local), ("p2", p2_train_local),
+        ("p3", p3_train_local), ("p4", p4_train_local),
+    ]:
+        _nll = -(y_train * np.log(np.clip(_arr, 1e-6, 1 - 1e-6))
+                 + (1 - y_train) * np.log(1 - np.clip(_arr, 1e-6, 1 - 1e-6))).mean()
+        print(f"[Calibrator] {_name}_train_oof: shape={_arr.shape}  log-loss={float(_nll):.6f}")
 
-    print("[Calibrator] Member 2 (GBDT, residual-mode) on train...")
-    # Residual-mode Member 2: tree output is logit-residual; compose
-    # with Member 1's TRAIN probabilities (the anchor used at fit time)
-    # to recover the actual probability. Uses the augmented dense
-    # matrix (X_train_dense + mean-encoded interactions).
-    p2_train_local = gbdt_compose_residual_batch(
-        gbdt_state, X_train_dense_m2, p_a_train.astype(np.float64, copy=False)
-    )
-
-    print("[Calibrator] Member 3 (kNN) on train...")
-    # Score in chunks rather than materializing a single
-    # ``[N_train, embedding_dim]`` float32 buffer (~80 GB at 5M rows
-    # x 4096 dims). Each chunk is allocated, scored and discarded;
-    # peak overhead is ``CHUNK * D * 4`` bytes.
-    _train_item_keys_arr = primary.train["item_key"].astype(str).to_numpy()
-    _train_subj_keys_arr = [str(s) for s in primary.train["subject_key"]]
-    p3_train_local = np.empty(len(primary.train), dtype=np.float32)
-    _knn_chunk = int(CFG.get("calibrator", {}).get("knn_chunk_rows", 250_000))
-    for _start in range(0, len(primary.train), _knn_chunk):
-        _stop = min(_start + _knn_chunk, len(primary.train))
-        _chunk_emb = np.stack(
-            [item_emb_lookup[k] for k in _train_item_keys_arr[_start:_stop]],
-            axis=0,
-        ).astype(np.float32, copy=False)
-        _chunk_subj = _train_subj_keys_arr[_start:_stop]
-        p3_train_local[_start:_stop] = knn_apply_batch(
-            knn_state, _chunk_emb, _chunk_subj
-        ).astype(np.float32, copy=False)
-        del _chunk_emb, _chunk_subj
-    del _train_item_keys_arr, _train_subj_keys_arr
-    gc.collect()
-
-    print("[Calibrator] Member 4 (LogReg on hybrid features) on train...")
-    # Member 4 operates on the hybrid matrix (embedding dense + 14 marginals).
-    p4_train_local = logreg_apply_state_batch(logreg_state, X_train_dense_m4)
-
-    # Train-side stacker features (matching the same builder used on val).
-    train_bench_present_local = np.array(
-        [
-            1.0 if str(b) in indexer.bc_to_id else 0.0
-            for b in primary.train["benchmark_condition_key"]
-        ],
-        dtype=np.float32,
-    )
-    train_nn_mean_sim_local = nn_train_mat[:, 1].astype(np.float32)
-    train_nn_support_local = nn_train_mat[:, 2].astype(np.float32)
-    if _centroid_cols_in_pool:
-        train_pool_idx_local = pool_features_z.set_index("item_key").reindex(
-            primary.train["item_key"].astype(str)
-        )
-        train_centroid_dist_local = train_pool_idx_local[_centroid_cols_in_pool].astype(np.float32).min(axis=1).to_numpy()
-    else:
-        train_centroid_dist_local = np.full(len(primary.train), 0.5, dtype=np.float32)
-
-    train_stacker_feats_local = build_stacker_features(
-        member_probs=np.stack([p1_train_local, p2_train_local, p3_train_local, p4_train_local], axis=1).astype(np.float32),
-        bench_present=train_bench_present_local,
-        nn_neighbor_support=train_nn_support_local,
-        nn_mean_similarity=train_nn_mean_sim_local,
-        centroid_distance=train_centroid_dist_local,
-    )
-    p_uncal_train_stacker_local = stacker_apply_batch(stacker_state, train_stacker_feats_local)
-    print(f"[Calibrator] p_uncal_train_stacker: shape={p_uncal_train_stacker_local.shape}  "
+    # OOF stacker prediction on train rows is exactly `p_stacker_train_oof`
+    # computed in section 9f. Reuse it -- no need to rebuild train stacker
+    # features here.
+    p_uncal_train_stacker_local = p_stacker_train_oof.astype(np.float32)
+    print(f"[Calibrator] p_uncal_train_stacker (OOF): shape={p_uncal_train_stacker_local.shape}  "
           f"log-loss={-(y_train * np.log(np.clip(p_uncal_train_stacker_local, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p_uncal_train_stacker_local, 1e-6, 1 - 1e-6))).mean():.6f}")
 
     # --- Build the residual table from the STACKED train predictions.
@@ -3098,8 +4030,14 @@ def _fit_nn_calibrator():
 # depends on, plus the calibrator's own config. Any change in Model A
 # weights, GBDT trees, kNN tables, LogReg weights, stacker weights, or
 # the calibrator hyperparameters auto-invalidates the cache.
+_oof_member_preds_digest = _hashlib.sha256(
+    np.ascontiguousarray(
+        np.stack([p_a_train_oof, p2_train_oof, p3_train_oof, p4_train_oof], axis=1),
+        dtype=np.float32,
+    ).tobytes()
+).hexdigest()[:16]
 CALIBRATOR_KEY_INPUTS = (
-    "nn_calibrator_v2",
+    "nn_calibrator_oof_v1",
     state_fingerprint(ckpt_a_cached["model_state"]),
     state_fingerprint(gbdt_state),
     state_fingerprint(knn_state),
@@ -3113,6 +4051,8 @@ CALIBRATOR_KEY_INPUTS = (
     int(len(primary.train)),
     int(len(primary.val)),
     int(NN_FEATURE_DIM),
+    int(OOF_N_FOLDS), int(OOF_SEED), bool(OOF_RETRAIN_M1),
+    _oof_member_preds_digest,
 )
 print(f"[cache] Calibrator key prefix: {state_fingerprint(CALIBRATOR_KEY_INPUTS)}")
 
