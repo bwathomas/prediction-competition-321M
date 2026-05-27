@@ -611,54 +611,73 @@ def fit_member5(
     # train_loss. We score each training row through apply_one's
     # composition function so the NLL reflects what the runtime
     # will actually emit. Sub-sampled for speed.
-    rng = np.random.default_rng(0)
-    sample_n = int(min(10000, int(subject_ids_per_row.shape[0])))
-    sample_idx = rng.choice(int(subject_ids_per_row.shape[0]), size=sample_n, replace=False)
-    state_preview = Member5State(
-        projection_weights=beta,
-        projection_bias=bias,
-        projection_d_emb=d_emb,
-        item_keys=item_keys_sorted,
-        predicted_difficulty=predicted_sorted,
-        sort_order=sort_order,
-        subject_keys=tuple(subject_keys_list),
-        passrate_sorted=passrate_dense_sorted,
-        passrate_mask_sorted=passrate_mask_sorted,
-        subject_obs_count=subj_obs_count,
-        subject_global=subj_global,
-        item_global_passrate_sorted=item_global_sorted,
-        item_obs_count_sorted=item_obs_count_sorted,
-        global_mean=global_mean,
-        k=int(k),
-        tau=float(tau),
-        item_fallback_weight=float(item_fallback_weight),
-        min_subjects_per_item=int(min_subjects_per_item),
-        n_train=int(subject_ids_per_row.shape[0]),
-        train_loss=0.0,
-        val_loss=0.0,
-        ridge_alpha=float(ridge_alpha),
-    )
-    sub_subj = subject_ids_per_row[sample_idx]
-    sub_emb = item_embeddings[item_ids_per_row[sample_idx]]
-    sub_y = labels[sample_idx]
-    p_sample = apply_batch_via_ids(
-        state_preview,
-        subject_ids=sub_subj,
-        query_item_embeddings=sub_emb,
-    )
-    nll = -float(np.mean(
-        sub_y * np.log(np.clip(p_sample, _EPS, 1.0 - _EPS))
-        + (1 - sub_y) * np.log(1 - np.clip(p_sample, _EPS, 1.0 - _EPS))
-    ))
+    #
+    # Skipped entirely on the "fast path" where the caller passed
+    # only pre-built passrate matrices (subject_ids_per_row/
+    # item_ids_per_row/labels are length-0 sentinels). Without that
+    # skip, np.random.choice(0, size=0) -> empty sample, then
+    # np.mean(empty) -> nan + RuntimeWarning("Mean of empty slice")
+    # and the state ends up with ``train_loss=nan`` cached forever.
+    n_rows = int(subject_ids_per_row.shape[0])
+    if n_rows == 0:
+        nll = 0.0
+        sample_n = 0
+        LOG.info(
+            "fit_member5: n_items=%d  n_subjects=%d  K=%d  tau=%.3f  "
+            "ridge_alpha=%.3g  pred_diff range=[%.4f, %.4f]  "
+            "sampled_train_nll skipped (fast path: row arrays empty)",
+            n_items, n_subjects, int(k), float(tau), float(ridge_alpha),
+            float(predicted_sorted.min()), float(predicted_sorted.max()),
+        )
+    else:
+        rng = np.random.default_rng(0)
+        sample_n = int(min(10000, n_rows))
+        sample_idx = rng.choice(n_rows, size=sample_n, replace=False)
+        state_preview = Member5State(
+            projection_weights=beta,
+            projection_bias=bias,
+            projection_d_emb=d_emb,
+            item_keys=item_keys_sorted,
+            predicted_difficulty=predicted_sorted,
+            sort_order=sort_order,
+            subject_keys=tuple(subject_keys_list),
+            passrate_sorted=passrate_dense_sorted,
+            passrate_mask_sorted=passrate_mask_sorted,
+            subject_obs_count=subj_obs_count,
+            subject_global=subj_global,
+            item_global_passrate_sorted=item_global_sorted,
+            item_obs_count_sorted=item_obs_count_sorted,
+            global_mean=global_mean,
+            k=int(k),
+            tau=float(tau),
+            item_fallback_weight=float(item_fallback_weight),
+            min_subjects_per_item=int(min_subjects_per_item),
+            n_train=int(n_rows),
+            train_loss=0.0,
+            val_loss=0.0,
+            ridge_alpha=float(ridge_alpha),
+        )
+        sub_subj = subject_ids_per_row[sample_idx]
+        sub_emb = item_embeddings[item_ids_per_row[sample_idx]]
+        sub_y = labels[sample_idx]
+        p_sample = apply_batch_via_ids(
+            state_preview,
+            subject_ids=sub_subj,
+            query_item_embeddings=sub_emb,
+        )
+        nll = -float(np.mean(
+            sub_y * np.log(np.clip(p_sample, _EPS, 1.0 - _EPS))
+            + (1 - sub_y) * np.log(1 - np.clip(p_sample, _EPS, 1.0 - _EPS))
+        ))
 
-    LOG.info(
-        "fit_member5: n_items=%d  n_subjects=%d  K=%d  tau=%.3f  "
-        "ridge_alpha=%.3g  pred_diff range=[%.4f, %.4f]  "
-        "sampled_train_nll(%d rows)=%.5f",
-        n_items, n_subjects, int(k), float(tau), float(ridge_alpha),
-        float(predicted_sorted.min()), float(predicted_sorted.max()),
-        sample_n, nll,
-    )
+        LOG.info(
+            "fit_member5: n_items=%d  n_subjects=%d  K=%d  tau=%.3f  "
+            "ridge_alpha=%.3g  pred_diff range=[%.4f, %.4f]  "
+            "sampled_train_nll(%d rows)=%.5f",
+            n_items, n_subjects, int(k), float(tau), float(ridge_alpha),
+            float(predicted_sorted.min()), float(predicted_sorted.max()),
+            sample_n, nll,
+        )
 
     return Member5State(
         projection_weights=beta,

@@ -29,8 +29,12 @@ notice.
 
 from __future__ import annotations
 
+import ast
+import importlib
+import inspect
 import pathlib
 import re
+import sys
 
 import pytest
 
@@ -149,3 +153,92 @@ def test_calibrator_member3_scores_in_chunks(notebook_text: str) -> None:
         "Expected the calibrator to honor a configurable chunk size "
         "via CFG['calibrator']['knn_chunk_rows']."
     )
+
+
+def _resolve_src_imports(tree: ast.AST) -> dict[str, object]:
+    """Return {local_name: imported_object} for every `from src.* import ...`."""
+    table: dict[str, object] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if not (node.module == "src" or node.module.startswith("src.")):
+                continue
+            try:
+                mod = importlib.import_module(node.module)
+            except Exception:
+                continue
+            for alias in node.names:
+                obj = getattr(mod, alias.name, None)
+                table[alias.asname or alias.name] = obj
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if not (alias.name == "src" or alias.name.startswith("src.")):
+                    continue
+                try:
+                    mod = importlib.import_module(alias.name)
+                except Exception:
+                    continue
+                table[alias.asname or alias.name.split(".")[0]] = mod
+    return table
+
+
+def test_every_src_call_passes_only_declared_kwargs(notebook_text: str) -> None:
+    """Static guard: every notebook call to a `from src.* import X` callable
+    must use only kwargs declared by X's real ``inspect.signature``.
+
+    This catches the stale-kwarg failure mode (``fit_knn_member(K=...)`` or
+    ``knn_apply_batch(item_keys=...)``) on the entire notebook surface, not
+    just the few sites we've stumbled into. The check is purely static
+    (AST + importlib), so it costs ~1 second of test time and runs every
+    CI invocation.
+    """
+    repo_root = NOTEBOOK_PY.resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    tree = ast.parse(notebook_text)
+    imports = _resolve_src_imports(tree)
+    if not imports:
+        pytest.skip("No src.* imports resolved; cannot run signature audit.")
+
+    issues: list[str] = []
+    audited = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        name = node.func.id
+        obj = imports.get(name)
+        if obj is None:
+            continue
+        try:
+            sig = inspect.signature(obj)
+        except (TypeError, ValueError):
+            continue
+        accepts_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        if accepts_var_keyword:
+            continue
+        declared_kw = {
+            n for n, p in sig.parameters.items()
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        audited += 1
+        for kw in node.keywords:
+            if kw.arg is None:
+                continue
+            if kw.arg not in declared_kw:
+                issues.append(
+                    f"{name}(...) at notebook line {node.lineno}: "
+                    f"unexpected kwarg '{kw.arg}' (declared kwargs: "
+                    f"{sorted(declared_kw)})"
+                )
+
+    assert not issues, (
+        "Found notebook calls passing kwargs the imported src.* callable "
+        "does not declare:\n  - " + "\n  - ".join(issues)
+    )
+    assert audited > 0, "Audit ran but checked zero call sites -- import resolution likely broke."

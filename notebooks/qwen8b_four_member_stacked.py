@@ -2581,6 +2581,58 @@ else:
         "Falling back to legacy Member 2 (Member 1 anchor + full schema)."
     )
 
+
+# %% [markdown]
+# ### 9b'. Member 2 v3 (M1-calibration tree) setup
+#
+# v3 is a small GBDT whose features include Member 1's prediction plus
+# per-metadata-level observation counts and explicit "unknown ___" flags.
+# It REPLACES v2's GBDT output (per-fold and global) when enabled --
+# v3 reuses v2's subject_mean infrastructure (anchor + per-fold table),
+# so v2 setup must run first. The v2 GBDT itself is skipped when v3 is
+# enabled (saves the per-fold ~280 MB X matrix build and ~4 min train).
+#
+# Design context: v2's OOF NLL was 0.778 on fold 0 (worse than the
+# constant-mean baseline 0.628) because its 23 non-embedding features
+# carry zero item information on cold items, so the trees confidently
+# predicted (subject, cluster, bc) cell aggregates that don't match
+# individual cold items. v3 fixes this by adding M1's prediction as
+# the item-aware signal and letting the tree LEARN WHEN to trust it
+# vs shrink to subject_mean -- a pure calibration role.
+
+# %%
+_M2V3_ENABLED = bool(CFG.get("member2_v3", {}).get("enabled", True))
+_M2V3_SMOOTHING = float(CFG.get("member2_v3", {}).get("smoothing", 30.0))
+# Chunk size for M1 scoring on fold-train rows. ~256k rows * 4096 dim *
+# 4 bytes = ~4 GB peak per chunk for the LookupDataset item_emb stack.
+_M2V3_M1_CHUNK_ROWS = int(CFG.get("member2_v3", {}).get("m1_chunk_rows", 256_000))
+
+if _M2V3_ENABLED:
+    if not _M2V2_ENABLED:
+        raise RuntimeError(
+            "Member 2 v3 currently piggybacks on v2's subject_mean setup "
+            "(subject_mean_table_global, subject_mean_val, the per-fold "
+            "fold_subject_mean_table). Either enable _M2V2_ENABLED=True "
+            "and let v3 replace its GBDT output, or implement a v3-only "
+            "subject_mean setup path before disabling v2."
+        )
+    from src.member2_v3_calibration import (
+        MEMBER2_V3_FEATURE_NAMES,
+        M2V3_FEATURE_DIM,
+        Member2V3FeatureBuilder,
+        Member2V3State,
+        build_member2_v3_features,
+        fit_member2_v3_feature_builder,
+    )
+    print(
+        f"[Member 2 v3] M1-calibration tree ENABLED (smoothing={_M2V3_SMOOTHING}, "
+        f"F={M2V3_FEATURE_DIM} features incl. obs counts for subject/cluster/bc/"
+        "macro_family/organization/family + (subject,bc) + (subject,cluster) cells, "
+        "plus is_unknown_* flags per axis). REPLACES v2 GBDT output."
+    )
+else:
+    print("[Member 2 v3] DISABLED via CFG['member2_v3']['enabled']=False.")
+
 # %% [markdown]
 # ## 9c. Train Member 2 (LightGBM)
 #
@@ -3614,39 +3666,50 @@ for fold in folds:
         )
 
         # Build the Member 2 v2 feature matrices for fold-train and fold-OOF.
-        _fold_subj_obs_count_train_log1p = apply_subject_obs_count(
-            fold_subject_mean_table, _mef_subj_fold_train, log1p=True,
-        ).astype(np.float32)
-        _fold_subj_obs_count_oof_log1p = apply_subject_obs_count(
-            fold_subject_mean_table, _mef_subj_fold_oof, log1p=True,
-        ).astype(np.float32)
-        X_fold_train_m2v2 = build_member2_feature_matrix(
-            member2_v2_schema,
-            subject_ids=_mef_subj_fold_train,
-            cluster_ids=_mef_cluster_fold_train,
-            bc_ids=_mef_bc_fold_train,
-            bc_redacted_mask=bc_redacted_train[fold.train_row_idx].astype(np.float32),
-            subject_obs_count_log1p=_fold_subj_obs_count_train_log1p,
-            subject_cat_lookup=_m2v2_subj_cat_lookup,
-            subject_num_lookup=_m2v2_subj_num_lookup,
-            bench_cat_lookup=_m2v2_bench_cat_lookup,
-            bench_num_lookup=_m2v2_bench_num_lookup,
-            interaction_matrix=fold_member2_interaction_train.astype(np.float32),
-        )
-        X_fold_oof_m2v2 = build_member2_feature_matrix(
-            member2_v2_schema,
-            subject_ids=_mef_subj_fold_oof,
-            cluster_ids=_mef_cluster_fold_oof,
-            bc_ids=_mef_bc_fold_oof,
-            bc_redacted_mask=bc_redacted_train[fold.oof_row_idx].astype(np.float32),
-            subject_obs_count_log1p=_fold_subj_obs_count_oof_log1p,
-            subject_cat_lookup=_m2v2_subj_cat_lookup,
-            subject_num_lookup=_m2v2_subj_num_lookup,
-            bench_cat_lookup=_m2v2_bench_cat_lookup,
-            bench_num_lookup=_m2v2_bench_num_lookup,
-            interaction_matrix=fold_member2_interaction_oof.astype(np.float32),
-        )
-        # Accumulate OOF subject_mean for the GLOBAL Member 2 v2 fit in 9.5c.
+        # OOM/compute discipline: when v3 is enabled (the default) the v2
+        # GBDT will be SKIPPED below, so these matrices have no consumer
+        # and would burn ~280 MB (train) + ~140 MB (OOF) for nothing.
+        # Skip when v3 owns the Member 2 output path.
+        if not _M2V3_ENABLED:
+            _fold_subj_obs_count_train_log1p = apply_subject_obs_count(
+                fold_subject_mean_table, _mef_subj_fold_train, log1p=True,
+            ).astype(np.float32)
+            _fold_subj_obs_count_oof_log1p = apply_subject_obs_count(
+                fold_subject_mean_table, _mef_subj_fold_oof, log1p=True,
+            ).astype(np.float32)
+            X_fold_train_m2v2 = build_member2_feature_matrix(
+                member2_v2_schema,
+                subject_ids=_mef_subj_fold_train,
+                cluster_ids=_mef_cluster_fold_train,
+                bc_ids=_mef_bc_fold_train,
+                bc_redacted_mask=bc_redacted_train[fold.train_row_idx].astype(np.float32),
+                subject_obs_count_log1p=_fold_subj_obs_count_train_log1p,
+                subject_cat_lookup=_m2v2_subj_cat_lookup,
+                subject_num_lookup=_m2v2_subj_num_lookup,
+                bench_cat_lookup=_m2v2_bench_cat_lookup,
+                bench_num_lookup=_m2v2_bench_num_lookup,
+                interaction_matrix=fold_member2_interaction_train.astype(np.float32),
+            )
+            X_fold_oof_m2v2 = build_member2_feature_matrix(
+                member2_v2_schema,
+                subject_ids=_mef_subj_fold_oof,
+                cluster_ids=_mef_cluster_fold_oof,
+                bc_ids=_mef_bc_fold_oof,
+                bc_redacted_mask=bc_redacted_train[fold.oof_row_idx].astype(np.float32),
+                subject_obs_count_log1p=_fold_subj_obs_count_oof_log1p,
+                subject_cat_lookup=_m2v2_subj_cat_lookup,
+                subject_num_lookup=_m2v2_subj_num_lookup,
+                bench_cat_lookup=_m2v2_bench_cat_lookup,
+                bench_num_lookup=_m2v2_bench_num_lookup,
+                interaction_matrix=fold_member2_interaction_oof.astype(np.float32),
+            )
+        else:
+            # v3 owns Member 2; v2 matrices are dead weight on this path.
+            X_fold_train_m2v2 = None
+            X_fold_oof_m2v2 = None
+        # Accumulate OOF subject_mean for the GLOBAL Member 2 v2 / v3 fit
+        # in 9.5c. Both v2 and v3 globals use it as the inference-time
+        # anchor for honest OOF training of the booster.
         subject_mean_train_oof_acc.write_fold(fold.oof_row_idx, subject_mean_oof_fold)
 
     # ----- Fold X_train_dense / X_oof_dense (uses GLOBAL schema -- ack'd leak) -----
@@ -3699,14 +3762,32 @@ for fold in folds:
         _fold_train_pos = {int(r): i for i, r in enumerate(fold.train_row_idx)}
         _es_train_local = np.array([_fold_train_pos[int(r)] for r in _es_train_rows], dtype=np.int64)
         _es_val_local = np.array([_fold_train_pos[int(r)] for r in _es_val_rows], dtype=np.int64)
-        _es_train_df = primary.train.iloc[_es_train_rows]
-        _es_val_df = primary.train.iloc[_es_val_rows]
-        _train_ds_fold = _build(_es_train_df, nn_train_mat_fold[_es_train_local])
-        _val_ds_fold = _build(_es_val_df, nn_train_mat_fold[_es_val_local])
-        _oof_ds_fold = _build(fold_oof_df, nn_oof_mat_fold)
+        del _fold_train_pos
+        # OOM guard: do NOT materialize _train_ds_fold / _val_ds_fold here.
+        # ``_build`` calls ``stack_lookup`` which allocates [N, 4096] fp32 per
+        # row (~16 KB/row). For a typical fold that's ~47 GB for ES-train,
+        # ~5 GB for ES-val, ~27 GB for OOF -- ~79 GB transient _before_ the
+        # cache call. On cache HIT that's pure waste; on cache MISS it stacks
+        # on top of training memory. We defer the train/val build into the
+        # compute_fn (so cache HIT skips it entirely; cache MISS GCs them
+        # at function return), and build _oof_ds_fold only after the cache
+        # call (it's only needed for scoring, never for training).
 
         # Fold M1 training closure (mirrors _train_model_a structure).
-        def _train_fold_model_a(_fold=fold, _train_ds=_train_ds_fold, _val_ds=_val_ds_fold):
+        # Datasets are built INSIDE so a cache HIT pays zero RAM for them.
+        def _train_fold_model_a(
+            _fold=fold,
+            _es_train_rows=_es_train_rows,
+            _es_val_rows=_es_val_rows,
+            _es_train_local=_es_train_local,
+            _es_val_local=_es_val_local,
+        ):
+            _es_train_df = primary.train.iloc[_es_train_rows]
+            _es_val_df = primary.train.iloc[_es_val_rows]
+            _train_ds_local = _build(_es_train_df, nn_train_mat_fold[_es_train_local])
+            _val_ds_local = _build(_es_val_df, nn_train_mat_fold[_es_val_local])
+            del _es_train_df, _es_val_df
+            gc.collect()
             train_mod.build_model = _build_with_overrides
             try:
                 _active_dropout_cfg["cfg"] = a_drop
@@ -3716,8 +3797,8 @@ for fold in folds:
                     model_name=MODEL_A_NAME,
                     model_cfg=model_a_cfg,
                     train_cfg=train_cfg,
-                    train_ds=_train_ds,
-                    val_ds=_val_ds,
+                    train_ds=_train_ds_local,
+                    val_ds=_val_ds_local,
                     indexer=indexer,
                     seed=int(MODEL_A_SEED) + 1000 * (int(_fold.fold_id) + 1),
                     run_id=f"qwen8b_oof_fold{_fold.fold_id}_model_a",
@@ -3734,6 +3815,13 @@ for fold in folds:
                 for h in _active_dropout_cfg["installed_handles"]:
                     h.remove()
                 _ckpt = torch.load(_result.checkpoint_path, map_location="cpu", weights_only=False)
+                # Free datasets BEFORE returning so memory drops _before_
+                # we cache-save the bundle (saves the on-disk pickle path
+                # from competing with ~52 GB of live ds tensors).
+                del _train_ds_local, _val_ds_local
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 return {"train_result": _result, "ckpt": _ckpt}
             finally:
                 _active_dropout_cfg["cfg"] = None
@@ -3748,8 +3836,11 @@ for fold in folds:
                 json.dumps(asdict(model_a_cfg), default=str, sort_keys=True),
                 json.dumps(asdict(train_cfg), default=str, sort_keys=True),
                 json.dumps(asdict(a_drop), default=str, sort_keys=True),
-                int(_train_ds_fold.subject_ids.shape[0]),
-                int(_val_ds_fold.subject_ids.shape[0]),
+                # NOTE: equivalent to the prior cache key fields
+                # (_train_ds_fold.subject_ids.shape[0], _val_ds_fold.subject_ids.shape[0])
+                # but computed WITHOUT materializing the datasets first.
+                int(len(_es_train_rows)),
+                int(len(_es_val_rows)),
                 int(indexer.n_subjects), int(indexer.n_bc),
                 int(_NN_FEATURE_DIM_CACHE_TAG),
                 int(fold_cond_context.n_families),
@@ -3760,42 +3851,81 @@ for fold in folds:
             compute_fn=_train_fold_model_a,
         )
         _fold_ckpt = _fold_m1_bundle["ckpt"]
+        # Build _oof_ds_fold _after_ the cache call so:
+        #   - cache HIT path: train/val ds were never built (~52 GB saved)
+        #   - cache MISS path: train/val ds were built inside compute_fn
+        #     and freed before this point (~52 GB saved at this peak)
+        # Only _oof_ds_fold (~27 GB at largest fold) is live during scoring.
+        _oof_ds_fold = _build(fold_oof_df, nn_oof_mat_fold)
         # Load fold M1 weights into a fresh model + score on OOF rows.
         _fold_model = _build_model_for_inf(MODEL_A_NAME, model_a_cfg)
         _fold_model.attach_metadata_tables(meta_id_tables)
         _fold_model.load_state_dict(_fold_ckpt["model_state"])
         _fold_model = _fold_model.to(device).eval()
         p_a_oof_fold = _score_dataset(_oof_ds_fold, _fold_model)
-        # Member 2's residual anchor: on the LEGACY Member 2 path it must
-        # come from this fold's M1 (so we score M1 on every fold-train
-        # row -- builds a full-size dataset, ~few GB of tensors). On the
-        # Task 3 path Member 2 v2 uses subject_mean as the anchor, so
-        # this anchor scoring is pure waste; skip it.
-        if not _M2V2_ENABLED:
-            _train_ds_fold_full = _build(fold_train_df, nn_train_mat_fold)
-            p_a_anchor_fold_train = _score_dataset(_train_ds_fold_full, _fold_model)
-            del _train_ds_fold_full
+        # Whether we need M1's predictions on every fold-train row:
+        #   - LEGACY Member 2 (no v2, no v3): yes -- residual anchor.
+        #   - v2-only (Task 3 v2, no v3): no -- v2 uses subject_mean.
+        #   - v3 enabled: YES -- v3's calibration tree consumes p_m1 as
+        #     a per-row feature, so we need it on all fold-train rows.
+        _need_fold_train_m1_anchor = (not _M2V2_ENABLED) or _M2V3_ENABLED
+        if _need_fold_train_m1_anchor:
+            # MEMORY: scoring all fold-train rows at once allocates a
+            # ~50 GB LookupDataset (rows * 4096 * 4 bytes). Chunk it so
+            # peak is ~chunk_rows * 4096 * 4 ~= 4 GB per chunk.
+            _chunk_rows_m1 = int(
+                CFG.get("member2_v3", {}).get("m1_chunk_rows", 256_000)
+            )
+            import time as _m1_time_local
+            p_a_anchor_fold_train = np.empty(len(fold_train_df), dtype=np.float32)
+            _m1_t0 = _m1_time_local.time()
+            for _cs in range(0, len(fold_train_df), _chunk_rows_m1):
+                _ce = min(_cs + _chunk_rows_m1, len(fold_train_df))
+                _chunk_df = fold_train_df.iloc[_cs:_ce]
+                _chunk_nn = nn_train_mat_fold[_cs:_ce]
+                _chunk_ds = _build(_chunk_df, _chunk_nn)
+                p_a_anchor_fold_train[_cs:_ce] = _score_dataset(
+                    _chunk_ds, _fold_model,
+                )
+                del _chunk_ds, _chunk_nn, _chunk_df
+                gc.collect()
+                if (_ce % (_chunk_rows_m1 * 2)) == 0 or _ce == len(fold_train_df):
+                    _rps = _ce / max(_m1_time_local.time() - _m1_t0, 1e-6)
+                    print(
+                        f"[OOF f{fold.fold_id}] M1 fold-train scoring "
+                        f"{_ce:,}/{len(fold_train_df):,} rows "
+                        f"({_rps:,.0f} rows/s)"
+                    )
         else:
             p_a_anchor_fold_train = None
         _fold_model = _fold_model.to("cpu")
-        del _fold_model, _train_ds_fold, _val_ds_fold, _oof_ds_fold
+        del _fold_model, _oof_ds_fold
         gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
     else:
         # Use global p_a_train (saw all train items -- documented small leak).
         p_a_oof_fold = p_a_train[fold.oof_row_idx]
-        if not _M2V2_ENABLED:
+        _need_fold_train_m1_anchor = (not _M2V2_ENABLED) or _M2V3_ENABLED
+        if _need_fold_train_m1_anchor:
             p_a_anchor_fold_train = p_a_train[fold.train_row_idx]
         else:
             p_a_anchor_fold_train = None
     p_a_train_oof_acc.write_fold(fold.oof_row_idx, p_a_oof_fold)
 
-    # The NN feature matrices are no longer needed: their consumers
-    # (X_fold_*_dense, M1 datasets, and the aux-feature slices) have all
-    # been served. At full scale this is ~360 MB (train) + ~200 MB (oof)
-    # of headroom returned to the OS before Member 2 starts.
-    del nn_train_mat_fold, nn_oof_mat_fold
-    gc.collect()
+    # The NN feature matrices are no longer needed *on the legacy
+    # path*: their consumers (X_fold_*_dense, M1 datasets, and the
+    # aux-feature slices) have all been served and we can return
+    # ~360 MB (train) + ~200 MB (oof) to the OS before Member 2
+    # starts.
+    #
+    # On the Task 3 path (``X_fold_*_dense`` is ``None``) the M4
+    # chunked X build below still consumes them, so we KEEP them
+    # alive and free each one immediately after its M4 build loop
+    # completes (see the matching ``del nn_train_mat_fold`` and
+    # ``del nn_oof_mat_fold`` inside the M4 chunked sections).
+    if X_fold_train_dense is not None and X_fold_oof_dense is not None:
+        del nn_train_mat_fold, nn_oof_mat_fold
+        gc.collect()
 
     # ----- Fold Member 2 (GBDT residual) -----
     _y_fold_train_np = _y_fold_train
@@ -3803,21 +3933,235 @@ for fold in folds:
         [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
         dtype=np.int64,
     )
-    if _M2V2_ENABLED:
+    if _M2V3_ENABLED:
+        # Task 3b: M1-calibration tree. Uses subject_mean as residual anchor
+        # (same as v2) but feeds M1's prediction + obs-count proxies + unknown
+        # flags as features so the tree can learn WHEN to trust M1 vs shrink
+        # to subject_mean. This is the structural fix for v2's "no item info
+        # on cold items -> worse than baseline" failure mode (M2 fold-0 NLL
+        # = 0.778 vs constant-mean 0.628).
+        print(
+            f"[OOF f{fold.fold_id}] Training fold Member 2 v3 "
+            f"(M1-calibration GBDT, F={M2V3_FEATURE_DIM} features, subject_mean anchor)..."
+        )
+        # Sanity: v3 requires the M1 anchor on fold-train rows. We forced
+        # the scoring above when _M2V3_ENABLED, so this should always pass.
+        if p_a_anchor_fold_train is None or len(p_a_anchor_fold_train) != len(fold_train_df):
+            raise RuntimeError(
+                f"v3 needs p_a_anchor_fold_train sized {len(fold_train_df)}; "
+                f"got {None if p_a_anchor_fold_train is None else len(p_a_anchor_fold_train)}. "
+                "Check the M1-anchor scoring branch above (_need_fold_train_m1_anchor)."
+            )
+        # 1. Fit the v3 feature builder on fold-train (per-id obs counts +
+        #    shrunken passrates, restricted to this fold's training rows
+        #    so OOF rows are NEVER in the aggregates).
+        _fold_v3_builder = fit_member2_v3_feature_builder(
+            subject_ids=_mef_subj_fold_train,
+            cluster_ids=_mef_cluster_fold_train,
+            bc_ids=_mef_bc_fold_train,
+            labels=_y_fold_train_np,
+            n_subjects=int(indexer.n_subjects),
+            n_clusters=int(N_CLUSTERS_CTX),
+            n_bcs=int(indexer.n_bc),
+            n_macro_families=int(N_MACRO_FAMILIES),
+            n_organizations=int(N_ORGANIZATIONS),
+            n_families=int(N_FAMILIES),
+            subject_to_macro_family_id=s2macro,
+            subject_to_organization_id=s2org,
+            subject_to_family_id=s2fam,
+            smoothing=_M2V3_SMOOTHING,
+        )
+        # 2. Materialize the v3 feature matrix for fold-train rows.
+        X_v3_fold_train = build_member2_v3_features(
+            _fold_v3_builder,
+            p_m1=p_a_anchor_fold_train,
+            subject_mean=subject_mean_train_fold,
+            subject_ids=_mef_subj_fold_train,
+            cluster_ids=_mef_cluster_fold_train,
+            bc_ids=_mef_bc_fold_train,
+            bc_redacted_mask=bc_redacted_train[fold.train_row_idx].astype(np.float32),
+        )
+        # 3. Cache key with FULL content fingerprints. Same defense-in-depth
+        #    as the v2 strengthening: shape alone hides feature-pipeline
+        #    drift, and a cache HIT on stale state silently corrupts the
+        #    stacker (the v2 0.778 NLL bug).
+        import hashlib as _m2v3_hashlib
+        _m2v3_feat_names_hash = _m2v3_hashlib.sha256(
+            "\0".join(MEMBER2_V3_FEATURE_NAMES).encode("utf-8")
+        ).hexdigest()[:16]
+        _m2v3_X_train_hash = _m2v3_hashlib.sha256(
+            np.ascontiguousarray(X_v3_fold_train, dtype=np.float32).tobytes()
+        ).hexdigest()[:16]
+        _m2v3_anchor_hash = _m2v3_hashlib.sha256(
+            np.ascontiguousarray(subject_mean_train_fold, dtype=np.float64).tobytes()
+        ).hexdigest()[:16]
+        _m2v3_pm1_hash = _m2v3_hashlib.sha256(
+            np.ascontiguousarray(p_a_anchor_fold_train, dtype=np.float32).tobytes()
+        ).hexdigest()[:16]
+        _fold_gbdt_state = cache_or_compute(
+            "gbdt_state_oof_fold",
+            key_inputs=(
+                # ``v3_calib_v1`` is distinct from any v2 key prefix, so v2
+                # entries don't collide. Bump the suffix here when changing
+                # the v3 feature schema or the GBDT hyperparams below.
+                "gbdt_oof_v3_calib_v1",
+                fold.fold_id, fold_suffix,
+                int(M2V3_FEATURE_DIM), int(X_v3_fold_train.shape[0]),
+                int(SEED),
+                round(float(_M2V3_SMOOTHING), 4),
+                _m2v3_feat_names_hash,
+                _m2v3_X_train_hash,
+                _m2v3_anchor_hash,
+                _m2v3_pm1_hash,
+            ),
+            compute_fn=lambda _ff=fold: fit_gbdt_member(
+                X=X_v3_fold_train,
+                y=_y_fold_train_np,
+                feature_names=MEMBER2_V3_FEATURE_NAMES,
+                init_pred_train=subject_mean_train_fold,
+                holdout_group_id=_gbdt_train_item_id_fold,
+                # Tighter than v2: v3 has only 25 features so it overfits
+                # easily without aggressive regularization. min_data_in_leaf
+                # bumped to 200, num_leaves halved to 31, n_estimators
+                # capped at 300 with patient early stopping.
+                n_estimators=int(
+                    CFG.get("member2_v3", {}).get("n_estimators", 300)
+                ),
+                learning_rate=float(
+                    CFG.get("member2_v3", {}).get("learning_rate", 0.05)
+                ),
+                num_leaves=int(
+                    CFG.get("member2_v3", {}).get("num_leaves", 31)
+                ),
+                min_data_in_leaf=int(
+                    CFG.get("member2_v3", {}).get("min_data_in_leaf", 200)
+                ),
+                feature_fraction=float(
+                    CFG.get("member2_v3", {}).get("feature_fraction", 0.9)
+                ),
+                bagging_fraction=float(
+                    CFG.get("member2_v3", {}).get("bagging_fraction", 0.8)
+                ),
+                bagging_freq=int(
+                    CFG.get("member2_v3", {}).get("bagging_freq", 5)
+                ),
+                early_stopping_rounds=int(
+                    CFG.get("member2_v3", {}).get("early_stopping_rounds", 30)
+                ),
+                seed=int(SEED) + 100 * (int(_ff.fold_id) + 1) + 17,
+            ),
+        )
+        # Free the train-side X matrix BEFORE building the OOF one so peak
+        # memory is one X matrix at a time. Each is ~3M rows * 25 cols *
+        # 4 bytes = ~300 MB, but tight is tight.
+        del X_v3_fold_train
+        gc.collect()
+        X_v3_fold_oof = build_member2_v3_features(
+            _fold_v3_builder,
+            p_m1=p_a_oof_fold,
+            subject_mean=subject_mean_oof_fold,
+            subject_ids=_mef_subj_fold_oof,
+            cluster_ids=_mef_cluster_fold_oof,
+            bc_ids=_mef_bc_fold_oof,
+            bc_redacted_mask=bc_redacted_train[fold.oof_row_idx].astype(np.float32),
+        )
+        p2_oof_fold = gbdt_compose_residual_batch(
+            _fold_gbdt_state, X_v3_fold_oof, subject_mean_oof_fold,
+        )
+        del X_v3_fold_oof
+        gc.collect()
+        # Gate 3d (NLL vs baseline) -- identical guard to v2 but pointed
+        # at the v3 output. The same blow-up signature would mean v3 is
+        # broken too and we should not ship it.
+        _p2_oof_clip = np.clip(p2_oof_fold, 1e-6, 1.0 - 1e-6)
+        _yfold_oof = fold_oof_df["label"].astype(float).to_numpy()
+        _p2_oof_nll = float(
+            -(_yfold_oof * np.log(_p2_oof_clip)
+              + (1.0 - _yfold_oof) * np.log(1.0 - _p2_oof_clip)).mean()
+        )
+        _p2_q = np.quantile(p2_oof_fold, [0.0, 0.01, 0.5, 0.99, 1.0])
+        _baseline_mean = float(_yfold_oof.mean())
+        _p2_baseline = float(
+            -(_baseline_mean * np.log(_baseline_mean)
+              + (1.0 - _baseline_mean) * np.log(1.0 - _baseline_mean))
+        )
+        # Gate 3e (NEW): decorrelation from M1. The v3 tree must NOT
+        # collapse into "predict whatever M1 predicts" -- if it does, it
+        # is contributing no incremental signal and the stacker weight
+        # will pin to zero. Some correlation is expected (M1 is a feature),
+        # but a correlation above 0.995 means the tree memorized M1.
+        _corr_v3_m1 = float(
+            np.corrcoef(p2_oof_fold.astype(np.float64),
+                        p_a_oof_fold.astype(np.float64))[0, 1]
+        )
+        print(
+            f"  [Gate 3d fold {fold.fold_id}] M2 v3 OOF NLL={_p2_oof_nll:.5f}  "
+            f"baseline(constant_mean)={_p2_baseline:.5f}  "
+            f"corr(M2v3, M1)={_corr_v3_m1:+.4f}  "
+            f"p2 quantiles min/1%/50%/99%/max="
+            f"{_p2_q[0]:.4f}/{_p2_q[1]:.4f}/{_p2_q[2]:.4f}/{_p2_q[3]:.4f}/{_p2_q[4]:.4f}"
+        )
+        if _p2_oof_nll > _p2_baseline + 0.05:
+            raise AssertionError(
+                f"Gate 3d FAIL fold {fold.fold_id}: M2 v3 OOF NLL={_p2_oof_nll:.5f} "
+                f"is materially WORSE than the constant-mean baseline "
+                f"({_p2_baseline:.5f}). v3 was designed specifically to fix "
+                "this v2 failure mode. Inspect the v3 feature pipeline."
+            )
+        if abs(_corr_v3_m1) > 0.995:
+            raise AssertionError(
+                f"Gate 3e FAIL fold {fold.fold_id}: |corr(M2v3, M1)|={abs(_corr_v3_m1):.4f} "
+                "> 0.995. The calibration tree just memorized Member 1 -- "
+                "no incremental signal. Try increasing min_data_in_leaf, "
+                "lowering n_estimators, or dropping the logit_p_m1 feature."
+            )
+        del _p2_oof_clip, _yfold_oof, _p2_q, _baseline_mean, _p2_baseline
+        del _p2_oof_nll, _corr_v3_m1, _fold_v3_builder
+        gc.collect()
+    elif _M2V2_ENABLED:
         # Task 3: non-embedding schema + subject_mean anchor.
         print(
             f"[OOF f{fold.fold_id}] Training fold Member 2 v2 (GBDT residual, "
             f"subject_mean anchor, non-embedding schema X cols={X_fold_train_m2v2.shape[1]})..."
         )
+        # Cache key fingerprints that catch silent-stale-state failures:
+        #   - ``feature_names_hash``: detects column reorder/rename/add/drop
+        #     within the v2 schema (shape alone misses these).
+        #   - ``X_train_content_hash``: 16-byte digest of the full
+        #     fp32 X matrix bytes. Detects any change to the upstream
+        #     feature pipeline (mean-encoding, interaction matrix,
+        #     bc_redacted mask, subject_obs_count) that produces the
+        #     same shape but different values.
+        #   - ``init_pred_train_hash``: detects silent subject_mean
+        #     anchor changes (smoothing, label set used to fit the table).
+        # M2 v2 fold-0 NLL=0.778 (worse than constant!) on a cache HIT
+        # is exactly the failure mode these guard against -- a state
+        # trained on different inputs was loaded and scored against
+        # mismatched current inputs.
+        import hashlib as _m2v2_hashlib
+        _m2v2_feat_names_hash = _m2v2_hashlib.sha256(
+            "\0".join(member2_v2_schema.feature_names).encode("utf-8")
+        ).hexdigest()[:16]
+        _m2v2_X_train_hash = _m2v2_hashlib.sha256(
+            np.ascontiguousarray(X_fold_train_m2v2, dtype=np.float32).tobytes()
+        ).hexdigest()[:16]
+        _m2v2_anchor_hash = _m2v2_hashlib.sha256(
+            np.ascontiguousarray(subject_mean_train_fold, dtype=np.float64).tobytes()
+        ).hexdigest()[:16]
         _fold_gbdt_state = cache_or_compute(
             "gbdt_state_oof_fold",
             key_inputs=(
-                # ``subjmean_v1`` invalidates legacy Member-1-anchor + full-schema
-                # entries. Smoothing tied in so changing the prior strength refits.
-                "gbdt_oof_v2_subjmean", fold.fold_id, fold_suffix,
+                # ``subjmean_v3_contenthash`` invalidates earlier v2 entries
+                # (which lacked feature_names / X content / anchor fingerprints
+                # and produced the M2 fold-0 OOF NLL=0.778 silent-corruption bug).
+                "gbdt_oof_v3_subjmean_contenthash",
+                fold.fold_id, fold_suffix,
                 int(X_fold_train_m2v2.shape[1]), int(X_fold_train_m2v2.shape[0]),
                 int(SEED),
                 round(float(_M2V2_SMOOTHING), 4),
+                _m2v2_feat_names_hash,
+                _m2v2_X_train_hash,
+                _m2v2_anchor_hash,
             ),
             compute_fn=lambda _ff=fold: fit_gbdt_member(
                 X=X_fold_train_m2v2,
@@ -3839,6 +4183,41 @@ for fold in folds:
         p2_oof_fold = gbdt_compose_residual_batch(
             _fold_gbdt_state, X_fold_oof_m2v2, subject_mean_oof_fold,
         )
+        # Diagnostic: catch extreme-prediction blowups (the 0.778 NLL signature).
+        # If MOST predictions are calibrated near the OOF passrate but a tail
+        # is wildly extreme (sigmoid(logit(anchor) + big_residual)), the NLL
+        # gets dominated by the tail. We report quantiles + an OOF NLL preview.
+        _p2_oof_clip = np.clip(p2_oof_fold, 1e-6, 1.0 - 1e-6)
+        _yfold_oof = fold_oof_df["label"].astype(float).to_numpy()
+        _p2_oof_nll = float(
+            -(_yfold_oof * np.log(_p2_oof_clip)
+              + (1.0 - _yfold_oof) * np.log(1.0 - _p2_oof_clip)).mean()
+        )
+        _p2_q = np.quantile(p2_oof_fold, [0.0, 0.01, 0.5, 0.99, 1.0])
+        # NLL of the constant-mean predictor = entropy of the label mean.
+        _baseline_mean = float(_yfold_oof.mean())
+        _p2_baseline = float(
+            -(_baseline_mean * np.log(_baseline_mean)
+              + (1.0 - _baseline_mean) * np.log(1.0 - _baseline_mean))
+        )
+        print(
+            f"  [Gate 3d fold {fold.fold_id}] M2 v2 OOF NLL={_p2_oof_nll:.5f}  "
+            f"baseline(constant_mean)={_p2_baseline:.5f}  "
+            f"p2 quantiles min/1%/50%/99%/max="
+            f"{_p2_q[0]:.4f}/{_p2_q[1]:.4f}/{_p2_q[2]:.4f}/{_p2_q[3]:.4f}/{_p2_q[4]:.4f}"
+        )
+        if _p2_oof_nll > _p2_baseline + 0.05:
+            # 0.05 nat is generous; in a healthy run M2 should beat
+            # baseline by a few nats. Worse-than-baseline is a hard fail.
+            raise AssertionError(
+                f"Gate 3d FAIL fold {fold.fold_id}: M2 v2 OOF NLL={_p2_oof_nll:.5f} "
+                f"is materially WORSE than the constant-mean baseline "
+                f"({_p2_baseline:.5f}). This is the cache-stale / extreme-prediction "
+                f"blowup signature. Quantile spread: min={_p2_q[0]:.4f} max={_p2_q[4]:.4f}. "
+                "Wipe gbdt_state_oof_fold__*.pkl and retry, or inspect the "
+                "feature pipeline."
+            )
+        del _p2_oof_clip, _yfold_oof, _p2_q, _baseline_mean, _p2_baseline, _p2_oof_nll
     else:
         # Legacy: full-schema Member 2 with Member 1 anchor.
         # MEMORY: build the m2 matrices JIT (now), train, score, free.
@@ -3896,7 +4275,14 @@ for fold in folds:
     # Build fold-local subject keys (ordered subject_id -> subject_key).
     _fold_subject_keys = _subject_keys_ordered  # subject set is global
     _fold_passrate_dense = np.asarray(fold_passrate_csr.todense(), dtype=np.float32)
-    _fold_passrate_mask_dense = np.asarray(fold_passrate_mask_csr.todense(), dtype=np.float32)
+    # MEMORY: store the mask as bool, not fp32. Both fit_knn_member
+    # (src/knn_member.py:1062) and fit_member5 (src/member5_difficulty_knn.py:541)
+    # cast to bool internally, so the result is numerically identical
+    # and the cache key (which is shape/seed-based) is unchanged. The
+    # dtype change drops ~540 MB at full scale ([907, 197114] fp32 ->
+    # bool = 715 MB -> 178 MB) and removes the need for an extra
+    # _fold_passrate_mask_bool copy at Member 5 fit time.
+    _fold_passrate_mask_dense = np.asarray(fold_passrate_mask_csr.todense(), dtype=bool)
     _fold_item_emb_stacked = np.stack(
         [np.asarray(item_emb_lookup[k], dtype=np.float32) for k in fold.train_item_keys],
         axis=0,
@@ -3904,9 +4290,21 @@ for fold in folds:
     _fold_knn_state = cache_or_compute(
         "knn_state_oof_fold",
         key_inputs=(
-            "knn_oof_v1", fold.fold_id, fold_suffix,
+            # ``knn_oof_v2`` invalidates entries built with the old
+            # broken kwargs (K/min_subjects_per_item/tau_init/train_lr/
+            # train_iters/train_l2) which never matched fit_knn_member's
+            # actual signature; the per-fold call now mirrors the
+            # GLOBAL Member 3 invocation (pca_dim, quantization, k,
+            # tau_subject, tau_global, item_fallback_weight).
+            "knn_oof_v2", fold.fold_id, fold_suffix,
             int(len(fold.train_item_keys)), int(indexer.n_subjects),
             int(SEED),
+            int(_m3_cfg.get("pca_dim", 128)),
+            str(_m3_cfg.get("quantization", "int8")),
+            int(_m3_cfg.get("k", 128)),
+            round(float(_m3_cfg.get("tau_subject", 5.0)), 6),
+            round(float(_m3_cfg.get("tau_global", 200.0)), 6),
+            round(float(_m3_cfg.get("item_fallback_weight", 0.5)), 6),
         ),
         compute_fn=lambda _ff=fold: fit_knn_member(
             item_keys=list(_ff.train_item_keys),
@@ -3914,12 +4312,12 @@ for fold in folds:
             subject_keys=_fold_subject_keys,
             passrate_dense=_fold_passrate_dense,
             passrate_mask=_fold_passrate_mask_dense,
-            K=int(CFG.get("member3_knn", {}).get("K", 32)),
-            min_subjects_per_item=int(CFG.get("member3_knn", {}).get("min_subjects_per_item", 3)),
-            tau_init=float(CFG.get("member3_knn", {}).get("tau_init", 1.0)),
-            train_lr=float(CFG.get("member3_knn", {}).get("train_lr", 0.05)),
-            train_iters=int(CFG.get("member3_knn", {}).get("train_iters", 300)),
-            train_l2=float(CFG.get("member3_knn", {}).get("train_l2", 0.0)),
+            pca_dim=int(_m3_cfg.get("pca_dim", 128)),
+            quantization=str(_m3_cfg.get("quantization", "int8")),
+            k=int(_m3_cfg.get("k", 128)),
+            tau_subject=float(_m3_cfg.get("tau_subject", 5.0)),
+            tau_global=float(_m3_cfg.get("tau_global", 200.0)),
+            item_fallback_weight=float(_m3_cfg.get("item_fallback_weight", 0.5)),
             seed=int(SEED) + 200 * (int(_ff.fold_id) + 1),
         ),
     )
@@ -3935,9 +4333,8 @@ for fold in folds:
     )
     p3_oof_fold = knn_apply_batch(
         _fold_knn_state,
-        subject_keys=fold_oof_df["subject_key"].astype(str).tolist(),
-        item_keys=fold_oof_df["item_key"].astype(str).tolist(),
-        query_item_embeddings=_m3_oof_query_emb,
+        _m3_oof_query_emb,
+        fold_oof_df["subject_key"].astype(str).tolist(),
     )
     p3_train_oof_acc.write_fold(fold.oof_row_idx, p3_oof_fold)
     # The fold's KNN state (~900 MB at full scale: [S, N] passrate_sorted
@@ -3976,7 +4373,10 @@ for fold in folds:
         # already built for Member 3) so we don't pay double the memory.
         # The pre-built passrate path skips fit_member5's internal
         # aggregation -- this is the OOM fix.
-        _fold_passrate_mask_bool = _fold_passrate_mask_dense.astype(bool)
+        # `_fold_passrate_mask_dense` is already bool above (see
+        # construction comment), so no separate bool copy is needed:
+        # fit_member5's astype(bool, copy=False) on line 541 is a no-op
+        # on bool input.
         _fold_m5_state = cache_or_compute(
             "member5_state_oof_fold",
             key_inputs=(
@@ -4002,7 +4402,7 @@ for fold in folds:
                 item_ids_per_row=np.zeros(0, dtype=np.int64),
                 labels=np.zeros(0, dtype=np.float64),
                 passrate_dense=_fold_passrate_dense,
-                passrate_mask=_fold_passrate_mask_bool,
+                passrate_mask=_fold_passrate_mask_dense,
                 k=_M5_K,
                 tau=_M5_TAU,
                 ridge_alpha=_M5_RIDGE_ALPHA,
@@ -4010,14 +4410,34 @@ for fold in folds:
                 min_subjects_per_item=_M5_MIN_SUBJ_PER_ITEM,
             ),
         )
-        del _fold_passrate_mask_bool
+        # --- MEMORY: free the M5 fit-time inputs IMMEDIATELY (the OOM fix).
+        # `Member5State` holds its OWN sorted copies of passrate +
+        # mask (member5_difficulty_knn.py lines 78-79), and the
+        # scoring path `apply_batch_via_ids` does NOT touch
+        # `_fold_item_emb_stacked` or the originals -- it projects
+        # the OOF query embeddings through `state.projection_weights`
+        # and indexes into `state.passrate_sorted` / `_mask_sorted`.
+        # Holding the originals during scoring + Member 4 training is
+        # the leading peak contributor; freeing here drops ~4.6 GB
+        # before the next allocation (OOF item-emb stack, then the
+        # ~16 GB X_fold_train_dense_m4 build for Member 4).
+        del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
         gc.collect()
 
-        # --- Score fold Member 5 on OOF rows ---
-        # Build the OOF item embedding stack JUST IN TIME (kept narrow:
-        # ~1.6 GB at full scale for 100k rows x 4096 dims) and free it
-        # immediately after scoring so Member 4's much larger
-        # X_fold_train_dense_m4 build has headroom.
+        # --- Score fold Member 5 on OOF rows (CHUNKED) ---
+        # At full scale the per-fold OOF has ~1.67M rows. A single
+        # ``np.stack`` of [1_675_412, 4096] fp32 = ~25.6 GiB -- the
+        # peak that previously OOM'd or hung this cell. We instead
+        # build the item-emb stack chunk by chunk, score each chunk
+        # through m5_apply_batch_via_ids, and write the results into
+        # a pre-allocated [N_oof] output array. Peak per chunk is
+        # ``chunk_rows * 4096 * 4`` bytes (default 256k -> ~4 GiB),
+        # which fits comfortably alongside the live M5 state (~870 MB)
+        # and the global stuff that survived the pre-OOF cleanup.
+        #
+        # Chunking also gives the user progress feedback for
+        # ``apply_batch_via_ids`` (a pure-Python per-row loop that
+        # takes 3-5 min on the full fold OOF).
         _fold_oof_subj_ids = np.fromiter(
             (
                 int(indexer.subject_to_id.get(str(s), -1))
@@ -4026,38 +4446,52 @@ for fold in folds:
             dtype=np.int64,
             count=len(fold_oof_df),
         )
-        _fold_oof_item_emb = np.stack(
-            [np.asarray(item_emb_lookup[str(k)], dtype=np.float32)
-             for k in fold_oof_df["item_key"]],
-            axis=0,
-        )
-        p5_oof_fold = m5_apply_batch_via_ids(
-            _fold_m5_state,
-            subject_ids=_fold_oof_subj_ids,
-            query_item_embeddings=_fold_oof_item_emb,
-        )
+        _N_OOF_M5 = int(len(fold_oof_df))
+        _M5_APPLY_CHUNK = int(CFG.get("member5", {}).get("apply_chunk_rows", 256_000))
+        _M5_APPLY_CHUNK = max(1, min(_N_OOF_M5, _M5_APPLY_CHUNK))
+        _fold_oof_item_keys_list = fold_oof_df["item_key"].astype(str).tolist()
+        p5_oof_fold = np.empty(_N_OOF_M5, dtype=np.float32)
+        _m5_t = _time_m5.time()
+        _last_log = _m5_t
+        for _cs in range(0, _N_OOF_M5, _M5_APPLY_CHUNK):
+            _ce = min(_cs + _M5_APPLY_CHUNK, _N_OOF_M5)
+            _chunk_emb = np.empty(
+                (_ce - _cs, int(_fold_m5_state.projection_d_emb)), dtype=np.float32,
+            )
+            for _ri, _kidx in enumerate(range(_cs, _ce)):
+                _chunk_emb[_ri] = item_emb_lookup[_fold_oof_item_keys_list[_kidx]]
+            p5_oof_fold[_cs:_ce] = m5_apply_batch_via_ids(
+                _fold_m5_state,
+                subject_ids=_fold_oof_subj_ids[_cs:_ce],
+                query_item_embeddings=_chunk_emb,
+            )
+            del _chunk_emb
+            _now = _time_m5.time()
+            if _now - _last_log > 30.0 or _ce == _N_OOF_M5:
+                print(
+                    f"[OOF f{fold.fold_id}] M5 OOF scoring "
+                    f"{_ce:,}/{_N_OOF_M5:,} rows "
+                    f"({(_ce / max(_now - _m5_t, 1e-9)):.0f} rows/s)"
+                )
+                _last_log = _now
         p5_train_oof_acc.write_fold(fold.oof_row_idx, p5_oof_fold)
 
-        # Eagerly free the fold's Member 5 artifacts (state + OOF emb
-        # stack + per-row id vectors). The state holds [S, N] passrate
-        # arrays inside the cached object -- if we don't free them here
-        # they survive through Member 4's training (~30 GB peak dense
-        # matrix), pushing total RAM over the Colab cap. Member 5 has
-        # already written p5_oof_fold into the accumulator so the
-        # state is no longer needed for this fold.
-        del _fold_oof_subj_ids, _fold_oof_item_emb, _fold_m5_state
+        # Eagerly free the fold's Member 5 artifacts (state + per-row
+        # id vectors + item-key list). The state holds [S, N]
+        # passrate arrays inside the cached object -- if we don't
+        # free them here they survive through Member 4's training
+        # (~30 GB peak dense matrix), pushing total RAM over the
+        # Colab cap. Member 5 has already written p5_oof_fold into
+        # the accumulator so the state is no longer needed.
+        del _fold_oof_subj_ids, _fold_oof_item_keys_list, _fold_m5_state
         gc.collect()
     else:
         p5_oof_fold = None
-
-    # Members 3 + 5 are now both done. The fold-scoped item-embedding
-    # stack (~4 GB at full scale) and the dense passrate / mask matrices
-    # (~720 MB each) are no longer referenced -- free them BEFORE
-    # Member 4's training builds its ~25 GB X_fold_train_dense_m4. The
-    # legacy code did this at the end of the iteration, which kept
-    # ~5 GB live during the heaviest training step.
-    del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
-    gc.collect()
+        # Member 5 disabled: free the M5-fit-time inputs here instead
+        # (when enabled, they're freed right after the M5 fit returns;
+        # see the matching block inside the `if _M5_ENABLED:` branch).
+        del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
+        gc.collect()
 
     # ----- Fold Member 4 (LogReg hybrid) -----
     # MEMORY: build M4's training matrix JIT, train, free, then build
@@ -4094,6 +4528,11 @@ for fold in folds:
             )
             X_fold_train_dense_m4[_cs:_ce, :_F_BASE] = _chunk_X
             del _chunk_X
+        # Task 3 path kept ``nn_train_mat_fold`` alive specifically
+        # for this build. It's no longer referenced after the loop;
+        # free its ~360 MB before the M4 logreg trainer allocates
+        # its torch tensors.
+        del nn_train_mat_fold
         gc.collect()
     else:
         # Legacy path: concat the already-built base with the marginal.
@@ -4154,6 +4593,9 @@ for fold in folds:
             )
             X_fold_oof_dense_m4[_cs:_ce, :_F_BASE] = _chunk_X
             del _chunk_X
+        # Task 3 path kept ``nn_oof_mat_fold`` alive for this build;
+        # free its ~200 MB before the M4 OOF scoring step.
+        del nn_oof_mat_fold
         gc.collect()
     else:
         X_fold_oof_dense_m4 = np.concatenate(
@@ -4210,7 +4652,10 @@ for fold in folds:
     del fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
     del fold_member2_interaction_train, fold_member2_interaction_oof
     if _M2V2_ENABLED:
-        del X_fold_train_m2v2, X_fold_oof_m2v2
+        # On the v3 path the v2 matrices were never materialized (set to
+        # None); skip the explicit del to avoid a NameError-by-del.
+        if not _M2V3_ENABLED:
+            del X_fold_train_m2v2, X_fold_oof_m2v2
         del subject_mean_train_fold, subject_mean_oof_fold
         del fold_subject_mean_table
     gc.collect()
@@ -4330,7 +4775,200 @@ print("[OOF Gate 1b] PASS: zero NN-neighbor leakage across all folds.")
 #     is numerically stable for subject_mean values near 0 and 1.
 
 # %%
-if _M2V2_ENABLED:
+member2_v3_global_state = None  # populated below when _M2V3_ENABLED
+
+if _M2V3_ENABLED:
+    # v3 GLOBAL fit: trains the SHIPPED M1-calibration tree on the full
+    # training set with OOF anchors for both M1 prediction (p_a_train_oof,
+    # accumulated by per-fold M1 retrains) AND the subject_mean baseline
+    # (subject_mean_train_oof). Both honest -> no label leakage into the
+    # training inputs, so the tree truly learns calibration patterns
+    # rather than memorizing the train labels via the anchors.
+    print(
+        "\n[Member 2 v3 / 9.5c] Fitting GLOBAL v3 feature builder + "
+        "training calibration GBDT on full train (OOF M1 + OOF subject_mean anchors)..."
+    )
+    member2_v3_global_builder = fit_member2_v3_feature_builder(
+        subject_ids=_mef_train_subj,
+        cluster_ids=_mef_train_cluster,
+        bc_ids=_mef_train_bc,
+        labels=y_train,
+        n_subjects=int(indexer.n_subjects),
+        n_clusters=int(N_CLUSTERS_CTX),
+        n_bcs=int(indexer.n_bc),
+        n_macro_families=int(N_MACRO_FAMILIES),
+        n_organizations=int(N_ORGANIZATIONS),
+        n_families=int(N_FAMILIES),
+        subject_to_macro_family_id=s2macro,
+        subject_to_organization_id=s2org,
+        subject_to_family_id=s2fam,
+        smoothing=_M2V3_SMOOTHING,
+    )
+    X_train_v3_global = build_member2_v3_features(
+        member2_v3_global_builder,
+        p_m1=p_a_train_oof,                  # honest OOF M1 anchors
+        subject_mean=subject_mean_train_oof,  # honest OOF subject_mean anchors
+        subject_ids=_mef_train_subj,
+        cluster_ids=_mef_train_cluster,
+        bc_ids=_mef_train_bc,
+        bc_redacted_mask=bc_redacted_train.astype(np.float32),
+    )
+    print(
+        f"[Member 2 v3 / 9.5c] X_train_v3_global: {X_train_v3_global.shape}  "
+        f"p_a_train_oof: {p_a_train_oof.shape}  "
+        f"subject_mean_train_oof: {subject_mean_train_oof.shape}  "
+        "(both anchors are OOF per-row; label leakage = 0)"
+    )
+
+    import hashlib as _m2v3g_hashlib
+    _m2v3g_feat_names_hash = _m2v3g_hashlib.sha256(
+        "\0".join(MEMBER2_V3_FEATURE_NAMES).encode("utf-8")
+    ).hexdigest()[:16]
+    _m2v3g_X_hash = _m2v3g_hashlib.sha256(
+        np.ascontiguousarray(X_train_v3_global, dtype=np.float32).tobytes()
+    ).hexdigest()[:16]
+    _m2v3g_anchor_hash = _m2v3g_hashlib.sha256(
+        np.ascontiguousarray(subject_mean_train_oof, dtype=np.float64).tobytes()
+    ).hexdigest()[:16]
+    _m2v3g_pm1_hash = _m2v3g_hashlib.sha256(
+        np.ascontiguousarray(p_a_train_oof, dtype=np.float32).tobytes()
+    ).hexdigest()[:16]
+
+    def _fit_member2_v3_global():
+        print(
+            "[Member 2 v3 / 9.5c] training LightGBM RESIDUAL "
+            f"(X cols={X_train_v3_global.shape[1]}, anchor=subject_mean OOF, "
+            "objective=binary with logit(anchor) as init_score, features include "
+            "p_m1)..."
+        )
+        return fit_gbdt_member(
+            X=X_train_v3_global,
+            y=y_train,
+            feature_names=MEMBER2_V3_FEATURE_NAMES,
+            init_pred_train=subject_mean_train_oof,
+            n_estimators=int(
+                CFG.get("member2_v3", {}).get("n_estimators_global", 400)
+            ),
+            learning_rate=float(
+                CFG.get("member2_v3", {}).get("learning_rate", 0.05)
+            ),
+            num_leaves=int(
+                CFG.get("member2_v3", {}).get("num_leaves", 31)
+            ),
+            min_data_in_leaf=int(
+                CFG.get("member2_v3", {}).get("min_data_in_leaf", 200)
+            ),
+            early_stopping_rounds=int(
+                CFG.get("member2_v3", {}).get("early_stopping_rounds_global", 30)
+            ),
+            seed=SEED,
+            parity_atol=1.0e-5,
+            val_fraction=float(
+                CFG.get("member2_v3", {}).get("val_fraction", 0.1)
+            ),
+            max_bin=int(
+                CFG.get("member2_v3", {}).get("max_bin", 63)
+            ),
+            force_col_wise=bool(
+                CFG.get("member2_v3", {}).get("force_col_wise", True)
+            ),
+            log_period=int(
+                CFG.get("member2_v3", {}).get("log_period", 25)
+            ),
+            num_threads=CFG.get("member2_v3", {}).get("num_threads", None),
+            holdout_group_id=gbdt_train_item_id,
+        )
+
+    member2_v3_gbdt_state = cache_or_compute(
+        "gbdt_state",
+        key_inputs=(
+            "member2_v3_calib_global_v1",  # never collides with v2 keys
+            int(M2V3_FEATURE_DIM), len(primary.train), SEED,
+            round(BC_REDACT_FRAC, 3), _bc_redact_seed,
+            round(float(_M2V3_SMOOTHING), 4),
+            int(OOF_N_FOLDS), int(OOF_SEED), bool(OOF_RETRAIN_M1),
+            _m2v3g_feat_names_hash, _m2v3g_X_hash,
+            _m2v3g_anchor_hash, _m2v3g_pm1_hash,
+        ),
+        compute_fn=_fit_member2_v3_global,
+    )
+    if str(member2_v3_gbdt_state.output_mode) != "residual_logit":
+        raise RuntimeError(
+            "Expected member2_v3_gbdt_state.output_mode='residual_logit', "
+            f"got {member2_v3_gbdt_state.output_mode!r}."
+        )
+    # Build the shipped state. Downstream code (export, smoke tests)
+    # treats ``gbdt_state`` as the LightGBM booster -- alias here so
+    # everything that worked for v2 keeps working without per-module
+    # branching. The full v3 state (booster + builder) lives in
+    # ``member2_v3_global_state``.
+    member2_v3_global_state = Member2V3State(
+        gbdt=member2_v3_gbdt_state,
+        builder=member2_v3_global_builder,
+    )
+    gbdt_state = member2_v3_gbdt_state
+
+    # Gate 3b parity (re-verified on a small sample, same as v2 branch).
+    print("\n[Gate 3b v3] verifying pure-NumPy tree walker parity vs LightGBM raw_score...")
+    _gate3b_sample = int(min(2000, X_train_v3_global.shape[0]))
+    _gate3b_idx = np.random.default_rng(0).choice(
+        X_train_v3_global.shape[0], size=_gate3b_sample, replace=False,
+    )
+    from src.gbdt_member import predict_raw as _gbdt_predict_raw_g3b
+    _walker_raw = _gbdt_predict_raw_g3b(member2_v3_gbdt_state, X_train_v3_global[_gate3b_idx])
+    print(
+        f"[Gate 3b v3] PASS: implicit during fit (parity_atol=1e-5); "
+        f"re-verified pure-NumPy walker on {_gate3b_sample:,}-row sample "
+        f"raw_score range [{float(_walker_raw.min()):.4f}, {float(_walker_raw.max()):.4f}]."
+    )
+
+    # Apply Member 2 v3 to val rows. p_a_val comes from M1's val scoring
+    # (computed in section 9a/9b); subject_mean_val from M2 v2 setup
+    # (which was kept enabled as a prerequisite of v3).
+    X_val_v3 = build_member2_v3_features(
+        member2_v3_global_builder,
+        p_m1=p_a_val,
+        subject_mean=subject_mean_val,
+        subject_ids=_mef_val_subj,
+        cluster_ids=_mef_val_cluster,
+        bc_ids=_mef_val_bc,
+        bc_redacted_mask=bc_redacted_val.astype(np.float32),
+    )
+    p_member2_val = gbdt_compose_residual_batch(
+        member2_v3_gbdt_state, X_val_v3, subject_mean_val,
+    )
+    nll_m2 = float(
+        -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
+          + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean()
+    )
+    # Gate 3e at val scale: confirm v3 hasn't collapsed into pure M1.
+    _corr_v3_m1_val = float(
+        np.corrcoef(
+            p_member2_val.astype(np.float64), p_a_val.astype(np.float64)
+        )[0, 1]
+    )
+    print(
+        f"\n[Member 2 v3] val log-loss: {nll_m2:.6f}  "
+        f"corr(M2v3, M1) on val={_corr_v3_m1_val:+.4f}"
+    )
+    print(
+        f"[Member 2 v3] train NLL stored in state: {member2_v3_gbdt_state.train_loss:.6f}  "
+        f"booster's internal val NLL (item-cold split): {member2_v3_gbdt_state.val_loss:.6f}"
+    )
+    print(
+        f"[Member 2 v3] n_trees={member2_v3_gbdt_state.n_trees}  "
+        f"bias={member2_v3_gbdt_state.bias:+.4f}"
+    )
+    if abs(_corr_v3_m1_val) > 0.995:
+        raise AssertionError(
+            f"Gate 3e FAIL on val: |corr(M2v3, M1)|={abs(_corr_v3_m1_val):.4f} > 0.995. "
+            "Global v3 collapsed into Member 1; tree contributed no incremental signal."
+        )
+    # Free the per-row v3 feature matrices we just used.
+    del X_train_v3_global, X_val_v3
+    gc.collect()
+
+elif _M2V2_ENABLED:
     print("\n[Member 2 v2 / 9.5c] Building GLOBAL X_train_m2v2 (full train, OOF anchor)...")
     X_train_m2v2_global = build_member2_feature_matrix(
         member2_v2_schema,
@@ -4997,29 +5635,32 @@ else:
         )
         _fold_passrate_dense = np.asarray(fold_passrate_csr.todense(), dtype=np.float32)
         _fold_passrate_mask_dense = np.asarray(fold_passrate_mask_csr.todense(), dtype=np.float32)
+        # Mirror the per-fold real-label invocation (above). The old
+        # K/min_subjects_per_item/tau_init/train_lr/train_iters/train_l2
+        # kwargs never matched fit_knn_member's signature and would
+        # crash with TypeError as soon as Gate 1c was enabled.
         _fold_knn_shuf = fit_knn_member(
             item_keys=list(fold.train_item_keys),
             item_embeddings=_fold_item_emb_stacked,
             subject_keys=_subject_keys_ordered,
             passrate_dense=_fold_passrate_dense,
             passrate_mask=_fold_passrate_mask_dense,
-            K=int(CFG.get("member3_knn", {}).get("K", 32)),
-            min_subjects_per_item=int(CFG.get("member3_knn", {}).get("min_subjects_per_item", 3)),
-            tau_init=float(CFG.get("member3_knn", {}).get("tau_init", 1.0)),
-            train_lr=float(CFG.get("member3_knn", {}).get("train_lr", 0.05)),
-            train_iters=int(CFG.get("member3_knn", {}).get("train_iters", 300)),
-            train_l2=float(CFG.get("member3_knn", {}).get("train_l2", 0.0)),
+            pca_dim=int(_m3_cfg.get("pca_dim", 128)),
+            quantization=str(_m3_cfg.get("quantization", "int8")),
+            k=int(_m3_cfg.get("k", 128)),
+            tau_subject=float(_m3_cfg.get("tau_subject", 5.0)),
+            tau_global=float(_m3_cfg.get("tau_global", 200.0)),
+            item_fallback_weight=float(_m3_cfg.get("item_fallback_weight", 0.5)),
             seed=int(SEED) + 200 * (int(fold.fold_id) + 1) + 99999,
         )
         p3_shuf_fold = knn_apply_batch(
             _fold_knn_shuf,
-            subject_keys=fold_oof_df["subject_key"].astype(str).tolist(),
-            item_keys=fold_oof_df["item_key"].astype(str).tolist(),
-            query_item_embeddings=np.stack(
+            np.stack(
                 [np.asarray(item_emb_lookup[k], dtype=np.float32)
                  for k in fold_oof_df["item_key"].astype(str)],
                 axis=0,
             ),
+            fold_oof_df["subject_key"].astype(str).tolist(),
         )
         p3_train_shuf_acc.write_fold(fold.oof_row_idx, p3_shuf_fold)
 
