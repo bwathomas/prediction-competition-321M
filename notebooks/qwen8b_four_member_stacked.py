@@ -2110,16 +2110,196 @@ y_train = primary.train["label"].astype(float).to_numpy().astype(np.float32)
 print(f"[member_features] X_train: {X_train_dense.shape}  X_val: {X_val_dense.shape}")
 
 # %% [markdown]
+# ## 9b-bis. Mean-encoded interaction features for Members 2 & 4
+#
+# These cells fit per-cell pass-rate statistics on TRAIN rows and emit
+# two compact dense feature matrices:
+#
+#   * `member2_interaction_train/val` -- 8 cold-start-safe interaction
+#     columns (subject x item-cluster + subject x bench_condition
+#     means/counts/deviations) that get APPENDED to `X_train_dense` /
+#     `X_val_dense`. The point is to give the GBDT something to split
+#     on that's BOTH novel (not encoded by the existing dense schema)
+#     AND directly correlated with the label, so its trees stop
+#     re-discovering Member 1's signal and start contributing
+#     independent information to the stacker.
+#
+#   * `member4_marginal_train/val` -- 14 mean-encoded marginal columns
+#     (subject mean, bc mean, cluster mean, plus a handful of two-way
+#     interactions and a constant) that REPLACE Member 4's feature
+#     view entirely. Member 4 currently shares X_train_dense with
+#     Member 2 -- including all qwen-embedding-derived features --
+#     which is why its predictions are heavily correlated with
+#     Members 1 and 3 (which also lean on those embeddings). Cutting
+#     it off from the embedding view forces the stacker to either
+#     downweight it (if redundant) OR weight it highly when it
+#     contributes a complementary signal (subject / bench baselines
+#     that the other members are getting wrong).
+#
+# Cells with no training observations fall back through:
+# subj_cluster -> cluster_mean -> global_mean, etc. (Bayesian
+# shrinkage with `smoothing=30`). Val rows look up the precomputed
+# train-time aggregates -- the val labels themselves are NEVER
+# consulted at fit time.
+
+# %%
+from src.mean_encoded_features import (
+    MEMBER2_INTERACTION_FEATURE_DIM,
+    MEMBER2_INTERACTION_FEATURE_NAMES,
+    MEMBER4_MARGINAL_FEATURE_DIM,
+    MEMBER4_MARGINAL_FEATURE_NAMES,
+    apply_member2_interaction_features,
+    apply_member4_marginal_features,
+    fit_mean_encoded_stats,
+)
+
+
+def _compute_id_arrays(rows_df):
+    """Subject / cluster / bc-condition int ids for the rows in df.
+    Returns (subj_ids, cluster_ids, bc_ids) all int64. Unknown ids
+    map to -1 (the mean-encoded apply functions handle this safely)."""
+    subj_ids = np.fromiter(
+        (indexer.subject_id(str(s)) for s in rows_df["subject_key"]),
+        count=int(len(rows_df)),
+        dtype=np.int64,
+    )
+    cluster_ids = np.fromiter(
+        (int(cluster_assignments.get(str(k), -1)) for k in rows_df["item_key"]),
+        count=int(len(rows_df)),
+        dtype=np.int64,
+    )
+    bc_ids = np.fromiter(
+        (
+            int(indexer.bc_to_id.get(str(b), -1))
+            for b in rows_df["benchmark_condition_key"]
+        ),
+        count=int(len(rows_df)),
+        dtype=np.int64,
+    )
+    return subj_ids, cluster_ids, bc_ids
+
+
+_mef_train_subj, _mef_train_cluster, _mef_train_bc = _compute_id_arrays(primary.train)
+_mef_val_subj, _mef_val_cluster, _mef_val_bc = _compute_id_arrays(primary.val)
+_N_CLUSTERS_ME = int(CFG["clustering"]["k"])
+print(
+    f"[mean-enc] id arrays built: "
+    f"train_subj_unique={int(np.unique(_mef_train_subj).size):,}  "
+    f"train_cluster_unique={int(np.unique(_mef_train_cluster).size):,}  "
+    f"train_bc_unique={int(np.unique(_mef_train_bc).size):,}  "
+    f"(n_subjects={indexer.n_subjects}, n_clusters={_N_CLUSTERS_ME}, "
+    f"n_bc={indexer.n_bc})"
+)
+
+
+def _fit_mean_encoded_stats():
+    return fit_mean_encoded_stats(
+        subject_ids=_mef_train_subj,
+        cluster_ids=_mef_train_cluster,
+        bc_ids=_mef_train_bc,
+        labels=y_train,
+        n_subjects=int(indexer.n_subjects),
+        n_clusters=int(_N_CLUSTERS_ME),
+        n_bcs=int(indexer.n_bc),
+        smoothing=float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)),
+    )
+
+
+mean_encoded_stats = cache_or_compute(
+    "mean_encoded_stats",
+    key_inputs=(
+        "v1",
+        int(indexer.n_subjects), int(_N_CLUSTERS_ME), int(indexer.n_bc),
+        len(primary.train), SEED,
+        round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+    ),
+    compute_fn=_fit_mean_encoded_stats,
+)
+print(
+    f"[mean-enc] stats fit OK: "
+    f"global_mean={mean_encoded_stats.global_mean:.4f}  "
+    f"smoothing={mean_encoded_stats.smoothing:.1f}  "
+    f"|subj_cluster_mean|={mean_encoded_stats.subj_cluster_mean.shape}  "
+    f"|subj_bc_mean|={mean_encoded_stats.subj_bc_mean.shape}"
+)
+
+member2_interaction_train = apply_member2_interaction_features(
+    mean_encoded_stats,
+    subject_ids=_mef_train_subj,
+    cluster_ids=_mef_train_cluster,
+    bc_ids=_mef_train_bc,
+)
+member2_interaction_val = apply_member2_interaction_features(
+    mean_encoded_stats,
+    subject_ids=_mef_val_subj,
+    cluster_ids=_mef_val_cluster,
+    bc_ids=_mef_val_bc,
+)
+member4_marginal_train = apply_member4_marginal_features(
+    mean_encoded_stats,
+    subject_ids=_mef_train_subj,
+    cluster_ids=_mef_train_cluster,
+    bc_ids=_mef_train_bc,
+)
+member4_marginal_val = apply_member4_marginal_features(
+    mean_encoded_stats,
+    subject_ids=_mef_val_subj,
+    cluster_ids=_mef_val_cluster,
+    bc_ids=_mef_val_bc,
+)
+print(
+    f"[mean-enc] Member 2 interaction features: train {member2_interaction_train.shape}  "
+    f"val {member2_interaction_val.shape}  cols={MEMBER2_INTERACTION_FEATURE_DIM}"
+)
+print(
+    f"[mean-enc] Member 4 marginal features:    train {member4_marginal_train.shape}  "
+    f"val {member4_marginal_val.shape}  cols={MEMBER4_MARGINAL_FEATURE_DIM}"
+)
+
+# Augmented dense matrices for Member 2 (interaction features appended
+# to the existing 1202-feature schema). Member 2 sees BOTH the original
+# embedding-derived features AND the new mean-encoded interactions.
+X_train_dense_m2 = np.concatenate(
+    [X_train_dense, member2_interaction_train], axis=1
+).astype(np.float32, copy=False)
+X_val_dense_m2 = np.concatenate(
+    [X_val_dense, member2_interaction_val], axis=1
+).astype(np.float32, copy=False)
+member2_feature_names = tuple(member_feat_schema.feature_names) + tuple(
+    MEMBER2_INTERACTION_FEATURE_NAMES
+)
+print(
+    f"[mean-enc] Member 2 augmented X: "
+    f"train {X_train_dense_m2.shape}  val {X_val_dense_m2.shape}  "
+    f"(was {X_train_dense.shape[1]} cols, now {X_train_dense_m2.shape[1]} cols)"
+)
+
+# %% [markdown]
 # ## 9c. Train Member 2 (LightGBM)
 #
 # Offline LightGBM training; we ship the compiled tree arrays + bias
 # for pure-NumPy traversal at runtime. The internal parity check (in
 # `fit_gbdt_member`) ensures the NumPy walker matches LightGBM's
 # `predict(raw_score=True)` to within `parity_atol=1e-5`.
+#
+# **Residual-learner mode (post-2026-05-26):** instead of training the
+# GBDT to predict the label directly, we train it to predict
+# `logit(y) - logit(p_member1_train)` under a `regression_l2`
+# objective. At inference the walker emits a tree residual; the
+# composer combines it with Member 1's current-row logit to recover
+# a probability. The math is just an additive shift in logit space.
+# Why: a direct-label GBDT will largely re-learn whatever Member 1
+# already captures (the stacker correctly downweighted the legacy
+# member 2 to ~0.018, i.e. it contributed nothing), so we force it
+# to spend capacity on the residual the anchor missed. `init_pred`
+# is Member 1's IN-SAMPLE train predictions -- not technically OOF,
+# but Member 1 is regularized enough that this is good enough; a
+# proper k-fold OOF Member 1 would be cleaner if we re-run.
 
 # %%
 from src.gbdt_member import (
     apply_batch as gbdt_apply_batch,
+    compose_residual_batch as gbdt_compose_residual_batch,
     fit_gbdt_member,
 )
 
@@ -2149,16 +2329,24 @@ print(
 
 
 def _fit_member2():
-    # ~1.5-2.5 min on the 5M x 1200 feature schema with the speed
+    # ~1.5-2.5 min on the 5M x ~1210 feature schema with the speed
     # knobs below (max_bin=63, force_col_wise=True). The default
     # LightGBM params (max_bin=255, no force_col_wise) take 5-10 min
     # at this scale; the speed knobs are bit-exact under
     # ``deterministic=True``.
-    print("[Member 2] training LightGBM (typically 1.5-2.5 min on 5M rows)...")
+    print(
+        "[Member 2] training LightGBM in RESIDUAL mode "
+        f"(X cols={X_train_dense_m2.shape[1]}, anchor=Member 1, "
+        "objective=regression_l2 on logit-residual)..."
+    )
     return fit_gbdt_member(
-        X=X_train_dense,
+        X=X_train_dense_m2,
         y=y_train,
-        feature_names=tuple(member_feat_schema.feature_names),
+        feature_names=member2_feature_names,
+        # Residual-learner anchor: Member 1's in-sample train preds.
+        # The trees learn logit(y) - logit(p_a_train) instead of y,
+        # so they MUST contribute orthogonal signal to be useful.
+        init_pred_train=p_a_train.astype(np.float64, copy=False),
         n_estimators=int(CFG.get("member2_gbdt", {}).get("n_estimators", 400)),
         learning_rate=float(CFG.get("member2_gbdt", {}).get("learning_rate", 0.05)),
         num_leaves=int(CFG.get("member2_gbdt", {}).get("num_leaves", 31)),
@@ -2202,24 +2390,43 @@ gbdt_state = cache_or_compute(
     # ``redact_v1`` ties the booster cache to the bc-redacted feature
     # matrix so re-running with a different redaction fraction or
     # seed forces a re-fit.
-    key_inputs=(member_feat_schema.feature_dim, len(primary.train), SEED,
+    # ``residual_v1`` ties the cache to the residual-learner mode
+    # (regression_l2 on logit-residual) AND the augmented feature
+    # matrix that includes mean-encoded interactions. Old binary-
+    # objective entries are incompatible with compose_residual_batch.
+    key_inputs=(int(X_train_dense_m2.shape[1]), len(primary.train), SEED,
                 "speed_v1", "init_v2", "honest_loss_v1",
-                "coldsplit_v1", "redact_v1",
+                "coldsplit_v1", "redact_v1", "residual_v1",
                 round(BC_REDACT_FRAC, 3), _bc_redact_seed),
     compute_fn=_fit_member2,
 )
-p_member2_val = gbdt_apply_batch(gbdt_state, X_val_dense)
+# Member 2 now outputs a RESIDUAL LOGIT; compose with Member 1's val
+# probabilities to recover the actual probability the runtime will
+# emit. We assert the state is in residual mode (defensive against
+# stale cache entries from older notebook runs).
+if str(gbdt_state.output_mode) != "residual_logit":
+    raise RuntimeError(
+        f"Expected gbdt_state.output_mode='residual_logit' (residual-learner "
+        f"mode), got {gbdt_state.output_mode!r}. The cache key bump should "
+        "have invalidated the legacy binary-mode entry; delete the cache "
+        "file manually if this fires."
+    )
+p_member2_val = gbdt_compose_residual_batch(
+    gbdt_state, X_val_dense_m2, p_a_val.astype(np.float64, copy=False)
+)
 nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
-# ``gbdt_state.val_loss`` is the manual cross-entropy on
-# ``booster.predict()`` over the booster's INTERNAL val split (10% of
-# train rows). ``nll_m2`` is the cross-entropy of the runtime walker
-# on the EXTERNAL cold-start ``primary.val``. The two should be close
-# (within ~0.01 nats on a healthy fit) and BOTH should reflect the
-# actual runtime predictions -- not LightGBM's optimistic internal
-# ``binary_logloss`` metric, which we no longer trust.
-print(f"[Member 2] val log-loss (cold-start primary.val):    {nll_m2:.6f}")
-print(f"[Member 2] val NLL stored in state (LGBM val split): {gbdt_state.val_loss:.6f}")
+# ``gbdt_state.val_loss`` (residual mode) is the COMPOSED NLL on the
+# booster's INTERNAL val split (10% of train rows, held out by item).
+# ``nll_m2`` is the same composition on the EXTERNAL cold-start
+# ``primary.val``. The two should be within ~0.01 nats on a healthy
+# fit. BOTH reflect actual runtime predictions.
+print(f"[Member 2] residual val log-loss (cold-start primary.val):    {nll_m2:.6f}")
+print(f"[Member 2] residual val NLL stored in state (LGBM val split): {gbdt_state.val_loss:.6f}")
+# Quick sanity: a residual-mode Member 2 with zero useful signal
+# would emit p_member2_val == p_a_val (tree residual == 0), so its
+# val NLL would equal Member 1's. Any DELTA between nll_m2 and
+# Member 1's val NLL is signal contributed by the trees.
 print(f"[Member 2] train NLL stored in state (manual):       {gbdt_state.train_loss:.6f}")
 print(f"[Member 2] n_trees={gbdt_state.n_trees}  bias={gbdt_state.bias:+.4f}")
 
@@ -2403,66 +2610,61 @@ from src.logreg_member import (
 
 
 def _fit_member4():
-    print("[Member 4] training hand-rolled torch logistic regression...")
+    # Member 4 now trains on MEAN-ENCODED MARGINAL FEATURES ONLY
+    # (subject mean, bc mean, cluster mean, plus a few interactions
+    # and a constant). The qwen-embedding-derived dense features it
+    # used to share with Member 2 are gone -- those are exactly what
+    # made it heavily correlated with Members 1/3 (also embedding-
+    # leaning) and earned it a stacker weight of ~0.10. Cutting it
+    # off forces it to specialize on raw subject/bc baselines, which
+    # is precisely the signal the embedding-based members are most
+    # likely to lose calibration on (rare subjects, unusual bcs).
+    print(
+        f"[Member 4] training torch logistic regression on "
+        f"MEAN-ENCODED MARGINALS (X cols={member4_marginal_train.shape[1]}, "
+        f"NO embedding features)..."
+    )
     return fit_logreg_member(
-        X=X_train_dense,
+        X=member4_marginal_train,
         y=y_train,
-        feature_names=tuple(member_feat_schema.feature_names),
+        feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
         epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
         learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
         weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
-        # L1 sparsity: shrinks low-signal weights toward zero.
-        # The member_feat_schema includes ~hundreds of cond / subject_cat
-        # / cluster one-hots that fire on a few percent of rows; without
-        # an L1 term the LR puts a small but nonzero coefficient on
-        # every one of them and ||w|| inflates without commensurate val
-        # NLL improvement (the user observed ||w||=961 on the legacy
-        # fit). 1e-3 is a moderate strength; bump to 1e-2 if the
-        # sparse-feature filter still leaves too many active weights.
-        l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength", 1.0e-3)),
-        # min_feature_std: post-fit zero-out for near-constant feature
-        # cols (cluster ids that appear in <0.1% of rows, cond cols
-        # representing rare combos). A column with std < 1e-2 in the
-        # train slice is below the noise floor of the ~1.0 std signal
-        # cols; its baked weight is dominated by the data noise on
-        # those few rows. Zeroing it removes that noise.
-        min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
+        # L1 is less useful on a 14-feature dense matrix; keep a tiny
+        # L1 in case the constant column gets a nonzero weight that
+        # ought to live in the bias instead.
+        l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_marginal", 1.0e-4)),
+        # min_feature_std irrelevant at 14 cols; pass 0.0.
+        min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std_marginal", 0.0)),
         early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
         seed=SEED,
         # Hold out 10% of train for early-stopping val.
         val_fraction=0.1,
-        # Item-stratified cold-start internal val split (mirrors
-        # Member 2). Without this, the LR's early-stopping val is
-        # row-level and overstates generalization just like the
-        # legacy GBDT internal val did.
+        # Item-stratified cold-start internal val split. Even though
+        # the marginal features don't directly leak item identity,
+        # we keep the stratified split for consistency with Member 2.
         holdout_group_id=gbdt_train_item_id,
     )
 
 
-# ``std_v1`` invalidates any older entry that was fit WITHOUT
-# per-feature standardization. The member_feat_schema mixes 4
-# orders of magnitude in feature scale (theta vs centroid_dist
-# vs one-hots vs NN features); without z-scoring, Adam saturates
-# the sigmoid and the resulting logreg gets val NLL ~3 (worse
-# than predicting the prior). The new fit z-scores on TRAIN
-# stats and bakes (mu, sigma) into the saved (weights, bias)
-# so the runtime path stays a pure x @ w + b matvec.
-# ``l1minfreq_v1`` invalidates entries fit without L1 + min_feature_std
-# (the legacy ||w||=961, val NLL ~0.49 fit).
-# ``coldsplit_v1`` ties the LR to its item-stratified internal val.
-# ``redact_v1`` ties the cache to the bc-redacted feature matrix.
+# Cache key bumped: ``marginal_v1`` ties this entry to the new
+# mean-encoded marginal feature schema. Old entries (which were
+# fit on the 1200+ feature dense matrix) are incompatible -- the
+# saved (weights, bias) operates on a 14-dim input now.
 logreg_state = cache_or_compute(
     "logreg_state",
     key_inputs=(
-        member_feat_schema.feature_dim, len(primary.train), SEED,
-        "std_v1", "l1minfreq_v1", "coldsplit_v1", "redact_v1",
-        round(float(CFG.get("member4_logreg", {}).get("l1_strength", 1.0e-3)), 6),
-        round(float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)), 6),
+        int(MEMBER4_MARGINAL_FEATURE_DIM), len(primary.train), SEED,
+        "std_v1", "l1minfreq_v1", "coldsplit_v1", "redact_v1", "marginal_v1",
+        round(float(CFG.get("member4_logreg", {}).get("l1_strength_marginal", 1.0e-4)), 6),
+        round(float(CFG.get("member4_logreg", {}).get("min_feature_std_marginal", 0.0)), 6),
+        round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
         round(BC_REDACT_FRAC, 3), _bc_redact_seed,
     ),
     compute_fn=_fit_member4,
 )
-p_member4_val = logreg_apply_state_batch(logreg_state, X_val_dense)
+p_member4_val = logreg_apply_state_batch(logreg_state, member4_marginal_val)
 nll_m4 = float(-(ylab_val * np.log(np.clip(p_member4_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member4_val, 1e-6, 1 - 1e-6))).mean())
 print(f"[Member 4] val log-loss: {nll_m4:.6f}  "
@@ -2612,8 +2814,14 @@ def _fit_nn_calibrator():
     print(f"[Calibrator] p1_train: shape={p1_train_local.shape}  "
           f"log-loss={-(y_train * np.log(np.clip(p1_train_local, 1e-6, 1 - 1e-6)) + (1 - y_train) * np.log(1 - np.clip(p1_train_local, 1e-6, 1 - 1e-6))).mean():.6f}")
 
-    print("[Calibrator] Member 2 (GBDT) on train...")
-    p2_train_local = gbdt_apply_batch(gbdt_state, X_train_dense)
+    print("[Calibrator] Member 2 (GBDT, residual-mode) on train...")
+    # Residual-mode Member 2: tree output is logit-residual; compose
+    # with Member 1's TRAIN probabilities (the anchor used at fit time)
+    # to recover the actual probability. Uses the augmented dense
+    # matrix (X_train_dense + mean-encoded interactions).
+    p2_train_local = gbdt_compose_residual_batch(
+        gbdt_state, X_train_dense_m2, p_a_train.astype(np.float64, copy=False)
+    )
 
     print("[Calibrator] Member 3 (kNN) on train...")
     # Score in chunks rather than materializing a single
@@ -2638,8 +2846,10 @@ def _fit_nn_calibrator():
     del _train_item_keys_arr, _train_subj_keys_arr
     gc.collect()
 
-    print("[Calibrator] Member 4 (LogReg) on train...")
-    p4_train_local = logreg_apply_state_batch(logreg_state, X_train_dense)
+    print("[Calibrator] Member 4 (LogReg on marginal features) on train...")
+    # Member 4 now operates on the mean-encoded marginal matrix,
+    # NOT X_train_dense (which it no longer accepts).
+    p4_train_local = logreg_apply_state_batch(logreg_state, member4_marginal_train)
 
     # Train-side stacker features (matching the same builder used on val).
     train_bench_present_local = np.array(

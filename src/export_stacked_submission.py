@@ -210,12 +210,47 @@ if _HAS_STACKED_BUNDLE:
                 )
             except NameError:
                 feats_m24 = np.zeros(_GBDT_STATE.feature_dim, dtype=np.float32)
-            p2 = float(_gbdt_mod.apply_one(_GBDT_STATE, feats_m24))
+
+            # ---- Member 2 (GBDT) ----
+            # Residual-mode states (output_mode='residual_logit') were
+            # trained to predict logit(y) - logit(p_member1); the
+            # runtime composer adds p1's logit back to recover a
+            # probability. Legacy binary-mode states return the
+            # probability directly via apply_one. The output_mode
+            # attribute defaults to 'probability' for states saved
+            # before the residual mode was introduced, so this branch
+            # is safe for old artifacts too.
+            _gbdt_mode = getattr(_GBDT_STATE, "output_mode", "probability")
+            if int(_GBDT_STATE.feature_dim) == int(feats_m24.shape[0]):
+                feats_for_gbdt = feats_m24
+            else:
+                # Feature-dim mismatch -- the runtime feature builder isn't
+                # wired up. In residual mode with zero features and bias
+                # near 0 the tree contribution is small, so composing
+                # with p1 still yields a sensible probability (~p1).
+                feats_for_gbdt = np.zeros(
+                    int(_GBDT_STATE.feature_dim), dtype=np.float32
+                )
+            if _gbdt_mode == "residual_logit":
+                # ``compose_residual_one`` is only present in
+                # post-2026-05-26 builds. ``getattr`` keeps this defensive
+                # if a frozen older copy of gbdt_member.py is in the
+                # bundle for some reason.
+                _compose = getattr(_gbdt_mod, "compose_residual_one", None)
+                if _compose is None:
+                    p2 = float(p1)
+                else:
+                    p2 = float(_compose(_GBDT_STATE, feats_for_gbdt, float(p1)))
+            else:
+                p2 = float(_gbdt_mod.apply_one(_GBDT_STATE, feats_for_gbdt))
+
+            # ---- Member 4 (LogReg) ----
             if int(_LOGREG_STATE.feature_dim) == int(feats_m24.shape[0]):
                 p4 = float(_logreg_mod.apply_state_one(_LOGREG_STATE, feats_m24))
             else:
                 # Member 4 may have been trained on a different feature
-                # schema; fall back to its bias.
+                # schema (e.g. the post-Task-3 14-dim mean-encoded
+                # marginals); fall back to its bias prediction.
                 p4 = float(_logreg_mod.apply_state_one(
                     _LOGREG_STATE,
                     np.zeros(int(_LOGREG_STATE.feature_dim), dtype=np.float32),

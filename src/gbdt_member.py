@@ -186,6 +186,15 @@ class GBDTMemberState:
     n_trees: int
     train_loss: float
     val_loss: float
+    # NEW (residual mode, see ``fit_gbdt_member(init_pred_train=...)``).
+    # ``objective`` is "binary" (legacy: walker output = sigmoid(sum_leaves +
+    # bias) is the probability) or "regression" (walker output = sum_leaves +
+    # bias is the RESIDUAL LOGIT; caller must compose with an anchor
+    # member's logit via ``compose_residual_one``/``compose_residual_batch``).
+    # Older saved states without these fields default to "binary" /
+    # "probability" so on-disk artifacts keep loading.
+    objective: str = "binary"
+    output_mode: str = "probability"   # "probability" or "residual_logit"
 
     def __post_init__(self) -> None:
         n = int(self.feature_concat.shape[0])
@@ -247,7 +256,9 @@ class GBDTMemberState:
             "n_trees": int(self.n_trees),
             "train_loss": float(self.train_loss),
             "val_loss": float(self.val_loss),
-            "format_version": 1,
+            "objective": str(self.objective),
+            "output_mode": str(self.output_mode),
+            "format_version": 2,
         }
         (out / "meta.json").write_text(
             json.dumps(meta, indent=2), encoding="utf-8"
@@ -281,6 +292,8 @@ class GBDTMemberState:
             n_trees=int(meta.get("n_trees", 0)),
             train_loss=float(meta.get("train_loss", 0.0)),
             val_loss=float(meta.get("val_loss", 0.0)),
+            objective=str(meta.get("objective", "binary")),
+            output_mode=str(meta.get("output_mode", "probability")),
         )
 
 
@@ -336,7 +349,18 @@ def _traverse_one_tree(
 
 
 def apply_one(state: GBDTMemberState, features: np.ndarray) -> float:
-    """Single-row inference -> Python ``float`` in (eps, 1-eps)."""
+    """Single-row inference -> Python ``float`` in (eps, 1-eps).
+
+    Only valid for ``output_mode == "probability"`` (binary objective).
+    For ``residual_logit`` states call :func:`compose_residual_one` with
+    an anchor logit instead -- this guard prevents accidentally treating
+    a tree-residual output as a probability.
+    """
+    if state.output_mode != "probability":
+        raise RuntimeError(
+            f"apply_one is invalid for output_mode={state.output_mode!r}; "
+            "use compose_residual_one(state, features, init_logit) instead."
+        )
     if features.ndim != 1:
         raise ValueError(f"features must be 1D, got shape {features.shape}")
     if int(features.shape[0]) != int(state.feature_dim):
@@ -438,7 +462,15 @@ def apply_batch(
     ``O(tree_depth)`` numpy ops instead of ``O(B * tree_depth)``
     Python ops, which is a 30-100x wall-clock reduction on large
     val sets.
+
+    Only valid for ``output_mode == "probability"`` (binary objective).
+    For residual-mode states use :func:`compose_residual_batch`.
     """
+    if state.output_mode != "probability":
+        raise RuntimeError(
+            f"apply_batch is invalid for output_mode={state.output_mode!r}; "
+            "use compose_residual_batch(state, X, init_logit) instead."
+        )
     if features_matrix.ndim != 2:
         raise ValueError(
             f"features_matrix must be 2D, got shape {features_matrix.shape}"
@@ -464,6 +496,107 @@ def apply_batch(
     pos = raw >= 0
     out[pos] = 1.0 / (1.0 + np.exp(-raw[pos]))
     e = np.exp(raw[~pos])
+    out[~pos] = e / (1.0 + e)
+    out = np.clip(out, _EPS, 1.0 - _EPS)
+    return out.astype(np.float32, copy=False)
+
+
+# ---------------------------------------------------------------------------
+# Residual-mode helpers
+# ---------------------------------------------------------------------------
+#
+# When ``fit_gbdt_member`` is called with ``init_pred_train=...``, the trees
+# are trained on a regression target ``logit(y) - logit(p_init)`` and the
+# state stores ``objective="regression"``, ``output_mode="residual_logit"``.
+# In that case the walker's sum-of-leaves + bias is the residual logit;
+# the final probability is ``sigmoid(logit(p_init_at_inference) + residual)``.
+# These helpers do the composition so callers can't accidentally treat a
+# residual as a probability (the ``apply_*`` guards above catch that too).
+
+
+def _logit_clip(p, eps: float = _EPS):
+    """Vectorized OR scalar logit with clipping to (eps, 1-eps)."""
+    if isinstance(p, (int, float)):
+        x = max(min(float(p), 1.0 - eps), eps)
+        return math.log(x / (1.0 - x))
+    arr = np.asarray(p, dtype=np.float64)
+    arr = np.clip(arr, eps, 1.0 - eps)
+    return np.log(arr / (1.0 - arr))
+
+
+def compose_residual_one(
+    state: GBDTMemberState,
+    features: np.ndarray,
+    init_pred: float,
+) -> float:
+    """Single-row residual composition -> probability in (eps, 1-eps).
+
+    ``init_pred`` is the anchor member's probability for this row (e.g.
+    Member 1's IRT-MLP output). The final probability is
+
+        sigmoid( logit(init_pred) + tree_residual + bias ).
+    """
+    if state.output_mode != "residual_logit":
+        raise RuntimeError(
+            f"compose_residual_one requires output_mode='residual_logit', "
+            f"got {state.output_mode!r}"
+        )
+    if features.ndim != 1:
+        raise ValueError(f"features must be 1D, got shape {features.shape}")
+    if int(features.shape[0]) != int(state.feature_dim):
+        raise ValueError(
+            f"features dim {features.shape[0]} != state.feature_dim "
+            f"{state.feature_dim}"
+        )
+    residual = float(state.bias)
+    for t in range(int(state.n_trees)):
+        residual += _traverse_one_tree(state, t, features)
+    z = float(_logit_clip(float(init_pred))) + residual
+    if not math.isfinite(z):
+        return 0.5
+    p = _sigmoid_stable_one(z)
+    return float(min(max(p, _EPS), 1.0 - _EPS))
+
+
+def compose_residual_batch(
+    state: GBDTMemberState,
+    features_matrix: np.ndarray,
+    init_pred: np.ndarray,
+) -> np.ndarray:
+    """Vectorized residual composition. ``init_pred`` is per-row in (0, 1).
+
+    Returns float32 probabilities of shape ``[N]``.
+    """
+    if state.output_mode != "residual_logit":
+        raise RuntimeError(
+            f"compose_residual_batch requires output_mode='residual_logit', "
+            f"got {state.output_mode!r}"
+        )
+    if features_matrix.ndim != 2:
+        raise ValueError(
+            f"features_matrix must be 2D, got {features_matrix.shape}"
+        )
+    if int(features_matrix.shape[1]) != int(state.feature_dim):
+        raise ValueError(
+            f"features_matrix dim {features_matrix.shape[1]} != "
+            f"state.feature_dim {state.feature_dim}"
+        )
+    N = int(features_matrix.shape[0])
+    init_pred_arr = np.asarray(init_pred, dtype=np.float64).reshape(-1)
+    if int(init_pred_arr.shape[0]) != N:
+        raise ValueError(
+            f"init_pred length {init_pred_arr.shape[0]} != N {N}"
+        )
+    if N == 0:
+        return np.empty(0, dtype=np.float32)
+    init_logit = _logit_clip(init_pred_arr)
+    residual = predict_raw(state, features_matrix)
+    z = init_logit + residual
+    z = np.where(np.isfinite(z), z, 0.0)
+    out = np.empty_like(z)
+    pos = z >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    e = np.exp(z[~pos])
     out[~pos] = e / (1.0 + e)
     out = np.clip(out, _EPS, 1.0 - _EPS)
     return out.astype(np.float32, copy=False)
@@ -632,6 +765,7 @@ def fit_gbdt_member(
     log_period: int = 25,
     num_threads: int | None = None,
     holdout_group_id: np.ndarray | None = None,
+    init_pred_train: np.ndarray | None = None,
 ) -> GBDTMemberState:
     """Train a LightGBM binary classifier and compile its trees to numpy.
 
@@ -671,6 +805,19 @@ def fit_gbdt_member(
       its early-stopping val_logloss reflects actual cold-start
       generalization rather than item memorization. Without this
       kwarg the previous random-row behavior is preserved.
+
+    * ``init_pred_train``: per-row anchor probability (e.g. Member 1's
+      OOF train predictions) in ``(0, 1)``. When provided, the trainer
+      switches to **residual mode**: LightGBM is configured with
+      ``objective='regression'`` (l2) on the target
+      ``logit(y) - logit(init_pred_train)``. The resulting state has
+      ``output_mode='residual_logit'``; at inference, callers must
+      use :func:`compose_residual_one`/:func:`compose_residual_batch`
+      passing the SAME anchor member's probability at the inference
+      row. The point is to force the trees to spend capacity on the
+      part of the label the anchor missed -- a near-zero stacker
+      weight on Member 2 (the classic "your trees just relearned
+      Member 1" failure mode) becomes impossible by construction.
     """
     import lightgbm as lgb  # offline only
 
@@ -688,6 +835,45 @@ def fit_gbdt_member(
                 f"holdout_group_id shape {holdout_group_id.shape} != "
                 f"({X.shape[0]},)"
             )
+
+    # ---- Residual-mode setup ------------------------------------------------
+    # If init_pred_train is provided we configure LightGBM as a binary
+    # learner with a per-row ``init_score = logit(init_pred_train)``.
+    # The trees then learn an additive logit-space correction:
+    #
+    #     final_logit = init_score + tree_score
+    #     gradient    = sigmoid(final_logit) - y
+    #
+    # This is the canonical way to do boosted residual learning -- the
+    # binary cross-entropy at each step properly handles {0,1} labels
+    # without the gradient-explosion problem regression-on-logit(y)
+    # would have. At inference, ``booster.predict(X, raw_score=True)``
+    # returns ``tree_score`` (modern LightGBM does NOT add init_score
+    # back during predict), so the composer just does
+    # ``sigmoid(logit(p_init) + tree_score)``.
+    #
+    # We keep the original ``y`` as the training label (LightGBM does
+    # the gradient math itself given init_score); only the Dataset
+    # gains an ``init_score`` field.
+    residual_mode = init_pred_train is not None
+    init_pred_train_clean: np.ndarray | None = None
+    init_score_train: np.ndarray | None = None
+    y_for_metrics: np.ndarray = y
+    if residual_mode:
+        ipt = np.asarray(init_pred_train, dtype=np.float64).reshape(-1)
+        if ipt.shape[0] != int(X.shape[0]):
+            raise ValueError(
+                f"init_pred_train shape {ipt.shape} != ({X.shape[0]},)"
+            )
+        if not np.all(np.isfinite(ipt)):
+            raise ValueError("init_pred_train contains NaN/Inf")
+        ipt_clipped = np.clip(ipt, _EPS, 1.0 - _EPS)
+        init_pred_train_clean = ipt_clipped
+        # Per-row init_score = logit(init_pred). LightGBM uses this
+        # additively in logit space.
+        init_score_train = np.log(ipt_clipped / (1.0 - ipt_clipped)).astype(
+            np.float64, copy=False
+        )
 
     rng = np.random.default_rng(int(seed))
     N = int(X.shape[0])
@@ -761,10 +947,22 @@ def fit_gbdt_member(
     # unaffected.
     feature_names_for_lgbm = _sanitize_for_lightgbm(feature_names)
 
+    # Build per-split init_score arrays in residual mode. Each Dataset
+    # gets its own slice -- LightGBM's training and metric paths both
+    # consume init_score additively in logit space.
+    if residual_mode:
+        assert init_score_train is not None
+        is_train_split = init_score_train[train_idx]
+        is_val_split = init_score_train[val_idx]
+    else:
+        is_train_split = None
+        is_val_split = None
+
     train_set = lgb.Dataset(
         X_train,
         label=y_train,
         weight=w_train,
+        init_score=is_train_split,
         feature_name=feature_names_for_lgbm,
         categorical_feature=[],
         free_raw_data=False,
@@ -773,12 +971,17 @@ def fit_gbdt_member(
         X_val,
         label=y_val,
         weight=w_val,
+        init_score=is_val_split,
         feature_name=feature_names_for_lgbm,
         categorical_feature=[],
         reference=train_set,
         free_raw_data=False,
     )
 
+    # Same objective in both modes -- residual mode just adds a per-row
+    # init_score on the Dataset. boost_from_average is disabled in
+    # residual mode because init_score already provides a per-row
+    # baseline that's better than the population mean.
     params: dict[str, Any] = {
         "objective": "binary",
         "metric": "binary_logloss",
@@ -793,10 +996,7 @@ def fit_gbdt_member(
         "verbosity": -1,
         "seed": int(seed),
         "deterministic": True,
-        # No "categorical_feature" param: we one-hot upstream so all
-        # features are numeric. Passing categorical_feature in params
-        # is deprecated and triggers a UserWarning; we omit it and
-        # instead pass categorical_feature=[] to the Dataset ctor.
+        "boost_from_average": not residual_mode,
     }
     if num_threads is not None:
         params["num_threads"] = int(num_threads)
@@ -829,17 +1029,18 @@ def fit_gbdt_member(
 
     feat, thr, l, r, dl, offsets = _concat_trees(compiled)
 
-    # Anchor rows to derive bias = init_score. LightGBM's binary
-    # objective with ``boost_from_average=True`` adds an implicit
-    # ``logit(mean_y_train)`` to every prediction in PROBABILITY space
-    # but NOT to ``raw_score=True`` outputs in modern (>=4) versions.
-    # We therefore recover the init_score by going through probability
-    # space (see the back-solve below) which is robust to the version
-    # difference.
+    # Anchor rows to derive bias. In BOTH modes, we want the walker to
+    # output what ``booster.predict(X, raw_score=True)`` returns (the
+    # bare tree contribution; modern LightGBM does NOT add init_score
+    # back at prediction time). The probability composition is
+    # finished externally:
+    #   binary mode:    p = sigmoid(walker_output)
+    #   residual mode:  p = sigmoid(logit(init_pred) + walker_output)
+    # so bias_estimate = mean(predict_raw - sum_leaves) recovers any
+    # constant LightGBM internally added (boost_from_average baseline).
     anchor_idx = rng.choice(int(X.shape[0]), size=min(256, int(X.shape[0])), replace=False)
     X_anchor = X[anchor_idx]
 
-    # Sum of leaf values (NO bias) using a temporary state with bias=0.
     tmp_state = GBDTMemberState(
         feature_concat=feat,
         threshold_concat=thr,
@@ -852,77 +1053,127 @@ def fit_gbdt_member(
         bias=0.0,
         fit_method="lightgbm",
         n_train=int(N),
-        n_pos=int(np.sum(y == 1.0)),
+        n_pos=int(np.sum(y_for_metrics == 1.0)),
         n_trees=int(len(compiled)),
         train_loss=0.0,
         val_loss=0.0,
+        objective="binary",
+        output_mode=("residual_logit" if residual_mode else "probability"),
     )
     sum_leaves = predict_raw(tmp_state, X_anchor.astype(np.float32, copy=False))
 
-    # Bias / init_score recovery via PROBABILITY back-solve. In modern
-    # LightGBM (>=4) the binary objective bakes the ``init_score``
-    # into the FIRST tree's leaf values rather than emitting it as a
-    # separate constant, so on healthy fits this lands at ~0 and the
-    # walker is already correct without it. We still solve for it
-    # explicitly so a non-binary or per-row-init-score variant fails
-    # loudly here instead of silently shipping a calibration bug.
-    prob_lgb = booster.predict(X_anchor).astype(np.float64)
-    prob_lgb = np.clip(prob_lgb, 1e-15, 1.0 - 1e-15)
-    raw_with_init = np.log(prob_lgb / (1.0 - prob_lgb))
-    delta = raw_with_init - sum_leaves.astype(np.float64)
+    # Single bias-recovery formula for both modes: compare to raw_score.
+    raw_lgb = booster.predict(X_anchor, raw_score=True).astype(np.float64)
+    delta = raw_lgb - sum_leaves.astype(np.float64)
     bias_estimate = float(delta.mean())
     bias_std = float(delta.std())
     if bias_std > 1.0e-4:
         raise RuntimeError(
-            f"GBDT init_score not constant across anchor rows: "
-            f"mean={bias_estimate} std={bias_std}. This usually means "
-            "the model has per-row init scores or the dump is malformed."
+            f"GBDT bias not constant across anchor rows: "
+            f"mean={bias_estimate} std={bias_std}. The booster may be "
+            "emitting per-row constants (categorical splits with missing "
+            "or NaN handling can cause this)."
         )
 
     # Compute MANUAL cross-entropy on the booster's own predictions.
-    # LightGBM's reported ``binary_logloss`` (in best_score / log
-    # callbacks) is empirically NOT equal to mean cross-entropy on
-    # ``booster.predict(X)`` -- we have observed gaps of 0.10 - 0.15
-    # nats on this codebase's 5M x 1200 feature shape, with reported
-    # < manual. Whatever LightGBM is reporting (likely something
-    # involving its internal score updater + bagging interaction in
-    # v4+), it is NOT the number we want to gate ensembling on.
+    # LightGBM's reported ``binary_logloss`` metric implicitly treats
+    # every label > 0 as a hard +1 (see ``LossOnPoint`` in
+    # ``metric/binary_metric.hpp``), so on SOFT labels in [0, 1] it
+    # diverges arbitrarily from the soft Bernoulli cross-entropy the
+    # ``binary`` objective actually optimizes. The manual NLL below
+    # uses the raw label values directly and is the honest number to
+    # gate ensembling on. (See scripts/_diag_gbdt_softlabel_gap.py for
+    # the controlled repro.)
     #
-    # We therefore store the manual NLL as the canonical
-    # ``train_loss`` / ``val_loss`` and log the LGBM-reported numbers
-    # alongside so callers can spot the divergence themselves.
-    p_train_lgb = booster.predict(X_train).astype(np.float64)
-    p_val_lgb = booster.predict(X_val).astype(np.float64)
+    # In RESIDUAL mode we instead report the cross-entropy of the
+    # COMPOSED probability sigmoid(logit(init_pred) + tree_residual)
+    # against the original soft labels -- that's what the runtime
+    # actually emits via compose_residual_*.
     eps_clip = 1.0e-6
-    p_train_lgb = np.clip(p_train_lgb, eps_clip, 1.0 - eps_clip)
-    p_val_lgb = np.clip(p_val_lgb, eps_clip, 1.0 - eps_clip)
-    y_train_f = y_train.astype(np.float64)
-    y_val_f = y_val.astype(np.float64)
-    manual_train_nll = float(
-        -np.mean(y_train_f * np.log(p_train_lgb) + (1.0 - y_train_f) * np.log(1.0 - p_train_lgb))
-    )
-    manual_val_nll = float(
-        -np.mean(y_val_f * np.log(p_val_lgb) + (1.0 - y_val_f) * np.log(1.0 - p_val_lgb))
-    )
-    reported_train_nll = float(
-        booster.best_score.get("train", {}).get("binary_logloss", 0.0)
-    )
-    reported_val_nll = float(
-        booster.best_score.get("val", {}).get("binary_logloss", 0.0)
-    )
-    # If the reported and manual numbers disagree noticeably, surface
-    # a warning at fit time so we don't get fooled by a stale
-    # heuristic when comparing members in the stacker.
-    nll_gap = abs(manual_val_nll - reported_val_nll)
-    if nll_gap > 0.02:
-        LOG.warning(
-            "GBDT fit: LGBM-reported val_logloss=%.5f differs from manual "
-            "cross-entropy on booster.predict()=%.5f by %.4f nats. The "
-            "manual number (which matches the runtime walker) is what "
-            "this state will report as val_loss. The LGBM-reported value "
-            "is preserved as a side-channel diagnostic.",
-            reported_val_nll, manual_val_nll, nll_gap,
+    if residual_mode:
+        # ``booster.predict(X)`` returns ``sigmoid(tree_score)`` -- it
+        # does NOT add init_score back in modern LightGBM. So the
+        # composed probability is ``sigmoid(init_score + tree_score)``
+        # which we compute via raw_score + per-row init_score.
+        assert init_pred_train_clean is not None
+        ip_train = init_pred_train_clean[train_idx]
+        ip_val = init_pred_train_clean[val_idx]
+        is_train = np.log(ip_train / (1.0 - ip_train))
+        is_val = np.log(ip_val / (1.0 - ip_val))
+        tree_raw_train = booster.predict(X_train, raw_score=True).astype(np.float64)
+        tree_raw_val = booster.predict(X_val, raw_score=True).astype(np.float64)
+        logit_train = is_train + tree_raw_train
+        logit_val = is_val + tree_raw_val
+        def _sig(z: np.ndarray) -> np.ndarray:
+            out = np.empty_like(z)
+            pos = z >= 0
+            out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+            e = np.exp(z[~pos])
+            out[~pos] = e / (1.0 + e)
+            return out
+        p_train_composed = np.clip(_sig(logit_train), eps_clip, 1.0 - eps_clip)
+        p_val_composed = np.clip(_sig(logit_val), eps_clip, 1.0 - eps_clip)
+        y_train_orig_f = y_for_metrics[train_idx].astype(np.float64)
+        y_val_orig_f = y_for_metrics[val_idx].astype(np.float64)
+        manual_train_nll = float(
+            -np.mean(
+                y_train_orig_f * np.log(p_train_composed)
+                + (1.0 - y_train_orig_f) * np.log(1.0 - p_train_composed)
+            )
         )
+        manual_val_nll = float(
+            -np.mean(
+                y_val_orig_f * np.log(p_val_composed)
+                + (1.0 - y_val_orig_f) * np.log(1.0 - p_val_composed)
+            )
+        )
+        # binary_logloss reported in residual mode is computed by
+        # LightGBM WITHOUT adding init_score back (it sees just the
+        # tree contribution). That number is uninterpretable on its
+        # own; surface it as diagnostic only.
+        reported_train_nll = float(
+            booster.best_score.get("train", {}).get("binary_logloss", 0.0)
+        )
+        reported_val_nll = float(
+            booster.best_score.get("val", {}).get("binary_logloss", 0.0)
+        )
+    else:
+        p_train_lgb = booster.predict(X_train).astype(np.float64)
+        p_val_lgb = booster.predict(X_val).astype(np.float64)
+        p_train_lgb = np.clip(p_train_lgb, eps_clip, 1.0 - eps_clip)
+        p_val_lgb = np.clip(p_val_lgb, eps_clip, 1.0 - eps_clip)
+        y_train_f = y_train.astype(np.float64)
+        y_val_f = y_val.astype(np.float64)
+        manual_train_nll = float(
+            -np.mean(y_train_f * np.log(p_train_lgb) + (1.0 - y_train_f) * np.log(1.0 - p_train_lgb))
+        )
+        manual_val_nll = float(
+            -np.mean(y_val_f * np.log(p_val_lgb) + (1.0 - y_val_f) * np.log(1.0 - p_val_lgb))
+        )
+        reported_train_nll = float(
+            booster.best_score.get("train", {}).get("binary_logloss", 0.0)
+        )
+        reported_val_nll = float(
+            booster.best_score.get("val", {}).get("binary_logloss", 0.0)
+        )
+    # If the reported and manual numbers disagree noticeably (binary
+    # mode only; the regression-mode reported metric is l2-on-residuals
+    # which lives on a different scale than manual NLL, so we skip the
+    # warning there).
+    if not residual_mode:
+        nll_gap = abs(manual_val_nll - reported_val_nll)
+        if nll_gap > 0.02:
+            LOG.warning(
+                "GBDT fit: LGBM-reported val_logloss=%.5f differs from manual "
+                "cross-entropy on booster.predict()=%.5f by %.4f nats. The "
+                "manual number (which matches the runtime walker) is what "
+                "this state will report as val_loss. The LGBM-reported value "
+                "is preserved as a side-channel diagnostic. (Most common "
+                "cause: soft labels in [0,1] -- LightGBM's binary_logloss "
+                "metric binarizes via I[y>0] but the binary OBJECTIVE "
+                "optimizes soft cross-entropy.)",
+                reported_val_nll, manual_val_nll, nll_gap,
+            )
 
     # Build the final state with the recovered bias.
     final_state = GBDTMemberState(
@@ -937,31 +1188,35 @@ def fit_gbdt_member(
         bias=float(bias_estimate),
         fit_method="lightgbm",
         n_train=int(N),
-        n_pos=int(np.sum(y == 1.0)),
+        n_pos=int(np.sum(y_for_metrics == 1.0)),
         n_trees=int(len(compiled)),
         train_loss=float(manual_train_nll),
         val_loss=float(manual_val_nll),
+        objective="binary",
+        output_mode=("residual_logit" if residual_mode else "probability"),
     )
 
     # ---- Parity check (FAIL-FAST) ----
-    # Two parity checks, raw space AND probability space. The raw-space
-    # check is what we used to do, but in modern LightGBM
-    # ``raw_score=True`` excludes init_score so the raw-space test
-    # passes even when ``bias`` is wrong. The probability-space check
-    # is end-to-end (same path the runtime walker takes) and catches
-    # any bias / link-function error at fit time.
+    # Raw-space check: walker (sum_leaves + bias) MUST equal
+    # ``booster.predict(X, raw_score=True)`` to within fp tolerance
+    # in BOTH modes. The walker output is what callers will compose
+    # with init_score (residual mode) or pass through sigmoid (binary
+    # mode), so this is the contract that matters.
+    #
+    # Probability-space check only runs in binary mode; in residual
+    # mode the runtime composition with per-row init_pred is tested
+    # separately in the unit suite (the booster's own predict() does
+    # NOT add init_score back, so it doesn't match the composed
+    # probability and isn't the right baseline here).
     raw_numpy = predict_raw(final_state, X_val.astype(np.float32, copy=False))
     raw_lgb_val = booster.predict(X_val, raw_score=True).astype(np.float64)
-    # Subtract bias because LightGBM's raw_score does NOT include init_score
-    # in current versions; comparing raw_numpy - bias to raw_lgb_val makes
-    # the diagnostic meaningful regardless of the LightGBM version.
-    max_abs_err_raw = float(
-        np.max(np.abs((raw_numpy - float(final_state.bias)) - raw_lgb_val))
-    )
-
-    p_numpy = apply_batch(final_state, X_val.astype(np.float32, copy=False))
-    p_lgb_val = booster.predict(X_val).astype(np.float64)
-    max_abs_err_prob = float(np.max(np.abs(p_numpy - p_lgb_val)))
+    max_abs_err_raw = float(np.max(np.abs(raw_numpy - raw_lgb_val)))
+    if residual_mode:
+        max_abs_err_prob = float("nan")
+    else:
+        p_numpy = apply_batch(final_state, X_val.astype(np.float32, copy=False))
+        p_lgb_val = booster.predict(X_val).astype(np.float64)
+        max_abs_err_prob = float(np.max(np.abs(p_numpy - p_lgb_val)))
 
     if max_abs_err_raw > float(parity_atol):
         raise RuntimeError(
@@ -969,17 +1224,18 @@ def fit_gbdt_member(
             f"> {parity_atol}. The numpy walker disagrees with LightGBM "
             "on leaf-sum traversal; do not ship this state."
         )
-    if max_abs_err_prob > float(parity_atol):
+    if (not residual_mode) and max_abs_err_prob > float(parity_atol):
         raise RuntimeError(
             f"GBDT probability-space parity failed: max abs error "
             f"{max_abs_err_prob} > {parity_atol}. Bias / init_score "
             "recovery is broken; do not ship this state."
         )
     LOG.info(
-        "GBDT fit OK: n_trees=%d total_nodes=%d feature_dim=%d "
+        "GBDT fit OK: mode=%s n_trees=%d total_nodes=%d feature_dim=%d "
         "manual_train_nll=%.5f manual_val_nll=%.5f "
         "lgbm_reported_train=%.5f lgbm_reported_val=%.5f "
         "parity_raw=%.2e parity_prob=%.2e bias=%.4f",
+        ("binary-residual" if residual_mode else "binary"),
         final_state.n_trees,
         final_state.total_nodes,
         final_state.feature_dim,
@@ -999,5 +1255,7 @@ __all__ = [
     "apply_one",
     "apply_batch",
     "predict_raw",
+    "compose_residual_one",
+    "compose_residual_batch",
     "fit_gbdt_member",
 ]
