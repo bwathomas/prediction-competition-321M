@@ -352,6 +352,24 @@ CFG["nn_features"]["enabled"] = True
 CFG["nn_features"]["k"] = 16
 CFG["nn_features"]["similarity"] = "cosine"
 CFG["nn_features"]["prefer_gpu"] = True
+
+# --- Out-of-fold (OOF) training for honest stacking.
+# Item-grouped K-fold: each fold's OOF items are disjoint from its train
+# items. Members are retrained per-fold; OOF predictions feed the stacker
+# instead of the (in-sample-for-the-meta-learner) val predictions.
+# ``n_folds=3`` is the agreed compromise between leakage discipline and
+# Colab cost (3x Member-1 training vs current; ~3-5h extra wall time).
+# ``run_shuffled_label_control`` triggers Gate 1c when set to True --
+# expensive (re-runs the entire OOF pipeline on permuted labels), so
+# defaults to False; user toggles it on demand.
+CFG.setdefault("oof", {})
+CFG["oof"].setdefault("enabled", True)
+CFG["oof"].setdefault("n_folds", 3)
+CFG["oof"].setdefault("seed", 7)
+CFG["oof"].setdefault("run_shuffled_label_control", False)
+CFG["oof"].setdefault("shuffled_label_seed", 12345)
+CFG["oof"].setdefault("nn_neighbor_probe_sample_size", 2000)
+CFG["oof"].setdefault("optimism_threshold_nats", 0.03)
 CFG.setdefault("judge", {})
 CFG["judge"]["enabled"] = False
 CFG.setdefault("lora", {})
@@ -859,6 +877,85 @@ if mask.sum() >= 100:
             "Fix the (subject, item) keying or pool / index dim mismatch "
             "before training."
         )
+
+# %% [markdown]
+# ## 6.5. OOF fold setup (Task 1 of the diversification plan)
+#
+# Build the item-grouped K-fold schedule used by all per-fold member
+# retraining downstream. The folds partition `primary.train` by
+# **item_key**, so any row in fold *f*'s OOF set is guaranteed not to
+# share an item with fold *f*'s training set. This is the foundation
+# for honest stacker inputs: the stacker is trained on OOF member
+# predictions (each row's prediction comes from a member that never
+# saw that row's item) instead of on val (where the meta-learner is
+# in-sample). Val becomes a pure held-out reporting set.
+#
+# Gate 1a (RED-TEAM): assert item-key disjointness per fold AND the
+# stronger "every train row appears in exactly one fold's OOF set"
+# row-partition invariant. Catches off-by-one bugs in fold assignment.
+
+# %%
+from src.oof_folds import (
+    ItemFold,
+    assert_item_disjoint,
+    assert_nn_neighbors_in_fold_train,
+    assert_row_idx_partition,
+    fold_cache_suffix,
+    make_item_grouped_folds,
+    report_train_vs_val_optimism,
+)
+
+OOF_ENABLED = bool(CFG["oof"].get("enabled", True))
+OOF_N_FOLDS = int(CFG["oof"].get("n_folds", 3))
+OOF_SEED = int(CFG["oof"].get("seed", 7))
+
+# Per-row item_key array over primary.train. We treat keys as strings
+# everywhere so the fold-id dict lookups can't be tripped by dtype mismatch.
+_train_row_item_keys = primary.train["item_key"].astype(str).to_numpy()
+print(
+    f"[OOF] N_train_rows={len(_train_row_item_keys):,}  "
+    f"unique_items={len(set(_train_row_item_keys)):,}  "
+    f"n_folds={OOF_N_FOLDS}  seed={OOF_SEED}"
+)
+
+folds: list[ItemFold] = make_item_grouped_folds(
+    item_keys_per_row=_train_row_item_keys,
+    n_folds=OOF_N_FOLDS,
+    seed=OOF_SEED,
+)
+
+# Gate 1a: item-disjointness, per-fold AND row-partition invariant.
+print("[OOF Gate 1a] Asserting item-key disjointness on every fold...")
+for f in folds:
+    assert_item_disjoint(f)
+assert_row_idx_partition(folds, n_rows=len(_train_row_item_keys))
+print(
+    f"[OOF Gate 1a] PASS: all {len(folds)} folds have disjoint train/OOF "
+    f"item-key sets AND each of {len(_train_row_item_keys):,} train rows "
+    "appears in exactly one fold's OOF set."
+)
+
+print("\n[OOF] Fold summary (per fold: n_train_items, n_oof_items, "
+      "n_train_rows, n_oof_rows, cache_suffix):")
+print(f"{'fold':>6}  {'train_items':>12}  {'oof_items':>10}  "
+      f"{'train_rows':>12}  {'oof_rows':>10}  {'cache_suffix':<18}")
+for f in folds:
+    suffix = fold_cache_suffix(
+        fold_id=f.fold_id, train_item_keys=f.train_item_keys
+    )
+    print(f"  {f.fold_id:>4d}  {len(f.train_item_keys):>12,d}  "
+          f"{len(f.oof_item_keys):>10,d}  {len(f.train_row_idx):>12,d}  "
+          f"{len(f.oof_row_idx):>10,d}  {suffix:<18}")
+
+# Per-row fold id, useful for diagnostics + downstream per-fold work.
+_train_row_fold_id = np.full(len(_train_row_item_keys), -1, dtype=np.int64)
+for f in folds:
+    _train_row_fold_id[f.oof_row_idx] = f.fold_id
+assert (_train_row_fold_id >= 0).all(), \
+    "BUG: some training row failed to receive a fold id (should never happen given Gate 1a)"
+
+print(f"\n[OOF] Per-row fold-id distribution: "
+      f"{np.bincount(_train_row_fold_id).tolist()}  (should sum to N_train_rows)")
 
 # %% [markdown]
 # ## 7. Build training tensors + metadata artifacts
