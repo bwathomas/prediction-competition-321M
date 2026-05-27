@@ -2754,11 +2754,32 @@ def _fit_stacker():
     )
 
 
+import hashlib as _hashlib
+
+# Digest the actual member-prediction matrix so the cache invalidates
+# whenever any upstream member's per-row predictions change. The
+# previous key only included shape metadata, which meant swapping out
+# Members 2/4 (residual learner, marginal features) silently reused
+# the OLD stacker weights -- a calibration bug we hit in the
+# diversification rollout. ~50 ms on 266k x 8 fp32; negligible.
+_stacker_X_digest = _hashlib.sha256(
+    np.ascontiguousarray(stacker_X_val, dtype=np.float32).tobytes()
+).hexdigest()[:16]
+_stacker_y_digest = _hashlib.sha256(
+    np.ascontiguousarray(ylab_val, dtype=np.float32).tobytes()
+).hexdigest()[:16]
 stacker_state = cache_or_compute(
     "stacker_state",
     # ``coldfb_v1`` invalidates older stackers trained on (member 2
     # row-cold val, member 3 K=32, member 4 untrimmed) outputs.
-    key_inputs=(stacker_X_val.shape[1], len(ylab_val), SEED, "coldfb_v1"),
+    # ``divers_v1`` ties the cache to the per-row prediction digests
+    # below, so any change in Members 1-4 (or aux features) forces
+    # a re-fit.
+    key_inputs=(
+        stacker_X_val.shape[1], len(ylab_val), SEED,
+        "coldfb_v1", "divers_v1",
+        _stacker_X_digest, _stacker_y_digest,
+    ),
     compute_fn=_fit_stacker,
 )
 print(f"[Stacker] weights: {stacker_state.weights}")
