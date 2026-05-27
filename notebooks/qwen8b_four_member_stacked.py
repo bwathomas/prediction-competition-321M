@@ -395,6 +395,30 @@ CFG["oof"].setdefault("optimism_threshold_nats", 0.03)
 CFG.setdefault("member2_v2", {})
 CFG["member2_v2"].setdefault("enabled", True)
 CFG["member2_v2"].setdefault("subject_mean_smoothing", 30.0)
+# --- Member 5: kNN on a 1-D supervised difficulty projection (Task 4) ---
+# Member 3 already does kNN on raw item embeddings (semantic similarity).
+# Member 5 builds neighborhoods in PREDICTED DIFFICULTY space instead --
+# items that look alike in topic but differ in difficulty land in different
+# neighborhoods, which is the decorrelation source we want.
+#
+# Knobs (sane defaults; the per-fold OOF loop + Gate 4b will report whether
+# we need to tune them):
+#   k=32                          # neighborhood size (1-D so binary-search-fast)
+#   tau=0.05                      # Gaussian kernel scale on the difficulty axis
+#   ridge_alpha=10.0              # L2 on the projection's weights
+#   item_fallback_weight=0.3      # mirror of Member 3's discount on unobserved cells
+#   min_subjects_per_item=3       # items with fewer rated subjects skip the fit
+# Set `enabled=False` to skip Member 5 and revert to the 4-member stacker
+# (legacy / Task-3 behavior) for A/B comparison.
+CFG.setdefault("member5", {})
+CFG["member5"].setdefault("enabled", True)
+CFG["member5"].setdefault("k", 32)
+CFG["member5"].setdefault("tau", 0.05)
+CFG["member5"].setdefault("ridge_alpha", 10.0)
+CFG["member5"].setdefault("item_fallback_weight", 0.3)
+CFG["member5"].setdefault("min_subjects_per_item", 3)
+# Sample size for Gate 4d's apply round-trip probe.
+CFG["member5"].setdefault("gate4d_sample_size", 64)
 CFG.setdefault("judge", {})
 CFG["judge"]["enabled"] = False
 CFG.setdefault("lora", {})
@@ -2831,6 +2855,222 @@ del val_item_emb
 gc.collect()
 
 # %% [markdown]
+# ## 9d-bis. Train Member 5 (kNN on a 1-D supervised difficulty projection)
+#
+# Task 4 of the diversification plan. Member 3 finds neighbors by COSINE
+# SIMILARITY on raw item embeddings -- "topically similar" items.
+# Member 5 fits a weighted ridge regression of item-mean-passrate on
+# item embeddings, projects every item into a 1-D PREDICTED DIFFICULTY
+# axis, and finds neighbors on that 1-D line. Items that are
+# topically similar but differ in difficulty are far in this space,
+# and vice versa, so Member 5's errors should be only weakly correlated
+# with Member 3's (verified in Gate 4b below).
+#
+# Pure NumPy at runtime: ridge solve at fit time, binary-search +
+# Gaussian-kernel aggregation at apply time. ~O(log N + K) per query
+# vs Member 3's O(N) -- the 1-D layout lets us skip PCA + quantization.
+
+# %%
+if CFG.get("member5", {}).get("enabled", False):
+    import time as _time_m5
+    from src.member5_difficulty_knn import (
+        Member5State,
+        assert_projection_disjoint_from_val,
+        apply_batch_via_ids as m5_apply_batch_via_ids,
+        apply_batch as m5_apply_batch,
+        apply_one as m5_apply_one,
+        fit_member5,
+    )
+
+    _m5_cfg = CFG["member5"]
+    _M5_ENABLED = True
+    _M5_K = int(_m5_cfg.get("k", 32))
+    _M5_TAU = float(_m5_cfg.get("tau", 0.05))
+    _M5_RIDGE_ALPHA = float(_m5_cfg.get("ridge_alpha", 10.0))
+    _M5_ITEM_FB_WEIGHT = float(_m5_cfg.get("item_fallback_weight", 0.3))
+    _M5_MIN_SUBJ_PER_ITEM = int(_m5_cfg.get("min_subjects_per_item", 3))
+    _M5_GATE4D_SAMPLE_SIZE = int(_m5_cfg.get("gate4d_sample_size", 64))
+
+    print(
+        f"[Member 5] enabled. k={_M5_K} tau={_M5_TAU} ridge_alpha={_M5_RIDGE_ALPHA} "
+        f"item_fb_w={_M5_ITEM_FB_WEIGHT} min_subj_per_item={_M5_MIN_SUBJ_PER_ITEM}"
+    )
+
+    # --- Map training rows -> (subject_id, item_id) for the fit input ---
+    # item_id_per_row = position in `train_item_keys`. Build a quick dict.
+    _train_item_key_to_pos = {
+        k: i for i, k in enumerate(train_item_keys)
+    }
+    _m5_subj_ids_global = np.fromiter(
+        (
+            int(indexer.subject_to_id.get(str(s), -1))
+            for s in primary.train["subject_key"]
+        ),
+        dtype=np.int64,
+        count=len(primary.train),
+    )
+    _m5_item_ids_global = np.fromiter(
+        (
+            int(_train_item_key_to_pos.get(str(k), -1))
+            for k in primary.train["item_key"]
+        ),
+        dtype=np.int64,
+        count=len(primary.train),
+    )
+    _m5_y_global = primary.train["label"].astype(float).to_numpy()
+    # Sanity: every row must have a valid (subj, item) lookup.
+    _m5_bad = int(((_m5_subj_ids_global < 0) | (_m5_item_ids_global < 0)).sum())
+    if _m5_bad > 0:
+        raise RuntimeError(
+            f"[Member 5] {_m5_bad:,} training rows have unresolvable "
+            "subject_id or item_id. Indexer / train_item_keys are out of sync."
+        )
+
+    # --- Stack item embeddings for the global Member 5 fit ---
+    _t_m5 = _time_m5.time()
+    print(f"[Member 5] stacking {len(train_item_keys):,} item embeddings (D=?)...")
+    _m5_item_emb = np.empty(
+        (len(train_item_keys), int(item_emb_lookup[train_item_keys[0]].shape[0])),
+        dtype=np.float32,
+    )
+    for _i, _k in enumerate(train_item_keys):
+        _m5_item_emb[_i] = item_emb_lookup[_k]
+    print(f"[Member 5] stacked in {_time_m5.time() - _t_m5:.1f}s "
+          f"({_m5_item_emb.nbytes / 1024**3:.2f} GB)")
+
+    # --- Gate 4c (global): projection-leakage probe vs val items ---
+    # Member 5 is FIT on `train_item_keys` only; val items are excluded
+    # by construction (primary.train and primary.val are item-disjoint).
+    # The probe makes that contract loud: if anything ever changes the
+    # split, this gate will catch it before the projection sees val rows.
+    _val_item_keys_list = [str(k) for k in primary.val["item_key"]]
+    _gate4c_global_result = assert_projection_disjoint_from_val(
+        fit_item_keys=list(train_item_keys),
+        val_item_keys=_val_item_keys_list,
+    )
+    print(
+        f"[Gate 4c global] PASS: projection fit on "
+        f"{_gate4c_global_result['n_fit_items']:,} items, "
+        f"val has {_gate4c_global_result['n_val_items']:,} items, "
+        f"overlap = {_gate4c_global_result['n_overlap']}."
+    )
+
+    # --- Global Member 5 fit (cached) ---
+    def _fit_member5_global():
+        return fit_member5(
+            item_keys=list(train_item_keys),
+            item_embeddings=_m5_item_emb,
+            subject_keys=list(_subject_keys_ordered),
+            subject_ids_per_row=_m5_subj_ids_global,
+            item_ids_per_row=_m5_item_ids_global,
+            labels=_m5_y_global,
+            k=_M5_K,
+            tau=_M5_TAU,
+            ridge_alpha=_M5_RIDGE_ALPHA,
+            item_fallback_weight=_M5_ITEM_FB_WEIGHT,
+            min_subjects_per_item=_M5_MIN_SUBJ_PER_ITEM,
+        )
+
+    member5_state: Member5State = cache_or_compute(
+        "member5_state",
+        key_inputs=(
+            "m5_dknn_v1",
+            int(len(train_item_keys)),
+            int(indexer.n_subjects),
+            int(len(primary.train)),
+            int(_m5_item_emb.shape[1]),
+            _M5_K, round(_M5_TAU, 6), round(_M5_RIDGE_ALPHA, 6),
+            round(_M5_ITEM_FB_WEIGHT, 6), int(_M5_MIN_SUBJ_PER_ITEM),
+            int(SEED),
+        ),
+        compute_fn=_fit_member5_global,
+    )
+    print(
+        f"[Member 5] state: n_items={member5_state.n_items:,}  "
+        f"n_subjects={member5_state.n_subjects:,}  "
+        f"k={member5_state.k}  tau={member5_state.tau:.4f}  "
+        f"global_mean={member5_state.global_mean:.4f}  "
+        f"train_loss(sample)={member5_state.train_loss:.5f}  "
+        f"||beta||={float(np.linalg.norm(member5_state.projection_weights)):.4f}"
+    )
+
+    # --- Gate 4d: apply round-trip probe ---
+    # The pure-numpy apply path is the only thing the runtime executes.
+    # Verify on a sample of train rows that apply_one (subject_key path)
+    # matches apply_batch_via_ids (subject_id path) bit-for-bit. If they
+    # diverge, the runtime bundle would silently mispredict.
+    _g4d_n = min(_M5_GATE4D_SAMPLE_SIZE, int(_m5_subj_ids_global.shape[0]))
+    _g4d_rng = np.random.default_rng(int(SEED) + 99)
+    _g4d_idx = _g4d_rng.choice(int(_m5_subj_ids_global.shape[0]),
+                               size=_g4d_n, replace=False)
+    _g4d_sids = _m5_subj_ids_global[_g4d_idx]
+    _g4d_iids = _m5_item_ids_global[_g4d_idx]
+    _g4d_embs = _m5_item_emb[_g4d_iids]
+    _g4d_skeys = [str(_subject_keys_ordered[int(s)]) for s in _g4d_sids]
+    _g4d_p_batch = m5_apply_batch_via_ids(
+        member5_state, subject_ids=_g4d_sids, query_item_embeddings=_g4d_embs,
+    )
+    _g4d_p_one = np.array(
+        [m5_apply_one(member5_state, _g4d_embs[r], _g4d_skeys[r])
+         for r in range(_g4d_n)],
+        dtype=np.float32,
+    )
+    _g4d_max_dev = float(np.max(np.abs(_g4d_p_batch.astype(np.float64)
+                                       - _g4d_p_one.astype(np.float64))))
+    if _g4d_max_dev > 1.0e-5:
+        raise AssertionError(
+            f"[Gate 4d] FAIL: max |apply_batch - apply_one| = {_g4d_max_dev:.3e} "
+            f"on {_g4d_n} sample rows. The batch/single-row codepaths "
+            "have diverged -- the runtime would mispredict."
+        )
+    print(
+        f"[Gate 4d] PASS: apply_batch == apply_one on {_g4d_n} sample rows "
+        f"(max abs dev = {_g4d_max_dev:.3e})."
+    )
+
+    # --- Score on val rows ---
+    _t = _time_m5.time()
+    print(f"[Member 5] scoring {len(primary.val):,} val rows...")
+    _m5_val_item_emb = np.empty(
+        (len(primary.val), int(_m5_item_emb.shape[1])), dtype=np.float32,
+    )
+    for _i, _k in enumerate(primary.val["item_key"]):
+        _m5_val_item_emb[_i] = item_emb_lookup[str(_k)]
+    p_member5_val = m5_apply_batch(
+        member5_state,
+        subject_keys=[str(s) for s in primary.val["subject_key"]],
+        query_item_embeddings=_m5_val_item_emb,
+    )
+    _m5_dt = _time_m5.time() - _t
+    nll_m5 = float(-(
+        ylab_val * np.log(np.clip(p_member5_val, 1e-6, 1 - 1e-6))
+        + (1 - ylab_val) * np.log(1 - np.clip(p_member5_val, 1e-6, 1 - 1e-6))
+    ).mean())
+    print(
+        f"[Member 5] scored val in {_m5_dt:.1f}s "
+        f"({len(p_member5_val) / max(_m5_dt, 1e-9):.0f} rows/s)  "
+        f"val log-loss: {nll_m5:.6f}  "
+        f"p stats: min={p_member5_val.min():.4f} "
+        f"mean={p_member5_val.mean():.4f} max={p_member5_val.max():.4f}"
+    )
+    # Free the bulky val embedding stack; we keep _m5_item_emb (used by
+    # per-fold OOF Member 5 below). The val stack will be reproduced from
+    # the much-smaller item lookup if needed.
+    del _m5_val_item_emb
+    gc.collect()
+else:
+    _M5_ENABLED = False
+    member5_state = None
+    p_member5_val = None
+    nll_m5 = float("nan")
+    _m5_item_emb = None
+    _m5_subj_ids_global = None
+    _m5_item_ids_global = None
+    _train_item_key_to_pos = None
+    print("[Member 5] DISABLED via CFG['member5']['enabled']=False")
+
+
+# %% [markdown]
 # ## 9e. Train Member 4 (Logistic regression)
 #
 # Hand-rolled torch trainer (Adam + L2 + early stopping). At runtime
@@ -2984,6 +3224,14 @@ p4_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p4_train_oof")
 nn_mean_sim_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="nn_mean_sim_oof")
 nn_support_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="nn_support_oof")
 centroid_dist_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="centroid_dist_oof")
+# Task 4: Member 5 OOF accumulator (created only when Member 5 is enabled).
+if _M5_ENABLED:
+    p5_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p5_train_oof")
+    # Per-fold Gate 4c results (printed in aggregate after the loop).
+    _gate4c_per_fold: dict[int, dict] = {}
+else:
+    p5_train_oof_acc = None
+    _gate4c_per_fold = {}
 
 # Task 3 (Member 2 v2): accumulate per-row OOF subject_mean (computed
 # from each fold's train labels only) so the GLOBAL Member 2 fit in
@@ -3533,6 +3781,114 @@ for fold in folds:
     )
     p3_train_oof_acc.write_fold(fold.oof_row_idx, p3_oof_fold)
 
+    # ----- Fold Member 5 (difficulty-projected kNN) -----
+    # Trained from scratch per fold on fold-train items + fold-train rows
+    # so OOF predictions on fold-OOF rows are genuinely "model never saw
+    # this item's label" (Gate 4a). The projection regression uses only
+    # fold-train items' per-item passrate, which is itself computed from
+    # fold-train labels only -- so target leakage is impossible.
+    if _M5_ENABLED:
+        print(f"[OOF f{fold.fold_id}] Training fold Member 5 (difficulty-kNN)...")
+        # Fold-local item position map (item_key -> 0..len(fold.train_item_keys)).
+        _fold_item_key_to_pos = {
+            k: i for i, k in enumerate(fold.train_item_keys)
+        }
+        # Fold-train rows -> subject_ids + item_ids in the fold's item space.
+        _fold_train_subj_ids = np.fromiter(
+            (
+                int(indexer.subject_to_id.get(str(s), -1))
+                for s in fold_train_df["subject_key"]
+            ),
+            dtype=np.int64,
+            count=len(fold_train_df),
+        )
+        _fold_train_item_ids = np.fromiter(
+            (
+                int(_fold_item_key_to_pos.get(str(k), -1))
+                for k in fold_train_df["item_key"]
+            ),
+            dtype=np.int64,
+            count=len(fold_train_df),
+        )
+        _fold_train_y_m5 = fold_train_df["label"].astype(float).to_numpy()
+        # All fold-train rows must have valid lookups (the fold's training
+        # universe is exactly fold.train_item_keys, by construction).
+        _bad_m5 = int(((_fold_train_subj_ids < 0)
+                       | (_fold_train_item_ids < 0)).sum())
+        if _bad_m5 > 0:
+            raise RuntimeError(
+                f"[Member 5 fold {fold.fold_id}] {_bad_m5:,} fold-train rows "
+                "have unresolvable subject_id or item_id."
+            )
+
+        # --- Gate 4c (per-fold): projection-leakage probe vs OOF items ---
+        # The fold's Member 5 is fit on `fold.train_item_keys` only. The
+        # fold's OOF rows reference items in `fold.oof_item_keys` (item-
+        # disjoint from train by Gate 1a). The probe verifies that the
+        # fitted Member 5 NEVER saw any OOF-item's embedding during fit;
+        # if Gate 1a's item-disjoint contract ever breaks, this fires.
+        _gate4c_fold = assert_projection_disjoint_from_val(
+            fit_item_keys=list(fold.train_item_keys),
+            val_item_keys=list(fold.oof_item_keys),
+        )
+        _gate4c_per_fold[int(fold.fold_id)] = _gate4c_fold
+
+        # --- Stack item embeddings for the fold's projection fit ---
+        # _fold_item_emb_stacked was created above for Member 3 (same
+        # ordering as fold.train_item_keys), so reuse it -- saves
+        # re-stacking ~100k embeddings per fold.
+        _fold_m5_state = cache_or_compute(
+            "member5_state_oof_fold",
+            key_inputs=(
+                "m5_oof_v1", fold.fold_id, fold_suffix,
+                int(len(fold.train_item_keys)), int(indexer.n_subjects),
+                int(len(fold_train_df)), int(_fold_item_emb_stacked.shape[1]),
+                _M5_K, round(_M5_TAU, 6), round(_M5_RIDGE_ALPHA, 6),
+                round(_M5_ITEM_FB_WEIGHT, 6), int(_M5_MIN_SUBJ_PER_ITEM),
+                int(SEED),
+            ),
+            compute_fn=lambda _ff=fold: fit_member5(
+                item_keys=list(_ff.train_item_keys),
+                item_embeddings=_fold_item_emb_stacked,
+                subject_keys=list(_subject_keys_ordered),
+                subject_ids_per_row=_fold_train_subj_ids,
+                item_ids_per_row=_fold_train_item_ids,
+                labels=_fold_train_y_m5,
+                k=_M5_K,
+                tau=_M5_TAU,
+                ridge_alpha=_M5_RIDGE_ALPHA,
+                item_fallback_weight=_M5_ITEM_FB_WEIGHT,
+                min_subjects_per_item=_M5_MIN_SUBJ_PER_ITEM,
+            ),
+        )
+
+        # --- Score fold Member 5 on OOF rows ---
+        # OOF items are item-disjoint from the fold's fit set, so every
+        # OOF row's item embedding gets projected through the SAME w/b
+        # the fit produced (no item-id lookup needed -- the projection
+        # is purely a function of the embedding).
+        _fold_oof_subj_ids = np.fromiter(
+            (
+                int(indexer.subject_to_id.get(str(s), -1))
+                for s in fold_oof_df["subject_key"]
+            ),
+            dtype=np.int64,
+            count=len(fold_oof_df),
+        )
+        _fold_oof_item_emb = np.stack(
+            [np.asarray(item_emb_lookup[str(k)], dtype=np.float32)
+             for k in fold_oof_df["item_key"]],
+            axis=0,
+        )
+        p5_oof_fold = m5_apply_batch_via_ids(
+            _fold_m5_state,
+            subject_ids=_fold_oof_subj_ids,
+            query_item_embeddings=_fold_oof_item_emb,
+        )
+        p5_train_oof_acc.write_fold(fold.oof_row_idx, p5_oof_fold)
+    else:
+        p5_oof_fold = None
+
     # ----- Fold Member 4 (LogReg hybrid) -----
     print(f"[OOF f{fold.fold_id}] Training fold Member 4 (LogReg hybrid)...")
     _fold_m4_feature_names = (
@@ -3581,6 +3937,7 @@ for fold in folds:
     print(
         f"  M1={_nll(p_a_oof_fold):.5f}  M2={_nll(p2_oof_fold):.5f}  "
         f"M3={_nll(p3_oof_fold):.5f}  M4={_nll(p4_oof_fold):.5f}"
+        + (f"  M5={_nll(p5_oof_fold):.5f}" if _M5_ENABLED else "")
     )
 
     # Free fold-scoped artifacts before next iteration (keep RAM bounded).
@@ -3596,6 +3953,10 @@ for fold in folds:
         del X_fold_train_m2v2, X_fold_oof_m2v2
         del subject_mean_train_fold, subject_mean_oof_fold
         del fold_subject_mean_table
+    if _M5_ENABLED:
+        del _fold_train_subj_ids, _fold_train_item_ids, _fold_train_y_m5
+        del _fold_oof_subj_ids, _fold_oof_item_emb
+        del _fold_item_key_to_pos
     gc.collect()
 
 # Finalize OOF accumulators -- raises if anything is missing / non-finite.
@@ -3604,6 +3965,10 @@ p_a_train_oof = p_a_train_oof_acc.finalize()
 p2_train_oof = p2_train_oof_acc.finalize()
 p3_train_oof = p3_train_oof_acc.finalize()
 p4_train_oof = p4_train_oof_acc.finalize()
+if _M5_ENABLED:
+    p5_train_oof = p5_train_oof_acc.finalize()
+else:
+    p5_train_oof = None
 nn_mean_sim_oof = nn_mean_sim_oof_acc.finalize().astype(np.float32)
 nn_support_oof = nn_support_oof_acc.finalize().astype(np.float32)
 centroid_dist_oof = centroid_dist_oof_acc.finalize().astype(np.float32)
@@ -3618,7 +3983,23 @@ print(f"  M1 OOF: {_nll_full(p_a_train_oof):.5f}  vs in-sample p_a_train: {_nll_
 print(f"  M2 OOF: {_nll_full(p2_train_oof):.5f}")
 print(f"  M3 OOF: {_nll_full(p3_train_oof):.5f}")
 print(f"  M4 OOF: {_nll_full(p4_train_oof):.5f}")
+if _M5_ENABLED:
+    print(f"  M5 OOF: {_nll_full(p5_train_oof):.5f}")
 print(f"[OOF] All accumulators finalized OK ({_N_TRAIN:,} rows each, all finite, single-write).")
+
+# Task 4: Aggregate Gate 4c (per-fold projection-leakage probe) results.
+if _M5_ENABLED and len(_gate4c_per_fold) > 0:
+    _g4c_total_fit = sum(r["n_fit_items"] for r in _gate4c_per_fold.values())
+    _g4c_total_val = sum(r["n_val_items"] for r in _gate4c_per_fold.values())
+    _g4c_total_overlap = sum(r["n_overlap"] for r in _gate4c_per_fold.values())
+    print(
+        f"\n[Gate 4c per-fold aggregate] {len(_gate4c_per_fold)} folds checked, "
+        f"sum(n_fit_items)={_g4c_total_fit:,}  "
+        f"sum(n_oof_items)={_g4c_total_val:,}  "
+        f"sum(overlap)={_g4c_total_overlap}. "
+        + ("PASS." if _g4c_total_overlap == 0
+           else f"FAIL: {_g4c_total_overlap} item overlaps found.")
+    )
 
 # Finalize Task 3 OOF subject_mean accumulator + aggregate Gate 3a summary.
 if _M2V2_ENABLED:
@@ -3848,6 +4229,7 @@ from src.stacker import (
     apply_batch as stacker_apply_batch,
     build_stacker_features,
     fit_stacker,
+    stacker_feature_names,
 )
 
 # ---------- Auxiliary stacker features (val side, kept for final reporting) ----------
@@ -3873,9 +4255,13 @@ if _centroid_cols:
 else:
     val_centroid_dist = np.full(len(primary.val), 0.5, dtype=np.float32)
 
-stacker_member_probs_val = np.stack(
-    [p_a_val, p_member2_val, p_member3_val, p_member4_val], axis=1
-).astype(np.float32)
+# Task 4: when Member 5 is enabled, build a [N, 5] member_probs stack
+# (M1, M2, M3, M4, M5); the column order is LOCKED across val and OOF-train
+# so the runtime's stacker.apply_one sees the same column ordering.
+_stacker_member_list_val = [p_a_val, p_member2_val, p_member3_val, p_member4_val]
+if _M5_ENABLED:
+    _stacker_member_list_val.append(p_member5_val)
+stacker_member_probs_val = np.stack(_stacker_member_list_val, axis=1).astype(np.float32)
 
 stacker_X_val = build_stacker_features(
     member_probs=stacker_member_probs_val,
@@ -3884,7 +4270,8 @@ stacker_X_val = build_stacker_features(
     nn_mean_similarity=val_nn_mean_sim,
     centroid_distance=val_centroid_dist,
 )
-print(f"[Stacker] X_val (final-reporting view): {stacker_X_val.shape}")
+print(f"[Stacker] X_val (final-reporting view): {stacker_X_val.shape} "
+      f"(n_members={'5' if _M5_ENABLED else '4'})")
 
 # ---------- OOF training side: build the stacker's TRAIN inputs from per-fold OOF preds ----------
 print("[Stacker] computing OOF-train aux features + member prob stack...")
@@ -3895,14 +4282,16 @@ _train_bench_present = np.array(
     ],
     dtype=np.float32,
 )
+_stacker_member_list_train_oof = [
+    p_a_train_oof.astype(np.float32),
+    p2_train_oof.astype(np.float32),
+    p3_train_oof.astype(np.float32),
+    p4_train_oof.astype(np.float32),
+]
+if _M5_ENABLED:
+    _stacker_member_list_train_oof.append(p5_train_oof.astype(np.float32))
 stacker_member_probs_train_oof = np.stack(
-    [
-        p_a_train_oof.astype(np.float32),
-        p2_train_oof.astype(np.float32),
-        p3_train_oof.astype(np.float32),
-        p4_train_oof.astype(np.float32),
-    ],
-    axis=1,
+    _stacker_member_list_train_oof, axis=1,
 )
 stacker_X_train_oof = build_stacker_features(
     member_probs=stacker_member_probs_train_oof,
@@ -3915,10 +4304,19 @@ ylab_train_np = primary.train["label"].astype(float).to_numpy().astype(np.float3
 print(f"[Stacker] X_train_oof: {stacker_X_train_oof.shape}  ylab_train: {ylab_train_np.shape}")
 
 
+_n_stacker_members = 5 if _M5_ENABLED else 4
+_stacker_feature_names = stacker_feature_names(_n_stacker_members)
+assert int(stacker_X_train_oof.shape[1]) == len(_stacker_feature_names), (
+    f"stacker_X_train_oof has {stacker_X_train_oof.shape[1]} cols but "
+    f"expected {len(_stacker_feature_names)} for n_members={_n_stacker_members}"
+)
+
+
 def _fit_stacker_oof():
     return fit_stacker(
         X=stacker_X_train_oof,
         y=ylab_train_np,
+        feature_names=_stacker_feature_names,
         n_iters=int(CFG.get("stacker", {}).get("n_iters", 1500)),
         learning_rate=float(CFG.get("stacker", {}).get("learning_rate", 0.05)),
         l2=float(CFG.get("stacker", {}).get("l2", 1.0)),
@@ -3947,7 +4345,12 @@ stacker_state = cache_or_compute(
     "stacker_state",
     key_inputs=(
         stacker_X_train_oof.shape[1], len(ylab_train_np), SEED,
-        "oof_v1",  # cache invalidator: OOF stacker is incompatible with val-stacker entries
+        # Cache invalidators: OOF (Task 1) and Member 5 (Task 4). The
+        # m5 tag bumps the key when Member 5 is added/removed so we
+        # never silently reuse a 4-member stacker on 5-member features.
+        "oof_v1",
+        "m5_v1" if _M5_ENABLED else "no_m5",
+        int(_n_stacker_members),
         int(OOF_N_FOLDS), int(OOF_SEED),
         bool(OOF_RETRAIN_M1),
         _stacker_Xtrain_digest, _stacker_ytrain_digest,
@@ -3971,13 +4374,15 @@ nll_stack_val = _bce(ylab_val, p_stacker_val)
 nll_uniform_val = _bce(ylab_val, stacker_member_probs_val.mean(axis=1))
 
 print(f"\n[Stacker] val log-loss summary (OOF-fit stacker, val is TRUE holdout):")
-print(f"  Member 1 (Model A IRT-MLP, val):  {_bce(ylab_val, p_a_val):.6f}")
-print(f"  Member 2 (LightGBM, val):         {nll_m2:.6f}")
-print(f"  Member 3 (kNN-similarity, val):   {nll_m3:.6f}")
-print(f"  Member 4 (LogReg, val):           {nll_m4:.6f}")
-print(f"  Uniform avg of 4 members (val):   {nll_uniform_val:.6f}")
-print(f"  STACKER (val, OOF-fit):           {nll_stack_val:.6f}")
-print(f"  STACKER (OOF-train, in-sample):   {nll_stack_train_oof:.6f}")
+print(f"  Member 1 (Model A IRT-MLP, val):    {_bce(ylab_val, p_a_val):.6f}")
+print(f"  Member 2 (LightGBM, val):           {nll_m2:.6f}")
+print(f"  Member 3 (kNN-similarity, val):     {nll_m3:.6f}")
+print(f"  Member 4 (LogReg, val):             {nll_m4:.6f}")
+if _M5_ENABLED:
+    print(f"  Member 5 (difficulty-kNN, val):     {nll_m5:.6f}")
+print(f"  Uniform avg of {_n_stacker_members} members (val):     {nll_uniform_val:.6f}")
+print(f"  STACKER (val, OOF-fit):             {nll_stack_val:.6f}")
+print(f"  STACKER (OOF-train, in-sample):     {nll_stack_train_oof:.6f}")
 if nll_stack_val > nll_uniform_val + 1e-3:
     print(
         "WARNING: Stacker did not beat uniform average. Consider increasing "
@@ -4018,6 +4423,62 @@ if _M2V2_ENABLED:
             "errors are sufficiently decorrelated from Member 1's. Task 3 met "
             "its decorrelation goal."
         )
+
+# Gate 4b (RED-TEAM, Task 4): error-correlation between Member 5
+# (difficulty-projected kNN) and Member 3 (raw-embedding kNN) on val.
+# The whole point of Member 5 is to find DIFFERENT neighborhoods than
+# Member 3 (difficulty vs topic). If their val errors are >= 0.90
+# correlated, they're effectively the same model and Member 5 is
+# adding cost without diversity -- the stacker can't extract a
+# useful linear combination of two near-collinear features.
+#
+# We also report Member 5 vs Member 1 as a secondary diagnostic: if
+# Member 5's neighborhoods reduce to "subject difficulty propensity"
+# (the IRT-MLP's theta), the M5/M1 corr will be high and the
+# diversity case for Member 5 collapses.
+if _M5_ENABLED and p_member5_val is not None:
+    _y64_4b = ylab_val.astype(np.float64)
+    _err_m1 = p_a_val.astype(np.float64) - _y64_4b
+    _err_m3 = p_member3_val.astype(np.float64) - _y64_4b
+    _err_m5 = p_member5_val.astype(np.float64) - _y64_4b
+    _corr_m5_m3 = float(np.corrcoef(_err_m5, _err_m3)[0, 1])
+    _corr_m5_m1 = float(np.corrcoef(_err_m5, _err_m1)[0, 1])
+    print(
+        f"\n[Gate 4b] Member 5 vs Member 3 error correlation (val): "
+        f"corr(err_m5, err_m3) = {_corr_m5_m3:+.4f}"
+    )
+    print(
+        f"[Gate 4b] Member 5 vs Member 1 error correlation (val): "
+        f"corr(err_m5, err_m1) = {_corr_m5_m1:+.4f}"
+    )
+    if abs(_corr_m5_m3) >= 0.90:
+        print(
+            f"[Gate 4b] FLAG: |corr(err_m5, err_m3)|={abs(_corr_m5_m3):.4f} "
+            ">= 0.90 -- Member 5 is essentially redundant with Member 3 "
+            "(difficulty-projected kNN and raw-embedding kNN are finding the "
+            "same neighborhoods). Possible fixes:\n"
+            "  1. Lower CFG['member5']['tau'] so the kernel is sharper and\n"
+            "     the difficulty distance distinguishes neighbors more.\n"
+            "  2. Increase CFG['member5']['ridge_alpha'] to suppress the\n"
+            "     low-signal embedding dimensions in the projection.\n"
+            "  3. Drop Member 5 if the diversity gain doesn't justify it."
+        )
+    else:
+        print(
+            f"[Gate 4b] PASS: |corr(err_m5, err_m3)|={abs(_corr_m5_m3):.4f} "
+            "< 0.90; Member 5's neighborhoods are sufficiently distinct from "
+            "Member 3's. Task 4 met its decorrelation goal."
+        )
+    # Report Member 5's stacker weight as a final diversity diagnostic:
+    # a weight near zero means the stacker found nothing to add.
+    _w5 = float(stacker_state.weights[4])  # logit_member5 is column 4
+    print(
+        f"[Task 4] Member 5 stacker weight = {_w5:+.4f} "
+        + ("(close to zero -- stacker found little to add; consider "
+           "dropping or retuning Member 5)"
+           if abs(_w5) < 0.05
+           else "(non-trivial -- Member 5 is contributing)")
+    )
 
 # %% [markdown]
 # ## 9f-bis. Gate 1d: train-vs-val optimism check
@@ -4116,6 +4577,10 @@ else:
     p2_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p2_train_shuf")
     p3_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p3_train_shuf")
     p4_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p4_train_shuf")
+    if _M5_ENABLED:
+        p5_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p5_train_shuf")
+    else:
+        p5_train_shuf_acc = None
 
     for fold in folds:
         print(f"\n[OOF Gate 1c] === fold {fold.fold_id} (shuffled labels) ===")
@@ -4319,6 +4784,55 @@ else:
         p4_shuf_fold = logreg_apply_state_batch(_fold_logreg_shuf, X_fo_m4)
         p4_train_shuf_acc.write_fold(fold.oof_row_idx, p4_shuf_fold)
 
+        # Task 4: Fold Member 5 on shuffled labels. The shuffled labels
+        # break any difficulty signal in the projection's regression
+        # target -- if the resulting Member 5 still beats chance on val
+        # we've found leakage in the difficulty pipeline.
+        if _M5_ENABLED:
+            _fold_train_subj_ids_shuf = np.fromiter(
+                (int(indexer.subject_to_id.get(str(s), -1))
+                 for s in fold_train_df["subject_key"]),
+                dtype=np.int64, count=len(fold_train_df),
+            )
+            _fold_item_key_to_pos_shuf = {
+                k: i for i, k in enumerate(fold.train_item_keys)
+            }
+            _fold_train_item_ids_shuf = np.fromiter(
+                (int(_fold_item_key_to_pos_shuf.get(str(k), -1))
+                 for k in fold_train_df["item_key"]),
+                dtype=np.int64, count=len(fold_train_df),
+            )
+            _fold_oof_subj_ids_shuf = np.fromiter(
+                (int(indexer.subject_to_id.get(str(s), -1))
+                 for s in fold_oof_df["subject_key"]),
+                dtype=np.int64, count=len(fold_oof_df),
+            )
+            _fold_oof_item_emb_shuf = np.stack(
+                [np.asarray(item_emb_lookup[str(k)], dtype=np.float32)
+                 for k in fold_oof_df["item_key"]],
+                axis=0,
+            )
+            _fold_m5_shuf = fit_member5(
+                item_keys=list(fold.train_item_keys),
+                item_embeddings=_fold_item_emb_stacked,
+                subject_keys=list(_subject_keys_ordered),
+                subject_ids_per_row=_fold_train_subj_ids_shuf,
+                item_ids_per_row=_fold_train_item_ids_shuf,
+                labels=_y_ft_shuf.astype(np.float64),  # SHUFFLED labels
+                k=_M5_K, tau=_M5_TAU, ridge_alpha=_M5_RIDGE_ALPHA,
+                item_fallback_weight=_M5_ITEM_FB_WEIGHT,
+                min_subjects_per_item=_M5_MIN_SUBJ_PER_ITEM,
+            )
+            p5_shuf_fold = m5_apply_batch_via_ids(
+                _fold_m5_shuf,
+                subject_ids=_fold_oof_subj_ids_shuf,
+                query_item_embeddings=_fold_oof_item_emb_shuf,
+            )
+            p5_train_shuf_acc.write_fold(fold.oof_row_idx, p5_shuf_fold)
+            del _fold_m5_shuf, _fold_oof_item_emb_shuf
+            del _fold_train_subj_ids_shuf, _fold_train_item_ids_shuf
+            del _fold_oof_subj_ids_shuf, _fold_item_key_to_pos_shuf
+
         # M1 real (passed through as feature).
         p_a_train_shuf_acc.write_fold(fold.oof_row_idx, p_a_oof_shuf)
 
@@ -4333,11 +4847,16 @@ else:
     p2_shuf = p2_train_shuf_acc.finalize()
     p3_shuf = p3_train_shuf_acc.finalize()
     p4_shuf = p4_train_shuf_acc.finalize()
+    if _M5_ENABLED:
+        p5_shuf = p5_train_shuf_acc.finalize()
 
     # Fit a stacker on shuffled-label OOF predictions and apply to val.
-    stacker_member_probs_train_shuf = np.stack(
-        [p_a_shuf, p2_shuf, p3_shuf, p4_shuf], axis=1
-    ).astype(np.float32)
+    # Match the live stacker's [N, n_members] column layout exactly so the
+    # null run is comparable.
+    _shuf_member_list = [p_a_shuf, p2_shuf, p3_shuf, p4_shuf]
+    if _M5_ENABLED:
+        _shuf_member_list.append(p5_shuf)
+    stacker_member_probs_train_shuf = np.stack(_shuf_member_list, axis=1).astype(np.float32)
     stacker_X_train_shuf = build_stacker_features(
         member_probs=stacker_member_probs_train_shuf,
         bench_present=_train_bench_present,
@@ -4348,6 +4867,7 @@ else:
     stacker_state_shuf = fit_stacker(
         X=stacker_X_train_shuf,
         y=y_train_shuf,
+        feature_names=stacker_feature_names(_n_stacker_members),
         n_iters=int(CFG.get("stacker", {}).get("n_iters", 1500)),
         learning_rate=float(CFG.get("stacker", {}).get("learning_rate", 0.05)),
         l2=float(CFG.get("stacker", {}).get("l2", 1.0)),
@@ -4533,9 +5053,14 @@ def _fit_nn_calibrator():
 # depends on, plus the calibrator's own config. Any change in Model A
 # weights, GBDT trees, kNN tables, LogReg weights, stacker weights, or
 # the calibrator hyperparameters auto-invalidates the cache.
+_oof_member_preds_for_digest = [
+    p_a_train_oof, p2_train_oof, p3_train_oof, p4_train_oof,
+]
+if _M5_ENABLED:
+    _oof_member_preds_for_digest.append(p5_train_oof)
 _oof_member_preds_digest = _hashlib.sha256(
     np.ascontiguousarray(
-        np.stack([p_a_train_oof, p2_train_oof, p3_train_oof, p4_train_oof], axis=1),
+        np.stack(_oof_member_preds_for_digest, axis=1),
         dtype=np.float32,
     ).tobytes()
 ).hexdigest()[:16]
@@ -4546,6 +5071,12 @@ CALIBRATOR_KEY_INPUTS = (
     state_fingerprint(knn_state),
     state_fingerprint(logreg_state),
     state_fingerprint(stacker_state),
+    # Task 4: include Member 5's state in the calibrator cache key so a
+    # Member-5-on/off toggle (or any retuning of k/tau/ridge_alpha)
+    # invalidates the calibrator entry. Without this, a stale calibrator
+    # fit on 4-member stacker outputs would silently apply to 5-member
+    # stacker outputs.
+    state_fingerprint(member5_state) if _M5_ENABLED else "no_m5",
     int(CFG["nn_calibration"]["k"]),
     str(CFG["nn_calibration"].get("similarity", "cosine")),
     float(CFG["nn_calibration"].get("temperature", 1.0)),
@@ -4755,6 +5286,12 @@ sub_dir = export_four_member_stacked_run(
     # would fall back to Member 1's prediction as the anchor, which
     # would silently mis-compose the val-fit Member 2 booster's trees.
     subject_mean_table=(subject_mean_table_global if _M2V2_ENABLED else None),
+    # Task 4: ship Member 5 (difficulty-projected kNN). The exporter
+    # raises if member5_state is non-None and stacker_state has only 4
+    # member columns -- that misconfig would silently drop Member 5 at
+    # runtime. We're safe here: when _M5_ENABLED, the stacker above
+    # was fit with [N, 5] member_probs (feature_dim==9).
+    member5_state=(member5_state if _M5_ENABLED else None),
 )
 print(f"[Export] stacked bundle: {sub_dir}")
 
@@ -4817,7 +5354,10 @@ print(f"  Member 1 (Model A IRT-MLP)        : {_ll(p_a_val):.6f}")
 print(f"  Member 2 (LightGBM)               : {_ll(p_member2_val):.6f}")
 print(f"  Member 3 (kNN-similarity)         : {_ll(p_member3_val):.6f}")
 print(f"  Member 4 (LogReg)                 : {_ll(p_member4_val):.6f}")
-print(f"  Uniform avg of 4                  : {_ll(stacker_member_probs_val.mean(axis=1)):.6f}")
+if _M5_ENABLED:
+    print(f"  Member 5 (difficulty-kNN)         : {_ll(p_member5_val):.6f}")
+print(f"  Uniform avg of {'5' if _M5_ENABLED else '4'}                  : "
+      f"{_ll(stacker_member_probs_val.mean(axis=1)):.6f}")
 print(f"  Stacker only                      : {_ll(p_stacker_val):.6f}")
 print(f"  Stacker + NN calibrator (FINAL)   : {_ll(p_final_val):.6f}")
 
@@ -4841,6 +5381,29 @@ checks: list[tuple[str, bool, str]] = [
                                        __import__("re").MULTILINE)),
      "found bare `import faiss`"),
 ]
+# Task 4: Member 5 bundle/runtime parity. When enabled offline, the
+# bundle MUST contain artifacts/member5_dknn/ AND the runtime block
+# MUST import member5_difficulty_knn -- otherwise the runtime would
+# silently fall back to the 4-member path even though the stacker was
+# fit on 5 columns (the stacker would then misinterpret the missing
+# 5th column as zero, breaking every prediction).
+if _M5_ENABLED:
+    m5_dir_in_bundle = (sub_dir / "artifacts" / "member5_dknn").exists()
+    m5_pure_in_bundle = (sub_dir / "_pure" / "member5_difficulty_knn.py").exists()
+    checks.extend([
+        ("Member 5 artifacts dir shipped",
+         m5_dir_in_bundle,
+         "missing artifacts/member5_dknn"),
+        ("Member 5 pure module shipped",
+         m5_pure_in_bundle,
+         "missing _pure/member5_difficulty_knn.py"),
+        ("Member 5 runtime loader present in model.py",
+         "_MEMBER5_STATE" in model_py_text and "member5_difficulty_knn" in model_py_text,
+         "Member 5 loader block missing from model.py"),
+        ("Stacker has 5 member columns (feature_dim==9)",
+         int(stacker_state.feature_dim) == 9,
+         f"stacker feature_dim={int(stacker_state.feature_dim)} (expected 9)"),
+    ])
 for name, ok, fail_reason in checks:
     flag = "PASS" if ok else "FAIL"
     print(f"  [{flag}] {name}" + ("" if ok else f"  ({fail_reason})"))
@@ -4948,6 +5511,29 @@ expected = max(min(knn_state.global_passrate, 1 - 1e-6), 1e-6)
 import math
 assert math.isclose(p3_unk, expected, abs_tol=1e-6)
 print(f"  [PASS] kNN unknown-subject -> global prior {p3_unk:.4f}")
+
+# Task 4: Member 5 robustness checks. These mirror the Member 3 checks
+# above so a future bundle integrator can spot Member 5 problems the
+# same way they spot Member 3 problems.
+if _M5_ENABLED and member5_state is not None:
+    # Zero-norm query -> Member 5 projects to ~bias, returns sane prob.
+    p5_zero = m5_apply_one(
+        member5_state, zero_q, _subject_keys_ordered[0],
+    )
+    assert 0.0 < p5_zero < 1.0 and np.isfinite(p5_zero), (
+        f"Member 5 zero-norm query returned {p5_zero!r}, expected (0, 1) finite."
+    )
+    print(f"  [PASS] M5 zero-norm query -> {p5_zero:.4f} (finite={np.isfinite(p5_zero)})")
+    # Unknown subject -> Member 5 falls through to global_mean / its own fallback.
+    p5_unk = m5_apply_one(
+        member5_state,
+        rng_redteam.normal(size=ITEM_EMB_DIM).astype(np.float32),
+        "totally_unknown_subject",
+    )
+    assert 0.0 < p5_unk < 1.0 and np.isfinite(p5_unk), (
+        f"Member 5 unknown-subject returned {p5_unk!r}, expected (0, 1) finite."
+    )
+    print(f"  [PASS] M5 unknown-subject -> {p5_unk:.4f} (fallback path)")
 
 # --- 12f. Final summary.
 print("\n" + "=" * 72)

@@ -33,6 +33,8 @@ from src.stacker import (
     fit_stacker,
     logit_clipped,
     make_kfold_split,
+    stacker_feature_dim,
+    stacker_feature_names,
 )
 
 
@@ -97,6 +99,100 @@ def test_build_stacker_features_layout():
     np.testing.assert_array_equal(feats[:, 5], nn_support)
     np.testing.assert_array_equal(feats[:, 6], nn_sim)
     np.testing.assert_array_equal(feats[:, 7], centroid_distance)
+
+
+def test_stacker_feature_names_helpers_match_legacy_4member_constants():
+    """The dynamic helpers must agree with the legacy constants for M=4
+    so existing 4-member callers/bundles keep working unchanged."""
+    assert stacker_feature_names(4) == STACKER_FEATURE_NAMES
+    assert stacker_feature_dim(4) == STACKER_FEATURE_DIM
+
+
+def test_stacker_feature_names_for_5_members_appends_logit_member5():
+    names_5 = stacker_feature_names(5)
+    assert len(names_5) == stacker_feature_dim(5) == 9
+    assert names_5[:5] == (
+        "logit_member1", "logit_member2", "logit_member3",
+        "logit_member4", "logit_member5",
+    )
+    assert names_5[5:] == STACKER_FEATURE_NAMES[4:]
+
+
+def test_stacker_feature_names_rejects_zero_members():
+    with pytest.raises(ValueError, match="n_members"):
+        stacker_feature_names(0)
+
+
+def test_build_stacker_features_supports_5_members():
+    """Task 4: stacker must accept [N, 5] member_probs and produce a
+    [N, 9] matrix with logit_member5 at column index 4 and the four
+    aux features at columns 5..8."""
+    member_probs = np.array(
+        [[0.1, 0.5, 0.9, 0.2, 0.3], [0.7, 0.3, 0.6, 0.4, 0.8]],
+        dtype=np.float32,
+    )
+    bench_present = np.array([1, 0], dtype=np.float32)
+    nn_support = np.array([1.5, 0.0], dtype=np.float32)
+    nn_sim = np.array([0.8, 0.1], dtype=np.float32)
+    centroid_distance = np.array([0.4, 1.2], dtype=np.float32)
+    feats = build_stacker_features(
+        member_probs=member_probs,
+        bench_present=bench_present,
+        nn_neighbor_support=nn_support,
+        nn_mean_similarity=nn_sim,
+        centroid_distance=centroid_distance,
+    )
+    assert feats.shape == (2, stacker_feature_dim(5))
+    expected_logits = np.log(member_probs / (1 - member_probs))
+    np.testing.assert_allclose(feats[:, 0:5], expected_logits, atol=1e-5)
+    np.testing.assert_array_equal(feats[:, 5], bench_present)
+    np.testing.assert_array_equal(feats[:, 6], nn_support)
+    np.testing.assert_array_equal(feats[:, 7], nn_sim)
+    np.testing.assert_array_equal(feats[:, 8], centroid_distance)
+
+
+def test_build_stacker_features_one_supports_5_members():
+    """Single-row Task 4 path."""
+    feats = build_stacker_features_one(
+        member_probs=[0.1, 0.5, 0.9, 0.2, 0.7],
+        bench_present=1.0,
+        nn_neighbor_support=1.5,
+        nn_mean_similarity=0.8,
+        centroid_distance=0.4,
+    )
+    assert int(feats.shape[0]) == stacker_feature_dim(5)
+    np.testing.assert_allclose(
+        feats[0:5],
+        [logit_clipped(p) for p in [0.1, 0.5, 0.9, 0.2, 0.7]],
+        atol=1e-5,
+    )
+
+
+def test_build_stacker_features_one_5_member_matches_batch():
+    """5-member single-row builder must produce the same row as the
+    batch builder; otherwise offline/runtime parity is broken."""
+    rng = np.random.default_rng(11)
+    member_probs = rng.uniform(0.05, 0.95, size=(8, 5)).astype(np.float32)
+    bench_present = rng.integers(0, 2, size=8).astype(np.float32)
+    nn_support = rng.uniform(0, 3, size=8).astype(np.float32)
+    nn_sim = rng.uniform(-0.1, 0.95, size=8).astype(np.float32)
+    centroid_distance = rng.uniform(0.05, 2.5, size=8).astype(np.float32)
+    feats_batch = build_stacker_features(
+        member_probs=member_probs,
+        bench_present=bench_present,
+        nn_neighbor_support=nn_support,
+        nn_mean_similarity=nn_sim,
+        centroid_distance=centroid_distance,
+    )
+    for i in range(member_probs.shape[0]):
+        f_one = build_stacker_features_one(
+            member_probs=member_probs[i].tolist(),
+            bench_present=float(bench_present[i]),
+            nn_neighbor_support=float(nn_support[i]),
+            nn_mean_similarity=float(nn_sim[i]),
+            centroid_distance=float(centroid_distance[i]),
+        )
+        np.testing.assert_allclose(f_one, feats_batch[i], atol=1e-5)
 
 
 def test_build_stacker_features_one_matches_batch():

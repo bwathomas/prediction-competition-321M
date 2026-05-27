@@ -431,6 +431,159 @@ def test_export_ships_subject_mean_table_when_provided(tmp_path):
     assert "legacy / pre-Task-3" in txt2 or "fall back" in txt2
 
 
+def _make_synthetic_member5_state(tmp_path: Path):
+    """Build a minimal Member5State that's compatible with the export
+    pipeline: a 6-D supervised difficulty projection with a handful of
+    items and subjects."""
+    from src.member5_difficulty_knn import fit_member5
+
+    rng = np.random.default_rng(7)
+    n_items = 60
+    n_subjects = 20
+    d_emb = 6
+    item_keys = tuple(f"item_{i}" for i in range(n_items))
+    subject_keys = tuple(f"subj_{s}" for s in range(n_subjects))
+    item_embeddings = rng.normal(size=(n_items, d_emb)).astype(np.float32)
+    # Random ratings.
+    rows_s, rows_i, rows_y = [], [], []
+    for s in range(n_subjects):
+        items_seen = rng.choice(n_items, size=15, replace=False)
+        for i in items_seen:
+            rows_s.append(s); rows_i.append(int(i))
+            rows_y.append(float(rng.random() < 0.5))
+    return fit_member5(
+        item_keys=item_keys,
+        item_embeddings=item_embeddings,
+        subject_keys=subject_keys,
+        subject_ids_per_row=np.array(rows_s, dtype=np.int64),
+        item_ids_per_row=np.array(rows_i, dtype=np.int64),
+        labels=np.array(rows_y, dtype=np.float64),
+        k=5, tau=0.05, ridge_alpha=0.5,
+        item_fallback_weight=0.3, min_subjects_per_item=2,
+    )
+
+
+def _make_5member_stacker_state(rng_seed: int = 99) -> StackerState:
+    """Synthetic 5-member stacker for the Member 5 export tests."""
+    rng = np.random.default_rng(rng_seed)
+    z = rng.normal(size=200).astype(np.float32)
+    p_true = 1.0 / (1.0 + np.exp(-z))
+    member_probs = np.stack(
+        [1 / (1 + np.exp(-(z + rng.normal(0, 0.3 + 0.1 * i, 200))))
+         for i in range(5)],
+        axis=1,
+    ).astype(np.float32)
+    bp = (rng.uniform(size=200) < 0.7).astype(np.float32)
+    nns = np.log1p(rng.uniform(0, 16, 200)).astype(np.float32)
+    nms = rng.uniform(-0.1, 0.95, 200).astype(np.float32)
+    cd = rng.uniform(0.1, 2.0, 200).astype(np.float32)
+
+    from src.stacker import build_stacker_features, stacker_feature_names
+
+    feats = build_stacker_features(
+        member_probs=member_probs,
+        bench_present=bp,
+        nn_neighbor_support=nns,
+        nn_mean_similarity=nms,
+        centroid_distance=cd,
+    )
+    y_st = (rng.uniform(size=200) < p_true).astype(np.float32)
+    return fit_stacker(
+        X=feats, y=y_st,
+        feature_names=stacker_feature_names(5),
+        n_iters=150, learning_rate=0.05, l2=1.0, seed=int(rng_seed),
+    )
+
+
+def test_export_ships_member5_state_when_provided_and_5col_stacker(tmp_path):
+    """Task 4: when member5_state is provided AND the stacker has 5
+    member columns (feature_dim == 9), the exporter must:
+
+    1. Write artifacts/member5_dknn/{member5_state.npz, member5_meta.json}.
+    2. Copy _pure/member5_difficulty_knn.py into the bundle.
+    3. Include the Member 5 runtime block in model.py that loads the
+       state and calls apply_one when the bundle has Member 5.
+    """
+    member1 = _build_minimal_member1_bundle(tmp_path)
+    states = _make_synthetic_states(tmp_path)
+    m5_state = _make_synthetic_member5_state(tmp_path)
+    stacker_5 = _make_5member_stacker_state()
+    assert int(stacker_5.feature_dim) == 9, (
+        f"5-member stacker fixture should have feature_dim==9, got "
+        f"{stacker_5.feature_dim}"
+    )
+
+    out = export_four_member_stacked_run(
+        member1_bundle_dir=member1,
+        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        stacker_state=stacker_5,
+        nn_calibrator=states[4], residual_table=states[5],
+        out_dir=tmp_path / "submission_with_m5",
+        src_dir=Path("src"),
+        member5_state=m5_state,
+    )
+    m5_dir = out / "artifacts" / "member5_dknn"
+    assert m5_dir.exists()
+    assert (m5_dir / "member5_state.npz").exists()
+    assert (m5_dir / "member5_meta.json").exists()
+    # Pure module is shipped.
+    assert (out / "_pure" / "member5_difficulty_knn.py").exists()
+    # Runtime template must reference Member 5.
+    txt = (out / "model.py").read_text(encoding="utf-8")
+    assert "_MEMBER5_STATE" in txt
+    assert "member5_dknn" in txt
+    assert "member5_difficulty_knn" in txt
+    # Locked member order: p1..p5 must appear in the inference block.
+    assert "[p1, p2, p3, p4]" in txt
+    # The Member 5 score must be appended to member_probs (5-member case).
+    assert "_member_probs_runtime.append(p5)" in txt
+
+
+def test_export_omits_member5_dir_when_not_provided(tmp_path):
+    """Task 4 backward-compat: 4-member bundle (member5_state=None,
+    legacy 4-col stacker) must NOT create artifacts/member5_dknn/, AND
+    the runtime template's Member 5 guard must still be present so that
+    the runtime correctly identifies the bundle as 4-member."""
+    member1 = _build_minimal_member1_bundle(tmp_path)
+    states = _make_synthetic_states(tmp_path)
+    out = export_four_member_stacked_run(
+        member1_bundle_dir=member1,
+        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        stacker_state=states[3],
+        nn_calibrator=states[4], residual_table=states[5],
+        out_dir=tmp_path / "submission_no_m5",
+        src_dir=Path("src"),
+        member5_state=None,
+    )
+    assert not (out / "artifacts" / "member5_dknn").exists()
+    txt = (out / "model.py").read_text(encoding="utf-8")
+    # The guard is still there (loaded conditionally on _HAS_MEMBER5).
+    assert "_HAS_MEMBER5" in txt
+    # The pure module is still shipped (cheap; downstream calls are guarded).
+    assert (out / "_pure" / "member5_difficulty_knn.py").exists()
+
+
+def test_export_rejects_member5_with_4col_stacker(tmp_path):
+    """Misconfiguration guard: shipping member5_state with a 4-column
+    stacker would silently ignore Member 5 at runtime. The exporter
+    must raise so the mistake is loud."""
+    member1 = _build_minimal_member1_bundle(tmp_path)
+    states = _make_synthetic_states(tmp_path)
+    m5_state = _make_synthetic_member5_state(tmp_path)
+    # states[3] is the legacy 4-column stacker.
+    assert int(states[3].feature_dim) == 8
+    with pytest.raises(ValueError, match="member5_state was provided"):
+        export_four_member_stacked_run(
+            member1_bundle_dir=member1,
+            gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+            stacker_state=states[3],
+            nn_calibrator=states[4], residual_table=states[5],
+            out_dir=tmp_path / "submission_mismatched",
+            src_dir=Path("src"),
+            member5_state=m5_state,
+        )
+
+
 def test_export_strips_faiss_and_appends_stacker_block(tmp_path):
     member1 = _build_minimal_member1_bundle(tmp_path)
     gbdt_state, knn_state, logreg_state, stacker_state, cal, rt = _make_synthetic_states(tmp_path)

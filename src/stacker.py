@@ -59,6 +59,12 @@ _EPS = 1.0e-6
 
 
 # Locked feature schema ----------------------------------------------------
+#
+# The legacy 4-member schema (kept as the module-level default for backward
+# compatibility with pre-Task-4 callers/bundles). For Task 4 (Member 5 -- the
+# difficulty-projected kNN) we allow a 5-member variant, and the builder
+# below accepts an arbitrary member count so the only thing the notebook has
+# to do is pass an [N, 5] member_probs matrix.
 
 STACKER_FEATURE_NAMES: tuple[str, ...] = (
     "logit_member1",
@@ -71,6 +77,32 @@ STACKER_FEATURE_NAMES: tuple[str, ...] = (
     "centroid_distance",
 )
 STACKER_FEATURE_DIM: int = len(STACKER_FEATURE_NAMES)
+
+_NUM_AUX_FEATURES: int = 4  # bench_present + 3 NN/centroid features
+
+
+def stacker_feature_names(n_members: int) -> tuple[str, ...]:
+    """Return the canonical column names for a stacker with ``n_members`` members.
+
+    The trailing 4 columns (bench_present, nn_neighbor_support,
+    nn_mean_similarity, centroid_distance) are fixed; the first
+    ``n_members`` columns are ``logit_memberN`` in 1-indexed order.
+    """
+    if int(n_members) < 1:
+        raise ValueError(f"n_members must be >= 1, got {n_members}")
+    member_cols = tuple(f"logit_member{i + 1}" for i in range(int(n_members)))
+    aux_cols = (
+        "bench_present",
+        "nn_neighbor_support",
+        "nn_mean_similarity",
+        "centroid_distance",
+    )
+    return member_cols + aux_cols
+
+
+def stacker_feature_dim(n_members: int) -> int:
+    """Total stacker feature dimensionality for ``n_members`` members."""
+    return int(n_members) + _NUM_AUX_FEATURES
 
 
 def logit_clipped(p: np.ndarray | float, eps: float = _EPS) -> np.ndarray | float:
@@ -259,25 +291,32 @@ def apply_batch(state: StackerState, features_matrix: np.ndarray) -> np.ndarray:
 
 def build_stacker_features(
     *,
-    member_probs: np.ndarray,         # [N, 4] in (0, 1)
+    member_probs: np.ndarray,         # [N, M] in (0, 1); M = #members (4 or 5)
     bench_present: np.ndarray,        # [N] in {0, 1}
     nn_neighbor_support: np.ndarray,  # [N] non-negative
     nn_mean_similarity: np.ndarray,   # [N] in [-1, 1] for cosine
     centroid_distance: np.ndarray,    # [N] non-negative
 ) -> np.ndarray:
-    """Assemble the [N, 8] stacker feature matrix.
+    """Assemble the [N, M+4] stacker feature matrix.
 
-    Member probs are converted to logit space here (clipped to (eps, 1-eps)).
-    The user spec mandates logit-space inputs because bce-on-sigmoid is
-    well-conditioned in that space and a stacker that gets fed raw
-    probabilities tends to learn a near-linear combination that biases
-    toward the prior at the boundaries.
+    ``M`` is the number of member columns (4 for the legacy ensemble,
+    5 once Task 4's difficulty-projected kNN is enabled). Member probs
+    are converted to logit space here (clipped to (eps, 1-eps)) -- the
+    user spec mandates logit-space inputs because bce-on-sigmoid is
+    well-conditioned there and a stacker fed raw probabilities tends
+    to learn a near-linear combination that biases toward the prior
+    at the boundaries.
     """
-    if member_probs.ndim != 2 or member_probs.shape[1] != 4:
+    if member_probs.ndim != 2:
         raise ValueError(
-            f"member_probs must be [N, 4], got {member_probs.shape}"
+            f"member_probs must be 2D [N, M], got {member_probs.shape}"
+        )
+    if member_probs.shape[1] < 1:
+        raise ValueError(
+            f"member_probs must have >= 1 member columns, got {member_probs.shape}"
         )
     N = int(member_probs.shape[0])
+    M = int(member_probs.shape[1])
     for arr_name, arr in [
         ("bench_present", bench_present),
         ("nn_neighbor_support", nn_neighbor_support),
@@ -290,14 +329,14 @@ def build_stacker_features(
                 f"{arr_name} length {a.shape[0]} != N {N}"
             )
 
-    out = np.empty((N, STACKER_FEATURE_DIM), dtype=np.float32)
-    out[:, 0:4] = logit_clipped(np.asarray(member_probs, dtype=np.float64)).astype(
+    out = np.empty((N, M + _NUM_AUX_FEATURES), dtype=np.float32)
+    out[:, 0:M] = logit_clipped(np.asarray(member_probs, dtype=np.float64)).astype(
         np.float32
     )
-    out[:, 4] = np.asarray(bench_present, dtype=np.float32).reshape(-1)
-    out[:, 5] = np.asarray(nn_neighbor_support, dtype=np.float32).reshape(-1)
-    out[:, 6] = np.asarray(nn_mean_similarity, dtype=np.float32).reshape(-1)
-    out[:, 7] = np.asarray(centroid_distance, dtype=np.float32).reshape(-1)
+    out[:, M + 0] = np.asarray(bench_present, dtype=np.float32).reshape(-1)
+    out[:, M + 1] = np.asarray(nn_neighbor_support, dtype=np.float32).reshape(-1)
+    out[:, M + 2] = np.asarray(nn_mean_similarity, dtype=np.float32).reshape(-1)
+    out[:, M + 3] = np.asarray(centroid_distance, dtype=np.float32).reshape(-1)
     out = np.where(np.isfinite(out), out, 0.0).astype(np.float32, copy=False)
     return out
 
@@ -310,18 +349,23 @@ def build_stacker_features_one(
     nn_mean_similarity: float,
     centroid_distance: float,
 ) -> np.ndarray:
-    """Single-row builder; mirrors ``build_stacker_features`` exactly."""
-    feats = np.empty(STACKER_FEATURE_DIM, dtype=np.float32)
-    if int(len(member_probs)) != 4:
+    """Single-row builder; mirrors ``build_stacker_features`` exactly.
+
+    ``member_probs`` length is read at call time, so the same function
+    handles both the legacy 4-member case and the Task-4 5-member case.
+    """
+    M = int(len(member_probs))
+    if M < 1:
         raise ValueError(
-            f"member_probs must be length 4, got {len(member_probs)}"
+            f"member_probs must have >= 1 entries, got {M}"
         )
+    feats = np.empty(M + _NUM_AUX_FEATURES, dtype=np.float32)
     for i, p in enumerate(member_probs):
         feats[i] = float(logit_clipped(float(p)))
-    feats[4] = float(bench_present)
-    feats[5] = float(nn_neighbor_support)
-    feats[6] = float(nn_mean_similarity)
-    feats[7] = float(centroid_distance)
+    feats[M + 0] = float(bench_present)
+    feats[M + 1] = float(nn_neighbor_support)
+    feats[M + 2] = float(nn_mean_similarity)
+    feats[M + 3] = float(centroid_distance)
     feats = np.where(np.isfinite(feats), feats, 0.0).astype(np.float32, copy=False)
     return feats
 

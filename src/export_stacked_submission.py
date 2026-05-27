@@ -131,6 +131,30 @@ if _HAS_STACKED_BUNDLE:
     _LOGREG_STATE = _logreg_mod.LogRegMemberState.load(_STACKED_ROOT / "member4_logreg")
     _STACKER_STATE = _stacker_mod.StackerState.load(_STACKED_ROOT / "stacker")
 
+    # Task 4: optional Member 5 (difficulty-projected kNN). When the
+    # bundle ships an artifacts/member5_dknn/ directory AND the stacker
+    # was fit with 5 member columns (feature_dim == 9), Member 5 is
+    # scored and fed into the stacker. When absent OR when the stacker
+    # was fit with only 4 columns (legacy/pre-Task-4 bundles), the
+    # runtime stays on the 4-member path.
+    _MEMBER5_DIR = _STACKED_ROOT / "member5_dknn"
+    _HAS_MEMBER5 = (
+        _MEMBER5_DIR.exists()
+        and int(_STACKER_STATE.feature_dim) >= 9
+    )
+    if _HAS_MEMBER5:
+        import member5_difficulty_knn as _m5_mod
+        _MEMBER5_STATE = _m5_mod.Member5State.load(_MEMBER5_DIR)
+        LOG.info(
+            "[stacked] loaded Member 5 (difficulty-kNN): "
+            "n_items=%d  n_subjects=%d  k=%d  tau=%.3f",
+            int(_MEMBER5_STATE.n_items), int(_MEMBER5_STATE.n_subjects),
+            int(_MEMBER5_STATE.k), float(_MEMBER5_STATE.tau),
+        )
+    else:
+        _m5_mod = None
+        _MEMBER5_STATE = None
+
     # Calibrator: state dict + optional residual table.
     _NN_CAL_STACKED_DIR = _STACKED_ROOT / "nn_calibrator_stacked"
     _NN_CAL_STATE_PATH = _NN_CAL_STACKED_DIR / "state.json"
@@ -304,8 +328,24 @@ if _HAS_STACKED_BUNDLE:
             n_support = float(np.log1p(int(_topk_sims.size)))
             centroid_dist = 0.5  # Phase 6 may upgrade this from the centroid module.
 
+            # Task 4: score Member 5 (difficulty-kNN) when present and
+            # pass it as the 5th member; otherwise stay on the legacy
+            # 4-member path. We MUST keep the [p1..pN] order locked --
+            # the stacker weights are aligned to this exact order.
+            _member_probs_runtime = [p1, p2, p3, p4]
+            if _HAS_MEMBER5 and _MEMBER5_STATE is not None and _m5_mod is not None:
+                try:
+                    p5 = float(_m5_mod.apply_one(
+                        _MEMBER5_STATE, item_emb, subject_key,
+                    ))
+                except Exception as _m5_exc:
+                    LOG.warning("[stacked] Member 5 apply failed (%s); "
+                                "falling back to its global mean.", _m5_exc)
+                    p5 = float(min(max(float(_MEMBER5_STATE.global_mean),
+                                       1e-6), 1.0 - 1e-6))
+                _member_probs_runtime.append(p5)
             stacker_feats = _stacker_mod.build_stacker_features_one(
-                member_probs=[p1, p2, p3, p4],
+                member_probs=_member_probs_runtime,
                 bench_present=bench_present,
                 nn_neighbor_support=n_support,
                 nn_mean_similarity=mean_sim,
@@ -405,6 +445,11 @@ _PURE_MODULE_NAMES: tuple[str, ...] = (
     "stacker",
     "nn_calibration",
     "member_features",
+    # Task 4: Member 5 (difficulty-projected kNN). Pure-numpy at runtime;
+    # shipped alongside knn_member.py. The model.py block above only
+    # imports it when artifacts/member5_dknn/ exists AND the stacker
+    # was fit with 5 member columns.
+    "member5_difficulty_knn",
 )
 
 
@@ -515,6 +560,7 @@ def export_four_member_stacked_run(
     src_dir: Path | str = "src",
     runtime_feature_builder_py: str | None = None,
     subject_mean_table: Any | None = None,
+    member5_state: Any | None = None,
     zip_cap_bytes: int = _DEFAULT_ZIP_CAP_BYTES,
     audit: bool = True,
 ) -> Path:
@@ -558,6 +604,14 @@ def export_four_member_stacked_run(
         ``subject_mean[subject_id]`` as the Member-2 anchor instead of
         Member 1's prediction. When ``None``, the runtime falls back
         to Member 1 as the anchor (legacy / pre-Task-3 behavior).
+    member5_state : Member5State | None
+        Task 4: Member 5 (difficulty-projected kNN). When provided AND
+        the stacker was fit with 5 member columns (feature_dim == 9),
+        the state is shipped to ``artifacts/member5_dknn/`` and the
+        runtime scores it alongside Members 1-4. When ``None`` (or
+        when the stacker has only 4 member columns), the runtime
+        stays on the 4-member path; this preserves backward
+        compatibility with pre-Task-4 bundles.
     zip_cap_bytes : int
         Hard upper bound on the bundle's uncompressed total size.
     audit : bool
@@ -604,6 +658,22 @@ def export_four_member_stacked_run(
         )
     if residual_table is not None:
         residual_table.save(artifacts_dir / "residual_table")
+
+    # Task 4: ship Member 5 (difficulty-projected kNN) when provided.
+    # We guard against the misconfiguration of shipping member5_state
+    # without a 5-column stacker, since the runtime would silently
+    # ignore it. Raise an explicit error to make the misconfig loud.
+    if member5_state is not None:
+        if int(stacker_state.feature_dim) < 9:
+            raise ValueError(
+                "member5_state was provided but stacker_state has "
+                f"feature_dim={int(stacker_state.feature_dim)} (<9), meaning "
+                "the stacker was fit on only 4 member columns and would "
+                "silently ignore Member 5 at runtime. Re-train the stacker "
+                "with [N, 5] member_probs OR drop member5_state from the "
+                "export call."
+            )
+        member5_state.save(artifacts_dir / "member5_dknn")
 
     # Task 3: ship the subject_mean table so the runtime can use it as
     # the Member-2 residual anchor (instead of Member 1's prediction).
