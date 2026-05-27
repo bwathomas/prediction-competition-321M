@@ -362,6 +362,75 @@ def test_export_assembles_bundle_layout(tmp_path):
     assert (out / "artifacts" / "residual_table" / "meta.json").exists()
 
 
+def test_export_ships_subject_mean_table_when_provided(tmp_path):
+    """Task 3: when subject_mean_table is passed, the exporter must
+    materialize artifacts/subject_mean/{subject_mean.npy, meta.json}
+    AND the runtime template must reference the table-aware anchor
+    selection block.
+
+    When subject_mean_table=None, the artifacts dir must NOT exist and
+    the template still works (legacy: Member 1 anchor)."""
+    from src.subject_mean import fit_subject_mean_table
+
+    member1 = _build_minimal_member1_bundle(tmp_path)
+    states = _make_synthetic_states(tmp_path)
+    sm_table = fit_subject_mean_table(
+        subject_ids=np.array([0, 0, 1, 1, 2], dtype=np.int64),
+        labels=np.array([1.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float64),
+        n_subjects=3,
+        smoothing=5.0,
+    )
+
+    out_with = export_four_member_stacked_run(
+        member1_bundle_dir=member1,
+        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        stacker_state=states[3], nn_calibrator=states[4], residual_table=states[5],
+        out_dir=tmp_path / "submission_with_sm",
+        src_dir=Path("src"),
+        subject_mean_table=sm_table,
+    )
+    sm_dir = out_with / "artifacts" / "subject_mean"
+    assert sm_dir.exists()
+    assert (sm_dir / "subject_mean.npy").exists()
+    assert (sm_dir / "subject_obs_count.npy").exists()
+    assert (sm_dir / "meta.json").exists()
+    meta = json.loads((sm_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["n_subjects"] == 3
+    assert math.isclose(meta["smoothing"], 5.0, abs_tol=1e-9)
+    assert 0.0 <= meta["global_mean"] <= 1.0
+    # Re-load the saved .npy and confirm values round-trip.
+    saved = np.load(sm_dir / "subject_mean.npy")
+    np.testing.assert_allclose(saved, sm_table.subject_mean, rtol=1e-10)
+
+    # Runtime template must include the table-aware anchor branch.
+    txt = (out_with / "model.py").read_text(encoding="utf-8")
+    assert "_SUBJECT_MEAN_TABLE" in txt
+    assert "_SUBJECT_MEAN_GLOBAL" in txt
+    # The Task-3 anchor selection logic must be present.
+    assert "subject_mean[subject_id]" in txt or "_SUBJECT_MEAN_TABLE[_s_id]" in txt
+
+    # And: without the table, the artifacts dir must NOT exist and the
+    # template should still load (the legacy Member 1 anchor branch
+    # kicks in via _SUBJECT_MEAN_TABLE is None).
+    second_root = tmp_path / "second_run"
+    second_root.mkdir()
+    member1_b = _build_minimal_member1_bundle(second_root)
+    out_without = export_four_member_stacked_run(
+        member1_bundle_dir=member1_b,
+        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        stacker_state=states[3], nn_calibrator=states[4], residual_table=states[5],
+        out_dir=tmp_path / "submission_no_sm",
+        src_dir=Path("src"),
+        subject_mean_table=None,
+    )
+    assert not (out_without / "artifacts" / "subject_mean").exists()
+    # Template still loads the table-aware block (with fallback to None).
+    txt2 = (out_without / "model.py").read_text(encoding="utf-8")
+    assert "_SUBJECT_MEAN_TABLE" in txt2
+    # Fallback comment must be present so future readers know it's intentional.
+    assert "legacy / pre-Task-3" in txt2 or "fall back" in txt2
+
+
 def test_export_strips_faiss_and_appends_stacker_block(tmp_path):
     member1 = _build_minimal_member1_bundle(tmp_path)
     gbdt_state, knn_state, logreg_state, stacker_state, cal, rt = _make_synthetic_states(tmp_path)

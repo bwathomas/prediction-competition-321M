@@ -152,6 +152,26 @@ if _HAS_STACKED_BUNDLE:
             n_training_items=int(_KNN_STATE.n_items),
         )
 
+    # Task 3: optional subject_mean table for Member 2's residual anchor.
+    # When present, Member 2 composes against `subject_mean[subject_id]`
+    # instead of Member 1's prediction (the legacy anchor). When absent,
+    # the runtime falls back to Member 1 -- safe for pre-Task-3 bundles.
+    _SUBJECT_MEAN_DIR = _STACKED_ROOT / "subject_mean"
+    if _SUBJECT_MEAN_DIR.exists():
+        _SUBJECT_MEAN_TABLE = np.load(_SUBJECT_MEAN_DIR / "subject_mean.npy").astype(np.float64)
+        _SUBJECT_MEAN_META = json.loads(
+            (_SUBJECT_MEAN_DIR / "meta.json").read_text(encoding="utf-8")
+        )
+        _SUBJECT_MEAN_GLOBAL = float(_SUBJECT_MEAN_META.get("global_mean", 0.5))
+        LOG.info(
+            "[stacked] loaded subject_mean table (n=%d, global_mean=%.4f) "
+            "for Member 2 residual anchor (Task 3).",
+            int(_SUBJECT_MEAN_TABLE.shape[0]), _SUBJECT_MEAN_GLOBAL,
+        )
+    else:
+        _SUBJECT_MEAN_TABLE = None
+        _SUBJECT_MEAN_GLOBAL = 0.5
+
     # Reuse Member 3's FAISS-free top-k for the calibrator's
     # neighbor lookup. The neighbor IDs returned are indices into
     # Member 3's item_keys, which MUST be the same ordering as the
@@ -240,7 +260,20 @@ if _HAS_STACKED_BUNDLE:
                 if _compose is None:
                     p2 = float(p1)
                 else:
-                    p2 = float(_compose(_GBDT_STATE, feats_for_gbdt, float(p1)))
+                    # Task 3: prefer subject_mean[subject_id] as the
+                    # residual anchor (when the subject_mean table was
+                    # shipped). Pre-Task-3 bundles ship no subject_mean
+                    # table, in which case fall back to Member 1's
+                    # prediction as the anchor (legacy behavior).
+                    if _SUBJECT_MEAN_TABLE is not None:
+                        _s_id = int(_SUBJECT_TO_ID.get(subject_key, 0))
+                        if 0 <= _s_id < int(_SUBJECT_MEAN_TABLE.shape[0]):
+                            _gbdt_anchor = float(_SUBJECT_MEAN_TABLE[_s_id])
+                        else:
+                            _gbdt_anchor = _SUBJECT_MEAN_GLOBAL
+                    else:
+                        _gbdt_anchor = float(p1)
+                    p2 = float(_compose(_GBDT_STATE, feats_for_gbdt, _gbdt_anchor))
             else:
                 p2 = float(_gbdt_mod.apply_one(_GBDT_STATE, feats_for_gbdt))
 
@@ -481,6 +514,7 @@ def export_four_member_stacked_run(
     out_dir: Path | str,
     src_dir: Path | str = "src",
     runtime_feature_builder_py: str | None = None,
+    subject_mean_table: Any | None = None,
     zip_cap_bytes: int = _DEFAULT_ZIP_CAP_BYTES,
     audit: bool = True,
 ) -> Path:
@@ -517,6 +551,13 @@ def export_four_member_stacked_run(
         See module docstring; if omitted, Members 2 & 4 fall back to
         their bias predictions and the stacker downweights them
         accordingly. Phase 6's notebook supplies this.
+    subject_mean_table : SubjectMeanTable | None
+        Task 3 (Member 2 v2): the per-subject mean pass-rate table used
+        as the GBDT residual anchor. When provided, shipped to
+        ``artifacts/subject_mean/`` and the runtime uses
+        ``subject_mean[subject_id]`` as the Member-2 anchor instead of
+        Member 1's prediction. When ``None``, the runtime falls back
+        to Member 1 as the anchor (legacy / pre-Task-3 behavior).
     zip_cap_bytes : int
         Hard upper bound on the bundle's uncompressed total size.
     audit : bool
@@ -563,6 +604,30 @@ def export_four_member_stacked_run(
         )
     if residual_table is not None:
         residual_table.save(artifacts_dir / "residual_table")
+
+    # Task 3: ship the subject_mean table so the runtime can use it as
+    # the Member-2 residual anchor (instead of Member 1's prediction).
+    if subject_mean_table is not None:
+        sm_dir = artifacts_dir / "subject_mean"
+        sm_dir.mkdir(parents=True, exist_ok=True)
+        import json as _json_sm
+        import numpy as _np_sm
+        _np_sm.save(sm_dir / "subject_mean.npy",
+                    _np_sm.asarray(subject_mean_table.subject_mean, dtype=_np_sm.float64))
+        _np_sm.save(sm_dir / "subject_obs_count.npy",
+                    _np_sm.asarray(subject_mean_table.subject_obs_count, dtype=_np_sm.float64))
+        (sm_dir / "meta.json").write_text(
+            _json_sm.dumps(
+                {
+                    "global_mean": float(subject_mean_table.global_mean),
+                    "smoothing": float(subject_mean_table.smoothing),
+                    "n_subjects": int(subject_mean_table.subject_mean.shape[0]),
+                    "schema_version": 1,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     # Step 3: copy pure-numpy modules.
     _copy_pure_modules(src_dir, out_dir / "_pure")

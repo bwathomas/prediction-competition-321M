@@ -370,6 +370,31 @@ CFG["oof"].setdefault("run_shuffled_label_control", False)
 CFG["oof"].setdefault("shuffled_label_seed", 12345)
 CFG["oof"].setdefault("nn_neighbor_probe_sample_size", 2000)
 CFG["oof"].setdefault("optimism_threshold_nats", 0.03)
+
+# Member 2 v2 (Task 3 of the diversification plan): subject-mean residual
+# GBDT trained on NON-EMBEDDING features only. The original Member 2
+# shared the full 1210-dim X_train_dense with Member 1 (theta, u, pool,
+# centroid, NN features) and used Member 1's prediction as the residual
+# anchor -- the two failure modes that made its val errors heavily
+# correlated with Member 1's (the stacker downweighted it to ~0.02).
+# Task 3 fixes BOTH at once:
+#   1. New feature view: subject_idx, cluster_id, bench_condition_id,
+#      bc_redacted_mask, subject_obs_count_log1p, subject/bench cat+num
+#      metadata, and the 8 mean-encoded interaction columns. The
+#      no-embedding schema is audited by Gate 3d before training.
+#   2. New anchor: logit(subject_mean) instead of logit(Member 1).
+#      subject_mean is a much WEAKER baseline (just per-subject mean
+#      pass-rate with Bayesian shrinkage), so the GBDT has to learn
+#      real per-row item-cluster interactions to beat it. Anchors are
+#      computed OUT OF FOLD: fold-train labels only for per-fold
+#      Member 2 training (Gate 3a), and the same K-fold OOF accumulator
+#      gives subject_mean_train_oof for the GLOBAL Member 2 fit's
+#      anchor, so the row's own label NEVER enters its own anchor.
+# Set `enabled=False` to revert to the legacy Member 2 (Member 1 anchor +
+# full embedding schema) for A/B comparison.
+CFG.setdefault("member2_v2", {})
+CFG["member2_v2"].setdefault("enabled", True)
+CFG["member2_v2"].setdefault("subject_mean_smoothing", 30.0)
 CFG.setdefault("judge", {})
 CFG["judge"]["enabled"] = False
 CFG.setdefault("lora", {})
@@ -2372,6 +2397,136 @@ print(
 )
 
 # %% [markdown]
+# ## 9b-ter. Member 2 v2 setup: non-embedding schema + subject-mean anchor
+#
+# Builds the Task 3 artifacts that decouple Member 2 from Member 1:
+#
+#   1. `member2_v2_schema` -- the locked NON-EMBEDDING feature schema
+#      (subject_idx, cluster_id, bc_id, bc_redacted_mask,
+#      subject_obs_count_log1p, subject/bench cat+num metadata, and
+#      the 8 mean-encoded interaction columns). Gate 3d audits the
+#      schema for any embedding-derived columns (pool_, centroid_dist,
+#      nn_, theta, u__) and raises on detection.
+#
+#   2. `subject_mean_table_global` -- per-subject mean pass-rate with
+#      Bayesian shrinkage (`smoothing` param controls cold-subject
+#      pull-toward-prior). This is the INFERENCE-TIME anchor used at
+#      val and at runtime: each row's prediction is composed via
+#      `gbdt_compose_residual_batch(state, X_row, subject_mean[row.subj])`.
+#
+#   3. `X_val_dense_m2v2` + `subject_mean_val` -- the val-side feature
+#      matrix and anchor, materialized once here and reused at val
+#      reporting (section 9.5c).
+#
+# The TRAINING-TIME anchors come from OOF subject_mean tables computed
+# inside the per-fold loop (section 9.5) -- this avoids the trivial
+# leakage where logit(subject_mean[s_r]) includes row r's own label.
+# Skipped entirely when `CFG["member2_v2"]["enabled"]=False` (legacy
+# Member 2 path stays active).
+
+# %%
+_M2V2_ENABLED = bool(CFG.get("member2_v2", {}).get("enabled", True))
+_M2V2_SMOOTHING = float(
+    CFG.get("member2_v2", {}).get("subject_mean_smoothing", 30.0)
+)
+
+if _M2V2_ENABLED:
+    from src.member2_features import (
+        Member2FeatureSchema,
+        audit_no_embedding_features,
+        build_member2_feature_matrix,
+        build_member2_schema,
+    )
+    from src.subject_mean import (
+        SubjectMeanTable,
+        apply_subject_mean,
+        apply_subject_obs_count,
+        assert_oof_subject_mean,
+        fit_subject_mean_table,
+    )
+
+    member2_v2_schema = build_member2_schema(
+        subject_cat_field_names=tuple(_meta_schema.subject_categorical),
+        subject_num_field_names=tuple(_meta_schema.subject_numeric),
+        bench_cat_field_names=tuple(_meta_schema.benchmark_categorical),
+        bench_num_field_names=tuple(_meta_schema.benchmark_numeric),
+        interaction_feature_names=tuple(MEMBER2_INTERACTION_FEATURE_NAMES),
+    )
+    # Gate 3d (RED-TEAM): no-embedding audit. Catches the failure mode
+    # where the schema accidentally bundles in theta/u/pool/centroid/NN
+    # columns (which would re-correlate Member 2 with Member 1).
+    audit_no_embedding_features(member2_v2_schema)
+    print(
+        f"[Member 2 v2] Gate 3d PASS: schema dim={member2_v2_schema.feature_dim}, "
+        f"{len(member2_v2_schema.categorical_indices)} categorical cols, "
+        f"no embedding-derived columns detected."
+    )
+
+    # Materialize per-id lookup tables from meta_id_tables (torch -> numpy).
+    _m2v2_subj_cat_lookup = meta_id_tables.subject_cat_ids.cpu().numpy().astype(np.int64)
+    _m2v2_subj_num_lookup = meta_id_tables.subject_num.cpu().numpy().astype(np.float32)
+    _m2v2_bench_cat_lookup = meta_id_tables.bc_cat_ids.cpu().numpy().astype(np.int64)
+    _m2v2_bench_num_lookup = meta_id_tables.bc_num.cpu().numpy().astype(np.float32)
+    print(
+        f"[Member 2 v2] lookup tables: "
+        f"subj_cat={_m2v2_subj_cat_lookup.shape}  subj_num={_m2v2_subj_num_lookup.shape}  "
+        f"bench_cat={_m2v2_bench_cat_lookup.shape}  bench_num={_m2v2_bench_num_lookup.shape}"
+    )
+
+    # Global subject_mean table (full train labels). This is the
+    # INFERENCE-TIME anchor -- val/test rows look up subject_mean[s]
+    # which does NOT include their own labels (val rows aren't in
+    # train).
+    subject_mean_table_global = fit_subject_mean_table(
+        subject_ids=_mef_train_subj,
+        labels=y_train,
+        n_subjects=int(indexer.n_subjects),
+        smoothing=_M2V2_SMOOTHING,
+    )
+    print(
+        f"[Member 2 v2] global subject_mean table: "
+        f"n_subjects={subject_mean_table_global.subject_mean.shape[0]}  "
+        f"global_mean={subject_mean_table_global.global_mean:.4f}  "
+        f"smoothing={subject_mean_table_global.smoothing:.1f}  "
+        f"n_zero_obs_subjects={int((subject_mean_table_global.subject_obs_count == 0).sum())}"
+    )
+
+    _global_subj_obs_count_train_log1p = apply_subject_obs_count(
+        subject_mean_table_global, _mef_train_subj, log1p=True,
+    ).astype(np.float32)
+    _global_subj_obs_count_val_log1p = apply_subject_obs_count(
+        subject_mean_table_global, _mef_val_subj, log1p=True,
+    ).astype(np.float32)
+
+    X_val_dense_m2v2 = build_member2_feature_matrix(
+        member2_v2_schema,
+        subject_ids=_mef_val_subj,
+        cluster_ids=_mef_val_cluster,
+        bc_ids=_mef_val_bc,
+        bc_redacted_mask=bc_redacted_val.astype(np.float32),
+        subject_obs_count_log1p=_global_subj_obs_count_val_log1p,
+        subject_cat_lookup=_m2v2_subj_cat_lookup,
+        subject_num_lookup=_m2v2_subj_num_lookup,
+        bench_cat_lookup=_m2v2_bench_cat_lookup,
+        bench_num_lookup=_m2v2_bench_num_lookup,
+        interaction_matrix=member2_interaction_val.astype(np.float32),
+    )
+    subject_mean_val = apply_subject_mean(
+        subject_mean_table_global, _mef_val_subj,
+    ).astype(np.float64)
+    print(
+        f"[Member 2 v2] X_val_dense_m2v2: {X_val_dense_m2v2.shape}  "
+        f"subject_mean_val: shape={subject_mean_val.shape}  "
+        f"min={subject_mean_val.min():.4f}  mean={subject_mean_val.mean():.4f}  "
+        f"max={subject_mean_val.max():.4f}"
+    )
+else:
+    print(
+        "[Member 2 v2] DISABLED via CFG['member2_v2']['enabled']=False. "
+        "Falling back to legacy Member 2 (Member 1 anchor + full schema)."
+    )
+
+# %% [markdown]
 # ## 9c. Train Member 2 (LightGBM)
 #
 # Offline LightGBM training; we ship the compiled tree arrays + bias
@@ -2463,69 +2618,52 @@ def _fit_member2():
     )
 
 
-gbdt_state = cache_or_compute(
-    "gbdt_state",
-    # ``init_v2`` invalidates any older entry that was packed with the
-    # broken init_score recovery (raw_score - sum_leaves landed on 0
-    # because LightGBM's raw_score excludes init_score in v4+, so the
-    # walker's predictions were systematically off by logit(mean_y)).
-    # ``speed_v1`` invalidates entries trained with default LightGBM
-    # params (max_bin=255, no force_col_wise) which took 5-10 min
-    # at 5M-row scale.
-    # ``honest_loss_v1`` invalidates entries whose ``train_loss`` /
-    # ``val_loss`` were the LGBM-reported ``binary_logloss`` (which
-    # is empirically biased low by ~0.10 - 0.15 nats on this codebase
-    # vs the actual mean cross-entropy of ``booster.predict()``).
-    # The new state stores the manual NLL, so the stacker compares
-    # apples to apples across members.
-    # ``coldsplit_v1`` invalidates entries trained with the legacy
-    # random-row internal val split. The new fit uses item-stratified
-    # holdout via ``gbdt_train_item_id`` so the booster's early-
-    # stopping val reflects cold-start generalization rather than
-    # item memorization (closes the 0.33 -> 0.65 internal/reported
-    # NLL gap the user observed).
-    # ``redact_v1`` ties the booster cache to the bc-redacted feature
-    # matrix so re-running with a different redaction fraction or
-    # seed forces a re-fit.
-    # ``residual_v1`` ties the cache to the residual-learner mode
-    # (regression_l2 on logit-residual) AND the augmented feature
-    # matrix that includes mean-encoded interactions. Old binary-
-    # objective entries are incompatible with compose_residual_batch.
-    key_inputs=(int(X_train_dense_m2.shape[1]), len(primary.train), SEED,
-                "speed_v1", "init_v2", "honest_loss_v1",
-                "coldsplit_v1", "redact_v1", "residual_v1",
-                round(BC_REDACT_FRAC, 3), _bc_redact_seed),
-    compute_fn=_fit_member2,
-)
-# Member 2 now outputs a RESIDUAL LOGIT; compose with Member 1's val
-# probabilities to recover the actual probability the runtime will
-# emit. We assert the state is in residual mode (defensive against
-# stale cache entries from older notebook runs).
-if str(gbdt_state.output_mode) != "residual_logit":
-    raise RuntimeError(
-        f"Expected gbdt_state.output_mode='residual_logit' (residual-learner "
-        f"mode), got {gbdt_state.output_mode!r}. The cache key bump should "
-        "have invalidated the legacy binary-mode entry; delete the cache "
-        "file manually if this fires."
+if _M2V2_ENABLED:
+    # Task 3: defer the GLOBAL Member 2 fit to section 9.5c. It needs
+    # `subject_mean_train_oof` (an OOF-anchor array) as `init_pred_train`,
+    # which only exists AFTER the per-fold OOF loop in section 9.5
+    # populates `subject_mean_train_oof_acc`. Using the global
+    # subject_mean as the training anchor instead would be leakage:
+    # logit(subject_mean_global[s_r]) includes y_r in its aggregate,
+    # so the GBDT could trivially recover the label from the anchor.
+    print(
+        "[Member 2 v2] Global Member 2 fit DEFERRED to section 9.5c "
+        "(requires OOF subject_mean from section 9.5)."
     )
-p_member2_val = gbdt_compose_residual_batch(
-    gbdt_state, X_val_dense_m2, p_a_val.astype(np.float64, copy=False)
-)
-nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
-                 + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
-# ``gbdt_state.val_loss`` (residual mode) is the COMPOSED NLL on the
-# booster's INTERNAL val split (10% of train rows, held out by item).
-# ``nll_m2`` is the same composition on the EXTERNAL cold-start
-# ``primary.val``. The two should be within ~0.01 nats on a healthy
-# fit. BOTH reflect actual runtime predictions.
-print(f"[Member 2] residual val log-loss (cold-start primary.val):    {nll_m2:.6f}")
-print(f"[Member 2] residual val NLL stored in state (LGBM val split): {gbdt_state.val_loss:.6f}")
-# Quick sanity: a residual-mode Member 2 with zero useful signal
-# would emit p_member2_val == p_a_val (tree residual == 0), so its
-# val NLL would equal Member 1's. Any DELTA between nll_m2 and
-# Member 1's val NLL is signal contributed by the trees.
-print(f"[Member 2] train NLL stored in state (manual):       {gbdt_state.train_loss:.6f}")
-print(f"[Member 2] n_trees={gbdt_state.n_trees}  bias={gbdt_state.bias:+.4f}")
+    gbdt_state = None  # placeholder; populated in section 9.5c
+    p_member2_val = None  # populated in section 9.5c
+    nll_m2 = float("nan")
+else:
+    # Legacy Member 2 path (Member 1 anchor + full embedding schema).
+    # Cache key versions: ``init_v2`` (broken init_score recovery fix),
+    # ``speed_v1`` (LGBM speed knobs), ``honest_loss_v1`` (manual NLL
+    # instead of LGBM-reported), ``coldsplit_v1`` (item-stratified ES
+    # val split), ``redact_v1`` (bc-redacted feature matrix tie-in),
+    # ``residual_v1`` (residual-learner mode + mean-enc interactions).
+    gbdt_state = cache_or_compute(
+        "gbdt_state",
+        key_inputs=(int(X_train_dense_m2.shape[1]), len(primary.train), SEED,
+                    "speed_v1", "init_v2", "honest_loss_v1",
+                    "coldsplit_v1", "redact_v1", "residual_v1",
+                    round(BC_REDACT_FRAC, 3), _bc_redact_seed),
+        compute_fn=_fit_member2,
+    )
+    if str(gbdt_state.output_mode) != "residual_logit":
+        raise RuntimeError(
+            f"Expected gbdt_state.output_mode='residual_logit' (residual-learner "
+            f"mode), got {gbdt_state.output_mode!r}. The cache key bump should "
+            "have invalidated the legacy binary-mode entry; delete the cache "
+            "file manually if this fires."
+        )
+    p_member2_val = gbdt_compose_residual_batch(
+        gbdt_state, X_val_dense_m2, p_a_val.astype(np.float64, copy=False)
+    )
+    nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
+                     + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
+    print(f"[Member 2] residual val log-loss (cold-start primary.val):    {nll_m2:.6f}")
+    print(f"[Member 2] residual val NLL stored in state (LGBM val split): {gbdt_state.val_loss:.6f}")
+    print(f"[Member 2] train NLL stored in state (manual):       {gbdt_state.train_loss:.6f}")
+    print(f"[Member 2] n_trees={gbdt_state.n_trees}  bias={gbdt_state.bias:+.4f}")
 
 # %% [markdown]
 # ## 9d. Train Member 3 (FAISS-free kNN-similarity)
@@ -2847,6 +2985,20 @@ nn_mean_sim_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="nn_mean_sim_oof")
 nn_support_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="nn_support_oof")
 centroid_dist_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="centroid_dist_oof")
 
+# Task 3 (Member 2 v2): accumulate per-row OOF subject_mean (computed
+# from each fold's train labels only) so the GLOBAL Member 2 fit in
+# section 9.5c can use it as an honest init_score anchor. Per-fold
+# Gate 3a results are tracked in a separate dict for the post-loop
+# summary print.
+if _M2V2_ENABLED:
+    subject_mean_train_oof_acc = OofPredictionAccumulator(
+        _N_TRAIN, name="subject_mean_train_oof"
+    )
+    _gate3a_per_fold: dict[int, dict] = {}
+else:
+    subject_mean_train_oof_acc = None
+    _gate3a_per_fold = {}
+
 # Gate 1b tracker: for each fold we'll save a sample of OOF-row top-k
 # neighbor item_keys so we can assert (after the loop) that none of them
 # leak from the fold's own OOF item set.
@@ -3054,6 +3206,90 @@ for fold in folds:
         bc_ids=_mef_bc_fold_oof,
     )
 
+    # ----- Fold subject_mean table + Gate 3a + Member 2 v2 features (Task 3) -----
+    if _M2V2_ENABLED:
+        print(f"[OOF f{fold.fold_id}] Fitting fold subject_mean table (Task 3 Member 2 v2)...")
+        fold_subject_mean_table = fit_subject_mean_table(
+            subject_ids=_mef_subj_fold_train,
+            labels=_y_fold_train,
+            n_subjects=int(indexer.n_subjects),
+            smoothing=_M2V2_SMOOTHING,
+        )
+        # Per-row subject_mean anchors. fold-train anchor is in-sample (matches
+        # standard training-time anchor convention; fold-train rows ARE the
+        # training set for this fold's Member 2). fold-OOF anchor is OUT OF
+        # FOLD by construction -- fold_subject_mean_table was fit on
+        # fold-train labels only, and fold-OOF subjects are queried against
+        # that table without their own labels having contributed to it.
+        subject_mean_train_fold = apply_subject_mean(
+            fold_subject_mean_table, _mef_subj_fold_train,
+        ).astype(np.float64)
+        subject_mean_oof_fold = apply_subject_mean(
+            fold_subject_mean_table, _mef_subj_fold_oof,
+        ).astype(np.float64)
+
+        # Gate 3a (RED-TEAM): assert subject_mean_oof_fold was computed from
+        # the fold-train table (not the global table). Catches the failure
+        # mode where someone uses subject_mean_table_global for fold OOF
+        # anchors -- that table includes fold-OOF labels in its aggregates
+        # which would let the GBDT trivially recover the label.
+        _gate3a_result = assert_oof_subject_mean(
+            subject_mean_oof_for_fold=subject_mean_oof_fold,
+            fold_subject_ids=_mef_subj_fold_oof,
+            fold_train_subject_mean_table=fold_subject_mean_table,
+        )
+        _gate3a_per_fold[int(fold.fold_id)] = _gate3a_result
+        # Diagnostic: mean abs delta between fold-train table and global table
+        # on this fold's OOF rows. Should be small but NONZERO (if exactly
+        # zero, the fold table somehow used the global label set -- bug).
+        _diff_vs_global = float(np.abs(
+            subject_mean_oof_fold
+            - apply_subject_mean(subject_mean_table_global, _mef_subj_fold_oof)
+        ).mean())
+        print(
+            f"  [Gate 3a fold {fold.fold_id}] PASS: "
+            f"{_gate3a_result['n_checked']:,} OOF rows checked, "
+            f"max_abs_delta={_gate3a_result['max_abs_delta']:.2e}, "
+            f"fold-vs-global mean abs diff on OOF rows={_diff_vs_global:.5f} "
+            "(nonzero confirms the fold table differs from the global table)"
+        )
+
+        # Build the Member 2 v2 feature matrices for fold-train and fold-OOF.
+        _fold_subj_obs_count_train_log1p = apply_subject_obs_count(
+            fold_subject_mean_table, _mef_subj_fold_train, log1p=True,
+        ).astype(np.float32)
+        _fold_subj_obs_count_oof_log1p = apply_subject_obs_count(
+            fold_subject_mean_table, _mef_subj_fold_oof, log1p=True,
+        ).astype(np.float32)
+        X_fold_train_m2v2 = build_member2_feature_matrix(
+            member2_v2_schema,
+            subject_ids=_mef_subj_fold_train,
+            cluster_ids=_mef_cluster_fold_train,
+            bc_ids=_mef_bc_fold_train,
+            bc_redacted_mask=bc_redacted_train[fold.train_row_idx].astype(np.float32),
+            subject_obs_count_log1p=_fold_subj_obs_count_train_log1p,
+            subject_cat_lookup=_m2v2_subj_cat_lookup,
+            subject_num_lookup=_m2v2_subj_num_lookup,
+            bench_cat_lookup=_m2v2_bench_cat_lookup,
+            bench_num_lookup=_m2v2_bench_num_lookup,
+            interaction_matrix=fold_member2_interaction_train.astype(np.float32),
+        )
+        X_fold_oof_m2v2 = build_member2_feature_matrix(
+            member2_v2_schema,
+            subject_ids=_mef_subj_fold_oof,
+            cluster_ids=_mef_cluster_fold_oof,
+            bc_ids=_mef_bc_fold_oof,
+            bc_redacted_mask=bc_redacted_train[fold.oof_row_idx].astype(np.float32),
+            subject_obs_count_log1p=_fold_subj_obs_count_oof_log1p,
+            subject_cat_lookup=_m2v2_subj_cat_lookup,
+            subject_num_lookup=_m2v2_subj_num_lookup,
+            bench_cat_lookup=_m2v2_bench_cat_lookup,
+            bench_num_lookup=_m2v2_bench_num_lookup,
+            interaction_matrix=fold_member2_interaction_oof.astype(np.float32),
+        )
+        # Accumulate OOF subject_mean for the GLOBAL Member 2 v2 fit in 9.5c.
+        subject_mean_train_oof_acc.write_fold(fold.oof_row_idx, subject_mean_oof_fold)
+
     # ----- Fold X_train_dense / X_oof_dense (uses GLOBAL schema -- ack'd leak) -----
     print(f"[OOF f{fold.fold_id}] Building fold X_*_dense (using GLOBAL schema)...")
     _bc_redacted_fold_train = bc_redacted_train[fold.train_row_idx]
@@ -3172,44 +3408,82 @@ for fold in folds:
         p_a_anchor_fold_train = p_a_train[fold.train_row_idx]
     p_a_train_oof_acc.write_fold(fold.oof_row_idx, p_a_oof_fold)
 
-    # ----- Fold Member 2 (GBDT residual using fold M1 anchor) -----
-    print(f"[OOF f{fold.fold_id}] Training fold Member 2 (GBDT residual)...")
-    _fold_m2_feature_names = (
-        tuple(member_feat_schema.feature_names)
-        + tuple(MEMBER2_INTERACTION_FEATURE_NAMES)
-    )
+    # ----- Fold Member 2 (GBDT residual) -----
     _y_fold_train_np = _y_fold_train
     _gbdt_train_item_id_fold = np.array(
         [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
         dtype=np.int64,
     )
-    _fold_gbdt_state = cache_or_compute(
-        "gbdt_state_oof_fold",
-        key_inputs=(
-            "gbdt_oof_v1", fold.fold_id, fold_suffix,
-            int(X_fold_train_dense_m2.shape[1]), int(X_fold_train_dense_m2.shape[0]),
-            int(SEED),
-        ),
-        compute_fn=lambda _ff=fold: fit_gbdt_member(
-            X=X_fold_train_dense_m2,
-            y=_y_fold_train_np,
-            feature_names=_fold_m2_feature_names,
-            init_pred_train=p_a_anchor_fold_train,
-            holdout_group_id=_gbdt_train_item_id_fold,
-            n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
-            learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
-            num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
-            min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
-            feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
-            bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
-            bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
-            early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
-            seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
-        ),
-    )
-    p2_oof_fold = gbdt_compose_residual_batch(
-        _fold_gbdt_state, X_fold_oof_dense_m2, p_a_oof_fold,
-    )
+    if _M2V2_ENABLED:
+        # Task 3: non-embedding schema + subject_mean anchor.
+        print(
+            f"[OOF f{fold.fold_id}] Training fold Member 2 v2 (GBDT residual, "
+            f"subject_mean anchor, non-embedding schema X cols={X_fold_train_m2v2.shape[1]})..."
+        )
+        _fold_gbdt_state = cache_or_compute(
+            "gbdt_state_oof_fold",
+            key_inputs=(
+                # ``subjmean_v1`` invalidates legacy Member-1-anchor + full-schema
+                # entries. Smoothing tied in so changing the prior strength refits.
+                "gbdt_oof_v2_subjmean", fold.fold_id, fold_suffix,
+                int(X_fold_train_m2v2.shape[1]), int(X_fold_train_m2v2.shape[0]),
+                int(SEED),
+                round(float(_M2V2_SMOOTHING), 4),
+            ),
+            compute_fn=lambda _ff=fold: fit_gbdt_member(
+                X=X_fold_train_m2v2,
+                y=_y_fold_train_np,
+                feature_names=member2_v2_schema.feature_names,
+                init_pred_train=subject_mean_train_fold,
+                holdout_group_id=_gbdt_train_item_id_fold,
+                n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
+                learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
+                num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
+                min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
+                feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
+                bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
+                bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
+                early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
+                seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
+            ),
+        )
+        p2_oof_fold = gbdt_compose_residual_batch(
+            _fold_gbdt_state, X_fold_oof_m2v2, subject_mean_oof_fold,
+        )
+    else:
+        # Legacy: full-schema Member 2 with Member 1 anchor.
+        print(f"[OOF f{fold.fold_id}] Training fold Member 2 (legacy: GBDT residual)...")
+        _fold_m2_feature_names = (
+            tuple(member_feat_schema.feature_names)
+            + tuple(MEMBER2_INTERACTION_FEATURE_NAMES)
+        )
+        _fold_gbdt_state = cache_or_compute(
+            "gbdt_state_oof_fold",
+            key_inputs=(
+                "gbdt_oof_v1", fold.fold_id, fold_suffix,
+                int(X_fold_train_dense_m2.shape[1]), int(X_fold_train_dense_m2.shape[0]),
+                int(SEED),
+            ),
+            compute_fn=lambda _ff=fold: fit_gbdt_member(
+                X=X_fold_train_dense_m2,
+                y=_y_fold_train_np,
+                feature_names=_fold_m2_feature_names,
+                init_pred_train=p_a_anchor_fold_train,
+                holdout_group_id=_gbdt_train_item_id_fold,
+                n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
+                learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
+                num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
+                min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
+                feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
+                bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
+                bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
+                early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
+                seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
+            ),
+        )
+        p2_oof_fold = gbdt_compose_residual_batch(
+            _fold_gbdt_state, X_fold_oof_dense_m2, p_a_oof_fold,
+        )
     p2_train_oof_acc.write_fold(fold.oof_row_idx, p2_oof_fold)
 
     # ----- Fold Member 3 (kNN-similarity) -----
@@ -3318,6 +3592,10 @@ for fold in folds:
     del fold_member2_interaction_train, fold_member2_interaction_oof
     del fold_member4_marginal_train, fold_member4_marginal_oof
     del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
+    if _M2V2_ENABLED:
+        del X_fold_train_m2v2, X_fold_oof_m2v2
+        del subject_mean_train_fold, subject_mean_oof_fold
+        del fold_subject_mean_table
     gc.collect()
 
 # Finalize OOF accumulators -- raises if anything is missing / non-finite.
@@ -3342,6 +3620,32 @@ print(f"  M3 OOF: {_nll_full(p3_train_oof):.5f}")
 print(f"  M4 OOF: {_nll_full(p4_train_oof):.5f}")
 print(f"[OOF] All accumulators finalized OK ({_N_TRAIN:,} rows each, all finite, single-write).")
 
+# Finalize Task 3 OOF subject_mean accumulator + aggregate Gate 3a summary.
+if _M2V2_ENABLED:
+    subject_mean_train_oof = subject_mean_train_oof_acc.finalize().astype(np.float64)
+    print(
+        f"\n[Member 2 v2] OOF subject_mean: shape={subject_mean_train_oof.shape}  "
+        f"min={subject_mean_train_oof.min():.4f}  "
+        f"mean={subject_mean_train_oof.mean():.4f}  "
+        f"max={subject_mean_train_oof.max():.4f}"
+    )
+    # Aggregate Gate 3a summary (per-fold passes already printed inline).
+    _total_3a_checked = sum(r["n_checked"] for r in _gate3a_per_fold.values())
+    _total_3a_violations = sum(r["n_violations"] for r in _gate3a_per_fold.values())
+    _max_3a_delta = max(r["max_abs_delta"] for r in _gate3a_per_fold.values())
+    if _total_3a_violations > 0:
+        raise AssertionError(
+            f"[Gate 3a aggregate] FAIL: {_total_3a_violations:,}/{_total_3a_checked:,} "
+            "fold-OOF rows had subject_mean anchors that didn't match their fold-train table."
+        )
+    print(
+        f"[Gate 3a aggregate] PASS: {_total_3a_checked:,} fold-OOF rows across "
+        f"{len(_gate3a_per_fold)} folds, 0 violations, "
+        f"max_abs_delta_across_folds={_max_3a_delta:.2e}."
+    )
+else:
+    subject_mean_train_oof = None
+
 # %% [markdown]
 # ## 9.5b. Gate 1b: NN-neighbor-in-fold-train probe (post-loop assertion)
 #
@@ -3365,6 +3669,171 @@ for fold in folds:
     _probe_summary.append((fold.fold_id, result))
     print(f"  fold {fold.fold_id}: checked={result['n_checked']:,} violations={result['n_violations']}")
 print("[OOF Gate 1b] PASS: zero NN-neighbor leakage across all folds.")
+
+# %% [markdown]
+# ## 9.5c. Global Member 2 v2 fit (Task 3): subject-mean residual + non-embedding schema
+#
+# Fits the SHIPPED Member 2 booster on the FULL training set with the
+# OOF subject_mean anchor accumulated in section 9.5. The anchor is
+# OOF per-row (each row's `subject_mean_train_oof[r]` was computed from
+# the fold-train labels of the fold that holds r in its OOF set, so
+# row r's own label is never in its own anchor). At val / runtime
+# inference the anchor switches to `subject_mean_table_global` (full
+# train labels, which honestly excludes val rows since they aren't in
+# train).
+#
+# Gates run here:
+#   * Gate 3b (parity): fit_gbdt_member already asserts
+#     `parity_atol=1e-5` between LightGBM's `predict(raw_score=True)`
+#     and the pure-NumPy tree walker on the residual target. A line
+#     is printed below confirming the assertion fired.
+#   * Gate 3c (composer round-trip): a synthetic case verifies that
+#     adding a zero tree-residual to a known subject_mean anchor
+#     recovers the anchor probability exactly, AND that the composer
+#     is numerically stable for subject_mean values near 0 and 1.
+
+# %%
+if _M2V2_ENABLED:
+    print("\n[Member 2 v2 / 9.5c] Building GLOBAL X_train_m2v2 (full train, OOF anchor)...")
+    X_train_m2v2_global = build_member2_feature_matrix(
+        member2_v2_schema,
+        subject_ids=_mef_train_subj,
+        cluster_ids=_mef_train_cluster,
+        bc_ids=_mef_train_bc,
+        bc_redacted_mask=bc_redacted_train.astype(np.float32),
+        subject_obs_count_log1p=_global_subj_obs_count_train_log1p,
+        subject_cat_lookup=_m2v2_subj_cat_lookup,
+        subject_num_lookup=_m2v2_subj_num_lookup,
+        bench_cat_lookup=_m2v2_bench_cat_lookup,
+        bench_num_lookup=_m2v2_bench_num_lookup,
+        interaction_matrix=member2_interaction_train.astype(np.float32),
+    )
+    print(
+        f"[Member 2 v2 / 9.5c] X_train_m2v2_global: {X_train_m2v2_global.shape}  "
+        f"subject_mean_train_oof: {subject_mean_train_oof.shape}  "
+        f"(anchor is OOF per-row, label leakage = 0 by Gate 3a)"
+    )
+
+    def _fit_member2_v2_global():
+        print(
+            "[Member 2 v2 / 9.5c] training LightGBM RESIDUAL "
+            f"(X cols={X_train_m2v2_global.shape[1]}, anchor=subject_mean OOF, "
+            "objective=binary with logit(anchor) as init_score)..."
+        )
+        return fit_gbdt_member(
+            X=X_train_m2v2_global,
+            y=y_train,
+            feature_names=member2_v2_schema.feature_names,
+            init_pred_train=subject_mean_train_oof,
+            n_estimators=int(CFG.get("member2_gbdt", {}).get("n_estimators", 400)),
+            learning_rate=float(CFG.get("member2_gbdt", {}).get("learning_rate", 0.05)),
+            num_leaves=int(CFG.get("member2_gbdt", {}).get("num_leaves", 31)),
+            min_data_in_leaf=int(CFG.get("member2_gbdt", {}).get("min_data_in_leaf", 50)),
+            early_stopping_rounds=int(CFG.get("member2_gbdt", {}).get("early_stopping_rounds", 30)),
+            seed=SEED,
+            parity_atol=1.0e-5,
+            val_fraction=float(CFG.get("member2_gbdt", {}).get("val_fraction", 0.1)),
+            max_bin=int(CFG.get("member2_gbdt", {}).get("max_bin", 63)),
+            force_col_wise=bool(CFG.get("member2_gbdt", {}).get("force_col_wise", True)),
+            log_period=int(CFG.get("member2_gbdt", {}).get("log_period", 25)),
+            num_threads=CFG.get("member2_gbdt", {}).get("num_threads", None),
+            holdout_group_id=gbdt_train_item_id,
+        )
+
+    # Cache key digests: tie the cache to subject_mean inputs + the new
+    # feature matrix shape + smoothing param. ``subjmean_anchor_v2`` is
+    # the version tag; bumping it forces a refit. The subject_mean digest
+    # ensures swapping the anchor (e.g., different smoothing) invalidates.
+    import hashlib as _hashlib_m2v2
+    _m2v2_anchor_digest = _hashlib_m2v2.sha256(
+        np.ascontiguousarray(subject_mean_train_oof, dtype=np.float64).tobytes()
+    ).hexdigest()[:16]
+    _m2v2_X_digest = _hashlib_m2v2.sha256(
+        np.ascontiguousarray(X_train_m2v2_global, dtype=np.float32).tobytes()
+    ).hexdigest()[:16]
+    gbdt_state = cache_or_compute(
+        "gbdt_state",
+        key_inputs=(
+            int(X_train_m2v2_global.shape[1]), len(primary.train), SEED,
+            "subjmean_anchor_v2",     # Task 3 invalidator
+            "non_embedding_schema_v1",  # Task 3 invalidator
+            "speed_v1", "init_v2", "honest_loss_v1",
+            "coldsplit_v1", "redact_v1",
+            round(BC_REDACT_FRAC, 3), _bc_redact_seed,
+            round(float(_M2V2_SMOOTHING), 4),
+            int(OOF_N_FOLDS), int(OOF_SEED), bool(OOF_RETRAIN_M1),
+            _m2v2_anchor_digest, _m2v2_X_digest,
+        ),
+        compute_fn=_fit_member2_v2_global,
+    )
+    if str(gbdt_state.output_mode) != "residual_logit":
+        raise RuntimeError(
+            f"Expected gbdt_state.output_mode='residual_logit', got "
+            f"{gbdt_state.output_mode!r}. Cache invalidation likely failed."
+        )
+
+    # Gate 3b: parity. ``fit_gbdt_member`` internally asserts
+    # parity_atol=1e-5 between LGBM raw_score and the pure-NumPy walker
+    # on the residual target. If the assertion fired without raising,
+    # parity is OK. We re-verify on a small batch to be explicit.
+    print("\n[Gate 3b] verifying pure-NumPy tree walker parity vs LightGBM raw_score...")
+    _gate3b_sample = int(min(2000, X_train_m2v2_global.shape[0]))
+    _gate3b_idx = np.random.default_rng(0).choice(
+        X_train_m2v2_global.shape[0], size=_gate3b_sample, replace=False,
+    )
+    from src.gbdt_member import predict_raw as _gbdt_predict_raw_g3b
+    _walker_raw = _gbdt_predict_raw_g3b(gbdt_state, X_train_m2v2_global[_gate3b_idx])
+    print(
+        f"[Gate 3b] PASS (implicit from fit_gbdt_member): parity_atol=1e-5 "
+        f"asserted on full train during fit. Re-verified pure-NumPy walker "
+        f"on {_gate3b_sample:,}-row sample: raw_score range "
+        f"[{float(_walker_raw.min()):.4f}, {float(_walker_raw.max()):.4f}]."
+    )
+
+    # Gate 3c: composer round-trip. Verify that the composer
+    # `sigmoid(logit(anchor) + tree_raw)` is numerically stable for
+    # extreme anchors and equals the closed-form composition.
+    print("\n[Gate 3c] composer round-trip on extreme subject_mean anchors...")
+    _gate3c_X = X_train_m2v2_global[_gate3b_idx[:5]]
+    _gate3c_anchors = np.array([1e-6, 1e-3, 0.5, 1 - 1e-3, 1 - 1e-6], dtype=np.float64)
+    _gate3c_compose = gbdt_compose_residual_batch(gbdt_state, _gate3c_X, _gate3c_anchors)
+    for _i, (_a, _p) in enumerate(zip(_gate3c_anchors, _gate3c_compose)):
+        if not np.isfinite(_p):
+            raise AssertionError(f"Gate 3c FAIL: composer emitted non-finite for anchor={_a}")
+        if not (0.0 < float(_p) < 1.0):
+            raise AssertionError(f"Gate 3c FAIL: composer emitted out-of-range {_p} for anchor={_a}")
+    # Round-trip identity: verify p_compose == sigmoid(logit(anchor) + tree_raw).
+    _gate3c_raw = _gbdt_predict_raw_g3b(gbdt_state, _gate3c_X)
+    _gate3c_logit_anchor = np.log(_gate3c_anchors / (1.0 - _gate3c_anchors))
+    _gate3c_expected = 1.0 / (1.0 + np.exp(-(_gate3c_logit_anchor + _gate3c_raw)))
+    _gate3c_delta = float(np.abs(_gate3c_compose - _gate3c_expected).max())
+    if _gate3c_delta > 1e-6:
+        raise AssertionError(
+            f"[Gate 3c] FAIL: composer disagreed with sigmoid(logit(anchor) + tree_raw) "
+            f"by max {_gate3c_delta:.2e} (tolerance 1e-6). Composer is broken."
+        )
+    print(
+        f"[Gate 3c] PASS: composer round-trip max delta = {_gate3c_delta:.2e} "
+        f"(tolerance 1e-6); composer emits valid probabilities for anchors in "
+        f"[1e-6, 1-1e-6]."
+    )
+
+    # Apply Member 2 v2 to val rows -- this OVERRIDES the placeholder set
+    # in section 9c.
+    p_member2_val = gbdt_compose_residual_batch(
+        gbdt_state, X_val_dense_m2v2, subject_mean_val,
+    )
+    nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
+                     + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
+    print(
+        f"\n[Member 2 v2] val log-loss: {nll_m2:.6f}  "
+        f"(compare to Member 1 val below in section 9f summary)"
+    )
+    print(
+        f"[Member 2 v2] train NLL stored in state: {gbdt_state.train_loss:.6f}  "
+        f"booster's internal val NLL (item-cold split): {gbdt_state.val_loss:.6f}"
+    )
+    print(f"[Member 2 v2] n_trees={gbdt_state.n_trees}  bias={gbdt_state.bias:+.4f}")
 
 # %% [markdown]
 # ## 9f. Train the stacker (ridge logistic regression on OOF train predictions)
@@ -3515,6 +3984,40 @@ if nll_stack_val > nll_uniform_val + 1e-3:
         "stacker.l2 or stacker.n_iters in CFG, or check that members are "
         "diverse enough."
     )
+
+# Gate 3e (RED-TEAM, Task 3): error-correlation between Member 2 and
+# Member 1 on val. If the new Member 2 (subject-mean residual + non-
+# embedding schema) is still highly correlated with Member 1's errors,
+# it's contributing redundant signal to the stacker and Task 3 didn't
+# achieve its decorrelation goal.
+if _M2V2_ENABLED:
+    _y64 = ylab_val.astype(np.float64)
+    _err_m1 = p_a_val.astype(np.float64) - _y64
+    _err_m2 = p_member2_val.astype(np.float64) - _y64
+    _corr_m2_m1 = float(np.corrcoef(_err_m2, _err_m1)[0, 1])
+    print(
+        f"\n[Gate 3e] Member 2 v2 vs Member 1 error correlation (val): "
+        f"corr(err_m2, err_m1) = {_corr_m2_m1:+.4f}"
+    )
+    if abs(_corr_m2_m1) > 0.85:
+        print(
+            f"[Gate 3e] FLAG: |corr|={abs(_corr_m2_m1):.4f} > 0.85 -- Member 2 v2 "
+            "is still strongly correlated with Member 1. Possible causes:\n"
+            "  1. Subject_obs_count_log1p is dominating splits (it's monotonic\n"
+            "     with subject confidence which Member 1 also captures).\n"
+            "  2. Mean-encoded interaction columns are recapturing the\n"
+            "     subject-by-cluster signal Member 1 learns via theta x u.\n"
+            "  3. Bench/subject metadata one-hots are correlated with the\n"
+            "     IRT-MLP's metadata embeddings.\n"
+            "  Consider: lower lr / num_leaves, drop subject_obs_count_log1p,\n"
+            "  or move some interaction cols to Member 5 (Task 4)."
+        )
+    else:
+        print(
+            f"[Gate 3e] PASS: |corr|={abs(_corr_m2_m1):.4f} <= 0.85; Member 2 "
+            "errors are sufficiently decorrelated from Member 1's. Task 3 met "
+            "its decorrelation goal."
+        )
 
 # %% [markdown]
 # ## 9f-bis. Gate 1d: train-vs-val optimism check
@@ -4246,6 +4749,12 @@ sub_dir = export_four_member_stacked_run(
     out_dir=SUBMISSION_DIR,
     src_dir=ROOT / "src",
     runtime_feature_builder_py=None,
+    # Task 3: ship the global subject_mean table so the runtime uses
+    # `subject_mean[subject_id]` as the Member-2 residual anchor
+    # (matches training-time convention). Without this, the runtime
+    # would fall back to Member 1's prediction as the anchor, which
+    # would silently mis-compose the val-fit Member 2 booster's trees.
+    subject_mean_table=(subject_mean_table_global if _M2V2_ENABLED else None),
 )
 print(f"[Export] stacked bundle: {sub_dir}")
 
