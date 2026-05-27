@@ -2405,20 +2405,39 @@ print(
 # Augmented dense matrices for Member 2 (interaction features appended
 # to the existing 1202-feature schema). Member 2 sees BOTH the original
 # embedding-derived features AND the new mean-encoded interactions.
-X_train_dense_m2 = np.concatenate(
-    [X_train_dense, member2_interaction_train], axis=1
-).astype(np.float32, copy=False)
-X_val_dense_m2 = np.concatenate(
-    [X_val_dense, member2_interaction_val], axis=1
-).astype(np.float32, copy=False)
+#
+# MEMORY: only the LEGACY global Member 2 fit consumes these (~19 GB
+# combined for the train+val matrices). On the Task 3 path (default)
+# the global Member 2 uses ``X_*_dense_m2v2`` instead and these are
+# pure waste; gate construction behind ``_M2V2_ENABLED`` so we don't
+# blow ~19 GB of resident memory just to hold them through the OOF
+# loop (which built fresh fold-scoped matrices anyway).
 member2_feature_names = tuple(member_feat_schema.feature_names) + tuple(
     MEMBER2_INTERACTION_FEATURE_NAMES
 )
-print(
-    f"[mean-enc] Member 2 augmented X: "
-    f"train {X_train_dense_m2.shape}  val {X_val_dense_m2.shape}  "
-    f"(was {X_train_dense.shape[1]} cols, now {X_train_dense_m2.shape[1]} cols)"
-)
+# ``_M2V2_ENABLED`` is defined further down in section 9b-ter; peek at
+# the same CFG value here so we don't pre-allocate the legacy matrices
+# when the Task 3 path is active.
+_m2v2_enabled_early = bool(CFG.get("member2_v2", {}).get("enabled", True))
+if not _m2v2_enabled_early:
+    X_train_dense_m2 = np.concatenate(
+        [X_train_dense, member2_interaction_train], axis=1
+    ).astype(np.float32, copy=False)
+    X_val_dense_m2 = np.concatenate(
+        [X_val_dense, member2_interaction_val], axis=1
+    ).astype(np.float32, copy=False)
+    print(
+        f"[mean-enc] Member 2 augmented X: "
+        f"train {X_train_dense_m2.shape}  val {X_val_dense_m2.shape}  "
+        f"(was {X_train_dense.shape[1]} cols, now {X_train_dense_m2.shape[1]} cols)"
+    )
+else:
+    X_train_dense_m2 = None
+    X_val_dense_m2 = None
+    print(
+        "[mean-enc] Member 2 augmented X: NOT built (Task 3 path uses "
+        "X_*_dense_m2v2 instead -- saves ~19 GB resident memory)."
+    )
 
 # %% [markdown]
 # ## 9b-ter. Member 2 v2 setup: non-embedding schema + subject-mean anchor
@@ -2896,48 +2915,6 @@ if CFG.get("member5", {}).get("enabled", False):
         f"item_fb_w={_M5_ITEM_FB_WEIGHT} min_subj_per_item={_M5_MIN_SUBJ_PER_ITEM}"
     )
 
-    # --- Map training rows -> (subject_id, item_id) for the fit input ---
-    # item_id_per_row = position in `train_item_keys`. Build a quick dict.
-    _train_item_key_to_pos = {
-        k: i for i, k in enumerate(train_item_keys)
-    }
-    _m5_subj_ids_global = np.fromiter(
-        (
-            int(indexer.subject_to_id.get(str(s), -1))
-            for s in primary.train["subject_key"]
-        ),
-        dtype=np.int64,
-        count=len(primary.train),
-    )
-    _m5_item_ids_global = np.fromiter(
-        (
-            int(_train_item_key_to_pos.get(str(k), -1))
-            for k in primary.train["item_key"]
-        ),
-        dtype=np.int64,
-        count=len(primary.train),
-    )
-    _m5_y_global = primary.train["label"].astype(float).to_numpy()
-    # Sanity: every row must have a valid (subj, item) lookup.
-    _m5_bad = int(((_m5_subj_ids_global < 0) | (_m5_item_ids_global < 0)).sum())
-    if _m5_bad > 0:
-        raise RuntimeError(
-            f"[Member 5] {_m5_bad:,} training rows have unresolvable "
-            "subject_id or item_id. Indexer / train_item_keys are out of sync."
-        )
-
-    # --- Stack item embeddings for the global Member 5 fit ---
-    _t_m5 = _time_m5.time()
-    print(f"[Member 5] stacking {len(train_item_keys):,} item embeddings (D=?)...")
-    _m5_item_emb = np.empty(
-        (len(train_item_keys), int(item_emb_lookup[train_item_keys[0]].shape[0])),
-        dtype=np.float32,
-    )
-    for _i, _k in enumerate(train_item_keys):
-        _m5_item_emb[_i] = item_emb_lookup[_k]
-    print(f"[Member 5] stacked in {_time_m5.time() - _t_m5:.1f}s "
-          f"({_m5_item_emb.nbytes / 1024**3:.2f} GB)")
-
     # --- Gate 4c (global): projection-leakage probe vs val items ---
     # Member 5 is FIT on `train_item_keys` only; val items are excluded
     # by construction (primary.train and primary.val are item-disjoint).
@@ -2956,14 +2933,39 @@ if CFG.get("member5", {}).get("enabled", False):
     )
 
     # --- Global Member 5 fit (cached) ---
+    # Memory discipline: the full ~5 GB item-embedding stack is built
+    # ONLY INSIDE the compute_fn so that a cache HIT skips the alloc
+    # entirely. The fast-path passrate reuses Member 3's already-built
+    # `m3_passrate_dense` / `m3_passrate_mask` (~720 MB each, already
+    # live), bypassing fit_member5's row aggregation which would
+    # otherwise allocate ~3 GB more.
+
     def _fit_member5_global():
+        _t_inner = _time_m5.time()
+        print(f"[Member 5] stacking {len(train_item_keys):,} item embeddings "
+              "(inside cache compute_fn so cache HIT skips this entirely)...")
+        _m5_item_emb_local = np.empty(
+            (len(train_item_keys),
+             int(item_emb_lookup[train_item_keys[0]].shape[0])),
+            dtype=np.float32,
+        )
+        for _i, _k in enumerate(train_item_keys):
+            _m5_item_emb_local[_i] = item_emb_lookup[_k]
+        print(f"[Member 5]   stacked in {_time_m5.time() - _t_inner:.1f}s "
+              f"({_m5_item_emb_local.nbytes / 1024**3:.2f} GB)")
         return fit_member5(
             item_keys=list(train_item_keys),
-            item_embeddings=_m5_item_emb,
+            item_embeddings=_m5_item_emb_local,
             subject_keys=list(_subject_keys_ordered),
-            subject_ids_per_row=_m5_subj_ids_global,
-            item_ids_per_row=_m5_item_ids_global,
-            labels=_m5_y_global,
+            # Row arrays not needed on the fast path; pass empties to
+            # avoid the ~75 MB of per-row id vectors at full scale.
+            subject_ids_per_row=np.zeros(0, dtype=np.int64),
+            item_ids_per_row=np.zeros(0, dtype=np.int64),
+            labels=np.zeros(0, dtype=np.float64),
+            # Fast path: reuse Member 3's already-built passrate so we
+            # don't allocate another [S, N] copy.
+            passrate_dense=m3_passrate_dense,
+            passrate_mask=m3_passrate_mask,
             k=_M5_K,
             tau=_M5_TAU,
             ridge_alpha=_M5_RIDGE_ALPHA,
@@ -2974,11 +2976,12 @@ if CFG.get("member5", {}).get("enabled", False):
     member5_state: Member5State = cache_or_compute(
         "member5_state",
         key_inputs=(
-            "m5_dknn_v1",
+            # m5_dknn_v2 bumps cache key for the passrate-reuse path.
+            "m5_dknn_v2",
             int(len(train_item_keys)),
             int(indexer.n_subjects),
             int(len(primary.train)),
-            int(_m5_item_emb.shape[1]),
+            int(m3_passrate_dense.shape[1]),  # n_items / proxy for d_emb context
             _M5_K, round(_M5_TAU, 6), round(_M5_RIDGE_ALPHA, 6),
             round(_M5_ITEM_FB_WEIGHT, 6), int(_M5_MIN_SUBJ_PER_ITEM),
             int(SEED),
@@ -2999,14 +3002,27 @@ if CFG.get("member5", {}).get("enabled", False):
     # Verify on a sample of train rows that apply_one (subject_key path)
     # matches apply_batch_via_ids (subject_id path) bit-for-bit. If they
     # diverge, the runtime bundle would silently mispredict.
-    _g4d_n = min(_M5_GATE4D_SAMPLE_SIZE, int(_m5_subj_ids_global.shape[0]))
+    # Memory: only sample-sized arrays are materialized -- no full
+    # _m5_subj_ids_global / _m5_item_ids_global / _m5_item_emb stacks
+    # (those would each be ~5 GB at full scale and we don't need them
+    # past fit time).
+    _g4d_n_target = int(_M5_GATE4D_SAMPLE_SIZE)
+    _g4d_n_train = int(len(primary.train))
+    _g4d_n = min(_g4d_n_target, _g4d_n_train)
     _g4d_rng = np.random.default_rng(int(SEED) + 99)
-    _g4d_idx = _g4d_rng.choice(int(_m5_subj_ids_global.shape[0]),
-                               size=_g4d_n, replace=False)
-    _g4d_sids = _m5_subj_ids_global[_g4d_idx]
-    _g4d_iids = _m5_item_ids_global[_g4d_idx]
-    _g4d_embs = _m5_item_emb[_g4d_iids]
-    _g4d_skeys = [str(_subject_keys_ordered[int(s)]) for s in _g4d_sids]
+    _g4d_row_idx = _g4d_rng.choice(_g4d_n_train, size=_g4d_n, replace=False)
+    _g4d_train_subj_keys = primary.train["subject_key"].to_numpy()
+    _g4d_train_item_keys_arr = primary.train["item_key"].to_numpy()
+    _g4d_skeys = [str(_g4d_train_subj_keys[int(r)]) for r in _g4d_row_idx]
+    _g4d_ikeys = [str(_g4d_train_item_keys_arr[int(r)]) for r in _g4d_row_idx]
+    _g4d_sids = np.fromiter(
+        (int(indexer.subject_to_id.get(s, -1)) for s in _g4d_skeys),
+        dtype=np.int64, count=_g4d_n,
+    )
+    _g4d_embs = np.stack(
+        [np.asarray(item_emb_lookup[k], dtype=np.float32) for k in _g4d_ikeys],
+        axis=0,
+    )
     _g4d_p_batch = m5_apply_batch_via_ids(
         member5_state, subject_ids=_g4d_sids, query_item_embeddings=_g4d_embs,
     )
@@ -3027,12 +3043,18 @@ if CFG.get("member5", {}).get("enabled", False):
         f"[Gate 4d] PASS: apply_batch == apply_one on {_g4d_n} sample rows "
         f"(max abs dev = {_g4d_max_dev:.3e})."
     )
+    del (
+        _g4d_train_subj_keys, _g4d_train_item_keys_arr, _g4d_row_idx,
+        _g4d_skeys, _g4d_ikeys, _g4d_sids, _g4d_embs,
+        _g4d_p_batch, _g4d_p_one,
+    )
 
     # --- Score on val rows ---
     _t = _time_m5.time()
     print(f"[Member 5] scoring {len(primary.val):,} val rows...")
+    _d_emb_m5 = int(member5_state.projection_weights.shape[0])
     _m5_val_item_emb = np.empty(
-        (len(primary.val), int(_m5_item_emb.shape[1])), dtype=np.float32,
+        (len(primary.val), _d_emb_m5), dtype=np.float32,
     )
     for _i, _k in enumerate(primary.val["item_key"]):
         _m5_val_item_emb[_i] = item_emb_lookup[str(_k)]
@@ -3053,9 +3075,9 @@ if CFG.get("member5", {}).get("enabled", False):
         f"p stats: min={p_member5_val.min():.4f} "
         f"mean={p_member5_val.mean():.4f} max={p_member5_val.max():.4f}"
     )
-    # Free the bulky val embedding stack; we keep _m5_item_emb (used by
-    # per-fold OOF Member 5 below). The val stack will be reproduced from
-    # the much-smaller item lookup if needed.
+    # Free the bulky val embedding stack. There is no longer a global
+    # _m5_item_emb hanging around -- per-fold OOF Member 5 builds its
+    # own stack from item_emb_lookup, the same way Member 3 does.
     del _m5_val_item_emb
     gc.collect()
 else:
@@ -3063,10 +3085,6 @@ else:
     member5_state = None
     p_member5_val = None
     nll_m5 = float("nan")
-    _m5_item_emb = None
-    _m5_subj_ids_global = None
-    _m5_item_ids_global = None
-    _train_item_key_to_pos = None
     print("[Member 5] DISABLED via CFG['member5']['enabled']=False")
 
 
@@ -3162,6 +3180,76 @@ if nll_m4 > _nll_prior + 0.01:
           f"{_nll_prior:.4f}. Saturation likely. Check feature scales / lr.")
 else:
     print(f"  [OK] beats prior NLL {_nll_prior:.4f} by {_nll_prior - nll_m4:+.4f} nats")
+
+# %% [markdown]
+# ## 9e-bis. Pre-OOF memory reclamation
+#
+# AGGRESSIVE MEMORY DISCIPLINE: every dense matrix in this notebook is
+# float32 with ~1200 columns and ~5M train rows (~16 GB) or ~880k val
+# rows (~3 GB). At this point in the run, all of the GLOBAL members are
+# fit and val-scored, and the matrices below are no longer needed by
+# any downstream code:
+#
+#   * ``X_train_dense`` (~16 GB)  -- only used to concat into m2/m4
+#   * ``X_val_dense``   (~3 GB)   -- only used to concat into m2/m4
+#   * ``X_train_dense_m2`` (~16 GB, legacy only, may be None)
+#   * ``X_val_dense_m2``   (~3 GB,  legacy only, may be None)
+#   * ``X_train_dense_m4`` (~16 GB) -- consumed by global Member 4 fit
+#   * ``X_val_dense_m4``   (~3 GB)  -- consumed by Member 4 val scoring
+#   * ``member4_marginal_train/val`` (~few hundred MB, absorbed in m4)
+#   * ``member2_interaction_val``    (consumed by m2v2 val build above)
+#
+# The OOF loop in section 9.5 (and the global Member 2 v2 fit in 9.5c)
+# build their OWN fold-scoped / m2v2 matrices on the fly. Holding the
+# global matrices through that loop is what made the OOF fold-0 OOM
+# happen at "Building fold X_*_dense" -- the loop never even got a
+# chance to allocate its 16 GB X_fold_train_dense because ~50 GB of
+# now-obsolete globals were already pinned.
+#
+# ``X_train_dense_m2v2`` / ``X_val_dense_m2v2`` (small, ~hundreds of MB)
+# ARE kept alive: section 9.5c re-fits global Member 2 v2 with the OOF
+# subject_mean anchor produced by the OOF loop.
+# ``member2_interaction_train`` (~few hundred MB) is also kept alive
+# because section 9.5c's global Member 2 v2 build references it.
+
+# %%
+print("[Pre-OOF cleanup] Freeing global dense matrices no longer needed...")
+_pre_oof_to_free = [
+    ("X_train_dense", X_train_dense),
+    ("X_val_dense", X_val_dense),
+    ("X_train_dense_m4", X_train_dense_m4),
+    ("X_val_dense_m4", X_val_dense_m4),
+    ("member4_marginal_train", member4_marginal_train),
+    ("member4_marginal_val", member4_marginal_val),
+    ("member2_interaction_val", member2_interaction_val),
+]
+if X_train_dense_m2 is not None:
+    _pre_oof_to_free.append(("X_train_dense_m2", X_train_dense_m2))
+if X_val_dense_m2 is not None:
+    _pre_oof_to_free.append(("X_val_dense_m2", X_val_dense_m2))
+_pre_oof_freed_bytes = 0
+for _name, _arr in _pre_oof_to_free:
+    if _arr is None:
+        continue
+    if hasattr(_arr, "nbytes"):
+        _pre_oof_freed_bytes += int(_arr.nbytes)
+    print(f"  freeing {_name:<26s}: "
+          f"{_arr.shape if hasattr(_arr, 'shape') else type(_arr).__name__}  "
+          f"({(_arr.nbytes / 1024**3) if hasattr(_arr, 'nbytes') else 0:.2f} GB)")
+del _pre_oof_to_free
+# Bind the names to None so subsequent code that accidentally references
+# them gets a clean TypeError rather than a stale 16 GB matrix.
+X_train_dense = None
+X_val_dense = None
+X_train_dense_m2 = None
+X_val_dense_m2 = None
+X_train_dense_m4 = None
+X_val_dense_m4 = None
+member4_marginal_train = None
+member4_marginal_val = None
+member2_interaction_val = None
+gc.collect()
+print(f"[Pre-OOF cleanup] DONE -- released {_pre_oof_freed_bytes / 1024**3:.2f} GB.")
 
 # %% [markdown]
 # ## 9.5. Per-fold OOF compute (Task 1: honest stacking inputs)
@@ -3413,6 +3501,13 @@ for fold in folds:
     )
     _oof_nn_probe_data[fold.fold_id] = _probe_neighbor_keys
     del _probe_query_emb, _probe_idx
+    # `fold_nn_index` holds the fold-train item embedding index
+    # (~3 GB at full scale for 200k items x 4096 dims). Its consumers
+    # are all done -- compute_nn_features_streaming for both train/oof
+    # is complete, and the Gate 1b probe just ran. Free it before the
+    # heavier downstream allocations land.
+    del fold_nn_index
+    gc.collect()
 
     # ----- Fold mean encoded stats (fit on fold-train labels only) -----
     print(f"[OOF f{fold.fold_id}] Fitting fold mean-encoded stats...")
@@ -3453,6 +3548,10 @@ for fold in folds:
         cluster_ids=_mef_cluster_fold_oof,
         bc_ids=_mef_bc_fold_oof,
     )
+    # fold_mean_encoded_stats has been consumed by the four apply_*
+    # calls above; nothing else references it for this fold. Free now.
+    del fold_mean_encoded_stats
+    gc.collect()
 
     # ----- Fold subject_mean table + Gate 3a + Member 2 v2 features (Task 3) -----
     if _M2V2_ENABLED:
@@ -3539,27 +3638,40 @@ for fold in folds:
         subject_mean_train_oof_acc.write_fold(fold.oof_row_idx, subject_mean_oof_fold)
 
     # ----- Fold X_train_dense / X_oof_dense (uses GLOBAL schema -- ack'd leak) -----
-    print(f"[OOF f{fold.fold_id}] Building fold X_*_dense (using GLOBAL schema)...")
+    # MEMORY DISCIPLINE: at full scale these are ~16 GB (train) + ~8 GB
+    # (oof) per fold. On the Task 3 path the legacy Member 2 path is
+    # off, so the base X matrices have a SINGLE consumer (Member 4's
+    # concat-with-marginal). Defer the base build entirely on Task 3
+    # so we don't hold ~24 GB through Members 1/3/5 -- they don't read
+    # X_fold_*_dense. On legacy path we still need the base for both
+    # Member 2 and Member 4, so build it eagerly there.
     _bc_redacted_fold_train = bc_redacted_train[fold.train_row_idx]
     _bc_redacted_fold_oof = bc_redacted_train[fold.oof_row_idx]
-    X_fold_train_dense = _build_X(
-        fold_train_df, nn_train_mat_fold, _bc_redacted_fold_train,
-    )
-    X_fold_oof_dense = _build_X(
-        fold_oof_df, nn_oof_mat_fold, _bc_redacted_fold_oof,
-    )
-    X_fold_train_dense_m2 = np.concatenate(
-        [X_fold_train_dense, fold_member2_interaction_train], axis=1
-    ).astype(np.float32, copy=False)
-    X_fold_oof_dense_m2 = np.concatenate(
-        [X_fold_oof_dense, fold_member2_interaction_oof], axis=1
-    ).astype(np.float32, copy=False)
-    X_fold_train_dense_m4 = np.concatenate(
-        [X_fold_train_dense, fold_member4_marginal_train], axis=1
-    ).astype(np.float32, copy=False)
-    X_fold_oof_dense_m4 = np.concatenate(
-        [X_fold_oof_dense, fold_member4_marginal_oof], axis=1
-    ).astype(np.float32, copy=False)
+    if _M2V2_ENABLED:
+        print(
+            f"[OOF f{fold.fold_id}] DEFERRING X_fold_*_dense build "
+            "(Task 3 path: only Member 4 consumes them; built JIT below)."
+        )
+        X_fold_train_dense = None
+        X_fold_oof_dense = None
+    else:
+        print(f"[OOF f{fold.fold_id}] Building fold X_*_dense (legacy path)...")
+        X_fold_train_dense = _build_X(
+            fold_train_df, nn_train_mat_fold, _bc_redacted_fold_train,
+        )
+        X_fold_oof_dense = _build_X(
+            fold_oof_df, nn_oof_mat_fold, _bc_redacted_fold_oof,
+        )
+    gc.collect()
+    # ``X_fold_*_dense_m2`` / ``X_fold_*_dense_m4`` are built lazily below
+    # near their consumer (see Member 2 legacy branch and Member 4 block).
+
+    # Aux features for the stacker (mean_sim + log1p_n_observed) are
+    # cheap [N_oof] slices of nn_oof_mat_fold. Capture them EARLY so
+    # we can free nn_oof_mat_fold after X_fold_oof_dense is built --
+    # otherwise the full ~200 MB NN feature matrix sits in memory all
+    # the way through M2/M3/M5/M4 just for these two 1-D arrays.
+    _aux_mean_sim_fold, _aux_support_fold = _slice_nn_aux_from_oof_mat(nn_oof_mat_fold)
 
     # ----- Member 1 (fold-retrain OR fall back to global) -----
     if OOF_RETRAIN_M1:
@@ -3642,19 +3754,36 @@ for fold in folds:
         _fold_model.load_state_dict(_fold_ckpt["model_state"])
         _fold_model = _fold_model.to(device).eval()
         p_a_oof_fold = _score_dataset(_oof_ds_fold, _fold_model)
-        # Also score fold M1 on fold's TRAIN rows -- needed as Member 2's
-        # residual anchor when fitting fold Member 2 below.
-        _train_ds_fold_full = _build(fold_train_df, nn_train_mat_fold)
-        p_a_anchor_fold_train = _score_dataset(_train_ds_fold_full, _fold_model)
+        # Member 2's residual anchor: on the LEGACY Member 2 path it must
+        # come from this fold's M1 (so we score M1 on every fold-train
+        # row -- builds a full-size dataset, ~few GB of tensors). On the
+        # Task 3 path Member 2 v2 uses subject_mean as the anchor, so
+        # this anchor scoring is pure waste; skip it.
+        if not _M2V2_ENABLED:
+            _train_ds_fold_full = _build(fold_train_df, nn_train_mat_fold)
+            p_a_anchor_fold_train = _score_dataset(_train_ds_fold_full, _fold_model)
+            del _train_ds_fold_full
+        else:
+            p_a_anchor_fold_train = None
         _fold_model = _fold_model.to("cpu")
-        del _fold_model, _train_ds_fold, _val_ds_fold, _oof_ds_fold, _train_ds_fold_full
+        del _fold_model, _train_ds_fold, _val_ds_fold, _oof_ds_fold
         gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
     else:
         # Use global p_a_train (saw all train items -- documented small leak).
         p_a_oof_fold = p_a_train[fold.oof_row_idx]
-        p_a_anchor_fold_train = p_a_train[fold.train_row_idx]
+        if not _M2V2_ENABLED:
+            p_a_anchor_fold_train = p_a_train[fold.train_row_idx]
+        else:
+            p_a_anchor_fold_train = None
     p_a_train_oof_acc.write_fold(fold.oof_row_idx, p_a_oof_fold)
+
+    # The NN feature matrices are no longer needed: their consumers
+    # (X_fold_*_dense, M1 datasets, and the aux-feature slices) have all
+    # been served. At full scale this is ~360 MB (train) + ~200 MB (oof)
+    # of headroom returned to the OS before Member 2 starts.
+    del nn_train_mat_fold, nn_oof_mat_fold
+    gc.collect()
 
     # ----- Fold Member 2 (GBDT residual) -----
     _y_fold_train_np = _y_fold_train
@@ -3700,6 +3829,17 @@ for fold in folds:
         )
     else:
         # Legacy: full-schema Member 2 with Member 1 anchor.
+        # MEMORY: build the m2 matrices JIT (now), train, score, free.
+        # They are not used anywhere else; keeping them around through
+        # M3/M5/M4 like the old structure did wastes ~24 GB peak per fold.
+        print(f"[OOF f{fold.fold_id}] Building Member 2 legacy matrices (JIT)...")
+        X_fold_train_dense_m2 = np.concatenate(
+            [X_fold_train_dense, fold_member2_interaction_train], axis=1,
+        ).astype(np.float32, copy=False)
+        X_fold_oof_dense_m2 = np.concatenate(
+            [X_fold_oof_dense, fold_member2_interaction_oof], axis=1,
+        ).astype(np.float32, copy=False)
+        gc.collect()
         print(f"[OOF f{fold.fold_id}] Training fold Member 2 (legacy: GBDT residual)...")
         _fold_m2_feature_names = (
             tuple(member_feat_schema.feature_names)
@@ -3729,9 +3869,14 @@ for fold in folds:
                 seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
             ),
         )
+        # Free training matrix the moment scoring starts -- p_a_anchor too.
+        del X_fold_train_dense_m2
+        gc.collect()
         p2_oof_fold = gbdt_compose_residual_batch(
             _fold_gbdt_state, X_fold_oof_dense_m2, p_a_oof_fold,
         )
+        del X_fold_oof_dense_m2
+        gc.collect()
     p2_train_oof_acc.write_fold(fold.oof_row_idx, p2_oof_fold)
 
     # ----- Fold Member 3 (kNN-similarity) -----
@@ -3769,57 +3914,38 @@ for fold in folds:
     # Score fold Member 3 on OOF rows. fold_oof_df has item_keys NOT in
     # fold's item universe; knn_apply_batch handles this via cold-start
     # fallback (uses subject's mean over neighbors with valid items).
+    # MEMORY: build the [N_oof, d_emb] query stack as a local; the
+    # knn_apply call internally chunks so we don't need a second copy.
+    _m3_oof_query_emb = np.stack(
+        [np.asarray(item_emb_lookup[k], dtype=np.float32)
+         for k in fold_oof_df["item_key"].astype(str)],
+        axis=0,
+    )
     p3_oof_fold = knn_apply_batch(
         _fold_knn_state,
         subject_keys=fold_oof_df["subject_key"].astype(str).tolist(),
         item_keys=fold_oof_df["item_key"].astype(str).tolist(),
-        query_item_embeddings=np.stack(
-            [np.asarray(item_emb_lookup[k], dtype=np.float32)
-             for k in fold_oof_df["item_key"].astype(str)],
-            axis=0,
-        ),
+        query_item_embeddings=_m3_oof_query_emb,
     )
     p3_train_oof_acc.write_fold(fold.oof_row_idx, p3_oof_fold)
+    # The fold's KNN state (~900 MB at full scale: [S, N] passrate_sorted
+    # + mask_sorted) is no longer needed -- Member 5 has its own state
+    # below, and the OOF prediction has already been written to the
+    # accumulator. Free it before Member 5's allocations land.
+    del _fold_knn_state, _m3_oof_query_emb
+    gc.collect()
 
     # ----- Fold Member 5 (difficulty-projected kNN) -----
     # Trained from scratch per fold on fold-train items + fold-train rows
     # so OOF predictions on fold-OOF rows are genuinely "model never saw
     # this item's label" (Gate 4a). The projection regression uses only
-    # fold-train items' per-item passrate, which is itself computed from
-    # fold-train labels only -- so target leakage is impossible.
+    # fold-train items' per-item passrate, which is itself derived from
+    # the SAME `_fold_passrate_dense` / `_fold_passrate_mask_dense`
+    # matrices Member 3 already built (so we skip ~3 GB of [S, N]
+    # intermediates that the row-aggregation path would allocate -- the
+    # root cause of the Section 9.5 fold 0 OOM in the first Task-4 build).
     if _M5_ENABLED:
         print(f"[OOF f{fold.fold_id}] Training fold Member 5 (difficulty-kNN)...")
-        # Fold-local item position map (item_key -> 0..len(fold.train_item_keys)).
-        _fold_item_key_to_pos = {
-            k: i for i, k in enumerate(fold.train_item_keys)
-        }
-        # Fold-train rows -> subject_ids + item_ids in the fold's item space.
-        _fold_train_subj_ids = np.fromiter(
-            (
-                int(indexer.subject_to_id.get(str(s), -1))
-                for s in fold_train_df["subject_key"]
-            ),
-            dtype=np.int64,
-            count=len(fold_train_df),
-        )
-        _fold_train_item_ids = np.fromiter(
-            (
-                int(_fold_item_key_to_pos.get(str(k), -1))
-                for k in fold_train_df["item_key"]
-            ),
-            dtype=np.int64,
-            count=len(fold_train_df),
-        )
-        _fold_train_y_m5 = fold_train_df["label"].astype(float).to_numpy()
-        # All fold-train rows must have valid lookups (the fold's training
-        # universe is exactly fold.train_item_keys, by construction).
-        _bad_m5 = int(((_fold_train_subj_ids < 0)
-                       | (_fold_train_item_ids < 0)).sum())
-        if _bad_m5 > 0:
-            raise RuntimeError(
-                f"[Member 5 fold {fold.fold_id}] {_bad_m5:,} fold-train rows "
-                "have unresolvable subject_id or item_id."
-            )
 
         # --- Gate 4c (per-fold): projection-leakage probe vs OOF items ---
         # The fold's Member 5 is fit on `fold.train_item_keys` only. The
@@ -3833,14 +3959,19 @@ for fold in folds:
         )
         _gate4c_per_fold[int(fold.fold_id)] = _gate4c_fold
 
-        # --- Stack item embeddings for the fold's projection fit ---
-        # _fold_item_emb_stacked was created above for Member 3 (same
-        # ordering as fold.train_item_keys), so reuse it -- saves
-        # re-stacking ~100k embeddings per fold.
+        # Reuse `_fold_item_emb_stacked` (built above for Member 3) and
+        # `_fold_passrate_dense` / `_fold_passrate_mask_dense` (also
+        # already built for Member 3) so we don't pay double the memory.
+        # The pre-built passrate path skips fit_member5's internal
+        # aggregation -- this is the OOM fix.
+        _fold_passrate_mask_bool = _fold_passrate_mask_dense.astype(bool)
         _fold_m5_state = cache_or_compute(
             "member5_state_oof_fold",
             key_inputs=(
-                "m5_oof_v1", fold.fold_id, fold_suffix,
+                # m5_oof_v2 bumps the cache key for the passrate-reuse path
+                # (same numerical state, but cleaner discipline to invalidate
+                # once when the construction path changes).
+                "m5_oof_v2", fold.fold_id, fold_suffix,
                 int(len(fold.train_item_keys)), int(indexer.n_subjects),
                 int(len(fold_train_df)), int(_fold_item_emb_stacked.shape[1]),
                 _M5_K, round(_M5_TAU, 6), round(_M5_RIDGE_ALPHA, 6),
@@ -3851,9 +3982,15 @@ for fold in folds:
                 item_keys=list(_ff.train_item_keys),
                 item_embeddings=_fold_item_emb_stacked,
                 subject_keys=list(_subject_keys_ordered),
-                subject_ids_per_row=_fold_train_subj_ids,
-                item_ids_per_row=_fold_train_item_ids,
-                labels=_fold_train_y_m5,
+                # Row arrays are accepted but IGNORED on the fast path
+                # (passrate_dense + passrate_mask is sufficient for fit).
+                # Pass empty arrays so we don't allocate the per-row id
+                # vectors at all -- another ~75 MB saved per fold.
+                subject_ids_per_row=np.zeros(0, dtype=np.int64),
+                item_ids_per_row=np.zeros(0, dtype=np.int64),
+                labels=np.zeros(0, dtype=np.float64),
+                passrate_dense=_fold_passrate_dense,
+                passrate_mask=_fold_passrate_mask_bool,
                 k=_M5_K,
                 tau=_M5_TAU,
                 ridge_alpha=_M5_RIDGE_ALPHA,
@@ -3861,12 +3998,14 @@ for fold in folds:
                 min_subjects_per_item=_M5_MIN_SUBJ_PER_ITEM,
             ),
         )
+        del _fold_passrate_mask_bool
+        gc.collect()
 
         # --- Score fold Member 5 on OOF rows ---
-        # OOF items are item-disjoint from the fold's fit set, so every
-        # OOF row's item embedding gets projected through the SAME w/b
-        # the fit produced (no item-id lookup needed -- the projection
-        # is purely a function of the embedding).
+        # Build the OOF item embedding stack JUST IN TIME (kept narrow:
+        # ~1.6 GB at full scale for 100k rows x 4096 dims) and free it
+        # immediately after scoring so Member 4's much larger
+        # X_fold_train_dense_m4 build has headroom.
         _fold_oof_subj_ids = np.fromiter(
             (
                 int(indexer.subject_to_id.get(str(s), -1))
@@ -3886,10 +4025,75 @@ for fold in folds:
             query_item_embeddings=_fold_oof_item_emb,
         )
         p5_train_oof_acc.write_fold(fold.oof_row_idx, p5_oof_fold)
+
+        # Eagerly free the fold's Member 5 artifacts (state + OOF emb
+        # stack + per-row id vectors). The state holds [S, N] passrate
+        # arrays inside the cached object -- if we don't free them here
+        # they survive through Member 4's training (~30 GB peak dense
+        # matrix), pushing total RAM over the Colab cap. Member 5 has
+        # already written p5_oof_fold into the accumulator so the
+        # state is no longer needed for this fold.
+        del _fold_oof_subj_ids, _fold_oof_item_emb, _fold_m5_state
+        gc.collect()
     else:
         p5_oof_fold = None
 
+    # Members 3 + 5 are now both done. The fold-scoped item-embedding
+    # stack (~4 GB at full scale) and the dense passrate / mask matrices
+    # (~720 MB each) are no longer referenced -- free them BEFORE
+    # Member 4's training builds its ~25 GB X_fold_train_dense_m4. The
+    # legacy code did this at the end of the iteration, which kept
+    # ~5 GB live during the heaviest training step.
+    del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
+    gc.collect()
+
     # ----- Fold Member 4 (LogReg hybrid) -----
+    # MEMORY: build M4's training matrix JIT, train, free, then build
+    # M4's OOF matrix, score, free. At full scale each is ~16 GB
+    # (train) and ~8 GB (oof); having them coexist with each other AND
+    # with the base X_fold_*_dense was the leading peak contributor
+    # in the old structure. The base X_fold_*_dense gets absorbed
+    # into the concat result and is freed immediately after.
+    #
+    # On the Task 3 path we DEFERRED the base build above, so we
+    # construct ``X_fold_train_dense_m4`` directly in chunks: build a
+    # chunk of X via ``_build_X`` (small temporary, ~2 GB at chunk=500k)
+    # and write it into the pre-allocated full-size m4 matrix alongside
+    # the marginal columns. Peak only ever has the full m4 result +
+    # one chunk's temporary, never the full base X as a separate object.
+    print(f"[OOF f{fold.fold_id}] Building Member 4 train matrix (JIT)...")
+    _F_BASE = int(member_feat_schema.feature_dim)
+    _F_MARG = int(fold_member4_marginal_train.shape[1])
+    _F_M4 = _F_BASE + _F_MARG
+    if X_fold_train_dense is None:
+        # Chunked build: never materialize the full 16 GB base.
+        # Chunk size 500k keeps the per-chunk transient under ~2.5 GB.
+        _N_TR = int(len(fold_train_df))
+        _CHUNK_TR = int(CFG.get("oof", {}).get("xbuild_chunk_rows", 500_000))
+        X_fold_train_dense_m4 = np.empty((_N_TR, _F_M4), dtype=np.float32)
+        # Pre-write the marginal columns; they're small and fast.
+        X_fold_train_dense_m4[:, _F_BASE:] = fold_member4_marginal_train
+        for _cs in range(0, _N_TR, _CHUNK_TR):
+            _ce = min(_cs + _CHUNK_TR, _N_TR)
+            _chunk_X = _build_X(
+                fold_train_df.iloc[_cs:_ce],
+                nn_train_mat_fold[_cs:_ce],
+                _bc_redacted_fold_train[_cs:_ce],
+            )
+            X_fold_train_dense_m4[_cs:_ce, :_F_BASE] = _chunk_X
+            del _chunk_X
+        gc.collect()
+    else:
+        # Legacy path: concat the already-built base with the marginal.
+        X_fold_train_dense_m4 = np.concatenate(
+            [X_fold_train_dense, fold_member4_marginal_train], axis=1,
+        ).astype(np.float32, copy=False)
+        del X_fold_train_dense
+    # The marginal columns have been copied into the concat result.
+    # ``_bc_redacted_fold_train`` is no longer needed (only OOF half remains).
+    del fold_member4_marginal_train, _bc_redacted_fold_train
+    gc.collect()
+
     print(f"[OOF f{fold.fold_id}] Training fold Member 4 (LogReg hybrid)...")
     _fold_m4_feature_names = (
         tuple(member_feat_schema.feature_names)
@@ -3917,15 +4121,49 @@ for fold in folds:
             holdout_group_id=_gbdt_train_item_id_fold,
         ),
     )
+    # Training done. Free the [N_train, F+14] matrix BEFORE building the
+    # OOF matrix so they don't both live during scoring.
+    del X_fold_train_dense_m4
+    gc.collect()
+
+    print(f"[OOF f{fold.fold_id}] Building Member 4 OOF matrix (JIT) + scoring...")
+    if X_fold_oof_dense is None:
+        # Chunked build (Task 3 path): never materialize the full base.
+        _N_OF = int(len(fold_oof_df))
+        _CHUNK_OF = int(CFG.get("oof", {}).get("xbuild_chunk_rows", 500_000))
+        X_fold_oof_dense_m4 = np.empty((_N_OF, _F_M4), dtype=np.float32)
+        X_fold_oof_dense_m4[:, _F_BASE:] = fold_member4_marginal_oof
+        for _cs in range(0, _N_OF, _CHUNK_OF):
+            _ce = min(_cs + _CHUNK_OF, _N_OF)
+            _chunk_X = _build_X(
+                fold_oof_df.iloc[_cs:_ce],
+                nn_oof_mat_fold[_cs:_ce],
+                _bc_redacted_fold_oof[_cs:_ce],
+            )
+            X_fold_oof_dense_m4[_cs:_ce, :_F_BASE] = _chunk_X
+            del _chunk_X
+        gc.collect()
+    else:
+        X_fold_oof_dense_m4 = np.concatenate(
+            [X_fold_oof_dense, fold_member4_marginal_oof], axis=1,
+        ).astype(np.float32, copy=False)
+        del X_fold_oof_dense
+    del fold_member4_marginal_oof, _bc_redacted_fold_oof
+    gc.collect()
     p4_oof_fold = logreg_apply_state_batch(_fold_logreg_state, X_fold_oof_dense_m4)
     p4_train_oof_acc.write_fold(fold.oof_row_idx, p4_oof_fold)
+    del X_fold_oof_dense_m4
+    gc.collect()
 
     # ----- Aux features (NN mean sim, NN support, centroid dist for OOF rows) -----
-    _aux_mean_sim_fold, _aux_support_fold = _slice_nn_aux_from_oof_mat(nn_oof_mat_fold)
+    # _aux_mean_sim_fold + _aux_support_fold were captured early (right
+    # after nn_oof_mat_fold was built) so the full NN feature matrix
+    # could be freed alongside nn_train_mat_fold after Member 1.
     _aux_centroid_dist_fold = _centroid_dist_for_rows(fold_oof_df)
     nn_mean_sim_oof_acc.write_fold(fold.oof_row_idx, _aux_mean_sim_fold)
     nn_support_oof_acc.write_fold(fold.oof_row_idx, _aux_support_fold)
     centroid_dist_oof_acc.write_fold(fold.oof_row_idx, _aux_centroid_dist_fold)
+    del _aux_mean_sim_fold, _aux_support_fold, _aux_centroid_dist_fold
 
     print(
         f"[OOF f{fold.fold_id}] Fold OOF NLL summary on {len(fold.oof_row_idx):,} held-out rows:"
@@ -3941,22 +4179,28 @@ for fold in folds:
     )
 
     # Free fold-scoped artifacts before next iteration (keep RAM bounded).
-    del fold_nn_index, fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
-    del nn_train_mat_fold, nn_oof_mat_fold
-    del X_fold_train_dense, X_fold_oof_dense
-    del X_fold_train_dense_m2, X_fold_oof_dense_m2
-    del X_fold_train_dense_m4, X_fold_oof_dense_m4
+    # The vast majority of large fold-scoped objects were freed inline
+    # next to their last consumer (see comments at each free site).
+    # What's still in scope here is the small bookkeeping state that
+    # lives the whole fold:
+    #   * Passrate CSRs / conditional context             (~tens of MB)
+    #   * Member 2 interaction matrices                   (~few MB)
+    #   * Mean-encoded stats / subject_mean table         (~few MB)
+    #
+    # ``fold_nn_index`` was already freed right after the Gate-1b probe.
+    # ``nn_train_mat_fold`` / ``nn_oof_mat_fold`` were freed right after
+    # Member 1 (datasets) and X_fold_*_dense / aux capture were all done.
+    # ``X_fold_*_dense``, ``X_fold_*_dense_m4``, ``X_fold_*_dense_m2``,
+    # ``fold_member4_marginal_*``, ``_fold_item_emb_stacked``,
+    # ``_fold_passrate_dense`` / ``_fold_passrate_mask_dense``,
+    # ``_fold_knn_state``, and Member 5's per-fold state / OOF stack
+    # were all freed at their last consumer.
+    del fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
     del fold_member2_interaction_train, fold_member2_interaction_oof
-    del fold_member4_marginal_train, fold_member4_marginal_oof
-    del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
     if _M2V2_ENABLED:
         del X_fold_train_m2v2, X_fold_oof_m2v2
         del subject_mean_train_fold, subject_mean_oof_fold
         del fold_subject_mean_table
-    if _M5_ENABLED:
-        del _fold_train_subj_ids, _fold_train_item_ids, _fold_train_y_m5
-        del _fold_oof_subj_ids, _fold_oof_item_emb
-        del _fold_item_key_to_pos
     gc.collect()
 
 # Finalize OOF accumulators -- raises if anything is missing / non-finite.

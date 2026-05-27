@@ -10,6 +10,7 @@ import pytest
 
 from src.member5_difficulty_knn import (
     Member5State,
+    _derive_aggregates_from_dense,
     _knearest_sorted,
     aggregate_per_item_passrate,
     apply_batch,
@@ -139,6 +140,179 @@ def test_aggregate_per_item_passrate_basic():
     assert passrate_mask[2, 2] and not passrate_mask[2, 0]
     np.testing.assert_allclose(passrate_dense[0], [1.0, 0.0, 0.0])
     np.testing.assert_allclose(passrate_dense[2], [0.0, 0.0, 1.0])
+
+
+def test_derive_aggregates_from_dense_matches_row_aggregator():
+    """_derive_aggregates_from_dense must produce IDENTICAL per-item /
+    per-subject / global stats to aggregate_per_item_passrate's row
+    aggregation WHEN each (subject, item) cell is observed at most
+    once -- which is the contest's invariant (each row is one unique
+    (subject, item) completion).
+
+    NOTE: when the same (s, i) pair appears multiple times in rows,
+    the two paths diverge:
+      - row aggregator: item_mean = sum_labels / num_rows_for_item
+      - dense aggregator: item_mean = mean over subjects of
+        (subject's mean rating for this item)
+    For contest data these are equivalent because (s, i) pairs are unique.
+    Tests below pick a disjoint set of pairs to enforce the
+    no-duplicate invariant that the production data has.
+    """
+    rng = np.random.default_rng(99)
+    n_s, n_i = 12, 25
+    # Sample without replacement from the full S*N grid -> unique pairs.
+    flat_idx = rng.choice(n_s * n_i, size=200, replace=False)
+    s = (flat_idx // n_i).astype(np.int64)
+    i = (flat_idx % n_i).astype(np.int64)
+    y = rng.random(size=s.shape[0])
+    (item_mean_a, item_cnt_a, subj_global_a, subj_cnt_a,
+     pd, pm, gm_a) = aggregate_per_item_passrate(
+        subject_ids=s, item_ids=i, labels=y,
+        n_subjects=n_s, n_items=n_i,
+    )
+    (item_mean_b, item_cnt_b, subj_global_b, subj_cnt_b, gm_b) = (
+        _derive_aggregates_from_dense(pd, pm)
+    )
+    np.testing.assert_allclose(item_mean_a, item_mean_b, atol=1e-6)
+    np.testing.assert_allclose(item_cnt_a, item_cnt_b, atol=1e-6)
+    np.testing.assert_allclose(subj_global_a, subj_global_b, atol=1e-6)
+    np.testing.assert_allclose(subj_cnt_a, subj_cnt_b, atol=1e-6)
+    assert abs(gm_a - gm_b) < 1e-9
+
+
+def test_derive_aggregates_from_dense_rejects_shape_mismatch():
+    with pytest.raises(ValueError, match="shape"):
+        _derive_aggregates_from_dense(
+            np.zeros((3, 4), dtype=np.float32),
+            np.zeros((3, 5), dtype=bool),
+        )
+
+
+def test_derive_aggregates_from_dense_handles_empty_subject():
+    """A subject with no observed cells must produce 0 obs_count and
+    0 subject_global (not NaN), matching the row aggregator."""
+    pd = np.array(
+        [[0.0, 0.0, 0.0],
+         [0.5, 0.0, 0.0],
+         [0.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    pm = np.array(
+        [[False, False, False],
+         [True,  False, False],
+         [False, False, False]],
+        dtype=bool,
+    )
+    item_mean, item_cnt, subj_g, subj_cnt, gm = (
+        _derive_aggregates_from_dense(pd, pm)
+    )
+    assert subj_cnt[0] == 0 and subj_g[0] == 0.0
+    assert subj_cnt[2] == 0 and subj_g[2] == 0.0
+    assert subj_cnt[1] == 1 and abs(subj_g[1] - 0.5) < 1e-6
+    assert item_cnt[0] == 1 and abs(item_mean[0] - 0.5) < 1e-6
+    assert item_cnt[1] == 0 and item_mean[1] == 0.0
+
+
+def test_fit_member5_fast_path_matches_slow_path():
+    """End-to-end: fit_member5 with passrate_dense/mask pre-built MUST
+    produce a state equivalent to the row-aggregation path. Same
+    projection weights, same sort order, same predictions on a
+    sampled query.
+
+    This is the load-bearing test for the OOM fix: if the fast path
+    diverged from the slow path, the per-fold pipeline would be
+    silently wrong."""
+    inputs = _build_synthetic_member5_inputs(seed=77)
+    inputs.pop("true_difficulty")
+
+    # Pre-build the passrate matrices the same way aggregate_per_item_passrate does.
+    n_s, n_i = (
+        len(inputs["subject_keys"]),
+        len(inputs["item_keys"]),
+    )
+    (_, _, _, _, pd, pm, _) = aggregate_per_item_passrate(
+        subject_ids=inputs["subject_ids_per_row"],
+        item_ids=inputs["item_ids_per_row"],
+        labels=inputs["labels"],
+        n_subjects=n_s, n_items=n_i,
+    )
+
+    state_slow = fit_member5(
+        **inputs, k=5, tau=0.05, ridge_alpha=0.5,
+        item_fallback_weight=0.3, min_subjects_per_item=2,
+    )
+    state_fast = fit_member5(
+        **inputs, k=5, tau=0.05, ridge_alpha=0.5,
+        item_fallback_weight=0.3, min_subjects_per_item=2,
+        passrate_dense=pd, passrate_mask=pm,
+    )
+    # Projection equivalence (the input data is identical, so the
+    # weighted ridge fit must produce the same solution).
+    np.testing.assert_allclose(
+        state_fast.projection_weights, state_slow.projection_weights, atol=1e-6,
+    )
+    assert abs(state_fast.projection_bias - state_slow.projection_bias) < 1e-6
+    np.testing.assert_array_equal(state_fast.sort_order, state_slow.sort_order)
+    np.testing.assert_allclose(
+        state_fast.predicted_difficulty,
+        state_slow.predicted_difficulty,
+        atol=1e-6,
+    )
+    # Inference equivalence on a sample.
+    rng = np.random.default_rng(0)
+    sample = rng.choice(inputs["item_embeddings"].shape[0], size=16, replace=False)
+    q_embs = inputs["item_embeddings"][sample]
+    for s_id in [0, 5, 10]:
+        for r in range(q_embs.shape[0]):
+            p_slow = apply_one(state_slow, q_embs[r], f"subj_{s_id}")
+            p_fast = apply_one(state_fast, q_embs[r], f"subj_{s_id}")
+            assert abs(p_slow - p_fast) < 1e-6, (
+                f"row {r}, subj {s_id}: slow={p_slow} vs fast={p_fast}"
+            )
+
+
+def test_fit_member5_fast_path_requires_both_matrices():
+    """Passing only one of (passrate_dense, passrate_mask) must raise --
+    a half-configured fast path would silently bypass the row
+    aggregation without a substitute, producing nonsense aggregates."""
+    inputs = _build_synthetic_member5_inputs(seed=2)
+    inputs.pop("true_difficulty")
+    with pytest.raises(ValueError, match="passrate_dense and passrate_mask"):
+        fit_member5(
+            **inputs, k=5, tau=0.05, ridge_alpha=0.5,
+            item_fallback_weight=0.3, min_subjects_per_item=2,
+            passrate_dense=np.zeros((1, 1), dtype=np.float32),
+            passrate_mask=None,
+        )
+
+
+def test_fit_member5_fast_path_rejects_shape_mismatch():
+    """A passed passrate matrix that disagrees with n_items / n_subjects
+    must raise so misalignment doesn't silently produce wrong stats."""
+    inputs = _build_synthetic_member5_inputs(seed=3)
+    inputs.pop("true_difficulty")
+    n_s, n_i = (
+        len(inputs["subject_keys"]),
+        len(inputs["item_keys"]),
+    )
+    # Off-by-one rows.
+    bad_pd = np.zeros((n_s - 1, n_i), dtype=np.float32)
+    bad_pm = np.zeros((n_s - 1, n_i), dtype=bool)
+    with pytest.raises(ValueError, match="n_subjects"):
+        fit_member5(
+            **inputs, k=5, tau=0.05, ridge_alpha=0.5,
+            item_fallback_weight=0.3, min_subjects_per_item=2,
+            passrate_dense=bad_pd, passrate_mask=bad_pm,
+        )
+    # Off-by-one cols.
+    bad_pd2 = np.zeros((n_s, n_i + 1), dtype=np.float32)
+    bad_pm2 = np.zeros((n_s, n_i + 1), dtype=bool)
+    with pytest.raises(ValueError, match="n_items"):
+        fit_member5(
+            **inputs, k=5, tau=0.05, ridge_alpha=0.5,
+            item_fallback_weight=0.3, min_subjects_per_item=2,
+            passrate_dense=bad_pd2, passrate_mask=bad_pm2,
+        )
 
 
 def test_aggregate_handles_invalid_indices():

@@ -309,6 +309,70 @@ def fit_difficulty_projection(
 # ---------------------------------------------------------------------------
 
 
+def _derive_aggregates_from_dense(
+    passrate_dense: np.ndarray,
+    passrate_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Memory-efficient: derive per-item / per-subject / global stats
+    from already-built ``[S, N]`` passrate + mask matrices.
+
+    The per-fold notebook ALREADY builds these matrices for Member 3.
+    Re-aggregating them from rows inside ``fit_member5`` would allocate
+    another ``[S, N]`` cell-count matrix and a ``[S, N]`` safe-divide
+    intermediate (~1.4 GB at S=900, N=200k) -- enough to OOM the
+    high-RAM Colab box on fold 0. This helper extracts the stats with
+    O(N) auxiliary memory (per-row/column sums), no extra full
+    matrices allocated.
+
+    Returns
+    -------
+    item_mean_passrate : [N] fp32   -- per-item mean over rated subjects
+    item_obs_count     : [N] fp32   -- per-item count of rated subjects
+    subject_global     : [S] fp32   -- per-subject mean over rated items
+    subject_obs_count  : [S] fp32   -- per-subject count of rated items
+    global_mean        : Python float
+    """
+    pd = passrate_dense
+    pm = passrate_mask
+    if pd.ndim != 2 or pm.ndim != 2:
+        raise ValueError(
+            f"passrate_dense / passrate_mask must be 2D, got "
+            f"{pd.shape} / {pm.shape}"
+        )
+    if pd.shape != pm.shape:
+        raise ValueError(
+            f"passrate_dense shape {pd.shape} != passrate_mask shape {pm.shape}"
+        )
+
+    # Sum across the subjects axis (axis=0) -> per-item totals.
+    # ``dtype=np.float64`` in the accumulator avoids a full-precision
+    # intermediate matrix while still keeping numerical accuracy.
+    item_sum = pd.sum(axis=0, dtype=np.float64)        # [N]
+    item_cnt = pm.sum(axis=0, dtype=np.float64)        # [N]
+    safe_item = np.where(item_cnt > 0, item_cnt, 1.0)
+    item_mean = (item_sum / safe_item).astype(np.float32)
+    item_mean[item_cnt == 0] = 0.0
+
+    # Sum across the items axis (axis=1) -> per-subject totals.
+    subj_sum = pd.sum(axis=1, dtype=np.float64)        # [S]
+    subj_cnt = pm.sum(axis=1, dtype=np.float64)        # [S]
+    safe_subj = np.where(subj_cnt > 0, subj_cnt, 1.0)
+    subj_global = (subj_sum / safe_subj).astype(np.float32)
+    subj_global[subj_cnt == 0] = 0.0
+
+    total_sum = float(item_sum.sum())
+    total_cnt = float(item_cnt.sum())
+    global_mean = float(total_sum / total_cnt) if total_cnt > 0 else 0.5
+
+    return (
+        item_mean,
+        item_cnt.astype(np.float32),
+        subj_global,
+        subj_cnt.astype(np.float32),
+        global_mean,
+    )
+
+
 def aggregate_per_item_passrate(
     *,
     subject_ids: np.ndarray,     # [N_rows] int (>= 0)
@@ -400,6 +464,8 @@ def fit_member5(
     ridge_alpha: float = 1.0,
     item_fallback_weight: float = 0.3,
     min_subjects_per_item: int = 3,
+    passrate_dense: np.ndarray | None = None,
+    passrate_mask: np.ndarray | None = None,
 ) -> Member5State:
     """End-to-end Member 5 fit.
 
@@ -414,6 +480,9 @@ def fit_member5(
         with ``Indexer`` ordering).
     subject_ids_per_row / item_ids_per_row / labels
         Aligned ``[N_rows]`` arrays giving the training observations.
+        Ignored when ``passrate_dense`` and ``passrate_mask`` are
+        provided (fast path); only the ``[N_rows]`` shape is consulted
+        for the train-loss sample size.
     k
         kNN neighborhood size for the difficulty-axis search.
     tau
@@ -429,6 +498,21 @@ def fit_member5(
         Items with fewer rated subjects than this are excluded from
         the difficulty-projection fit (their item_mean_passrate is
         too noisy).
+    passrate_dense, passrate_mask
+        Optional. ``[n_subjects, n_items]`` matrices in the SAME
+        item ordering as ``item_keys``. When provided, ``fit_member5``
+        skips the internal ``aggregate_per_item_passrate`` call and
+        derives all aggregates directly from these matrices via
+        :func:`_derive_aggregates_from_dense`. This is the recommended
+        path when the caller already built a passrate matrix (e.g.
+        for Member 3) -- it avoids a ~3 GB peak of duplicated
+        ``[S, N]`` intermediates that have caused OOMs on Colab
+        high-RAM during per-fold OOF training.
+
+        Both must be passed together. ``passrate_dense`` is float
+        (interpreted in (0, 1) for observed cells, 0 elsewhere);
+        ``passrate_mask`` is bool (True for observed cells). Other
+        dtypes are accepted with an automatic cast.
     """
     item_keys_list = list(str(k) for k in item_keys)
     subject_keys_list = list(str(s) for s in subject_keys)
@@ -441,18 +525,53 @@ def fit_member5(
         )
     d_emb = int(item_embeddings.shape[1])
 
-    (
-        item_mean_passrate, item_obs_count,
-        subj_global, subj_obs_count,
-        passrate_dense, passrate_mask,
-        global_mean,
-    ) = aggregate_per_item_passrate(
-        subject_ids=subject_ids_per_row,
-        item_ids=item_ids_per_row,
-        labels=labels,
-        n_subjects=n_subjects,
-        n_items=n_items,
-    )
+    if (passrate_dense is None) ^ (passrate_mask is None):
+        raise ValueError(
+            "passrate_dense and passrate_mask must be passed together "
+            "(both or neither)."
+        )
+
+    if passrate_dense is not None and passrate_mask is not None:
+        # Fast path: derive per-item / per-subject / global stats from
+        # the pre-built dense matrices instead of re-aggregating from
+        # rows. Saves ~3 GB of [S, N] intermediates that the rows->dense
+        # add.at path used to allocate; this is what tripped the OOM
+        # in Section 9.5 fold 0.
+        passrate_dense = np.ascontiguousarray(passrate_dense, dtype=np.float32)
+        passrate_mask = np.ascontiguousarray(passrate_mask).astype(bool, copy=False)
+        if int(passrate_dense.shape[0]) != n_subjects:
+            raise ValueError(
+                f"passrate_dense rows {passrate_dense.shape[0]} != "
+                f"n_subjects {n_subjects}"
+            )
+        if int(passrate_dense.shape[1]) != n_items:
+            raise ValueError(
+                f"passrate_dense cols {passrate_dense.shape[1]} != "
+                f"n_items {n_items}"
+            )
+        (
+            item_mean_passrate, item_obs_count,
+            subj_global, subj_obs_count, global_mean,
+        ) = _derive_aggregates_from_dense(passrate_dense, passrate_mask)
+        LOG.info(
+            "fit_member5: using pre-built passrate (S=%d, N=%d, "
+            "observed=%d cells); skipping row-level aggregation.",
+            int(passrate_dense.shape[0]), int(passrate_dense.shape[1]),
+            int(passrate_mask.sum()),
+        )
+    else:
+        (
+            item_mean_passrate, item_obs_count,
+            subj_global, subj_obs_count,
+            passrate_dense, passrate_mask,
+            global_mean,
+        ) = aggregate_per_item_passrate(
+            subject_ids=subject_ids_per_row,
+            item_ids=item_ids_per_row,
+            labels=labels,
+            n_subjects=n_subjects,
+            n_items=n_items,
+        )
 
     # For the projection fit we restrict to items with enough rated
     # subjects (the per-item mean is too noisy for tiny support).
@@ -800,3 +919,8 @@ __all__ = [
     "apply_batch_via_ids",
     "assert_projection_disjoint_from_val",
 ]
+
+
+# Re-export the dense-matrix helper as a public API so notebook/scripts
+# can use it for tests or to short-circuit the aggregation in custom flows.
+__all__.append("_derive_aggregates_from_dense")
