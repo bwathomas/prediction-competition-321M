@@ -2609,62 +2609,70 @@ from src.logreg_member import (
 )
 
 
+X_train_dense_m4 = np.concatenate(
+    [X_train_dense, member4_marginal_train], axis=1
+).astype(np.float32, copy=False)
+X_val_dense_m4 = np.concatenate(
+    [X_val_dense, member4_marginal_val], axis=1
+).astype(np.float32, copy=False)
+member4_feature_names = tuple(member_feat_schema.feature_names) + tuple(
+    MEMBER4_MARGINAL_FEATURE_NAMES
+)
+print(
+    f"[Member 4] hybrid feature matrix: train {X_train_dense_m4.shape}  "
+    f"val {X_val_dense_m4.shape}  "
+    f"(embedding dense={X_train_dense.shape[1]} + marginals={MEMBER4_MARGINAL_FEATURE_DIM})"
+)
+
+
 def _fit_member4():
-    # Member 4 now trains on MEAN-ENCODED MARGINAL FEATURES ONLY
-    # (subject mean, bc mean, cluster mean, plus a few interactions
-    # and a constant). The qwen-embedding-derived dense features it
-    # used to share with Member 2 are gone -- those are exactly what
-    # made it heavily correlated with Members 1/3 (also embedding-
-    # leaning) and earned it a stacker weight of ~0.10. Cutting it
-    # off forces it to specialize on raw subject/bc baselines, which
-    # is precisely the signal the embedding-based members are most
-    # likely to lose calibration on (rare subjects, unusual bcs).
+    # HYBRID: embedding-derived dense features + 14 mean-encoded
+    # marginals. The marginal-only version (val NLL 0.523, stacker
+    # weight -0.075) was too weak to compete; the embedding-only
+    # version (val NLL 0.483, stacker weight ~0.10) was too redundant
+    # with M1/M3 (both also lean on embeddings). The hybrid keeps the
+    # predictive power AND gives the LR an exclusive feature axis
+    # (subject/bench marginals) that none of the other members use
+    # for direct prediction. Stronger L1 (3e-3, up from 1e-3) lets it
+    # pick a sparser subset over the now-1216-dim input.
     print(
-        f"[Member 4] training torch logistic regression on "
-        f"MEAN-ENCODED MARGINALS (X cols={member4_marginal_train.shape[1]}, "
-        f"NO embedding features)..."
+        f"[Member 4] training torch logistic regression on HYBRID "
+        f"(X cols={X_train_dense_m4.shape[1]}, "
+        f"embedding+marginal mix, l1_strength=3e-3)..."
     )
     return fit_logreg_member(
-        X=member4_marginal_train,
+        X=X_train_dense_m4,
         y=y_train,
-        feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+        feature_names=member4_feature_names,
         epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
         learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
         weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
-        # L1 is less useful on a 14-feature dense matrix; keep a tiny
-        # L1 in case the constant column gets a nonzero weight that
-        # ought to live in the bias instead.
-        l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_marginal", 1.0e-4)),
-        # min_feature_std irrelevant at 14 cols; pass 0.0.
-        min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std_marginal", 0.0)),
+        l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_hybrid", 3.0e-3)),
+        min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
         early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
         seed=SEED,
-        # Hold out 10% of train for early-stopping val.
         val_fraction=0.1,
-        # Item-stratified cold-start internal val split. Even though
-        # the marginal features don't directly leak item identity,
-        # we keep the stratified split for consistency with Member 2.
         holdout_group_id=gbdt_train_item_id,
     )
 
 
-# Cache key bumped: ``marginal_v1`` ties this entry to the new
-# mean-encoded marginal feature schema. Old entries (which were
-# fit on the 1200+ feature dense matrix) are incompatible -- the
-# saved (weights, bias) operates on a 14-dim input now.
+# Cache key bumped: ``hybrid_v1`` ties this entry to the hybrid feature
+# matrix (embedding dense + marginals). Old entries (marginal-only OR
+# legacy embedding-only) are incompatible -- the saved weights vector
+# has a different dimensionality.
 logreg_state = cache_or_compute(
     "logreg_state",
     key_inputs=(
-        int(MEMBER4_MARGINAL_FEATURE_DIM), len(primary.train), SEED,
-        "std_v1", "l1minfreq_v1", "coldsplit_v1", "redact_v1", "marginal_v1",
-        round(float(CFG.get("member4_logreg", {}).get("l1_strength_marginal", 1.0e-4)), 6),
-        round(float(CFG.get("member4_logreg", {}).get("min_feature_std_marginal", 0.0)), 6),
+        int(X_train_dense_m4.shape[1]), len(primary.train), SEED,
+        "std_v1", "l1minfreq_v1", "coldsplit_v1", "redact_v1", "hybrid_v1",
+        round(float(CFG.get("member4_logreg", {}).get("l1_strength_hybrid", 3.0e-3)), 6),
+        round(float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)), 6),
         round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
         round(BC_REDACT_FRAC, 3), _bc_redact_seed,
     ),
     compute_fn=_fit_member4,
 )
-p_member4_val = logreg_apply_state_batch(logreg_state, member4_marginal_val)
+p_member4_val = logreg_apply_state_batch(logreg_state, X_val_dense_m4)
 nll_m4 = float(-(ylab_val * np.log(np.clip(p_member4_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member4_val, 1e-6, 1 - 1e-6))).mean())
 print(f"[Member 4] val log-loss: {nll_m4:.6f}  "
@@ -2867,10 +2875,9 @@ def _fit_nn_calibrator():
     del _train_item_keys_arr, _train_subj_keys_arr
     gc.collect()
 
-    print("[Calibrator] Member 4 (LogReg on marginal features) on train...")
-    # Member 4 now operates on the mean-encoded marginal matrix,
-    # NOT X_train_dense (which it no longer accepts).
-    p4_train_local = logreg_apply_state_batch(logreg_state, member4_marginal_train)
+    print("[Calibrator] Member 4 (LogReg on hybrid features) on train...")
+    # Member 4 operates on the hybrid matrix (embedding dense + 14 marginals).
+    p4_train_local = logreg_apply_state_batch(logreg_state, X_train_dense_m4)
 
     # Train-side stacker features (matching the same builder used on val).
     train_bench_present_local = np.array(
