@@ -176,6 +176,35 @@ def test_subject_to_trait_arrays_have_correct_length() -> None:
         fit_member2_v3_feature_builder(smoothing=10.0, **inp)
 
 
+def test_fit_rejects_undersized_cluster_vocab_with_clear_message() -> None:
+    # Regression: undersized n_clusters used to raise a cryptic
+    # ``IndexError: index 64 is out of bounds for axis 1 with size 64``
+    # from deep inside np.add.at on the subj_x_cluster cell-count step.
+    # The user's first v3 run hit this when N_CLUSTERS_CTX=64 but the
+    # k-means partition produced cluster id 64 (so the actual vocab is
+    # 65). The module must now raise a CLEAR ValueError pointing at the
+    # right fix (``fold_cond_context.n_clusters``).
+    inp = _toy_inputs(n_rows=200)
+    # Smuggle one row with cluster_id == n_clusters (= out-of-bounds by 1).
+    inp["cluster_ids"][0] = int(inp["n_clusters"])
+    with pytest.raises(ValueError, match=r"observed max\(cluster_ids\)"):
+        fit_member2_v3_feature_builder(smoothing=10.0, **inp)
+
+
+def test_fit_rejects_undersized_bc_vocab_with_clear_message() -> None:
+    inp = _toy_inputs(n_rows=200)
+    inp["bc_ids"][0] = int(inp["n_bcs"])
+    with pytest.raises(ValueError, match=r"observed max\(bc_ids\)"):
+        fit_member2_v3_feature_builder(smoothing=10.0, **inp)
+
+
+def test_fit_rejects_undersized_subject_vocab_with_clear_message() -> None:
+    inp = _toy_inputs(n_rows=200)
+    inp["subject_ids"][0] = int(inp["n_subjects"])
+    with pytest.raises(ValueError, match=r"observed max\(subject_ids\)"):
+        fit_member2_v3_feature_builder(smoothing=10.0, **inp)
+
+
 # ---------------------------------------------------------------------------
 # Apply: shape + finiteness
 # ---------------------------------------------------------------------------

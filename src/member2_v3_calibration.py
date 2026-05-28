@@ -347,6 +347,36 @@ def fit_member2_v3_feature_builder(
             f"got ({n_subjects}, {n_clusters}, {n_bcs})"
         )
 
+    # Vocab-fit validation. Without this, undersized n_clusters / n_bcs
+    # / n_subjects throws a cryptic ``IndexError: index X is out of
+    # bounds for axis Y with size Z`` deep inside ``np.add.at`` on the
+    # 2-D cell-count step -- you have to trace back from the
+    # subj_x_cluster line to figure out which axis blew up. The
+    # canonical fix in the caller is to pass
+    # ``fold_cond_context.n_clusters`` (which already auto-grows from
+    # CFG['clustering']['k'] when the clustering produces more clusters
+    # than declared, as the conditional-passrate context does); for
+    # subjects/bcs use ``indexer.n_subjects`` / ``indexer.n_bc`` plus
+    # the same max-over-observed-ids guard.
+    for name, arr, n_expected in [
+        ("subject_ids", subj, n_subjects),
+        ("cluster_ids", clus, n_clusters),
+        ("bc_ids", bc, n_bcs),
+    ]:
+        if arr.size > 0:
+            max_obs = int(arr.max())
+            if max_obs >= int(n_expected):
+                raise ValueError(
+                    f"observed max({name}) = {max_obs} but n_{name[:-4]}s = "
+                    f"{int(n_expected)}. The caller's declared vocabulary is "
+                    "undersized for the actual data. Likely fix: pass "
+                    "``fold_cond_context.n_clusters`` (which auto-grows) "
+                    "instead of the raw CFG['clustering']['k'], and bound "
+                    "n_bcs / n_subjects with ``max(declared, "
+                    "int(arr.max()) + 1)`` over any id array fed into "
+                    "this fit."
+                )
+
     valid_subj_mask = subj >= 0
     if int(valid_subj_mask.sum()) == 0:
         global_mean = 0.5

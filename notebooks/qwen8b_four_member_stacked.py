@@ -3955,14 +3955,38 @@ for fold in folds:
         # 1. Fit the v3 feature builder on fold-train (per-id obs counts +
         #    shrunken passrates, restricted to this fold's training rows
         #    so OOF rows are NEVER in the aggregates).
+        #
+        # Vocab sizing: the clustering's CFG['clustering']['k']
+        # (N_CLUSTERS_CTX) is a LOWER bound -- ``build_conditional_passrate_context``
+        # auto-grows it when the k-means partition produces an extra
+        # cluster (we've seen 64 -> 65 in fold 0). Use
+        # ``fold_cond_context.n_clusters`` which already encodes the
+        # grown size, and also include the OOF cluster ids in the max
+        # so the same builder safely scores fold-OOF rows below.
+        # Bound n_bcs the same way against observed train+OOF ids.
+        def _safe_n_ids(declared_lb, *id_arrs):
+            n = int(declared_lb)
+            for arr in id_arrs:
+                arr = np.asarray(arr)
+                if arr.size > 0 and bool((arr >= 0).any()):
+                    n = max(n, int(arr.max()) + 1)
+            return n
+        _fold_v3_n_clusters = _safe_n_ids(
+            int(fold_cond_context.n_clusters),
+            _mef_cluster_fold_train, _mef_cluster_fold_oof,
+        )
+        _fold_v3_n_bcs = _safe_n_ids(
+            int(indexer.n_bc),
+            _mef_bc_fold_train, _mef_bc_fold_oof,
+        )
         _fold_v3_builder = fit_member2_v3_feature_builder(
             subject_ids=_mef_subj_fold_train,
             cluster_ids=_mef_cluster_fold_train,
             bc_ids=_mef_bc_fold_train,
             labels=_y_fold_train_np,
             n_subjects=int(indexer.n_subjects),
-            n_clusters=int(N_CLUSTERS_CTX),
-            n_bcs=int(indexer.n_bc),
+            n_clusters=_fold_v3_n_clusters,
+            n_bcs=_fold_v3_n_bcs,
             n_macro_families=int(N_MACRO_FAMILIES),
             n_organizations=int(N_ORGANIZATIONS),
             n_families=int(N_FAMILIES),
@@ -4788,14 +4812,34 @@ if _M2V3_ENABLED:
         "\n[Member 2 v3 / 9.5c] Fitting GLOBAL v3 feature builder + "
         "training calibration GBDT on full train (OOF M1 + OOF subject_mean anchors)..."
     )
+    # See per-fold v3 vocab-sizing comment: declared CFG['clustering']['k']
+    # is a lower bound; the conditional passrate context (and now the v3
+    # builder) must use the grown vocabulary. Also bound n_bcs by the
+    # max observed bc id across train + val so the apply path
+    # (which scores val rows below) never crashes on an unseen id.
+    def _safe_n_ids_global(declared_lb, *id_arrs):
+        n = int(declared_lb)
+        for arr in id_arrs:
+            arr = np.asarray(arr)
+            if arr.size > 0 and bool((arr >= 0).any()):
+                n = max(n, int(arr.max()) + 1)
+        return n
+    _global_v3_n_clusters = _safe_n_ids_global(
+        int(cond_context.n_clusters),
+        _mef_train_cluster, _mef_val_cluster,
+    )
+    _global_v3_n_bcs = _safe_n_ids_global(
+        int(indexer.n_bc),
+        _mef_train_bc, _mef_val_bc,
+    )
     member2_v3_global_builder = fit_member2_v3_feature_builder(
         subject_ids=_mef_train_subj,
         cluster_ids=_mef_train_cluster,
         bc_ids=_mef_train_bc,
         labels=y_train,
         n_subjects=int(indexer.n_subjects),
-        n_clusters=int(N_CLUSTERS_CTX),
-        n_bcs=int(indexer.n_bc),
+        n_clusters=_global_v3_n_clusters,
+        n_bcs=_global_v3_n_bcs,
         n_macro_families=int(N_MACRO_FAMILIES),
         n_organizations=int(N_ORGANIZATIONS),
         n_families=int(N_FAMILIES),
