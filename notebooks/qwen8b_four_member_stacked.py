@@ -2480,6 +2480,11 @@ from src.member2_metadata_mlp import (
 
 _m2_cfg = CFG.get("member2_mlp", {})
 _bc_keys_ordered = tuple(f"bc_{i}" for i in range(int(indexer.n_bc)))
+# Provenance keys in indexer id order (Member 3 kNN reuses this list).
+_subject_keys_ordered = [
+    k for k, _ in sorted(indexer.subject_to_id.items(), key=lambda kv: kv[1])
+]
+assert len(_subject_keys_ordered) == indexer.n_subjects
 
 _item_to_train_idx = {str(k): i for i, k in enumerate(train_item_keys)}
 m2_holdout_item_id = np.fromiter(
@@ -2631,13 +2636,7 @@ print(f"[Member 3] passrate_dense shape={m3_passrate_dense.shape}  "
       f"({_m3_dt_inflate:.1f}s)")
 
 
-# Subject_keys in the SAME order as passrate_dense's rows (which
-# is indexer's id ordering: subject_to_id maps key -> id, so we
-# need keys sorted by id).
-_subject_keys_ordered = [
-    k for k, _ in sorted(indexer.subject_to_id.items(), key=lambda kv: kv[1])
-]
-assert len(_subject_keys_ordered) == indexer.n_subjects
+# _subject_keys_ordered: built in section 9c (indexer id order).
 
 
 def _fit_member3():
