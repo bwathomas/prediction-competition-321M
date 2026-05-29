@@ -2590,6 +2590,141 @@ class Indexer:
 # ---------------------------------------------------------------------------
 
 
+class IndexedEmbeddingView:
+    """Compact row-indexable view over a unique embedding matrix
+    plus a per-row pointer array.
+
+    Behaviour contract: behaves like a ``[N, D]`` torch tensor for
+    the *indexing* operations that ``LookupDataset`` and the
+    chunked ``_score_dataset`` actually use --
+
+    * ``len(view) == N``
+    * ``view.shape == (N, D)``
+    * ``view[i]`` (scalar int) returns the i-th row as a 1-D
+      ``[D]`` tensor (zero-copy: a view into the unique stack).
+    * ``view[a:b]`` (slice) returns the contiguous range as a
+      stacked ``[b-a, D]`` tensor (materialised on demand via
+      ``index_select`` -- one allocation per *batch*, not per
+      *row*).
+    * ``view.to(device, dtype=...)`` moves only the unique
+      stack + pointers (which are tiny).
+
+    Memory comparison on the 5M-row x 4096-dim x 296k-unique-items
+    setting (the M-train dataset for the qwen8b notebook):
+
+    * Stacked dense ``[N, D]`` float32 = ~80 GB.
+    * IndexedEmbeddingView = ``[U, D]`` float32 + ``[N]`` int64
+      = ~4.85 GB. Approximately 16x less RAM at no
+      throughput cost (the per-batch ``index_select`` is
+      negligible vs the model forward pass).
+
+    Construction does *not* copy the unique stack. The caller is
+    responsible for keeping the underlying tensors alive for the
+    lifetime of the view; in practice ``IndexedEmbeddingView``
+    holds Python references to both, so they are released
+    together when the view is dropped.
+    """
+
+    def __init__(
+        self,
+        unique_emb: "torch.Tensor",  # type: ignore[name-defined]
+        row_to_uniq: "torch.Tensor",  # type: ignore[name-defined]
+    ) -> None:
+        import torch as _torch
+
+        if not isinstance(unique_emb, _torch.Tensor):
+            unique_emb = _torch.from_numpy(
+                np.asarray(unique_emb, dtype=np.float32)
+            )
+        if not isinstance(row_to_uniq, _torch.Tensor):
+            row_to_uniq = _torch.from_numpy(
+                np.asarray(row_to_uniq, dtype=np.int64)
+            )
+        if unique_emb.ndim != 2:
+            raise ValueError(
+                f"unique_emb must be 2-D, got shape {tuple(unique_emb.shape)}"
+            )
+        if row_to_uniq.ndim != 1:
+            raise ValueError(
+                f"row_to_uniq must be 1-D, got shape {tuple(row_to_uniq.shape)}"
+            )
+        if int(row_to_uniq.numel()) > 0:
+            if int(row_to_uniq.max().item()) >= int(unique_emb.shape[0]):
+                raise IndexError(
+                    f"row_to_uniq max={int(row_to_uniq.max().item())} "
+                    f">= unique_emb.shape[0]={int(unique_emb.shape[0])}"
+                )
+            if int(row_to_uniq.min().item()) < 0:
+                raise IndexError(
+                    f"row_to_uniq min={int(row_to_uniq.min().item())} < 0"
+                )
+        self._uniq = unique_emb.contiguous()
+        self._idx = row_to_uniq.contiguous().to(_torch.long)
+        self._n = int(self._idx.numel())
+        self._d = int(self._uniq.shape[1])
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self._n, self._d)
+
+    @property
+    def dtype(self):
+        return self._uniq.dtype
+
+    @property
+    def device(self):
+        return self._uniq.device
+
+    @property
+    def nbytes(self) -> int:
+        return int(
+            self._uniq.element_size() * self._uniq.numel()
+            + self._idx.element_size() * self._idx.numel()
+        )
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx):
+        import torch as _torch
+
+        if isinstance(idx, slice):
+            sel = self._idx[idx]
+            if int(sel.numel()) == 0:
+                return self._uniq.new_empty((0, self._d))
+            return self._uniq.index_select(0, sel)
+        if isinstance(idx, (list, tuple, np.ndarray)):
+            # ``idx`` is a list of LOGICAL row indices into the
+            # ``[N, D]`` view, NOT into the underlying unique
+            # stack. Map row -> unique pointer first, then gather.
+            row_sel = _torch.as_tensor(idx, dtype=_torch.long)
+            return self._uniq.index_select(0, self._idx.index_select(0, row_sel))
+        if isinstance(idx, _torch.Tensor):
+            if idx.dtype == _torch.bool:
+                sel = self._idx[idx]
+            else:
+                sel = self._idx.index_select(0, idx.long())
+            return self._uniq.index_select(0, sel.long())
+        return self._uniq[int(self._idx[int(idx)].item())]
+
+    def to(self, *args, **kwargs) -> "IndexedEmbeddingView":
+        moved_uniq = self._uniq.to(*args, **kwargs)
+        # The pointer array stays on CPU by default; downstream
+        # consumers only index into ``self._uniq`` from a single
+        # device at a time so we follow the unique-stack's device.
+        if "device" in kwargs:
+            moved_idx = self._idx.to(kwargs["device"])
+        elif args:
+            first = args[0]
+            try:
+                moved_idx = self._idx.to(first)
+            except (TypeError, RuntimeError):
+                moved_idx = self._idx
+        else:
+            moved_idx = self._idx
+        return IndexedEmbeddingView(moved_uniq, moved_idx)
+
+
 class LookupDataset(torch.utils.data.Dataset):
     """Yields ``(subject_id, bc_id, item_emb, subject_emb, pool_feats,
     cluster_id, judge_feats, nn_feats, label, sample_weight)`` per row.
@@ -2606,13 +2741,23 @@ class LookupDataset(torch.utils.data.Dataset):
     (shape ``[N, 8]`` when enabled, ``[N, 0]`` otherwise), pre-computed
     once at dataset construction time. This keeps the per-batch step
     free of FAISS / sparse-matrix lookups.
+
+    ``item_emb`` may be either a stacked ``[N, D]`` array/tensor (the
+    legacy form, which materialises one row per observation and so
+    needs ~``N*D*4`` bytes) **or** an :class:`IndexedEmbeddingView`,
+    which holds ``[U, D]`` unique-item embeddings + a ``[N]``
+    pointer and lazily yields per-row vectors on indexing. The
+    view is the right choice whenever many of the ``N`` rows share
+    the same item (e.g. the M-train split with ~17x average
+    item-row multiplicity); it cuts ~80 GB of dataset memory on
+    the qwen8b notebook to ~5 GB at zero accuracy cost.
     """
 
     def __init__(
         self,
         subject_ids: np.ndarray,
         bc_ids: np.ndarray,
-        item_emb: np.ndarray,
+        item_emb,
         labels: np.ndarray,
         subject_emb: np.ndarray | None = None,
         pool_feats: np.ndarray | None = None,
@@ -2623,7 +2768,16 @@ class LookupDataset(torch.utils.data.Dataset):
     ):
         self.subject_ids = torch.from_numpy(np.asarray(subject_ids, dtype=np.int64))
         self.bc_ids = torch.from_numpy(np.asarray(bc_ids, dtype=np.int64))
-        self.item_emb = torch.from_numpy(np.asarray(item_emb, dtype=np.float32))
+        if isinstance(item_emb, IndexedEmbeddingView):
+            if int(item_emb.shape[0]) != int(len(labels)):
+                raise ValueError(
+                    f"item_emb (IndexedEmbeddingView) length "
+                    f"{int(item_emb.shape[0])} != labels length "
+                    f"{int(len(labels))}"
+                )
+            self.item_emb = item_emb
+        else:
+            self.item_emb = torch.from_numpy(np.asarray(item_emb, dtype=np.float32))
         if subject_emb is None:
             self.subject_emb = torch.zeros((len(labels), 0), dtype=torch.float32)
         else:
@@ -2692,6 +2846,7 @@ __all__ = [
     "IRTItemKFactor",
     "IRTItemKFactorGatedMLP",
     "IRTItemKFactorMLP",
+    "IndexedEmbeddingView",
     "Indexer",
     "ItemIRTHeads",
     "ItemParameterMap",

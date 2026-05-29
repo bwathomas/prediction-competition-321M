@@ -1081,8 +1081,64 @@ def embed_unique_subjects(
 def stack_lookup(
     keys: Iterable[str], lookup: Mapping[str, np.ndarray]
 ) -> np.ndarray:
-    """Stack the per-row embedding matrix in dataframe order."""
+    """Stack the per-row embedding matrix in dataframe order.
+
+    Materialises a full ``[N, D]`` float32 array. Use
+    :func:`index_embeddings` instead when ``keys`` contains many
+    repeats of the same key (e.g. one row per (subject, item)
+    observation across millions of rows over ~300k unique items),
+    where ``stack_lookup`` would otherwise duplicate each unique
+    embedding ~``N/U`` times and blow up RAM by the same factor.
+    """
     return np.stack([lookup[k] for k in keys], axis=0).astype(np.float32, copy=False)
+
+
+def index_embeddings(
+    keys: Iterable[str], lookup: Mapping[str, np.ndarray]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compact alternative to :func:`stack_lookup` for many-row,
+    few-unique-key embedding lookups.
+
+    Returns ``(unique_emb, row_to_uniq)`` where:
+
+    * ``unique_emb`` is a ``[U, D]`` float32 array, containing each
+      distinct ``keys`` value exactly once. Order matches first
+      appearance in ``keys``, so the result is deterministic with
+      respect to the row order of the input dataframe.
+    * ``row_to_uniq`` is a ``[N]`` int64 array such that
+      ``unique_emb[row_to_uniq[i]] == lookup[keys[i]]`` for every
+      row ``i``.
+
+    Total memory: ``U*D*4 + N*8`` bytes, vs ``N*D*4`` for
+    :func:`stack_lookup`. On the qwen8b notebook (N=5M, D=4096,
+    U=296k) this drops the per-split memory from ~80 GB to ~5 GB.
+
+    The returned arrays plug directly into
+    :class:`src.models.IndexedEmbeddingView` to construct a
+    row-indexable view suitable for ``LookupDataset``.
+    """
+    keys_list = list(keys)
+    if not keys_list:
+        sample = next(iter(lookup.values()), np.zeros((0,), dtype=np.float32))
+        d = int(np.asarray(sample).shape[-1]) if np.asarray(sample).size else 0
+        return (
+            np.zeros((0, d), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+        )
+    seen: dict[str, int] = {}
+    for k in keys_list:
+        if k not in seen:
+            seen[k] = len(seen)
+    uniq_keys_ordered = list(seen.keys())
+    unique_emb = np.stack(
+        [lookup[k] for k in uniq_keys_ordered], axis=0,
+    ).astype(np.float32, copy=False)
+    row_to_uniq = np.fromiter(
+        (seen[k] for k in keys_list),
+        count=len(keys_list),
+        dtype=np.int64,
+    )
+    return unique_emb, row_to_uniq
 
 
 def _random_embeddings(keys: list[str], *, dim: int) -> np.ndarray:
@@ -1148,6 +1204,7 @@ __all__ = [
     "embed_unique_items",
     "embed_unique_subjects",
     "encoder_slug",
+    "index_embeddings",
     "is_qwen3_embedding",
     "item_contextual_text",
     "item_only_text",

@@ -1094,10 +1094,10 @@ print(f"\n[OOF] Per-row fold-id distribution: "
 
 # %%
 from src.data import prepare_metadata_artifacts
-from src.embeddings import stack_lookup
+from src.embeddings import index_embeddings
 from src.item_features import build_feature_matrix
 from src.metadata_features import MetadataSchema
-from src.models import LookupDataset
+from src.models import IndexedEmbeddingView, LookupDataset
 
 
 def _pool_matrix(keys):
@@ -1117,12 +1117,43 @@ def _cluster_vector(keys):
 
 
 def _build(split_part, nn_mat):
+    """Build a ``LookupDataset`` for ``split_part`` using an
+    :class:`IndexedEmbeddingView` for the item embeddings.
+
+    The previous implementation called ``stack_lookup`` to
+    materialise a per-row ``[N, 4096]`` float32 tensor. On the
+    full M-train split (~5,095,197 rows, 4,096-dim Qwen3 vectors,
+    over ~295,671 unique items) that single tensor is ~80 GB --
+    enough to OOM the box on its own, and it makes the
+    downstream Model A training + member fits (which themselves
+    each want ~15-25 GB of CPU RAM) effectively impossible
+    without first freeing the dataset. The conditional NN
+    feature stage upstream already pushes RSS to ~43 GB; adding
+    80 GB on top reliably crashes Colab.
+
+    Replacing the stacked tensor with an ``IndexedEmbeddingView``
+    over the unique-item embedding stack drops the per-split
+    cost to ``U*D*4 + N*8`` bytes -- roughly 4.85 GB instead of
+    80 GB on the train split, 4.85 GB instead of 4.4 GB on val.
+    Downstream consumers (``LookupDataset.__getitem__`` for the
+    DataLoader and the chunked ``_score_dataset``) only need
+    ``view[i]`` / ``view[a:b]``, both of which the view supports
+    with at most one ``index_select`` per batch -- negligible
+    relative to a model forward pass.
+    """
     s = np.array([indexer.subject_id(k) for k in split_part["subject_key"]], dtype=np.int64)
     bc = np.array(
         [indexer.bc_id(k) for k in split_part["benchmark_condition_key"]],
         dtype=np.int64,
     )
-    ie = stack_lookup(split_part["item_key"], item_emb_lookup)
+    _uniq_ie_np, _row_to_uniq_np = index_embeddings(
+        split_part["item_key"].astype(str).tolist(), item_emb_lookup,
+    )
+    # IndexedEmbeddingView accepts numpy arrays directly and wraps
+    # them as zero-copy torch tensors internally, so we don't need
+    # torch in scope at the call site (torch is first imported much
+    # further down, in cell 7c right before Model A training).
+    ie = IndexedEmbeddingView(_uniq_ie_np, _row_to_uniq_np)
     pf = _pool_matrix(split_part["item_key"])
     ci = _cluster_vector(split_part["item_key"])
     y = split_part["label"].astype(float).to_numpy()
@@ -1142,12 +1173,12 @@ def _build(split_part, nn_mat):
 
 # NOTE: We deliberately DO NOT build ``train_ds`` / ``val_ds`` here.
 # Cell 7b will rebuild them after recomputing ``nn_train_mat`` /
-# ``nn_val_mat`` with the conditional context, and ``_build`` materializes
-# a [N_rows, embedding_dim] per-row item embedding tensor via
-# ``stack_lookup`` -- at 5M rows x 4096 dims that's ~80 GB per copy. If
-# we built here AND in cell 7b, peak RAM doubles and we OOM on machines
-# that would otherwise comfortably hold one copy. The downstream cells
-# (training, scoring) all bind to the cell-7b versions.
+# ``nn_val_mat`` with the conditional context, and although ``_build``
+# now uses :class:`IndexedEmbeddingView` (which keeps only the ~296k
+# unique item vectors plus a per-row pointer, ~5 GB per split), building
+# both here and in cell 7b would still double-allocate the pool / NN /
+# label tensors. The downstream cells (training, scoring) all bind to
+# the cell-7b versions, so we skip the throwaway build here.
 print(
     f"NN feature matrices (legacy 0..14): "
     f"train={nn_train_mat.shape}  val={nn_val_mat.shape}  "
@@ -1637,13 +1668,17 @@ if "freshness" in nn_train_diag:
 # heavy datasets. Tolerant of cell re-runs (the names may already be
 # gone from a previous pass).
 #
-# Why this matters: ``_build`` materializes a per-row [N,
-# embedding_dim] item embedding tensor via ``stack_lookup`` -- at 5M
-# rows x 4096 dims that's ~80 GB per copy. If we leave the old
-# ``train_ds`` / ``val_ds`` bound while ``_build`` runs, peak RAM
-# briefly doubles and we OOM on machines that would otherwise hold
-# one copy comfortably. The per-split query-metadata dicts also
-# carry ~80 MB on the train split each.
+# Why this matters: ``_build`` builds the per-split LookupDataset.
+# The item-embedding channel is now wrapped as
+# :class:`IndexedEmbeddingView` over the ~296k unique-item Qwen3
+# vectors plus a per-row pointer (~5 GB / split, down from the
+# ~80 GB per split of the legacy stacked dense ``[N, 4096]``
+# tensor), but the pool / NN / label / id tensors still total a
+# few hundred MB per split, and the per-split query-metadata
+# dicts (``_*_qmeta``) carry ~80 MB on the train split each.
+# Dropping the previous ``train_ds`` / ``val_ds`` before
+# allocating the new ones still avoids transient peaks on cell
+# re-runs.
 for _stale_name in ("_train_qmeta", "_val_qmeta", "train_ds", "val_ds"):
     if _stale_name in globals():
         try:
@@ -2011,12 +2046,16 @@ trained_a = trained_a.to(device).eval()
 print("Scoring Model A on val...")
 p_a_val = _score_dataset(val_ds, trained_a)
 
-# Pre-score Model A on train ONCE here (cached). This lets us free
-# the heavy ``train_ds`` / ``val_ds`` item-embedding stacks (~84 GB
-# combined at 5M+260k rows x 4096 dims) before the
-# X_train_dense / X_val_dense build, which itself wants ~25 GB. The
-# downstream calibrator cell consumes ``p_a_train`` directly instead
-# of re-scoring, so this isn't a duplicate cost.
+# Pre-score Model A on train ONCE here (cached). Even though the
+# item-embedding channel is now an :class:`IndexedEmbeddingView`
+# (~5 GB per split rather than the legacy ~80 GB stacked tensor),
+# the dataset still holds pool / NN / id / label tensors that
+# add up to a few GB per split, and the X_train_dense / X_val_dense
+# build below wants ~25 GB of fresh CPU RAM. Caching ``p_a_train``
+# here lets us drop ``train_ds`` / ``val_ds`` immediately after the
+# Model A scoring pass; the downstream calibrator consumes
+# ``p_a_train`` directly instead of re-scoring, so this isn't a
+# duplicate cost.
 print("Scoring Model A on train (cached so calibrator skips re-score)...")
 
 
@@ -2036,12 +2075,17 @@ p_a_train = cache_or_compute(
 print(f"[Member 1] p_a_train: shape={p_a_train.shape}  "
       f"log-loss={-(primary.train['label'].astype(float).to_numpy() * np.log(np.clip(p_a_train, 1e-6, 1-1e-6)) + (1 - primary.train['label'].astype(float).to_numpy()) * np.log(1 - np.clip(p_a_train, 1e-6, 1-1e-6))).mean():.6f}")
 
-# Free the heavy item-embedding stacks now that Model A has produced
-# both train + val predictions. ``train_ds.item_emb`` alone is the
-# single largest object in scope (~80 GB at 5M rows x 4096 dims).
-# We leave the trained model itself bound (cheap) in case the
-# calibrator wants to score on additional rows; but per the cached
-# ``p_a_train`` / ``p_a_val`` we don't actually need it any more.
+# Free the train + val LookupDatasets now that Model A has produced
+# both train + val predictions. With ``IndexedEmbeddingView`` the
+# item-embedding channel is no longer the dominant cost (~5 GB per
+# split, down from ~80 GB on the legacy stacked path), but the
+# pool / NN / id / label tensors plus the unique-embedding stack
+# still add up to a few GB per split. Dropping them now leaves
+# headroom for the X_train_dense / X_val_dense build below and
+# the downstream member fits. The trained model itself stays
+# bound (cheap) in case the calibrator wants to score on
+# additional rows; per the cached ``p_a_train`` / ``p_a_val`` we
+# don't actually need it any more.
 trained_a = trained_a.to("cpu")
 for _stale_name in ("train_ds", "val_ds"):
     if _stale_name in globals():
@@ -4063,14 +4107,17 @@ for fold in folds:
         _es_val_local = np.array([_fold_train_pos[int(r)] for r in _es_val_rows], dtype=np.int64)
         del _fold_train_pos
         # OOM guard: do NOT materialize _train_ds_fold / _val_ds_fold here.
-        # ``_build`` calls ``stack_lookup`` which allocates [N, 4096] fp32 per
-        # row (~16 KB/row). For a typical fold that's ~47 GB for ES-train,
-        # ~5 GB for ES-val, ~27 GB for OOF -- ~79 GB transient _before_ the
-        # cache call. On cache HIT that's pure waste; on cache MISS it stacks
-        # on top of training memory. We defer the train/val build into the
-        # compute_fn (so cache HIT skips it entirely; cache MISS GCs them
-        # at function return), and build _oof_ds_fold only after the cache
-        # call (it's only needed for scoring, never for training).
+        # Even with the new :class:`IndexedEmbeddingView` wrapper (which
+        # cuts the per-split item-embedding tensor from the legacy ~80 GB
+        # stacked form down to ~5 GB of unique-vector storage + ~40 MB of
+        # per-row pointers), three concurrent fold datasets still hold
+        # several GB each of pool / NN / id / label / unique-embedding
+        # tensors. On cache HIT that's pure waste; on cache MISS it
+        # stacks on top of the Model A training peak. We defer the
+        # train/val build into the compute_fn (so cache HIT skips it
+        # entirely; cache MISS GCs them at function return), and build
+        # _oof_ds_fold only after the cache call (it's only needed for
+        # scoring, never for training).
 
         # Fold M1 training closure (mirrors _train_model_a structure).
         # Datasets are built INSIDE so a cache HIT pays zero RAM for them.
