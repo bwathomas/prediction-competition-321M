@@ -4318,6 +4318,19 @@ for fold in folds:
         gc.collect()
         # v5 is a direct binary GBDT, so its raw output IS the probability.
         p2_oof_fold = gbdt_apply_batch(_fold_gbdt_state, X_v5_fold_oof)
+        # Defense-in-depth: enforce 1-D + correct length so the OOF
+        # accumulator's per-fold write_fold (which sanity-checks shape)
+        # never sees a column-vector or off-length array.
+        p2_oof_fold = np.asarray(p2_oof_fold, dtype=np.float32).reshape(-1)
+        if p2_oof_fold.shape[0] != int(len(fold_oof_df)):
+            import warnings as _v5_pof_warn
+            _v5_pof_warn.warn(
+                f"[OOF f{fold.fold_id}] M2 v5 OOF length "
+                f"{p2_oof_fold.shape[0]} != fold_oof_df length "
+                f"{len(fold_oof_df)}. The accumulator write below will "
+                "raise a shape-mismatch error -- inspect the v5 builder "
+                "or the X_v5_fold_oof construction."
+            )
         del X_v5_fold_oof
         gc.collect()
         # Gate 3d (NLL vs baseline) -- warn instead of halt so a borderline
@@ -5460,6 +5473,23 @@ if _M2V5_ENABLED:
     )
     del _v5_pool_val_global, _v5_age_val_global
     p_member2_val = gbdt_apply_batch(member2_v5_gbdt_state, X_val_v5)
+    # Defense-in-depth: ensure 1-D shape and exact val-length. Catches
+    # any apply_batch contract drift before the val stack-up below
+    # (which would otherwise fail with a generic np.stack ValueError
+    # that doesn't point at Member 2).
+    p_member2_val = np.asarray(p_member2_val, dtype=np.float32).reshape(-1)
+    if p_member2_val.shape[0] != int(len(primary.val)):
+        import warnings as _v5_pmv_warn
+        _v5_pmv_warn.warn(
+            f"[Member 2 v5] p_member2_val length {p_member2_val.shape[0]} "
+            f"!= primary.val length {len(primary.val)}. The val stack-up "
+            "in section 10 will reject the mismatch with a clearer error."
+        )
+    print(
+        f"[Member 2 v5] p_member2_val shape={p_member2_val.shape}  "
+        f"dtype={p_member2_val.dtype}  "
+        f"(expected ({int(len(primary.val))},) fp32)"
+    )
     nll_m2 = float(
         -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
           + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean()
@@ -5910,8 +5940,72 @@ else:
 # (M1, M2, M3, M4, M5); the column order is LOCKED across val and OOF-train
 # so the runtime's stacker.apply_one sees the same column ordering.
 _stacker_member_list_val = [p_a_val, p_member2_val, p_member3_val, p_member4_val]
+_stacker_member_names_val = ["M1 (p_a_val)", "M2 (p_member2_val)", "M3 (p_member3_val)", "M4 (p_member4_val)"]
 if _M5_ENABLED:
     _stacker_member_list_val.append(p_member5_val)
+    _stacker_member_names_val.append("M5 (p_member5_val)")
+
+# Defensive shape audit + 1-D coercion. ``np.stack`` raises a generic
+# ``ValueError: all input arrays must have the same shape`` when any of
+# the per-member val arrays is a different shape from the rest -- which
+# does not tell us WHICH member is the offender. We pre-check here so
+# the diagnostic names the broken member, and we ravel any 2-D / column-
+# vector member silently (a (N, 1) -> (N,) coercion is information-
+# preserving).
+_N_VAL_EXPECTED = int(len(primary.val))
+_stacker_member_diagnosed = []
+import warnings as _stack_warn
+_stacker_audit_lines = [
+    f"[Stacker val audit] expected per-member length = {_N_VAL_EXPECTED:,}"
+]
+_stacker_audit_mismatched = False
+for _name, _arr in zip(_stacker_member_names_val, _stacker_member_list_val):
+    if _arr is None:
+        _stacker_audit_lines.append(
+            f"  - {_name}: array is None -- a 9.5c branch did not populate "
+            "this member. Re-run the relevant member-fit cells."
+        )
+        _stacker_audit_mismatched = True
+        _stacker_member_diagnosed.append(_arr)
+        continue
+    _arr_np = np.asarray(_arr)
+    _orig_shape = tuple(_arr_np.shape)
+    _flat = _arr_np.reshape(-1) if _arr_np.ndim != 1 else _arr_np
+    _len = int(_flat.shape[0])
+    _len_ok = (_len == _N_VAL_EXPECTED)
+    _shape_note = "" if _orig_shape == (_N_VAL_EXPECTED,) else (
+        f"  (coerced from shape {_orig_shape} -> ({_len},))"
+    )
+    _stacker_audit_lines.append(
+        f"  - {_name}: shape={_orig_shape}, length={_len:,}"
+        f"  {'OK' if _len_ok else 'LENGTH MISMATCH'}"
+        f"{_shape_note}"
+    )
+    if not _len_ok:
+        _stacker_audit_mismatched = True
+    _stacker_member_diagnosed.append(_flat)
+print("\n".join(_stacker_audit_lines))
+if _stacker_audit_mismatched:
+    _stack_warn.warn(
+        "[Stacker val audit] one or more member val arrays do not match "
+        f"primary.val length ({_N_VAL_EXPECTED:,}). The stacker cannot be "
+        "constructed until every member returns a per-row array of the "
+        "right length. Most common cause: the member's val-scoring cell "
+        "was skipped or short-circuited by a stale cache. Re-run the "
+        "specific member's 9.x cell with its cache file deleted, or set "
+        "the corresponding CFG['memberX']['enabled']=False to drop it "
+        "from the stacker. The stack call below will raise a clearer "
+        "error than np.stack's generic message."
+    )
+    # Surface a CLEAR error -- this is a structural invariant of the
+    # stacker (every member must be (N_val,)), not a soft data-quality
+    # issue. Halting here is safer than producing a corrupt stacker.
+    raise RuntimeError(
+        "[Stacker val audit] per-member val length mismatch -- see the "
+        "audit lines above for the offending member. Fix the upstream "
+        "scoring cell, do not edit this stack call."
+    )
+_stacker_member_list_val = _stacker_member_diagnosed
 stacker_member_probs_val = np.stack(_stacker_member_list_val, axis=1).astype(np.float32)
 
 stacker_X_val = build_stacker_features(
@@ -5939,8 +6033,58 @@ _stacker_member_list_train_oof = [
     p3_train_oof.astype(np.float32),
     p4_train_oof.astype(np.float32),
 ]
+_stacker_oof_names = [
+    "M1 (p_a_train_oof)", "M2 (p2_train_oof)",
+    "M3 (p3_train_oof)", "M4 (p4_train_oof)",
+]
 if _M5_ENABLED:
     _stacker_member_list_train_oof.append(p5_train_oof.astype(np.float32))
+    _stacker_oof_names.append("M5 (p5_train_oof)")
+
+# Mirror the val-side defensive audit: same generic ``np.stack`` error,
+# same need to surface WHICH OOF member is the offender. Length mismatch
+# here usually means the per-fold OOF accumulator wasn't finalized for
+# one of the members (cache HIT with shape drift), or a fold's
+# write_fold call silently underfilled.
+_N_TRAIN_EXPECTED = int(len(primary.train))
+_stacker_oof_diagnosed = []
+_stacker_oof_audit_lines = [
+    f"[Stacker OOF audit] expected per-member length = {_N_TRAIN_EXPECTED:,}"
+]
+_stacker_oof_audit_mismatched = False
+for _name, _arr in zip(_stacker_oof_names, _stacker_member_list_train_oof):
+    if _arr is None:
+        _stacker_oof_audit_lines.append(
+            f"  - {_name}: array is None -- the per-fold accumulator "
+            "produced no values. Re-run the per-fold OOF loop."
+        )
+        _stacker_oof_audit_mismatched = True
+        _stacker_oof_diagnosed.append(_arr)
+        continue
+    _arr_np = np.asarray(_arr)
+    _orig_shape = tuple(_arr_np.shape)
+    _flat = _arr_np.reshape(-1) if _arr_np.ndim != 1 else _arr_np
+    _len = int(_flat.shape[0])
+    _len_ok = (_len == _N_TRAIN_EXPECTED)
+    _shape_note = "" if _orig_shape == (_N_TRAIN_EXPECTED,) else (
+        f"  (coerced from shape {_orig_shape} -> ({_len},))"
+    )
+    _stacker_oof_audit_lines.append(
+        f"  - {_name}: shape={_orig_shape}, length={_len:,}"
+        f"  {'OK' if _len_ok else 'LENGTH MISMATCH'}"
+        f"{_shape_note}"
+    )
+    if not _len_ok:
+        _stacker_oof_audit_mismatched = True
+    _stacker_oof_diagnosed.append(_flat.astype(np.float32, copy=False))
+print("\n".join(_stacker_oof_audit_lines))
+if _stacker_oof_audit_mismatched:
+    raise RuntimeError(
+        "[Stacker OOF audit] per-member OOF length mismatch -- see the "
+        "audit lines above for the offending member. Fix the upstream "
+        "per-fold cell, do not edit this stack call."
+    )
+_stacker_member_list_train_oof = _stacker_oof_diagnosed
 stacker_member_probs_train_oof = np.stack(
     _stacker_member_list_train_oof, axis=1,
 )
