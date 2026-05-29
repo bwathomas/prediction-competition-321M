@@ -3514,6 +3514,15 @@ if _M6_ENABLED:
         ),
         compute_fn=_fit_member6,
     )
+    # Belt-and-braces FwFM teardown: the trainer already releases its
+    # internal GPU tensors + caching-allocator pool, but on a cache
+    # HIT the trainer never ran. Either way, force one more GC + VRAM
+    # flush so the next member fit doesn't inherit any pinned blocks.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     p_member6_val = fwfm_apply_state_batch(fwfm_state, X_val_dense_m4)
     nll_m6 = float(-(
         ylab_val * np.log(np.clip(p_member6_val, 1e-6, 1 - 1e-6))
@@ -3603,6 +3612,15 @@ X_val_dense_m4 = None
 member4_marginal_train = None
 member4_marginal_val = None
 gc.collect()
+# Flush PyTorch's CUDA caching allocator: at this point Members 1, 2,
+# and 6 have all just been trained on GPU. The trainer functions
+# release their per-fit pools internally, but the cache HIT path skips
+# those teardowns and the global allocator can still be holding a
+# multi-GB block from the last fit. We do a final flush here so the
+# OOF loop's per-fold M1 retraining inherits a clean VRAM state.
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 print(f"[Pre-OOF cleanup] DONE -- released {_pre_oof_freed_bytes / 1024**3:.2f} GB.")
 
 # %% [markdown]
@@ -4587,6 +4605,16 @@ for fold in folds:
                 holdout_group_id=_m2_holdout_fold,
             ),
         )
+        # Belt-and-braces FwFM teardown after every fold: the trainer
+        # already releases its GPU pool, but cache HITs skip the
+        # trainer entirely. Either way we force one more GC + VRAM
+        # flush so the NEXT fold's M1 retraining (~3-4 GB GPU model
+        # + train/val activations) doesn't OOM on a still-held FwFM
+        # block from the previous fold.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     # Training done. Free the [N_train, F+14] matrix BEFORE building the
     # OOF matrix so they don't both live during scoring.

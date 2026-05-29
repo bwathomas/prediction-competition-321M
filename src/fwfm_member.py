@@ -881,7 +881,7 @@ def fit_fwfm_member(
             _compute_loss(model, X_t_train, y_t_train, w_t_train).item()
         )
 
-    return FwFMState(
+    result = FwFMState(
         w0=float(best_state["w0"]),
         w=best_state["w"],
         V=best_state["V"],
@@ -903,6 +903,50 @@ def fit_fwfm_member(
         weight_decay_V=float(weight_decay_V),
         weight_decay_r=float(weight_decay_r),
     )
+
+    # ---- Explicit teardown before returning ----
+    #
+    # FwFM training holds two big allocations that easily OOM the
+    # following stages if left to Python's default GC: (1) the GPU
+    # copies of the train + val feature matrices, sized
+    # ``[N_*, F]`` float32 -- on the full-train path this is ~24 GB
+    # of VRAM for the train slice alone; (2) the per-slice CPU
+    # ``[N_*, F]`` float32 gather buffers ``X_*_used``, sized
+    # similarly on host RAM (the input ``X`` itself is *not* a copy
+    # -- it's the caller's array, untouched).
+    #
+    # The state we want to keep is tiny (a handful of small numpy
+    # arrays inside FwFMState). Drop every model/optim/tensor we
+    # still hold (re-bind to None instead of ``del`` so static
+    # analysis stays happy with the closure references in
+    # ``_FwFM.forward``), GC, and (when on CUDA) flush PyTorch's
+    # caching allocator so the next stage (e.g. Member 1
+    # retraining inside the OOF loop) sees the freed VRAM, not a
+    # "reserved" pool.
+    X_t_train = None  # noqa: F841
+    X_t_val = None  # noqa: F841
+    y_t_train = None  # noqa: F841
+    y_t_val = None  # noqa: F841
+    w_t_train = None  # noqa: F841
+    w_t_val = None  # noqa: F841
+    X_train_used = None  # noqa: F841
+    X_val_used = None  # noqa: F841
+    model = None  # noqa: F841
+    opt = None  # noqa: F841
+    field_id_tensor = None  # noqa: F841
+    field_idx_lists = None  # noqa: F841
+    best_state = None  # noqa: F841
+    import gc as _gc
+
+    _gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    return result
 
 
 __all__ = [

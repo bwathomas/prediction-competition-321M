@@ -1545,6 +1545,42 @@ def fit_member2_metadata_mlp(
         epochs_run, device, time.time() - t0,
         d_in, n_num_actual, n_subj_num, n_bench_num, n_marginals,
     )
+
+    # ---- Explicit teardown before returning ----
+    #
+    # Training holds: the live torch model on the chosen device, the
+    # AdamW optimizer state (one fp32 buffer per parameter), the
+    # snapshot-ensemble queue (CPU-side copies of the top-K best
+    # weights), the optional EMA shadow state, and the persistent
+    # GPU val tensors (``s_val``, ..., ``M_val_z`` -- the largest is
+    # ``M_val_z`` at ``[n_val, n_num]`` float32). After we've
+    # materialised the pure-numpy ``Member2MLPState`` above we don't
+    # need any of them; dropping them now + flushing the CUDA caching
+    # allocator means the next stage (M3/M4/M6 fit, OOF M1
+    # retraining, ...) sees the VRAM as free instead of reserved.
+    #
+    # NOTE: rebind to ``None`` rather than ``del`` so static analysis
+    # doesn't trip over the closures (``_set_lr``, ``_ema_step``,
+    # ``_eval_val_with_state``) that captured these names. The
+    # closures themselves go out of scope on ``return``.
+    model = None  # noqa: F841
+    optimizer = None  # noqa: F841
+    s_val = b_val = c_val = f_val = mf_val = o_val = t_val = None  # noqa: F841
+    M_val = M_val_z = y_val = None  # noqa: F841
+    mu_t = sd_t = None  # noqa: F841
+    snapshots = None  # noqa: F841
+    if use_ema:
+        ema_state = None  # noqa: F841
+    import gc as _gc
+
+    _gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
     return state
 
 
