@@ -2777,14 +2777,102 @@ def _fit_member2_mlp_global():
 
 import hashlib as _m2_hashlib
 
-_m2_num_digest = _m2_hashlib.sha256(
-    np.ascontiguousarray(m2_numerical_train, dtype=np.float32).tobytes()
-).hexdigest()[:16]
+
+def _content_digest(*arrays, k_rows: int = 4096) -> str:
+    """Stable short content digest of one or more numpy arrays.
+
+    Used to make ``cache_or_compute`` keys depend on the actual
+    contents (not just shapes) of the inputs to a fit.
+
+    Two complementary fingerprints are mixed in:
+
+    1. A stride-sampled byte hash (~``k_rows`` rows + the head/tail
+       64 rows) that catches any change to the "geometric layout"
+       of the array even when it spans 100s of MB.
+
+    2. A whole-array reduction (sum, sum-of-squares, abs-sum, min,
+       max) cast to float64 / int64. This is what guarantees that
+       **any** single-cell modification anywhere in the array
+       changes the digest -- the stride sample alone has misses
+       for cells that fall between strides. Both pieces together
+       give effective collision resistance against any practical
+       upstream feature-pipeline drift.
+
+    Cost on the working dataset (5M rows x ~30 cols float32) is
+    ~3-4 seconds per array on a single CPU core, dominated by the
+    reduction. That is negligible compared to a 4-8 minute M2/M6
+    fit, and it is paid once per ``cache_or_compute`` call.
+    """
+    h = _m2_hashlib.blake2b(digest_size=16)
+    for a in arrays:
+        if a is None:
+            h.update(b"|None|")
+            continue
+        ac = np.ascontiguousarray(a)
+        h.update(b"|dtype=")
+        h.update(str(ac.dtype).encode("ascii"))
+        h.update(b"|shape=")
+        h.update(str(ac.shape).encode("ascii"))
+        if ac.ndim == 0 or ac.size == 0:
+            continue
+        if ac.shape[0] <= int(k_rows):
+            h.update(ac.tobytes())
+        else:
+            stride = max(int(ac.shape[0]) // int(k_rows), 1)
+            h.update(ac[::stride].tobytes())
+            h.update(ac[:64].tobytes())
+            h.update(ac[-64:].tobytes())
+        if ac.dtype.kind == "f":
+            agg = np.asarray(
+                [
+                    float(ac.sum(dtype=np.float64)),
+                    float((ac.astype(np.float64) ** 2).sum()),
+                    float(np.abs(ac.astype(np.float64)).sum()),
+                    float(ac.min()),
+                    float(ac.max()),
+                ],
+                dtype=np.float64,
+            )
+        else:
+            ac64 = ac.astype(np.int64, copy=False)
+            agg = np.asarray(
+                [
+                    int(ac64.sum()),
+                    int((ac64 * ac64).sum()),
+                    int(np.abs(ac64).sum()),
+                    int(ac.min()),
+                    int(ac.max()),
+                ],
+                dtype=np.int64,
+            )
+        h.update(agg.tobytes())
+    return h.hexdigest()
+
+
+_m2_num_digest = _content_digest(m2_numerical_train, k_rows=8192)
+_m2_cat_digest = _content_digest(
+    _mef_train_subj.astype(np.int64, copy=False),
+    _mef_train_bc.astype(np.int64, copy=False),
+    _mef_train_cluster.astype(np.int64, copy=False),
+    _m2_meta_train["family_ids"].astype(np.int64, copy=False),
+    _m2_meta_train["macro_family_ids"].astype(np.int64, copy=False),
+    _m2_meta_train["organization_ids"].astype(np.int64, copy=False),
+    _m2_meta_train["bench_topic_ids"].astype(np.int64, copy=False),
+    y_train.astype(np.float32, copy=False),
+    m2_holdout_item_id.astype(np.int64, copy=False),
+    k_rows=8192,
+)
 
 member2_mlp_state = cache_or_compute(
     "member2_mlp_state",
     key_inputs=(
-        "member2_metadata_mlp_v2_dcnv2",
+        # Bumped tag: the v2_dcnv2 module + the new (num, cat,
+        # y, holdout) content digests defensively invalidate any
+        # prior M2 cache that predates the audit. The version
+        # string explicitly encodes the digest schema so that
+        # *any* future change to the digest helper invalidates
+        # all M2 caches built before that change.
+        "member2_metadata_mlp_v2_dcnv2_audit1",
         int(len(primary.train)), int(SEED),
         int(indexer.n_subjects), int(indexer.n_bc), int(_m2_n_clusters),
         int(_M2_N_FAMILIES), int(_M2_N_MACRO_FAMILIES),
@@ -2794,6 +2882,7 @@ member2_mlp_state = cache_or_compute(
         int(m2_numerical_train.shape[1]),
         round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
         _m2_num_digest,
+        _m2_cat_digest,
         tuple(sorted(_m2_cfg.items())),
     ),
     compute_fn=_fit_member2_mlp_global,
@@ -3502,15 +3591,36 @@ if _M6_ENABLED:
             holdout_group_id=holdout_item_id,
         )
 
+    # Content digests over the actual fit inputs. Previously the
+    # FwFM cache only saw shape + hyperparams, so a content shift in
+    # X_train_dense_m4 (e.g. the mean-encoded smoothing changes, the
+    # member_feat_schema is rebuilt, or the redaction seed flips)
+    # could silently HIT a stale FwFM. We sample-hash to keep this
+    # cheap on the ~16 GB matrix.
+    _m6_x_digest_train = _content_digest(X_train_dense_m4, k_rows=8192)
+    _m6_y_digest_train = _content_digest(
+        y_train.astype(np.float32, copy=False), k_rows=8192,
+    )
+    _m6_holdout_digest_train = _content_digest(
+        holdout_item_id.astype(np.int64, copy=False), k_rows=8192,
+    )
     fwfm_state = cache_or_compute(
         "fwfm_state",
         key_inputs=(
-            "m6_fwfm_v1",
+            # v2_audit1: positively invalidate the v1 cache so the
+            # post-teardown / post-feature-digest FwFM is built
+            # from scratch on first run. Bumping defensively is
+            # cheap (FwFM trains in ~2-3 min on full data).
+            "m6_fwfm_v2_audit1",
             int(X_train_dense_m4.shape[1]), len(primary.train), int(SEED),
             int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
             round(_M6_LR, 6), round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
             int(_M6_EPOCHS), int(_M6_BS), int(_M6_PATIENCE),
             round(_M6_VAL_FRAC, 4),
+            round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+            _m6_x_digest_train,
+            _m6_y_digest_train,
+            _m6_holdout_digest_train,
         ),
         compute_fn=_fit_member6,
     )
@@ -4169,10 +4279,30 @@ for fold in folds:
             show_progress=False,
         )
 
+    # Per-fold content digests over the actual fit inputs. The
+    # previous OOF cache key only saw cardinalities + column count,
+    # so any future change to ``_m2_gather_metadata`` semantics, the
+    # subject/benchmark numerical column ordering, or the per-fold
+    # marginal computation would silently HIT a stale OOF state.
+    _m2_num_digest_fold = _content_digest(_m2_num_fold_train, k_rows=8192)
+    _m2_cat_digest_fold = _content_digest(
+        _mef_subj_fold_train.astype(np.int64, copy=False),
+        _mef_bc_fold_train.astype(np.int64, copy=False),
+        _mef_cluster_fold_train.astype(np.int64, copy=False),
+        _m2_meta_fold_train["family_ids"].astype(np.int64, copy=False),
+        _m2_meta_fold_train["macro_family_ids"].astype(np.int64, copy=False),
+        _m2_meta_fold_train["organization_ids"].astype(np.int64, copy=False),
+        _m2_meta_fold_train["bench_topic_ids"].astype(np.int64, copy=False),
+        _y_fold_train.astype(np.float32, copy=False),
+        _m2_holdout_fold.astype(np.int64, copy=False),
+        k_rows=8192,
+    )
     _fold_m2_state = cache_or_compute(
         "member2_mlp_oof_fold",
         key_inputs=(
-            "member2_metadata_mlp_oof_v2_dcnv2",
+            # v2_dcnv2_audit1: positively invalidates any pre-audit
+            # OOF M2 cache and explicitly encodes the digest schema.
+            "member2_metadata_mlp_oof_v2_dcnv2_audit1",
             fold.fold_id, fold_suffix,
             int(len(fold.train_row_idx)), int(len(fold.oof_row_idx)),
             int(indexer.n_subjects), int(indexer.n_bc), int(_m2_fold_n_clusters),
@@ -4182,6 +4312,8 @@ for fold in folds:
             int(MEMBER4_MARGINAL_FEATURE_DIM),
             int(_m2_num_fold_train.shape[1]),
             round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+            _m2_num_digest_fold,
+            _m2_cat_digest_fold,
             tuple(sorted(_m2_cfg.items())),
             int(SEED),
         ),
@@ -4555,7 +4687,7 @@ for fold in folds:
         ),
         compute_fn=lambda _ff=fold: fit_logreg_member(
             X=X_fold_train_dense_m4,
-            y=_y_fold_train_np,
+            y=_y_fold_train,
             feature_names=_fold_m4_feature_names,
             epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
             learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
@@ -4574,21 +4706,37 @@ for fold in folds:
     # rematerializing the matrix later for an isolated M6 path.
     if _M6_ENABLED:
         print(f"[OOF f{fold.fold_id}] Training fold Member 6 (FwFM)...")
+        _m6_x_digest_fold = _content_digest(X_fold_train_dense_m4, k_rows=8192)
+        _m6_y_digest_fold = _content_digest(
+            _y_fold_train.astype(np.float32, copy=False), k_rows=8192,
+        )
+        _m6_holdout_digest_fold = _content_digest(
+            _m2_holdout_fold.astype(np.int64, copy=False), k_rows=8192,
+        )
         _fold_fwfm_state = cache_or_compute(
             "fwfm_state_oof_fold",
             key_inputs=(
-                "m6_fwfm_oof_v1", fold.fold_id, fold_suffix,
+                # v2_audit1: positively invalidate any pre-audit
+                # OOF FwFM cache, and pin the fit to (X, y,
+                # holdout, smoothing) content digests so future
+                # changes upstream cannot quietly reuse a stale
+                # per-fold FwFM.
+                "m6_fwfm_oof_v2_audit1", fold.fold_id, fold_suffix,
                 int(X_fold_train_dense_m4.shape[1]),
                 int(X_fold_train_dense_m4.shape[0]),
                 int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
                 round(_M6_LR, 6),
                 round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
                 int(_M6_EPOCHS), int(_M6_BS), int(_M6_PATIENCE),
+                round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+                _m6_x_digest_fold,
+                _m6_y_digest_fold,
+                _m6_holdout_digest_fold,
                 int(SEED),
             ),
             compute_fn=lambda _ff=fold: fit_fwfm_member(
                 X=X_fold_train_dense_m4,
-                y=_y_fold_train_np,
+                y=_y_fold_train,
                 feature_names=_fold_m4_feature_names,
                 field_ids=_m6_field_ids,
                 k=_M6_K,
