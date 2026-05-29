@@ -67,6 +67,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 LOG = logging.getLogger("export_stacked")
 
 # Hard ZIP-size cap (per CODABENCH_SUBMISSION_GUIDE / RUNTIME_ENV.md).
@@ -135,6 +137,95 @@ if _HAS_STACKED_BUNDLE:
         if _ME_DIR.exists()
         else None
     )
+
+    # ---- Member 2 metadata tables (subject + benchmark lookups) ----
+    # When shipped, the runtime can gather family / macro / organization
+    # / bench_topic ids and subject / bench numerical features per row.
+    # When absent (legacy bundles), Member 2 falls through to its
+    # cold-start path: every categorical -> UNK, every numerical -> 0
+    # with the missing-flag set to 1.
+    _M2_META_DIR = _STACKED_ROOT / "member2_metadata"
+    if _M2_META_DIR.exists():
+        _M2_META_TABLES = {
+            "subject_cat_ids": np.load(
+                _M2_META_DIR / "subject_cat_ids.npy"
+            ).astype(np.int64, copy=False),
+            "subject_num": np.load(
+                _M2_META_DIR / "subject_num.npy"
+            ).astype(np.float32, copy=False),
+            "bc_cat_ids": np.load(
+                _M2_META_DIR / "bc_cat_ids.npy"
+            ).astype(np.int64, copy=False),
+            "bc_num": np.load(
+                _M2_META_DIR / "bc_num.npy"
+            ).astype(np.float32, copy=False),
+        }
+        _M2_META_CFG = json.loads(
+            (_M2_META_DIR / "fields.json").read_text(encoding="utf-8")
+        )
+        _M2_FAMILY_COL = int(_M2_META_CFG.get("family_col", -1))
+        _M2_MACRO_COL = int(_M2_META_CFG.get("macro_family_col", -1))
+        _M2_ORG_COL = int(_M2_META_CFG.get("organization_col", -1))
+        _M2_TOPIC_COL = int(_M2_META_CFG.get("topic_col", -1))
+        _M2_N_SUBJ_NUM = int(_M2_STATE.n_subj_num)
+        _M2_N_BENCH_NUM = int(_M2_STATE.n_bench_num)
+
+        def _m2_runtime_gather(subj_id, bc_id):
+            t = _M2_META_TABLES
+            n_subj = int(t["subject_cat_ids"].shape[0])
+            n_bc = int(t["bc_cat_ids"].shape[0])
+            s_valid = 0 <= int(subj_id) < n_subj
+            b_valid = 0 <= int(bc_id) < n_bc
+            s_clamped = min(max(int(subj_id), 0), max(n_subj - 1, 0))
+            b_clamped = min(max(int(bc_id), 0), max(n_bc - 1, 0))
+            family_id = (
+                int(t["subject_cat_ids"][s_clamped, _M2_FAMILY_COL])
+                if (s_valid and _M2_FAMILY_COL >= 0) else -1
+            )
+            macro_family_id = (
+                int(t["subject_cat_ids"][s_clamped, _M2_MACRO_COL])
+                if (s_valid and _M2_MACRO_COL >= 0) else -1
+            )
+            organization_id = (
+                int(t["subject_cat_ids"][s_clamped, _M2_ORG_COL])
+                if (s_valid and _M2_ORG_COL >= 0) else -1
+            )
+            bench_topic_id = (
+                int(t["bc_cat_ids"][b_clamped, _M2_TOPIC_COL])
+                if (b_valid and _M2_TOPIC_COL >= 0) else -1
+            )
+            if _M2_N_SUBJ_NUM > 0 and s_valid:
+                subject_numerical = t["subject_num"][s_clamped].astype(
+                    np.float32, copy=True,
+                )
+            else:
+                subject_numerical = np.zeros(_M2_N_SUBJ_NUM, dtype=np.float32)
+                if _M2_N_SUBJ_NUM > 0:
+                    subject_numerical[1::2] = 1.0  # missing-flag = 1
+            if _M2_N_BENCH_NUM > 0 and b_valid:
+                bench_numerical = t["bc_num"][b_clamped].astype(
+                    np.float32, copy=True,
+                )
+            else:
+                bench_numerical = np.zeros(_M2_N_BENCH_NUM, dtype=np.float32)
+                if _M2_N_BENCH_NUM > 0:
+                    bench_numerical[1::2] = 1.0
+            return {
+                "family_id": family_id,
+                "macro_family_id": macro_family_id,
+                "organization_id": organization_id,
+                "bench_topic_id": bench_topic_id,
+                "subject_numerical": subject_numerical,
+                "bench_numerical": bench_numerical,
+            }
+    else:
+        _M2_META_TABLES = None
+        _m2_runtime_gather = lambda *_a, **_k: None  # noqa: E731
+        LOG.info(
+            "[stacked] Member 2 metadata tables absent -- runtime will use "
+            "the cold-start path for all rows (categoricals -> UNK, "
+            "numericals -> 0 with missing-flag=1)."
+        )
     _KNN_STATE = _knn_mod.KNNMemberState.load(_STACKED_ROOT / "member3_knn")
     _LOGREG_STATE = _logreg_mod.LogRegMemberState.load(_STACKED_ROOT / "member4_logreg")
     _STACKER_STATE = _stacker_mod.StackerState.load(_STACKED_ROOT / "stacker")
@@ -243,7 +334,7 @@ if _HAS_STACKED_BUNDLE:
             except NameError:
                 feats_m24 = np.zeros(_GBDT_STATE.feature_dim, dtype=np.float32)
 
-            # ---- Member 2 (metadata MLP) ----
+            # ---- Member 2 (dense metadata MLP, DCN-v2) ----
             try:
                 _s_id_m2 = int(_SUBJECT_TO_ID.get(subject_key, -1))
                 _bc_id_m2 = int(_BC_TO_ID.get(benchmark, -1))
@@ -254,6 +345,8 @@ if _HAS_STACKED_BUNDLE:
                     _cl_id_m2 = -1
             except Exception:
                 _s_id_m2, _bc_id_m2, _cl_id_m2 = -1, -1, -1
+
+            # Mean-encoded marginals (label-derived; same as offline M2).
             if _ME_STATS is not None:
                 _m2_marg = _me_mod.apply_member4_marginal_features_one(
                     _ME_STATS,
@@ -263,12 +356,50 @@ if _HAS_STACKED_BUNDLE:
                 ).astype(np.float32, copy=False)
             else:
                 _m2_marg = np.zeros(int(_M2_STATE.n_marginals), dtype=np.float32)
+
+            # Gather subject + benchmark structured metadata for the
+            # dense numerical channel. Falls back to "all cold" (UNK
+            # categoricals + zero numerics + missing-flag=1) when the
+            # metadata-tables artifact isn't shipped (legacy bundles).
+            if _M2_META_TABLES is not None:
+                _m2_meta_row = _m2_runtime_gather(_s_id_m2, _bc_id_m2)
+            else:
+                _m2_meta_row = {
+                    "family_id": -1, "macro_family_id": -1,
+                    "organization_id": -1, "bench_topic_id": -1,
+                    "subject_numerical": np.zeros(
+                        int(_M2_STATE.n_subj_num), dtype=np.float32,
+                    ),
+                    "bench_numerical": np.zeros(
+                        int(_M2_STATE.n_bench_num), dtype=np.float32,
+                    ),
+                }
+                # Missing-flag = 1 for every numerical field (cold).
+                if int(_M2_STATE.n_subj_num) > 0:
+                    _m2_meta_row["subject_numerical"][1::2] = 1.0
+                if int(_M2_STATE.n_bench_num) > 0:
+                    _m2_meta_row["bench_numerical"][1::2] = 1.0
+
+            # Assemble the numerical channel in the canonical order:
+            # subj_num | bench_num | bc_redacted_flag | marginals.
+            _m2_redacted = 0.0  # runtime input is never redacted.
+            _m2_num_row = np.concatenate([
+                np.asarray(_m2_meta_row["subject_numerical"], dtype=np.float32),
+                np.asarray(_m2_meta_row["bench_numerical"], dtype=np.float32),
+                np.asarray([_m2_redacted], dtype=np.float32),
+                _m2_marg,
+            ], axis=0).astype(np.float32, copy=False)
+
             p2 = float(_m2_mod.apply_state_one(
                 _M2_STATE,
                 subject_id=_s_id_m2,
                 bc_id=_bc_id_m2,
                 cluster_id=_cl_id_m2,
-                marginals=_m2_marg,
+                family_id=int(_m2_meta_row["family_id"]),
+                macro_family_id=int(_m2_meta_row["macro_family_id"]),
+                organization_id=int(_m2_meta_row["organization_id"]),
+                bench_topic_id=int(_m2_meta_row["bench_topic_id"]),
+                numerical=_m2_num_row,
             ))
 
             # ---- Member 4 (LogReg) ----
@@ -532,6 +663,7 @@ def export_four_member_stacked_run(
     runtime_feature_builder_py: str | None = None,
     mean_encoded_stats: Any | None = None,
     member5_state: Any | None = None,
+    member2_metadata_tables: Mapping[str, Any] | None = None,
     zip_cap_bytes: int = _DEFAULT_ZIP_CAP_BYTES,
     audit: bool = True,
 ) -> Path:
@@ -628,6 +760,55 @@ def export_four_member_stacked_run(
         )
     if residual_table is not None:
         residual_table.save(artifacts_dir / "residual_table")
+
+    # Ship Member 2 metadata lookup tables (subject_cat_ids, subject_num,
+    # bc_cat_ids, bc_num + the per-trait column indices). When omitted,
+    # the runtime falls back to cold-start every row -- the model still
+    # predicts (via UNK embeddings and missing-flag=1 numerics) but
+    # loses its subject- and benchmark-conditional signal.
+    if member2_metadata_tables is not None:
+        m2_meta_dir = artifacts_dir / "member2_metadata"
+        m2_meta_dir.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        try:
+            sub_cat = np.asarray(
+                member2_metadata_tables["subject_cat_ids"], dtype=np.int64,
+            )
+            sub_num = np.asarray(
+                member2_metadata_tables["subject_num"], dtype=np.float32,
+            )
+            bc_cat = np.asarray(
+                member2_metadata_tables["bc_cat_ids"], dtype=np.int64,
+            )
+            bc_num = np.asarray(
+                member2_metadata_tables["bc_num"], dtype=np.float32,
+            )
+        except KeyError as exc:
+            raise KeyError(
+                f"member2_metadata_tables missing required key {exc!s}; "
+                "expected keys: subject_cat_ids, subject_num, "
+                "bc_cat_ids, bc_num, family_col, macro_family_col, "
+                "organization_col, topic_col"
+            ) from exc
+        np.save(m2_meta_dir / "subject_cat_ids.npy", sub_cat)
+        np.save(m2_meta_dir / "subject_num.npy", sub_num)
+        np.save(m2_meta_dir / "bc_cat_ids.npy", bc_cat)
+        np.save(m2_meta_dir / "bc_num.npy", bc_num)
+        fields_payload = {
+            "family_col": int(member2_metadata_tables.get("family_col", -1)),
+            "macro_family_col": int(
+                member2_metadata_tables.get("macro_family_col", -1)
+            ),
+            "organization_col": int(
+                member2_metadata_tables.get("organization_col", -1)
+            ),
+            "topic_col": int(member2_metadata_tables.get("topic_col", -1)),
+            "n_subj_num": int(sub_num.shape[1]),
+            "n_bench_num": int(bc_num.shape[1]),
+        }
+        (m2_meta_dir / "fields.json").write_text(
+            _json.dumps(fields_payload, indent=2), encoding="utf-8",
+        )
 
     # Task 4: ship Member 5 (difficulty-projected kNN) when provided.
     # We guard against the misconfiguration of shipping member5_state

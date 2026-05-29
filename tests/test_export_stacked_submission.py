@@ -188,35 +188,69 @@ def _make_synthetic_states(tmp_path: Path):
         k=5,
     )
 
-    # Member 2: metadata MLP on synthetic ids + marginals.
-    from src.member2_metadata_mlp import fit_member2_metadata_mlp
+    # Member 2: dense metadata MLP on synthetic ids + numericals.
+    from src.member2_metadata_mlp import (
+        assemble_numerical,
+        fit_member2_metadata_mlp,
+        numerical_feature_names,
+    )
 
     N = 400
     n_subjects, n_bcs, n_clusters = 8, 5, 4
+    n_families, n_macro, n_org, n_topics = 4, 3, 3, 4
+    n_subj_num, n_bench_num = 2, 2
     n_marginals = 6
     subj_ids = rng.integers(0, n_subjects, size=N).astype(np.int64)
     bc_ids = rng.integers(0, n_bcs, size=N).astype(np.int64)
     cl_ids = rng.integers(0, n_clusters, size=N).astype(np.int64)
+    fam_ids = rng.integers(0, n_families, size=N).astype(np.int64)
+    mfam_ids = rng.integers(0, n_macro, size=N).astype(np.int64)
+    org_ids = rng.integers(0, n_org, size=N).astype(np.int64)
+    topic_ids = rng.integers(0, n_topics, size=N).astype(np.int64)
+    subj_num = rng.normal(size=(N, n_subj_num)).astype(np.float32)
+    bench_num = rng.normal(size=(N, n_bench_num)).astype(np.float32)
+    redact = (rng.uniform(size=N) < 0.2).astype(np.float32)
     marginals = rng.normal(size=(N, n_marginals)).astype(np.float32)
     z_m2 = marginals[:, 0] + 0.5 * (subj_ids % 3) - 0.3 * (bc_ids % 2)
     y = (rng.uniform(size=N) < (1 / (1 + np.exp(-z_m2)))).astype(np.float32)
+    num = assemble_numerical(
+        subject_numerical=subj_num,
+        bench_numerical=bench_num,
+        bc_redacted_flag=redact,
+        marginals=marginals,
+    )
+    num_names = numerical_feature_names(
+        subj_num_names=tuple(f"sn{i}" for i in range(n_subj_num)),
+        bench_num_names=tuple(f"bn{i}" for i in range(n_bench_num)),
+        marginal_names=tuple(f"m{i}" for i in range(n_marginals)),
+    )
     member2_mlp_state = fit_member2_metadata_mlp(
         subject_ids=subj_ids,
         bc_ids=bc_ids,
         cluster_ids=cl_ids,
-        marginals=marginals,
+        family_ids=fam_ids,
+        macro_family_ids=mfam_ids,
+        organization_ids=org_ids,
+        bench_topic_ids=topic_ids,
+        numerical=num,
         y=y,
         subject_keys=tuple(f"s{i}" for i in range(n_subjects)),
         bc_keys=tuple(f"b{i}" for i in range(n_bcs)),
-        marg_feature_names=tuple(f"m{i}" for i in range(n_marginals)),
+        num_feature_names=num_names,
         n_subjects=n_subjects,
         n_bcs=n_bcs,
         n_clusters=n_clusters,
-        d_subj=8,
-        d_bc=8,
-        d_cluster=4,
-        hid1=32,
-        hid2=16,
+        n_families=n_families,
+        n_macro_families=n_macro,
+        n_organizations=n_org,
+        n_bench_topics=n_topics,
+        n_subj_num=n_subj_num,
+        n_bench_num=n_bench_num,
+        n_marginals=n_marginals,
+        d_subj=8, d_bc=8, d_cluster=4,
+        d_family=4, d_macro=4, d_org=4, d_topic=4,
+        hid1=32, hid2=16,
+        n_cross_layers=2, cross_rank=8,
         epochs=5,
         batch_size=128,
         seed=1,

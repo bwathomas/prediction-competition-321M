@@ -384,21 +384,45 @@ CFG["oof"].setdefault("optimism_threshold_nats", 0.03)
 # 14 mean-encoded marginals). No item embeddings -- structurally orthogonal
 # to M1/M3/M4/M6.
 CFG.setdefault("member2_mlp", {})
+# Categorical-embedding widths.
 CFG["member2_mlp"].setdefault("d_subj", 32)
 CFG["member2_mlp"].setdefault("d_bc", 32)
 CFG["member2_mlp"].setdefault("d_cluster", 16)
+CFG["member2_mlp"].setdefault("d_family", 16)
+CFG["member2_mlp"].setdefault("d_macro", 8)
+CFG["member2_mlp"].setdefault("d_org", 16)
+CFG["member2_mlp"].setdefault("d_topic", 16)
+# Deep tower (two GLU blocks).
 CFG["member2_mlp"].setdefault("hid1", 256)
 CFG["member2_mlp"].setdefault("hid2", 128)
+# DCN-v2 cross tower (parallel with the deep tower).
+CFG["member2_mlp"].setdefault("n_cross_layers", 2)
+CFG["member2_mlp"].setdefault("cross_rank", 64)
+# Optimisation.
 CFG["member2_mlp"].setdefault("learning_rate", 1.0e-3)
 CFG["member2_mlp"].setdefault("weight_decay", 1.0e-5)
-CFG["member2_mlp"].setdefault("epochs", 40)
+CFG["member2_mlp"].setdefault("epochs", 60)
 CFG["member2_mlp"].setdefault("batch_size", 16384)
-CFG["member2_mlp"].setdefault("early_stopping_patience", 5)
+CFG["member2_mlp"].setdefault("early_stopping_patience", 8)
 CFG["member2_mlp"].setdefault("val_fraction", 0.1)
+# LR schedule.
+CFG["member2_mlp"].setdefault("warmup_epochs", 2)
+CFG["member2_mlp"].setdefault("use_cosine_schedule", True)
+# EMA + snapshot ensembling.
+CFG["member2_mlp"].setdefault("ema_decay", 0.999)
+CFG["member2_mlp"].setdefault("snapshot_ensemble_k", 3)
+# Categorical dropout (per-field independent UNK replacement).
 CFG["member2_mlp"].setdefault("cat_dropout_subject", 0.05)
 CFG["member2_mlp"].setdefault("cat_dropout_bc", 0.10)
 CFG["member2_mlp"].setdefault("cat_dropout_cluster", 0.10)
+CFG["member2_mlp"].setdefault("cat_dropout_family", 0.05)
+CFG["member2_mlp"].setdefault("cat_dropout_macro", 0.05)
+CFG["member2_mlp"].setdefault("cat_dropout_org", 0.05)
+CFG["member2_mlp"].setdefault("cat_dropout_topic", 0.10)
 CFG["member2_mlp"].setdefault("feat_dropout", 0.10)
+# Label smoothing + Mixup (Mixup on numerical channel only).
+CFG["member2_mlp"].setdefault("label_smoothing", 0.005)
+CFG["member2_mlp"].setdefault("mixup_alpha", 0.0)
 # --- Member 5: kNN on a 1-D supervised difficulty projection (Task 4) ---
 # Member 3 already does kNN on raw item embeddings (semantic similarity).
 # Member 5 builds neighborhoods in PREDICTED DIFFICULTY space instead --
@@ -466,9 +490,13 @@ CFG["member6"].setdefault("learning_rate", 1.0e-3)
 CFG["member6"].setdefault("weight_decay_w", 1.0e-5)
 CFG["member6"].setdefault("weight_decay_V", 1.0e-4)
 CFG["member6"].setdefault("weight_decay_r", 1.0e-4)
-CFG["member6"].setdefault("epochs", 40)
+# Bumped from 40 -> 100 because val-loss was still trending down at 40
+# in the last full run. ``early_stopping_patience`` keeps us honest:
+# we'll exit early when val-loss plateaus rather than burning the full
+# budget every time.
+CFG["member6"].setdefault("epochs", 100)
 CFG["member6"].setdefault("batch_size", 16384)
-CFG["member6"].setdefault("early_stopping_patience", 5)
+CFG["member6"].setdefault("early_stopping_patience", 10)
 CFG["member6"].setdefault("val_fraction", 0.1)
 # field_split_mode: "single" (classic FM, all cols in field 0) or
 # "embedding_vs_marginal" (2 fields: 0=embedding-derived M2 columns,
@@ -2434,16 +2462,221 @@ X_val_dense_m2 = None
 print("[mean-enc] Member 2: metadata MLP path (no dense_m2 matrices).")
 
 # %% [markdown]
-# ## 9c. Train Member 2 (metadata GLU MLP)
+# ## 9c. Train Member 2 (dense metadata MLP with DCN-v2)
 #
-# Small metadata-only MLP: subject / bc / cluster embeddings plus the
-# same 14 mean-encoded marginals Member 4 uses. No item embedding columns
-# so errors stay structurally orthogonal to M1/M3/M4/M6.
+# Dense metadata-only MLP. Inputs:
+#   * **Categorical** (7 fields, all embedded): subject_id, bc_id,
+#     cluster_id, family_id, macro_family_id, organization_id,
+#     bench_topic_id.
+#   * **Numerical**: subject CSV numerics (log_params + missing-flag,
+#     release_date + missing-flag), benchmark numerics (benchmark_age
+#     + missing-flag), per-row bc-redacted flag, plus the 14 mean-encoded
+#     marginals Member 4 also consumes.
+#
+# Architecture: parallel DCN-v2 cross tower + GLU deep tower, fused at
+# the head. Training tricks: linear-warmup + cosine LR, weight EMA,
+# snapshot-ensemble over the top-K best val checkpoints, optional
+# numerical-channel Mixup, optional label smoothing. See
+# ``src/member2_metadata_mlp.py`` for the full design.
+#
+# Why no item embeddings: keeps the member structurally orthogonal to
+# M1 (deep on embeddings), M3 (kNN on embeddings), M4 (linear on
+# embeddings + marginals), and M6 (bilinear on embeddings + marginals).
 
 # %%
 from src.member2_metadata_mlp import (
     apply_state_batch as m2_apply_state_batch,
+    assemble_numerical as m2_assemble_numerical,
     fit_member2_metadata_mlp,
+    numerical_feature_names as m2_numerical_feature_names,
+)
+
+# ---- Per-row metadata arrays (shared by global / OOF / shuffled fits) ----
+# Build once on the full train/val partitions; per-fold sections just
+# slice these by ``fold.train_row_idx`` / ``fold.oof_row_idx`` (or
+# rebuild from ``_compute_id_arrays(fold_*_df)`` for the family/macro/
+# org/topic/subject_num/bench_num columns since those are pure lookups
+# from the global subject_tables / meta_id_tables).
+
+_M2_SUBJECT_CAT_FIELDS = list(_meta_schema.subject_categorical)
+_M2_BENCH_CAT_FIELDS = list(_meta_schema.benchmark_categorical)
+_M2_SUBJECT_NUM_FIELDS = list(_meta_schema.subject_numeric)
+_M2_BENCH_NUM_FIELDS = list(_meta_schema.benchmark_numeric)
+
+_M2_SUBJ_NUM_FEATURE_NAMES: tuple[str, ...] = tuple(
+    name
+    for col in _M2_SUBJECT_NUM_FIELDS
+    for name in (f"{col}_value", f"{col}_missing")
+)
+_M2_BENCH_NUM_FEATURE_NAMES: tuple[str, ...] = tuple(
+    name
+    for col in _M2_BENCH_NUM_FIELDS
+    for name in (f"{col}_value", f"{col}_missing")
+)
+_M2_N_SUBJ_NUM: int = int(len(_M2_SUBJ_NUM_FEATURE_NAMES))
+_M2_N_BENCH_NUM: int = int(len(_M2_BENCH_NUM_FEATURE_NAMES))
+
+# Per-subject_id metadata lookup tables (numpy copies; static across
+# the run). For unknown subjects we route to UNK at gather time via
+# ``np.where(subj >= 0, ...)``.
+_M2_SUBJ_CAT_TABLE = (
+    meta_id_tables.subject_cat_ids.cpu().numpy().astype(np.int64)
+)              # [n_subjects, n_subject_cat_fields]
+_M2_SUBJ_NUM_TABLE = (
+    meta_id_tables.subject_num.cpu().numpy().astype(np.float32)
+)              # [n_subjects, 2 * n_subject_numeric]
+
+# Per-bc_id metadata lookup tables.
+_M2_BC_CAT_TABLE = (
+    meta_id_tables.bc_cat_ids.cpu().numpy().astype(np.int64)
+)              # [n_bc, n_benchmark_cat_fields]
+_M2_BC_NUM_TABLE = (
+    meta_id_tables.bc_num.cpu().numpy().astype(np.float32)
+)              # [n_bc, 2 * n_benchmark_numeric]
+
+# Index of each cat trait inside the per-subject / per-bc cat tables.
+_M2_FAMILY_COL = (
+    _M2_SUBJECT_CAT_FIELDS.index("family")
+    if "family" in _M2_SUBJECT_CAT_FIELDS else -1
+)
+_M2_MACRO_COL = (
+    _M2_SUBJECT_CAT_FIELDS.index("macro_family")
+    if "macro_family" in _M2_SUBJECT_CAT_FIELDS else -1
+)
+_M2_ORG_COL = (
+    _M2_SUBJECT_CAT_FIELDS.index("organization")
+    if "organization" in _M2_SUBJECT_CAT_FIELDS else -1
+)
+_M2_TOPIC_COL = (
+    _M2_BENCH_CAT_FIELDS.index("topic")
+    if "topic" in _M2_BENCH_CAT_FIELDS else -1
+)
+
+# Cardinalities -- include the UNK/MISSING row each vocab reserves.
+_M2_N_FAMILIES = int(N_FAMILIES) if _M2_FAMILY_COL >= 0 else 1
+_M2_N_MACRO_FAMILIES = int(N_MACRO_FAMILIES) if _M2_MACRO_COL >= 0 else 1
+_M2_N_ORGANIZATIONS = int(N_ORGANIZATIONS) if _M2_ORG_COL >= 0 else 1
+_M2_N_BENCH_TOPICS = (
+    int(meta_id_tables.benchmark_cat_cardinalities[_M2_TOPIC_COL])
+    if (_M2_TOPIC_COL >= 0 and len(meta_id_tables.benchmark_cat_cardinalities) > _M2_TOPIC_COL)
+    else 1
+)
+
+
+def _m2_gather_metadata(subj_ids: np.ndarray, bc_ids: np.ndarray) -> dict:
+    """Gather per-row M2 metadata: family/macro/org/topic ids + subj/bench numerics.
+
+    Out-of-range ids (-1 or beyond cardinality) are routed to UNK on
+    the categorical side (-1 stays -1; the apply / fit functions
+    route -1 to the UNK slot). For numerics we zero out the value and
+    set the missing-flag to 1 for cold rows, mirroring how the
+    NumericScaler encodes a missing source value.
+    """
+    s = np.asarray(subj_ids, dtype=np.int64).reshape(-1)
+    b = np.asarray(bc_ids, dtype=np.int64).reshape(-1)
+    n = int(s.shape[0])
+    n_subj = int(_M2_SUBJ_CAT_TABLE.shape[0])
+    n_bc = int(_M2_BC_CAT_TABLE.shape[0])
+    s_clamped = np.clip(s, 0, max(n_subj - 1, 0)).astype(np.int64)
+    b_clamped = np.clip(b, 0, max(n_bc - 1, 0)).astype(np.int64)
+    s_valid = (s >= 0) & (s < n_subj)
+    b_valid = (b >= 0) & (b < n_bc)
+
+    # Subject categoricals.
+    if _M2_FAMILY_COL >= 0:
+        family = np.where(
+            s_valid, _M2_SUBJ_CAT_TABLE[s_clamped, _M2_FAMILY_COL], -1
+        ).astype(np.int64)
+    else:
+        family = np.full(n, -1, dtype=np.int64)
+    if _M2_MACRO_COL >= 0:
+        macro = np.where(
+            s_valid, _M2_SUBJ_CAT_TABLE[s_clamped, _M2_MACRO_COL], -1
+        ).astype(np.int64)
+    else:
+        macro = np.full(n, -1, dtype=np.int64)
+    if _M2_ORG_COL >= 0:
+        organization = np.where(
+            s_valid, _M2_SUBJ_CAT_TABLE[s_clamped, _M2_ORG_COL], -1
+        ).astype(np.int64)
+    else:
+        organization = np.full(n, -1, dtype=np.int64)
+    # Benchmark categorical.
+    if _M2_TOPIC_COL >= 0:
+        topic = np.where(
+            b_valid, _M2_BC_CAT_TABLE[b_clamped, _M2_TOPIC_COL], -1
+        ).astype(np.int64)
+    else:
+        topic = np.full(n, -1, dtype=np.int64)
+
+    # Subject numerics (and missing-flag for cold subjects).
+    if _M2_N_SUBJ_NUM > 0:
+        subj_num = _M2_SUBJ_NUM_TABLE[s_clamped].astype(np.float32, copy=True)
+        cold = ~s_valid
+        if cold.any():
+            for j in range(int(len(_M2_SUBJECT_NUM_FIELDS))):
+                subj_num[cold, 2 * j] = 0.0
+                subj_num[cold, 2 * j + 1] = 1.0
+    else:
+        subj_num = np.zeros((n, 0), dtype=np.float32)
+
+    # Benchmark numerics.
+    if _M2_N_BENCH_NUM > 0:
+        bench_num = _M2_BC_NUM_TABLE[b_clamped].astype(np.float32, copy=True)
+        cold = ~b_valid
+        if cold.any():
+            for j in range(int(len(_M2_BENCH_NUM_FIELDS))):
+                bench_num[cold, 2 * j] = 0.0
+                bench_num[cold, 2 * j + 1] = 1.0
+    else:
+        bench_num = np.zeros((n, 0), dtype=np.float32)
+
+    return {
+        "family_ids": family,
+        "macro_family_ids": macro,
+        "organization_ids": organization,
+        "bench_topic_ids": topic,
+        "subject_numerical": subj_num,
+        "bench_numerical": bench_num,
+    }
+
+
+# Build canonical M2 numerical-feature-name tuple once.
+_M2_NUM_FEATURE_NAMES = m2_numerical_feature_names(
+    subj_num_names=_M2_SUBJ_NUM_FEATURE_NAMES,
+    bench_num_names=_M2_BENCH_NUM_FEATURE_NAMES,
+    marginal_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+)
+
+# Per-row train / val metadata (built once at module scope).
+_m2_meta_train = _m2_gather_metadata(_mef_train_subj, _mef_train_bc)
+_m2_meta_val = _m2_gather_metadata(_mef_val_subj, _mef_val_bc)
+
+m2_numerical_train = m2_assemble_numerical(
+    subject_numerical=_m2_meta_train["subject_numerical"],
+    bench_numerical=_m2_meta_train["bench_numerical"],
+    bc_redacted_flag=bc_redacted_train,
+    marginals=member4_marginal_train,
+)
+m2_numerical_val = m2_assemble_numerical(
+    subject_numerical=_m2_meta_val["subject_numerical"],
+    bench_numerical=_m2_meta_val["bench_numerical"],
+    bc_redacted_flag=bc_redacted_val,
+    marginals=member4_marginal_val,
+)
+print(
+    f"[Member 2 MLP] dense metadata channel built: "
+    f"n_num={m2_numerical_train.shape[1]} "
+    f"(subj={_M2_N_SUBJ_NUM}, bench={_M2_N_BENCH_NUM}, "
+    f"redact=1, marg={MEMBER4_MARGINAL_FEATURE_DIM})"
+)
+print(
+    f"[Member 2 MLP] cat cardinalities: "
+    f"subjects={int(indexer.n_subjects)}, bcs={int(indexer.n_bc)}, "
+    f"clusters=?, families={_M2_N_FAMILIES}, "
+    f"macro_families={_M2_N_MACRO_FAMILIES}, "
+    f"organizations={_M2_N_ORGANIZATIONS}, "
+    f"bench_topics={_M2_N_BENCH_TOPICS}"
 )
 
 _m2_cfg = CFG.get("member2_mlp", {})
@@ -2479,26 +2712,43 @@ _m2_n_clusters = max(
 
 def _fit_member2_mlp_global():
     print(
-        "[Member 2 MLP] training metadata GLU MLP on full train "
-        f"(N={len(primary.train):,}, marginals={member4_marginal_train.shape[1]})..."
+        "[Member 2 MLP] training DCN-v2 + GLU MLP on full train "
+        f"(N={len(primary.train):,}, n_num={m2_numerical_train.shape[1]})..."
     )
     return fit_member2_metadata_mlp(
         subject_ids=_mef_train_subj,
         bc_ids=_mef_train_bc,
         cluster_ids=_mef_train_cluster,
-        marginals=member4_marginal_train.astype(np.float32, copy=False),
+        family_ids=_m2_meta_train["family_ids"],
+        macro_family_ids=_m2_meta_train["macro_family_ids"],
+        organization_ids=_m2_meta_train["organization_ids"],
+        bench_topic_ids=_m2_meta_train["bench_topic_ids"],
+        numerical=m2_numerical_train,
         y=y_train,
         subject_keys=_subject_keys_ordered,
         bc_keys=_bc_keys_ordered,
-        marg_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+        num_feature_names=_M2_NUM_FEATURE_NAMES,
         n_subjects=int(indexer.n_subjects),
         n_bcs=int(indexer.n_bc),
         n_clusters=int(_m2_n_clusters),
+        n_families=int(_M2_N_FAMILIES),
+        n_macro_families=int(_M2_N_MACRO_FAMILIES),
+        n_organizations=int(_M2_N_ORGANIZATIONS),
+        n_bench_topics=int(_M2_N_BENCH_TOPICS),
+        n_subj_num=int(_M2_N_SUBJ_NUM),
+        n_bench_num=int(_M2_N_BENCH_NUM),
+        n_marginals=int(MEMBER4_MARGINAL_FEATURE_DIM),
         d_subj=int(_m2_cfg.get("d_subj", 32)),
         d_bc=int(_m2_cfg.get("d_bc", 32)),
         d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+        d_family=int(_m2_cfg.get("d_family", 16)),
+        d_macro=int(_m2_cfg.get("d_macro", 8)),
+        d_org=int(_m2_cfg.get("d_org", 16)),
+        d_topic=int(_m2_cfg.get("d_topic", 16)),
         hid1=int(_m2_cfg.get("hid1", 256)),
         hid2=int(_m2_cfg.get("hid2", 128)),
+        n_cross_layers=int(_m2_cfg.get("n_cross_layers", 2)),
+        cross_rank=int(_m2_cfg.get("cross_rank", 64)),
         learning_rate=float(_m2_cfg.get("learning_rate", 1.0e-3)),
         weight_decay=float(_m2_cfg.get("weight_decay", 1.0e-5)),
         epochs=int(_m2_cfg.get("epochs", 40)),
@@ -2508,7 +2758,17 @@ def _fit_member2_mlp_global():
         cat_dropout_subject=float(_m2_cfg.get("cat_dropout_subject", 0.05)),
         cat_dropout_bc=float(_m2_cfg.get("cat_dropout_bc", 0.10)),
         cat_dropout_cluster=float(_m2_cfg.get("cat_dropout_cluster", 0.10)),
+        cat_dropout_family=float(_m2_cfg.get("cat_dropout_family", 0.05)),
+        cat_dropout_macro=float(_m2_cfg.get("cat_dropout_macro", 0.05)),
+        cat_dropout_org=float(_m2_cfg.get("cat_dropout_org", 0.05)),
+        cat_dropout_topic=float(_m2_cfg.get("cat_dropout_topic", 0.10)),
         feat_dropout=float(_m2_cfg.get("feat_dropout", 0.10)),
+        warmup_epochs=int(_m2_cfg.get("warmup_epochs", 2)),
+        use_cosine_schedule=bool(_m2_cfg.get("use_cosine_schedule", True)),
+        ema_decay=float(_m2_cfg.get("ema_decay", 0.999)),
+        snapshot_ensemble_k=int(_m2_cfg.get("snapshot_ensemble_k", 3)),
+        label_smoothing=float(_m2_cfg.get("label_smoothing", 0.005)),
+        mixup_alpha=float(_m2_cfg.get("mixup_alpha", 0.0)),
         seed=int(SEED),
         holdout_group_id=m2_holdout_item_id,
         show_progress=True,
@@ -2517,19 +2777,23 @@ def _fit_member2_mlp_global():
 
 import hashlib as _m2_hashlib
 
-_m2_marg_digest = _m2_hashlib.sha256(
-    np.ascontiguousarray(member4_marginal_train, dtype=np.float32).tobytes()
+_m2_num_digest = _m2_hashlib.sha256(
+    np.ascontiguousarray(m2_numerical_train, dtype=np.float32).tobytes()
 ).hexdigest()[:16]
 
 member2_mlp_state = cache_or_compute(
     "member2_mlp_state",
     key_inputs=(
-        "member2_metadata_mlp_v1",
+        "member2_metadata_mlp_v2_dcnv2",
         int(len(primary.train)), int(SEED),
         int(indexer.n_subjects), int(indexer.n_bc), int(_m2_n_clusters),
-        int(member4_marginal_train.shape[1]),
+        int(_M2_N_FAMILIES), int(_M2_N_MACRO_FAMILIES),
+        int(_M2_N_ORGANIZATIONS), int(_M2_N_BENCH_TOPICS),
+        int(_M2_N_SUBJ_NUM), int(_M2_N_BENCH_NUM),
+        int(MEMBER4_MARGINAL_FEATURE_DIM),
+        int(m2_numerical_train.shape[1]),
         round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
-        _m2_marg_digest,
+        _m2_num_digest,
         tuple(sorted(_m2_cfg.items())),
     ),
     compute_fn=_fit_member2_mlp_global,
@@ -2540,7 +2804,11 @@ p_member2_val = m2_apply_state_batch(
     subject_ids=_mef_val_subj,
     bc_ids=_mef_val_bc,
     cluster_ids=_mef_val_cluster,
-    marginals=member4_marginal_val.astype(np.float32, copy=False),
+    family_ids=_m2_meta_val["family_ids"],
+    macro_family_ids=_m2_meta_val["macro_family_ids"],
+    organization_ids=_m2_meta_val["organization_ids"],
+    bench_topic_ids=_m2_meta_val["bench_topic_ids"],
+    numerical=m2_numerical_val,
 )
 nll_m2 = float(
     -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
@@ -3792,8 +4060,8 @@ for fold in folds:
         del nn_train_mat_fold, nn_oof_mat_fold
         gc.collect()
 
-    # ----- Fold Member 2 (metadata MLP) -----
-    print(f"[OOF f{fold.fold_id}] Training fold Member 2 (metadata MLP)...")
+    # ----- Fold Member 2 (dense metadata MLP) -----
+    print(f"[OOF f{fold.fold_id}] Training fold Member 2 (dense metadata MLP)...")
     _m2_holdout_fold = np.array(
         [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
         dtype=np.int64,
@@ -3804,24 +4072,60 @@ for fold in folds:
         int(_mef_cluster_fold_oof.max()) + 1 if _mef_cluster_fold_oof.size else 0,
     )
 
+    _m2_meta_fold_train = _m2_gather_metadata(
+        _mef_subj_fold_train, _mef_bc_fold_train,
+    )
+    _m2_meta_fold_oof = _m2_gather_metadata(
+        _mef_subj_fold_oof, _mef_bc_fold_oof,
+    )
+    _m2_num_fold_train = m2_assemble_numerical(
+        subject_numerical=_m2_meta_fold_train["subject_numerical"],
+        bench_numerical=_m2_meta_fold_train["bench_numerical"],
+        bc_redacted_flag=bc_redacted_train[fold.train_row_idx],
+        marginals=fold_member4_marginal_train,
+    )
+    _m2_num_fold_oof = m2_assemble_numerical(
+        subject_numerical=_m2_meta_fold_oof["subject_numerical"],
+        bench_numerical=_m2_meta_fold_oof["bench_numerical"],
+        bc_redacted_flag=bc_redacted_train[fold.oof_row_idx],
+        marginals=fold_member4_marginal_oof,
+    )
+
     def _fit_fold_m2_mlp(_ff=fold):
         return fit_member2_metadata_mlp(
             subject_ids=_mef_subj_fold_train,
             bc_ids=_mef_bc_fold_train,
             cluster_ids=_mef_cluster_fold_train,
-            marginals=fold_member4_marginal_train.astype(np.float32, copy=False),
+            family_ids=_m2_meta_fold_train["family_ids"],
+            macro_family_ids=_m2_meta_fold_train["macro_family_ids"],
+            organization_ids=_m2_meta_fold_train["organization_ids"],
+            bench_topic_ids=_m2_meta_fold_train["bench_topic_ids"],
+            numerical=_m2_num_fold_train,
             y=_y_fold_train,
             subject_keys=_subject_keys_ordered,
             bc_keys=_bc_keys_ordered,
-            marg_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+            num_feature_names=_M2_NUM_FEATURE_NAMES,
             n_subjects=int(indexer.n_subjects),
             n_bcs=int(indexer.n_bc),
             n_clusters=int(_m2_fold_n_clusters),
+            n_families=int(_M2_N_FAMILIES),
+            n_macro_families=int(_M2_N_MACRO_FAMILIES),
+            n_organizations=int(_M2_N_ORGANIZATIONS),
+            n_bench_topics=int(_M2_N_BENCH_TOPICS),
+            n_subj_num=int(_M2_N_SUBJ_NUM),
+            n_bench_num=int(_M2_N_BENCH_NUM),
+            n_marginals=int(MEMBER4_MARGINAL_FEATURE_DIM),
             d_subj=int(_m2_cfg.get("d_subj", 32)),
             d_bc=int(_m2_cfg.get("d_bc", 32)),
             d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+            d_family=int(_m2_cfg.get("d_family", 16)),
+            d_macro=int(_m2_cfg.get("d_macro", 8)),
+            d_org=int(_m2_cfg.get("d_org", 16)),
+            d_topic=int(_m2_cfg.get("d_topic", 16)),
             hid1=int(_m2_cfg.get("hid1", 256)),
             hid2=int(_m2_cfg.get("hid2", 128)),
+            n_cross_layers=int(_m2_cfg.get("n_cross_layers", 2)),
+            cross_rank=int(_m2_cfg.get("cross_rank", 64)),
             learning_rate=float(_m2_cfg.get("learning_rate", 1.0e-3)),
             weight_decay=float(_m2_cfg.get("weight_decay", 1.0e-5)),
             epochs=int(_m2_cfg.get("epochs", 40)),
@@ -3831,7 +4135,17 @@ for fold in folds:
             cat_dropout_subject=float(_m2_cfg.get("cat_dropout_subject", 0.05)),
             cat_dropout_bc=float(_m2_cfg.get("cat_dropout_bc", 0.10)),
             cat_dropout_cluster=float(_m2_cfg.get("cat_dropout_cluster", 0.10)),
+            cat_dropout_family=float(_m2_cfg.get("cat_dropout_family", 0.05)),
+            cat_dropout_macro=float(_m2_cfg.get("cat_dropout_macro", 0.05)),
+            cat_dropout_org=float(_m2_cfg.get("cat_dropout_org", 0.05)),
+            cat_dropout_topic=float(_m2_cfg.get("cat_dropout_topic", 0.10)),
             feat_dropout=float(_m2_cfg.get("feat_dropout", 0.10)),
+            warmup_epochs=int(_m2_cfg.get("warmup_epochs", 2)),
+            use_cosine_schedule=bool(_m2_cfg.get("use_cosine_schedule", True)),
+            ema_decay=float(_m2_cfg.get("ema_decay", 0.999)),
+            snapshot_ensemble_k=int(_m2_cfg.get("snapshot_ensemble_k", 3)),
+            label_smoothing=float(_m2_cfg.get("label_smoothing", 0.005)),
+            mixup_alpha=float(_m2_cfg.get("mixup_alpha", 0.0)),
             seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
             holdout_group_id=_m2_holdout_fold,
             show_progress=False,
@@ -3840,11 +4154,15 @@ for fold in folds:
     _fold_m2_state = cache_or_compute(
         "member2_mlp_oof_fold",
         key_inputs=(
-            "member2_metadata_mlp_oof_v1",
+            "member2_metadata_mlp_oof_v2_dcnv2",
             fold.fold_id, fold_suffix,
             int(len(fold.train_row_idx)), int(len(fold.oof_row_idx)),
             int(indexer.n_subjects), int(indexer.n_bc), int(_m2_fold_n_clusters),
-            int(fold_member4_marginal_train.shape[1]),
+            int(_M2_N_FAMILIES), int(_M2_N_MACRO_FAMILIES),
+            int(_M2_N_ORGANIZATIONS), int(_M2_N_BENCH_TOPICS),
+            int(_M2_N_SUBJ_NUM), int(_M2_N_BENCH_NUM),
+            int(MEMBER4_MARGINAL_FEATURE_DIM),
+            int(_m2_num_fold_train.shape[1]),
             round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
             tuple(sorted(_m2_cfg.items())),
             int(SEED),
@@ -3856,7 +4174,11 @@ for fold in folds:
         subject_ids=_mef_subj_fold_oof,
         bc_ids=_mef_bc_fold_oof,
         cluster_ids=_mef_cluster_fold_oof,
-        marginals=fold_member4_marginal_oof.astype(np.float32, copy=False),
+        family_ids=_m2_meta_fold_oof["family_ids"],
+        macro_family_ids=_m2_meta_fold_oof["macro_family_ids"],
+        organization_ids=_m2_meta_fold_oof["organization_ids"],
+        bench_topic_ids=_m2_meta_fold_oof["bench_topic_ids"],
+        numerical=_m2_num_fold_oof,
     )
     p2_train_oof_acc.write_fold(fold.oof_row_idx, p2_oof_fold)
 
@@ -5224,7 +5546,7 @@ else:
         p_a_oof_shuf = p_a_train[fold.oof_row_idx]   # real-label M1, used as feature
         p_a_anchor_shuf = p_a_train[fold.train_row_idx]
 
-        # Fold Member 2 (metadata MLP) on shuffled labels.
+        # Fold Member 2 (dense metadata MLP) on shuffled labels.
         _m2_holdout_shuf = np.array(
             [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
             dtype=np.int64,
@@ -5234,23 +5556,54 @@ else:
             int(_mef_cluster_ft.max()) + 1 if _mef_cluster_ft.size else 0,
             int(_mef_cluster_fo.max()) + 1 if _mef_cluster_fo.size else 0,
         )
+        _m2_meta_ft_shuf = _m2_gather_metadata(_mef_subj_ft, _mef_bc_ft)
+        _m2_meta_fo_shuf = _m2_gather_metadata(_mef_subj_fo, _mef_bc_fo)
+        _m2_num_ft_shuf = m2_assemble_numerical(
+            subject_numerical=_m2_meta_ft_shuf["subject_numerical"],
+            bench_numerical=_m2_meta_ft_shuf["bench_numerical"],
+            bc_redacted_flag=_bc_redacted_ft,
+            marginals=_m4_mg_ft_shuf,
+        )
+        _m2_num_fo_shuf = m2_assemble_numerical(
+            subject_numerical=_m2_meta_fo_shuf["subject_numerical"],
+            bench_numerical=_m2_meta_fo_shuf["bench_numerical"],
+            bc_redacted_flag=_bc_redacted_fo,
+            marginals=_m4_mg_fo_shuf,
+        )
         _fold_m2_shuf = fit_member2_metadata_mlp(
             subject_ids=_mef_subj_ft,
             bc_ids=_mef_bc_ft,
             cluster_ids=_mef_cluster_ft,
-            marginals=_m4_mg_ft_shuf.astype(np.float32, copy=False),
+            family_ids=_m2_meta_ft_shuf["family_ids"],
+            macro_family_ids=_m2_meta_ft_shuf["macro_family_ids"],
+            organization_ids=_m2_meta_ft_shuf["organization_ids"],
+            bench_topic_ids=_m2_meta_ft_shuf["bench_topic_ids"],
+            numerical=_m2_num_ft_shuf,
             y=_y_ft_shuf,
             subject_keys=_subject_keys_ordered,
             bc_keys=_bc_keys_ordered,
-            marg_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+            num_feature_names=_M2_NUM_FEATURE_NAMES,
             n_subjects=int(indexer.n_subjects),
             n_bcs=int(indexer.n_bc),
             n_clusters=int(_m2_shuf_n_clusters),
+            n_families=int(_M2_N_FAMILIES),
+            n_macro_families=int(_M2_N_MACRO_FAMILIES),
+            n_organizations=int(_M2_N_ORGANIZATIONS),
+            n_bench_topics=int(_M2_N_BENCH_TOPICS),
+            n_subj_num=int(_M2_N_SUBJ_NUM),
+            n_bench_num=int(_M2_N_BENCH_NUM),
+            n_marginals=int(MEMBER4_MARGINAL_FEATURE_DIM),
             d_subj=int(_m2_cfg.get("d_subj", 32)),
             d_bc=int(_m2_cfg.get("d_bc", 32)),
             d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+            d_family=int(_m2_cfg.get("d_family", 16)),
+            d_macro=int(_m2_cfg.get("d_macro", 8)),
+            d_org=int(_m2_cfg.get("d_org", 16)),
+            d_topic=int(_m2_cfg.get("d_topic", 16)),
             hid1=int(_m2_cfg.get("hid1", 256)),
             hid2=int(_m2_cfg.get("hid2", 128)),
+            n_cross_layers=int(_m2_cfg.get("n_cross_layers", 2)),
+            cross_rank=int(_m2_cfg.get("cross_rank", 64)),
             learning_rate=float(_m2_cfg.get("learning_rate", 1.0e-3)),
             weight_decay=float(_m2_cfg.get("weight_decay", 1.0e-5)),
             epochs=int(_m2_cfg.get("epochs", 40)),
@@ -5260,7 +5613,17 @@ else:
             cat_dropout_subject=float(_m2_cfg.get("cat_dropout_subject", 0.05)),
             cat_dropout_bc=float(_m2_cfg.get("cat_dropout_bc", 0.10)),
             cat_dropout_cluster=float(_m2_cfg.get("cat_dropout_cluster", 0.10)),
+            cat_dropout_family=float(_m2_cfg.get("cat_dropout_family", 0.05)),
+            cat_dropout_macro=float(_m2_cfg.get("cat_dropout_macro", 0.05)),
+            cat_dropout_org=float(_m2_cfg.get("cat_dropout_org", 0.05)),
+            cat_dropout_topic=float(_m2_cfg.get("cat_dropout_topic", 0.10)),
             feat_dropout=float(_m2_cfg.get("feat_dropout", 0.10)),
+            warmup_epochs=int(_m2_cfg.get("warmup_epochs", 2)),
+            use_cosine_schedule=bool(_m2_cfg.get("use_cosine_schedule", True)),
+            ema_decay=float(_m2_cfg.get("ema_decay", 0.999)),
+            snapshot_ensemble_k=int(_m2_cfg.get("snapshot_ensemble_k", 3)),
+            label_smoothing=float(_m2_cfg.get("label_smoothing", 0.005)),
+            mixup_alpha=float(_m2_cfg.get("mixup_alpha", 0.0)),
             seed=int(SEED) + 100 * (int(fold.fold_id) + 1) + 99999,
             holdout_group_id=_m2_holdout_shuf,
             show_progress=False,
@@ -5270,7 +5633,11 @@ else:
             subject_ids=_mef_subj_fo,
             bc_ids=_mef_bc_fo,
             cluster_ids=_mef_cluster_fo,
-            marginals=_m4_mg_fo_shuf.astype(np.float32, copy=False),
+            family_ids=_m2_meta_fo_shuf["family_ids"],
+            macro_family_ids=_m2_meta_fo_shuf["macro_family_ids"],
+            organization_ids=_m2_meta_fo_shuf["organization_ids"],
+            bench_topic_ids=_m2_meta_fo_shuf["bench_topic_ids"],
+            numerical=_m2_num_fo_shuf,
         )
         p2_train_shuf_acc.write_fold(fold.oof_row_idx, p2_shuf_fold)
 
@@ -5950,6 +6317,21 @@ sub_dir = export_four_member_stacked_run(
     # runtime. We're safe here: when _M5_ENABLED, the stacker above
     # was fit with [N, 5] member_probs (feature_dim==9).
     member5_state=(member5_state if _M5_ENABLED else None),
+    # Ship Member 2 dense-metadata lookup tables so the runtime can
+    # gather subject + benchmark categoricals + numerics per row.
+    # Without these, M2 would fall through to its cold-start path on
+    # every prediction (categoricals -> UNK, numerics -> 0 with
+    # missing-flag=1) and lose its conditional signal.
+    member2_metadata_tables={
+        "subject_cat_ids": _M2_SUBJ_CAT_TABLE,
+        "subject_num": _M2_SUBJ_NUM_TABLE,
+        "bc_cat_ids": _M2_BC_CAT_TABLE,
+        "bc_num": _M2_BC_NUM_TABLE,
+        "family_col": _M2_FAMILY_COL,
+        "macro_family_col": _M2_MACRO_COL,
+        "organization_col": _M2_ORG_COL,
+        "topic_col": _M2_TOPIC_COL,
+    },
 )
 print(f"[Export] stacked bundle: {sub_dir}")
 
@@ -6141,14 +6523,18 @@ print(f"  [PASS] calibrator.apply determinism (max delta: {float(np.abs(p_cal_a 
 print("\n" + "=" * 72)
 print("RED-TEAM SECTION E: edge cases on member apply functions")
 print("=" * 72)
-# Member 2 MLP: cold-start UNK ids + zero marginals -> finite probability.
+# Member 2 MLP: cold-start UNK ids + zero numerical channel -> finite probability.
 from src.member2_metadata_mlp import apply_state_one as _m2_apply_one
 p2_cold = _m2_apply_one(
     member2_mlp_state,
     subject_id=-1,
     bc_id=-1,
     cluster_id=-1,
-    marginals=np.zeros(int(member2_mlp_state.n_marginals), dtype=np.float32),
+    family_id=-1,
+    macro_family_id=-1,
+    organization_id=-1,
+    bench_topic_id=-1,
+    numerical=np.zeros(int(member2_mlp_state.n_num), dtype=np.float32),
 )
 print(f"  [PASS] M2 cold-start UNK -> {p2_cold:.4f} (finite={np.isfinite(p2_cold)})")
 
