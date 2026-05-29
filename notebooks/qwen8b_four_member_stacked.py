@@ -116,6 +116,7 @@
 # ## 1. Setup (Colab + local both supported)
 
 # %%
+import math
 import os
 import subprocess
 import sys
@@ -2310,31 +2311,17 @@ y_train = primary.train["label"].astype(float).to_numpy().astype(np.float32)
 print(f"[member_features] X_train: {X_train_dense.shape}  X_val: {X_val_dense.shape}")
 
 # %% [markdown]
-# ## 9b-bis. Mean-encoded interaction features for Members 2 & 4
+# ## 9b-bis. Mean-encoded features for Member 4 (also reused by Member 2)
 #
 # These cells fit per-cell pass-rate statistics on TRAIN rows and emit
-# two compact dense feature matrices:
-#
-#   * `member2_interaction_train/val` -- 8 cold-start-safe interaction
-#     columns (subject x item-cluster + subject x bench_condition
-#     means/counts/deviations) that get APPENDED to `X_train_dense` /
-#     `X_val_dense`. The point is to give the GBDT something to split
-#     on that's BOTH novel (not encoded by the existing dense schema)
-#     AND directly correlated with the label, so its trees stop
-#     re-discovering Member 1's signal and start contributing
-#     independent information to the stacker.
+# a compact dense feature matrix:
 #
 #   * `member4_marginal_train/val` -- 14 mean-encoded marginal columns
 #     (subject mean, bc mean, cluster mean, plus a handful of two-way
-#     interactions and a constant) that REPLACE Member 4's feature
-#     view entirely. Member 4 currently shares X_train_dense with
-#     Member 2 -- including all qwen-embedding-derived features --
-#     which is why its predictions are heavily correlated with
-#     Members 1 and 3 (which also lean on those embeddings). Cutting
-#     it off from the embedding view forces the stacker to either
-#     downweight it (if redundant) OR weight it highly when it
-#     contributes a complementary signal (subject / bench baselines
-#     that the other members are getting wrong).
+#     interactions and a constant). These are appended to Member 4's
+#     dense feature view, and are also fed directly as the only
+#     continuous inputs to the Member 2 metadata MLP (which sees only
+#     subject / bc / cluster IDs plus these 14 marginals).
 #
 # Cells with no training observations fall back through:
 # subj_cluster -> cluster_mean -> global_mean, etc. (Bayesian
@@ -2344,11 +2331,8 @@ print(f"[member_features] X_train: {X_train_dense.shape}  X_val: {X_val_dense.sh
 
 # %%
 from src.mean_encoded_features import (
-    MEMBER2_INTERACTION_FEATURE_DIM,
-    MEMBER2_INTERACTION_FEATURE_NAMES,
     MEMBER4_MARGINAL_FEATURE_DIM,
     MEMBER4_MARGINAL_FEATURE_NAMES,
-    apply_member2_interaction_features,
     apply_member4_marginal_features,
     fit_mean_encoded_stats,
 )
@@ -2423,18 +2407,6 @@ print(
     f"|subj_bc_mean|={mean_encoded_stats.subj_bc_mean.shape}"
 )
 
-member2_interaction_train = apply_member2_interaction_features(
-    mean_encoded_stats,
-    subject_ids=_mef_train_subj,
-    cluster_ids=_mef_train_cluster,
-    bc_ids=_mef_train_bc,
-)
-member2_interaction_val = apply_member2_interaction_features(
-    mean_encoded_stats,
-    subject_ids=_mef_val_subj,
-    cluster_ids=_mef_val_cluster,
-    bc_ids=_mef_val_bc,
-)
 member4_marginal_train = apply_member4_marginal_features(
     mean_encoded_stats,
     subject_ids=_mef_train_subj,
@@ -2446,10 +2418,6 @@ member4_marginal_val = apply_member4_marginal_features(
     subject_ids=_mef_val_subj,
     cluster_ids=_mef_val_cluster,
     bc_ids=_mef_val_bc,
-)
-print(
-    f"[mean-enc] Member 2 interaction features: train {member2_interaction_train.shape}  "
-    f"val {member2_interaction_val.shape}  cols={MEMBER2_INTERACTION_FEATURE_DIM}"
 )
 print(
     f"[mean-enc] Member 4 marginal features:    train {member4_marginal_train.shape}  "
@@ -3316,27 +3284,21 @@ else:
 # fit and val-scored, and the matrices below are no longer needed by
 # any downstream code:
 #
-#   * ``X_train_dense`` (~16 GB)  -- only used to concat into m2/m4
-#   * ``X_val_dense``   (~3 GB)   -- only used to concat into m2/m4
-#   * ``X_train_dense_m2`` (~16 GB, legacy only, may be None)
-#   * ``X_val_dense_m2``   (~3 GB,  legacy only, may be None)
+#   * ``X_train_dense`` (~16 GB)  -- only used to concat into m4
+#   * ``X_val_dense``   (~3 GB)   -- only used to concat into m4
+#   * ``X_train_dense_m2`` / ``X_val_dense_m2`` -- always ``None`` since
+#     the metadata MLP M2 doesn't build dense matrices. Kept in the
+#     free-list for forward-compat with experimental M2 variants.
 #   * ``X_train_dense_m4`` (~16 GB) -- consumed by global Member 4 fit
 #   * ``X_val_dense_m4``   (~3 GB)  -- consumed by Member 4 val scoring
-#   * ``member4_marginal_train/val`` (~few hundred MB, absorbed in m4)
-#   * ``member2_interaction_val``    (consumed by m2v2 val build above)
+#   * ``member4_marginal_train/val`` (~few hundred MB, absorbed in m4
+#     and consumed by the global Member 2 MLP fit above)
 #
-# The OOF loop in section 9.5 (and the global Member 2 v2 fit in 9.5c)
-# build their OWN fold-scoped / m2v2 matrices on the fly. Holding the
-# global matrices through that loop is what made the OOF fold-0 OOM
-# happen at "Building fold X_*_dense" -- the loop never even got a
-# chance to allocate its 16 GB X_fold_train_dense because ~50 GB of
-# now-obsolete globals were already pinned.
-#
-# ``X_train_dense_m2v2`` / ``X_val_dense_m2v2`` (small, ~hundreds of MB)
-# ARE kept alive: section 9.5c re-fits global Member 2 v2 with the OOF
-# subject_mean anchor produced by the OOF loop.
-# ``member2_interaction_train`` (~few hundred MB) is also kept alive
-# because section 9.5c's global Member 2 v2 build references it.
+# The OOF loop in section 9.5 builds its own fold-scoped matrices on
+# the fly. Holding the global matrices through that loop is what made
+# the OOF fold-0 OOM happen at "Building fold X_*_dense" -- the loop
+# never even got a chance to allocate its 16 GB X_fold_train_dense
+# because ~50 GB of now-obsolete globals were already pinned.
 
 # %%
 print("[Pre-OOF cleanup] Freeing global dense matrices no longer needed...")
@@ -3347,7 +3309,6 @@ _pre_oof_to_free = [
     ("X_val_dense_m4", X_val_dense_m4),
     ("member4_marginal_train", member4_marginal_train),
     ("member4_marginal_val", member4_marginal_val),
-    ("member2_interaction_val", member2_interaction_val),
 ]
 if X_train_dense_m2 is not None:
     _pre_oof_to_free.append(("X_train_dense_m2", X_train_dense_m2))
@@ -3373,7 +3334,6 @@ X_train_dense_m4 = None
 X_val_dense_m4 = None
 member4_marginal_train = None
 member4_marginal_val = None
-member2_interaction_val = None
 gc.collect()
 print(f"[Pre-OOF cleanup] DONE -- released {_pre_oof_freed_bytes / 1024**3:.2f} GB.")
 
@@ -3647,18 +3607,6 @@ for fold in folds:
         n_bcs=int(indexer.n_bc),
         smoothing=float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)),
     )
-    fold_member2_interaction_train = apply_member2_interaction_features(
-        fold_mean_encoded_stats,
-        subject_ids=_mef_subj_fold_train,
-        cluster_ids=_mef_cluster_fold_train,
-        bc_ids=_mef_bc_fold_train,
-    )
-    fold_member2_interaction_oof = apply_member2_interaction_features(
-        fold_mean_encoded_stats,
-        subject_ids=_mef_subj_fold_oof,
-        cluster_ids=_mef_cluster_fold_oof,
-        bc_ids=_mef_bc_fold_oof,
-    )
     fold_member4_marginal_train = apply_member4_marginal_features(
         fold_mean_encoded_stats,
         subject_ids=_mef_subj_fold_train,
@@ -3671,7 +3619,7 @@ for fold in folds:
         cluster_ids=_mef_cluster_fold_oof,
         bc_ids=_mef_bc_fold_oof,
     )
-    # fold_mean_encoded_stats has been consumed by the four apply_*
+    # fold_mean_encoded_stats has been consumed by the two apply_*
     # calls above; nothing else references it for this fold. Free now.
     del fold_mean_encoded_stats
     gc.collect()
@@ -4406,7 +4354,6 @@ for fold in folds:
     # ``_fold_knn_state``, and Member 5's per-fold state / OOF stack
     # were all freed at their last consumer.
     del fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
-    del fold_member2_interaction_train, fold_member2_interaction_oof
     gc.collect()
 
 # Finalize OOF accumulators -- raises if anything is missing / non-finite.
@@ -5042,7 +4989,7 @@ if _HEATMAP_OK:
         )
         fig.tight_layout()
         try:
-            _diag_dir = Path(CACHE_DIR) / "diagnostics"
+            _diag_dir = ROOT / "artifacts" / "diagnostics"
             _diag_dir.mkdir(parents=True, exist_ok=True)
             _out_png = _diag_dir / "member_correlation_heatmaps.png"
             fig.savefig(_out_png, dpi=120, bbox_inches="tight")
@@ -5180,14 +5127,6 @@ else:
             n_bcs=int(indexer.n_bc),
             smoothing=float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)),
         )
-        _m2_int_ft_shuf = apply_member2_interaction_features(
-            fold_mes_shuf, subject_ids=_mef_subj_ft,
-            cluster_ids=_mef_cluster_ft, bc_ids=_mef_bc_ft,
-        )
-        _m2_int_fo_shuf = apply_member2_interaction_features(
-            fold_mes_shuf, subject_ids=_mef_subj_fo,
-            cluster_ids=_mef_cluster_fo, bc_ids=_mef_bc_fo,
-        )
         _m4_mg_ft_shuf = apply_member4_marginal_features(
             fold_mes_shuf, subject_ids=_mef_subj_ft,
             cluster_ids=_mef_cluster_ft, bc_ids=_mef_bc_ft,
@@ -5268,8 +5207,6 @@ else:
         _bc_redacted_fo = bc_redacted_train[fold.oof_row_idx]
         X_ft = _build_X(fold_train_df, nn_train_mat_fold_shuf, _bc_redacted_ft)
         X_fo = _build_X(fold_oof_df, nn_oof_mat_fold_shuf, _bc_redacted_fo)
-        X_ft_m2 = np.concatenate([X_ft, _m2_int_ft_shuf], axis=1).astype(np.float32, copy=False)
-        X_fo_m2 = np.concatenate([X_fo, _m2_int_fo_shuf], axis=1).astype(np.float32, copy=False)
         X_ft_m4 = np.concatenate([X_ft, _m4_mg_ft_shuf], axis=1).astype(np.float32, copy=False)
         X_fo_m4 = np.concatenate([X_fo, _m4_mg_fo_shuf], axis=1).astype(np.float32, copy=False)
 
@@ -5447,7 +5384,7 @@ else:
                 dtype=np.int64, count=len(fold_train_df),
             )
             _fold_train_cluster_shuf = np.asarray(
-                _mef_cluster_fold_train, dtype=np.int64,
+                _mef_cluster_ft, dtype=np.int64,
             )
             _fold_oof_subj_ids_shuf = np.fromiter(
                 (int(indexer.subject_to_id.get(str(s), -1))
@@ -5455,7 +5392,7 @@ else:
                 dtype=np.int64, count=len(fold_oof_df),
             )
             _fold_oof_cluster_shuf = np.asarray(
-                _mef_cluster_fold_oof, dtype=np.int64,
+                _mef_cluster_fo, dtype=np.int64,
             )
             _fold_m5res_shuf = fit_member5_residual(
                 subject_ids=_fold_train_subj_ids_shuf,
@@ -5506,7 +5443,7 @@ else:
 
         del fold_nn_index, fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
         del nn_train_mat_fold_shuf, nn_oof_mat_fold_shuf, X_ft, X_fo
-        del X_ft_m2, X_fo_m2, X_ft_m4, X_fo_m4
+        del X_ft_m4, X_fo_m4
         del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
         del _fold_m2_shuf, _fold_knn_shuf, _fold_logreg_shuf
         gc.collect()
@@ -5703,7 +5640,7 @@ def _fit_nn_calibrator():
     nll_final_local = float(-(ylab_val * np.log(np.clip(p_final_val_local, 1e-6, 1 - 1e-6))
                               + (1 - ylab_val) * np.log(1 - np.clip(p_final_val_local, 1e-6, 1 - 1e-6))).mean())
     print(f"\n[Calibrator] post-calibration val log-loss: {nll_final_local:.6f}  "
-          f"(stacker: {nll_stack:.6f}, delta: {nll_final_local - nll_stack:+.6f})")
+          f"(stacker: {nll_stack_val:.6f}, delta: {nll_final_local - nll_stack_val:+.6f})")
 
     return {
         "calibrator_state": calibrator_local.state,
@@ -5713,7 +5650,7 @@ def _fit_nn_calibrator():
         "val_neighbor_rows": val_neighbor_rows_local,
         "val_neighbor_sims": val_neighbor_sims_local,
         "nll_final": float(nll_final_local),
-        "p_a_train": p_a_train_local.astype(np.float32),
+        "p_a_train": p1_train_local.astype(np.float32),
         "p1_train": p1_train_local,
         "p2_train": p2_train_local.astype(np.float32),
         "p3_train": p3_train_local.astype(np.float32),
@@ -5792,7 +5729,7 @@ print(
     f"[Calibrator] alpha={calibrator.state.alpha:.4f}  "
     f"shrinkage_tau={calibrator.state.shrinkage_tau:.4f}  "
     f"fit_method={calibrator.state.fit_method}  "
-    f"nll_final={nll_final:.6f} (stacker={nll_stack:.6f})"
+    f"nll_final={nll_final:.6f} (stacker={nll_stack_val:.6f})"
 )
 
 RESIDUAL_DIR = ROOT / "artifacts" / "nn_calibration_stacked"
@@ -6234,7 +6171,6 @@ p3_unk = _knn_apply_one(
     "totally_unknown_subject",
 )
 expected = max(min(knn_state.global_passrate, 1 - 1e-6), 1e-6)
-import math
 assert math.isclose(p3_unk, expected, abs_tol=1e-6)
 print(f"  [PASS] kNN unknown-subject -> global prior {p3_unk:.4f}")
 

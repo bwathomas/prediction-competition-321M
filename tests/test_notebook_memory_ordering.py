@@ -97,9 +97,9 @@ def test_calibrator_does_not_rescore_model_a_on_train(notebook_text: str) -> Non
         "Calibrator must not re-score Model A on train: train_ds was "
         "freed earlier to make memory headroom for the dense matrix."
     )
-    assert "p_a_train.astype" in body or "p_a_train_local = p_a_train" in body, (
-        "Calibrator must consume the cached ``p_a_train`` rather than "
-        "re-scoring."
+    assert "p1_train_local = p_a_train_oof.astype" in body, (
+        "Calibrator must consume the cached OOF ``p_a_train_oof`` rather "
+        "than re-scoring Model A."
     )
 
 
@@ -113,8 +113,14 @@ def test_member2_metadata_mlp_wired(notebook_text: str) -> None:
     assert "member2_v2" not in notebook_text
 
 
-def test_calibrator_member3_scores_in_chunks(notebook_text: str) -> None:
-    """kNN's train scoring must chunk the embedding stack."""
+def test_calibrator_reuses_oof_member3_predictions(notebook_text: str) -> None:
+    """Calibrator must skip in-sample kNN rescore and reuse ``p3_train_oof``.
+
+    The legacy in-sample path materialised an ~80 GB train item-embedding
+    stack and ran ``knn_apply_batch`` on it -- both prohibitively
+    expensive at full scale.  The current OOF-rewired calibrator reuses
+    the per-fold predictions already accumulated in section 9.5 instead.
+    """
     calibrator_match = re.search(
         r"def _fit_nn_calibrator\(\):.*?(?=\n# %%|\nCALIBRATOR_KEY_INPUTS|\Z)",
         notebook_text,
@@ -122,19 +128,17 @@ def test_calibrator_member3_scores_in_chunks(notebook_text: str) -> None:
     )
     assert calibrator_match is not None
     body = calibrator_match.group(0)
-    # The legacy unchunked path materialized the full 80 GB stack in one go.
     bad_pattern = re.compile(
         r"train_item_emb_local\s*=\s*np\.stack\(\s*\[\s*item_emb_lookup\[k\]"
         r"\s+for\s+k\s+in\s+primary\.train\[\"item_key\"\]\]"
     )
     assert not bad_pattern.search(body), (
         "Calibrator must NOT materialize the full train item-embedding "
-        "stack at once (~80 GB at 5M rows x 4096 dims). Use chunked "
-        "knn_apply_batch instead."
+        "stack at once (~80 GB at 5M rows x 4096 dims)."
     )
-    assert "knn_chunk_rows" in body, (
-        "Expected the calibrator to honor a configurable chunk size "
-        "via CFG['calibrator']['knn_chunk_rows']."
+    assert "p3_train_local = p3_train_oof.astype" in body, (
+        "Calibrator must consume the cached OOF ``p3_train_oof`` instead "
+        "of re-scoring Member 3 on full train."
     )
 
 
