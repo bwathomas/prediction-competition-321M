@@ -20,10 +20,14 @@ from src.member2_v5_attr_nn import (
     M2V5_BUCKET_B_END,
     M2V5_BUCKET_C_END,
     M2V5_BUCKET_D_END,
+    M2V5_BUCKET_E_END,
     M2V5_BUCKET_TE_END,
     M2V5_BUCKET_U_END,
     M2V5_FEATURE_DIM,
     M2V5_NN_SOURCE_INDICES,
+    M2V5_PCA_COL_END,
+    M2V5_PCA_COL_START,
+    M2V5_PCA_DIMS,
     MEMBER2_V5_FEATURE_NAMES,
     Member2V5FeatureBuilder,
     Member2V5State,
@@ -100,18 +104,32 @@ def _toy_age(N: int, seed: int = 23) -> np.ndarray:
     return age
 
 
+def _toy_pca(N: int, seed: int = 29) -> np.ndarray:
+    """[N, M2V5_PCA_DIMS] simulated PCA-projected item embedding."""
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=(N, M2V5_PCA_DIMS)).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Spec audits (the v4-saturation regression guards)
 # ---------------------------------------------------------------------------
-def test_schema_is_locked_at_49_columns() -> None:
-    assert M2V5_FEATURE_DIM == 49
-    assert len(MEMBER2_V5_FEATURE_NAMES) == 49
+def test_schema_is_locked_at_81_columns_with_pca_bucket() -> None:
+    # v5b: 49 cold-start cols + 32 PCA cols = 81.
+    assert M2V5_FEATURE_DIM == 49 + M2V5_PCA_DIMS == 81
+    assert len(MEMBER2_V5_FEATURE_NAMES) == 81
+    assert M2V5_PCA_DIMS == 32, (
+        "M2V5_PCA_DIMS bumped; ensure the notebook PCA fit + cache "
+        "prefix were bumped in lockstep before relaxing this test."
+    )
 
 
 def test_schema_contains_no_m1_inputs() -> None:
     # The whole point of v5 over v4: structural orthogonality with M1.
     # Any name containing "p_m1" / "logit_p_m1" / "m1" leaks the anchor.
-    banned = ("p_m1", "logit_p_m1", "p1", "model_a", "member1")
+    # PCA features are INPUTS (item embedding components) not OUTPUTS,
+    # so they are allowed -- but we still guard against any accidental
+    # name collision with the v3/v4 anchor schema.
+    banned = ("p_m1", "logit_p_m1", "model_a", "member1")
     for name in MEMBER2_V5_FEATURE_NAMES:
         for token in banned:
             assert token not in name.lower(), (
@@ -130,6 +148,9 @@ def test_bucket_boundaries_match_schema() -> None:
     assert M2V5_BUCKET_TE_END == 36
     assert M2V5_BUCKET_U_END == 42
     assert M2V5_BUCKET_D_END == 49
+    assert M2V5_BUCKET_E_END == 49 + M2V5_PCA_DIMS == 81
+    assert M2V5_PCA_COL_START == M2V5_BUCKET_D_END == 49
+    assert M2V5_PCA_COL_END == M2V5_BUCKET_E_END == 81
     # First Bucket-C col must be subject_obs_count_log1p (cold-start
     # primary "how well do we know this subject").
     assert MEMBER2_V5_FEATURE_NAMES[M2V5_BUCKET_B_END] == "subject_obs_count_log1p"
@@ -137,6 +158,9 @@ def test_bucket_boundaries_match_schema() -> None:
     assert MEMBER2_V5_FEATURE_NAMES[M2V5_BUCKET_C_END] == "subject_passrate_meanenc"
     # is_unknown_bc must be at index 38 (the user's explicit ask).
     assert MEMBER2_V5_FEATURE_NAMES[38] == "is_unknown_bc"
+    # First Bucket-E col must be item_pca_0 immediately after Bucket D.
+    assert MEMBER2_V5_FEATURE_NAMES[M2V5_BUCKET_D_END] == "item_pca_0"
+    assert MEMBER2_V5_FEATURE_NAMES[-1] == f"item_pca_{M2V5_PCA_DIMS - 1}"
 
 
 def test_pool_feature_block_matches_canonical_pool_names() -> None:
@@ -244,6 +268,7 @@ def test_build_features_shape_and_dtype() -> None:
         pool_features=_toy_pool(300),
         benchmark_age=_toy_age(300),
         nn_features_matrix=_toy_nn_matrix(300),
+        item_pca_features=_toy_pca(300),
     )
     assert X.shape == (300, M2V5_FEATURE_DIM)
     assert X.dtype == np.float32
@@ -262,6 +287,7 @@ def test_build_features_with_missing_pool_warns_but_finite() -> None:
             bc_ids=inp["bc_ids"][:50],
             pool_features=None,
             nn_features_matrix=_toy_nn_matrix(50),
+            item_pca_features=_toy_pca(50),
         )
     assert np.isfinite(X).all()
     # The 17 pool cols should be exactly zero.
@@ -282,11 +308,91 @@ def test_build_features_with_missing_nn_warns_but_finite() -> None:
             bc_ids=inp["bc_ids"][:40],
             pool_features=_toy_pool(40),
             nn_features_matrix=None,
+            item_pca_features=_toy_pca(40),
         )
     assert np.isfinite(X).all()
-    # The 7 NN cols at the end should be exactly zero.
+    # The 7 NN cols (Bucket D) should be exactly zero.
     assert np.all(X[:, 42:49] == 0.0)
     assert any(issubclass(_.category, Member2V5Warning) for _ in w)
+
+
+def test_build_features_with_missing_pca_warns_but_finite() -> None:
+    """v5b: omitting item_pca_features zero-fills Bucket E with a warning."""
+    inp = _toy_inputs(n_rows=30)
+    b = fit_member2_v5_feature_builder(smoothing=10.0, **inp)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        X = build_member2_v5_features(
+            b,
+            subject_ids=inp["subject_ids"][:30],
+            cluster_ids=inp["cluster_ids"][:30],
+            bc_ids=inp["bc_ids"][:30],
+            pool_features=_toy_pool(30),
+            nn_features_matrix=_toy_nn_matrix(30),
+            item_pca_features=None,
+        )
+    assert X.shape == (30, M2V5_FEATURE_DIM)
+    assert np.isfinite(X).all()
+    # Bucket E (PCA) must be exactly zero when not provided.
+    assert np.all(X[:, M2V5_PCA_COL_START:M2V5_PCA_COL_END] == 0.0)
+    # Exactly one Member2V5Warning should mention item_pca_features.
+    pca_warns = [
+        _ for _ in w
+        if issubclass(_.category, Member2V5Warning)
+        and "item_pca_features" in str(_.message)
+    ]
+    assert len(pca_warns) >= 1, (
+        "Missing item_pca_features should emit a Member2V5Warning naming "
+        "item_pca_features by name."
+    )
+
+
+def test_build_features_with_wrong_shape_pca_warns_but_finite() -> None:
+    """Wrong-shape PCA -> zero-fill + warning (matches pool / NN policy)."""
+    inp = _toy_inputs(n_rows=20)
+    b = fit_member2_v5_feature_builder(smoothing=10.0, **inp)
+    # Pass [N, 16] instead of [N, M2V5_PCA_DIMS=32] -- should be rejected
+    # softly without crashing.
+    bad_pca = np.zeros((20, 16), dtype=np.float32)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        X = build_member2_v5_features(
+            b,
+            subject_ids=inp["subject_ids"][:20],
+            cluster_ids=inp["cluster_ids"][:20],
+            bc_ids=inp["bc_ids"][:20],
+            pool_features=_toy_pool(20),
+            nn_features_matrix=_toy_nn_matrix(20),
+            item_pca_features=bad_pca,
+        )
+    assert np.isfinite(X).all()
+    assert np.all(X[:, M2V5_PCA_COL_START:M2V5_PCA_COL_END] == 0.0)
+    assert any(issubclass(_.category, Member2V5Warning) for _ in w)
+
+
+def test_build_features_pca_block_passes_through_when_correctly_shaped() -> None:
+    """When a correctly-shaped PCA matrix is provided, columns 49-80 must
+    contain those exact values (row order preserved, finite-fill applied)."""
+    inp = _toy_inputs(n_rows=15)
+    b = fit_member2_v5_feature_builder(smoothing=10.0, **inp)
+    pca = _toy_pca(15)
+    # Sprinkle a NaN to confirm the finite-fill behavior.
+    pca[3, 7] = np.nan
+    X = build_member2_v5_features(
+        b,
+        subject_ids=inp["subject_ids"][:15],
+        cluster_ids=inp["cluster_ids"][:15],
+        bc_ids=inp["bc_ids"][:15],
+        pool_features=_toy_pool(15),
+        nn_features_matrix=_toy_nn_matrix(15),
+        item_pca_features=pca,
+    )
+    expected = np.where(np.isfinite(pca), pca, 0.0).astype(np.float32)
+    np.testing.assert_allclose(
+        X[:, M2V5_PCA_COL_START:M2V5_PCA_COL_END],
+        expected,
+        atol=1e-6,
+    )
 
 
 def test_build_features_unknown_ids_fire_the_correct_flags() -> None:
@@ -305,6 +411,7 @@ def test_build_features_unknown_ids_fire_the_correct_flags() -> None:
         bc_ids=bc,
         pool_features=_toy_pool(20),
         nn_features_matrix=_toy_nn_matrix(20),
+        item_pca_features=_toy_pca(20),
     )
     # Cols 36..41 = unknown flags in subject/cluster/bc/macro/org/fam order.
     assert X[0, 36] == 1.0
@@ -331,6 +438,7 @@ def test_build_features_unknown_subject_falls_back_to_global_mean_passrate() -> 
         bc_ids=bc,
         pool_features=_toy_pool(10),
         nn_features_matrix=_toy_nn_matrix(10),
+        item_pca_features=_toy_pca(10),
     )
     g = float(b.global_mean)
     # Cols 28..35 are TE passrates; all should collapse to g for unknown ids.
@@ -392,6 +500,7 @@ def test_bc_redacted_mask_is_pipeline_through() -> None:
         bc_redacted_mask=mask,
         pool_features=_toy_pool(30),
         nn_features_matrix=_toy_nn_matrix(30),
+        item_pca_features=_toy_pca(30),
     )
     np.testing.assert_array_equal(X[:, 27], mask)
 
@@ -408,6 +517,7 @@ def test_benchmark_age_value_and_mask_columns() -> None:
         pool_features=_toy_pool(20),
         benchmark_age=age,
         nn_features_matrix=_toy_nn_matrix(20),
+        item_pca_features=_toy_pca(20),
     )
     # Col 17 = age value (NaN -> 0), col 18 = mask (NaN -> 0, finite -> 1).
     for i, a in enumerate(age):
@@ -436,6 +546,7 @@ def test_nn_column_selection_picks_correct_source_columns() -> None:
         bc_ids=inp["bc_ids"][:5],
         pool_features=_toy_pool(5),
         nn_features_matrix=nn,
+        item_pca_features=_toy_pca(5),
     )
     for k in range(7):
         assert X[0, 42 + k] == pytest.approx((k + 1) * 0.1, abs=1e-5)
@@ -522,6 +633,7 @@ def test_v5_features_can_be_trained_with_gbdt_member_direct_binary() -> None:
         pool_features=pool,
         benchmark_age=age,
         nn_features_matrix=nn,
+        item_pca_features=_toy_pca(len(inp["subject_ids"])),
     )
     # Direct binary mode: no init_pred_train.
     state = fit_gbdt_member(

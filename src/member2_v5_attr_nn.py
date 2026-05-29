@@ -78,7 +78,24 @@ categorical handling):
    47  nn_passrate_benchmark_conditional
    48  nn_distance_to_kth_neighbor
 
-Total: 49 features.
+  Bucket E  -- item embedding PCA (32 cols, post v5b):
+   49..80  item_pca_{0..31}
+
+  Bucket E was added in v5b after v5a's standalone OOF NLL plateaued
+  near the constant-mean baseline (~0.66). Diagnosis: the 49-col cold-
+  start schema collapses to near-constant features on the cold-start
+  subset (target encodings shrink to global_mean, log1p counts are
+  zero, unknown flags are constant), leaving the GBDT with only ~15
+  variable features to split on -- not enough for tree boundaries.
+  Adding 32 PCA components of the item embedding (a model INPUT, not
+  M1's OUTPUT) gives the tree genuine signal the MLP doesn't trivially
+  reproduce because trees and MLPs find structurally different
+  decision boundaries on the same inputs. M3 already uses the full
+  embedding for cosine kNN; v5b's GBDT uses the PCA-compressed version
+  for splits. Empirically expected to drop M2 OOF NLL into the 0.50-
+  0.55 range (sandwiched between M3 and M4).
+
+Total: 81 features (49 cold-start + 32 PCA-compressed item embedding).
 
 Trained as a DIRECT binary GBDT (no init_score, no residual framing,
 output = sigmoid(tree_raw)). See ``fit_gbdt_member(init_pred_train=None)``.
@@ -104,6 +121,13 @@ import numpy as np
 
 _EPS_PROB = 1e-7
 _DEFAULT_SMOOTHING = 30.0
+
+# Number of PCA components of the item embedding consumed by the GBDT.
+# Bumping this changes the schema -- callers MUST bump the cache prefix
+# (``gbdt_oof_v5b_attr_nn_pca_v1`` and ``member2_v5b_attr_nn_pca_v1``
+# in the notebook) AND re-fit the PCA matrix because the projection
+# dimensionality is baked into the X matrix layout.
+M2V5_PCA_DIMS: int = 32
 
 
 class Member2V5Warning(UserWarning):
@@ -176,6 +200,8 @@ MEMBER2_V5_FEATURE_NAMES: Tuple[str, ...] = (
     "nn_passrate_subject_conditional",
     "nn_passrate_benchmark_conditional",
     "nn_distance_to_kth_neighbor",
+    # Bucket E: PCA-compressed item embedding (M2V5_PCA_DIMS = 32)
+    *(f"item_pca_{i}" for i in range(M2V5_PCA_DIMS)),
 )
 M2V5_FEATURE_DIM = len(MEMBER2_V5_FEATURE_NAMES)
 
@@ -185,15 +211,23 @@ M2V5_BUCKET_C_END = 28   # + counts (9)
 M2V5_BUCKET_TE_END = 36  # + target encodings (8)
 M2V5_BUCKET_U_END = 42   # + unknown flags (6)
 M2V5_BUCKET_D_END = 49   # + NN aggregates (7)
+M2V5_BUCKET_E_END = M2V5_BUCKET_D_END + M2V5_PCA_DIMS  # + PCA = 81
 
-if M2V5_FEATURE_DIM != 49:
+# Convenience: the column range [M2V5_BUCKET_D_END, M2V5_BUCKET_E_END)
+# is exactly the PCA bucket.
+M2V5_PCA_COL_START = M2V5_BUCKET_D_END
+M2V5_PCA_COL_END = M2V5_BUCKET_E_END
+
+_M2V5_EXPECTED_DIM = 49 + M2V5_PCA_DIMS  # = 81 today; bump if PCA dim changes
+if M2V5_FEATURE_DIM != _M2V5_EXPECTED_DIM:
     # The module-level constant is what gets pickled into cache keys;
     # warn loudly if it ever drifts from the documented contract.
     warnings.warn(
         f"MEMBER2_V5_FEATURE_NAMES has {M2V5_FEATURE_DIM} entries, "
-        "expected 49. Either the schema was edited without updating "
-        "this constant, or the constant is stale. Bump cache prefix "
-        "before training.",
+        f"expected {_M2V5_EXPECTED_DIM} (49 cold-start + "
+        f"{M2V5_PCA_DIMS} PCA). Either the schema was edited without "
+        "updating this constant, or the constant is stale. Bump cache "
+        "prefix before training.",
         Member2V5Warning,
         stacklevel=2,
     )
@@ -779,6 +813,41 @@ def _pool_columns(
     return out
 
 
+def _pca_columns(
+    pca_matrix: np.ndarray | None, N: int, n_pca_dims: int
+) -> np.ndarray:
+    """Return ``[N, n_pca_dims]`` item embedding PCA bucket (Bucket E).
+
+    The caller is responsible for fitting + applying the PCA so the
+    v5 module stays decoupled from the embedding pipeline; the caller
+    just passes a pre-projected ``[N, n_pca_dims]`` matrix. Missing
+    or wrong-shape input -> zero-fill + a soft warning so the tree
+    loses the embedding-derived signal but does not crash.
+    """
+    out = np.zeros((N, int(n_pca_dims)), dtype=np.float32)
+    if pca_matrix is None:
+        warnings.warn(
+            "v5 build: item_pca_features is None -- 32-D PCA bucket "
+            "zero-filled. Tree loses item-embedding signal (the main "
+            "driver of v5b's NLL improvement over v5a). Pass the "
+            "[N, M2V5_PCA_DIMS] projected matrix to fix.",
+            Member2V5Warning,
+            stacklevel=2,
+        )
+        return out
+    pca = np.asarray(pca_matrix, dtype=np.float32)
+    if pca.ndim != 2 or pca.shape[0] != int(N) or pca.shape[1] != int(n_pca_dims):
+        warnings.warn(
+            f"v5 build: item_pca_features shape {pca.shape} != "
+            f"({N}, {n_pca_dims}). PCA bucket zero-filled.",
+            Member2V5Warning,
+            stacklevel=2,
+        )
+        return out
+    out[:] = np.where(np.isfinite(pca), pca, 0.0).astype(np.float32, copy=False)
+    return out
+
+
 def _benchmark_age_columns(
     benchmark_age: np.ndarray | None, N: int
 ) -> np.ndarray:
@@ -815,8 +884,9 @@ def build_member2_v5_features(
     pool_features: np.ndarray | None = None,
     benchmark_age: np.ndarray | None = None,
     nn_features_matrix: np.ndarray | None = None,
+    item_pca_features: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Materialize the ``[N, 49]`` fp32 feature matrix.
+    """Materialize the ``[N, M2V5_FEATURE_DIM]`` fp32 feature matrix.
 
     Column order is locked by :data:`MEMBER2_V5_FEATURE_NAMES`. The
     output is finite (NaN/Inf -> 0) so the GBDT trainer's parity
@@ -840,6 +910,16 @@ def build_member2_v5_features(
         ``[N, 23]`` float32 -- the upstream nn_features matrix for
         the rows being built. v5 selects 7 of the 23 columns; the
         rest are ignored.
+      item_pca_features:
+        ``[N, M2V5_PCA_DIMS]`` float32 -- per-row PCA projection of
+        the item embedding (rows aligned to subject_ids order). The
+        caller is responsible for fitting the PCA and projecting;
+        this module just packs the projection into columns
+        ``[M2V5_BUCKET_D_END, M2V5_BUCKET_E_END)``. Missing or
+        wrong-shape input -> zero-fill + ``Member2V5Warning`` and
+        the tree loses the embedding-derived signal but does not
+        crash. None is accepted for backwards compatibility with
+        callers that have not yet been upgraded to v5b.
     """
     subj = np.asarray(subject_ids, dtype=np.int64).reshape(-1)
     clus = np.asarray(cluster_ids, dtype=np.int64).reshape(-1)
@@ -931,6 +1011,9 @@ def build_member2_v5_features(
     # ---- Bucket D: NN aggregates (7) -----------------------------------
     nn_cols = _nn_aggregate_columns(nn_features_matrix, N)
 
+    # ---- Bucket E: PCA-compressed item embedding (M2V5_PCA_DIMS) -------
+    pca_cols = _pca_columns(item_pca_features, N, M2V5_PCA_DIMS)
+
     out = np.empty((N, M2V5_FEATURE_DIM), dtype=np.float32)
     # B (0..18)
     out[:, 0:17] = pool_cols
@@ -962,7 +1045,12 @@ def build_member2_v5_features(
     out[:, 40] = is_unk_org
     out[:, 41] = is_unk_fam
     # D (42..48)
-    out[:, 42:49] = nn_cols
+    out[:, M2V5_BUCKET_U_END:M2V5_BUCKET_D_END] = nn_cols
+    # E (49..80) -- item embedding PCA bucket; the slice indices stay
+    # in sync with M2V5_PCA_DIMS via the BUCKET constants so a future
+    # PCA-dim bump only requires updating M2V5_PCA_DIMS at the top of
+    # the module.
+    out[:, M2V5_PCA_COL_START:M2V5_PCA_COL_END] = pca_cols
 
     # Defensive finite-fill. Should be a no-op given upstream guards
     # but cheap insurance against a NaN/Inf squeak-through producing

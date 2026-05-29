@@ -2704,7 +2704,12 @@ else:
 
 # %%
 _M2V5_ENABLED = bool(CFG.get("member2_v5", {}).get("enabled", True))
-_M2V5_SMOOTHING = float(CFG.get("member2_v5", {}).get("smoothing", 30.0))
+# v5b defaults: smoothing relaxed 30 -> 10 (cold-start TE features now
+# have meaningful spread when an id has even a handful of obs, instead
+# of collapsing to the global mean until ~100+ obs accumulate). This
+# pairs with the GBDT min_data_in_leaf bump from 500 -> 100 to let the
+# tree exploit the 32-D PCA bucket at finer leaf resolution.
+_M2V5_SMOOTHING = float(CFG.get("member2_v5", {}).get("smoothing", 10.0))
 
 if _M2V5_ENABLED:
     import warnings as _v5_warn
@@ -2732,7 +2737,9 @@ if _M2V5_ENABLED:
     _M2V4_ENABLED = False
 
     from src.member2_v5_attr_nn import (
+        M2V5_BUCKET_D_END,
         M2V5_FEATURE_DIM,
+        M2V5_PCA_DIMS,
         MEMBER2_V5_FEATURE_NAMES,
         Member2V5FeatureBuilder,
         Member2V5State,
@@ -2741,14 +2748,139 @@ if _M2V5_ENABLED:
         fit_member2_v5_feature_builder,
     )
     print(
-        f"[Member 2 v5] attribute+NN tree ENABLED (smoothing={_M2V5_SMOOTHING}, "
-        f"F={M2V5_FEATURE_DIM} features = item content + honest counts + "
-        "mean-encoded passrates + NN aggregates; NO M1-derived inputs). "
-        "Trained as direct binary GBDT on y; output = sigmoid(tree_raw). "
-        "REPLACES v2/v3/v4 GBDT output."
+        f"[Member 2 v5b] attribute+NN+PCA tree ENABLED "
+        f"(smoothing={_M2V5_SMOOTHING}, F={M2V5_FEATURE_DIM} features "
+        f"= 49 cold-start + {M2V5_PCA_DIMS} item-embedding PCA cols; "
+        "NO M1-derived inputs). Trained as direct binary GBDT on y; "
+        "output = sigmoid(tree_raw). REPLACES v2/v3/v4 GBDT output."
     )
 else:
     print("[Member 2 v5] DISABLED via CFG['member2_v5']['enabled']=False.")
+
+
+# %% [markdown]
+# ### 9b''''. v5b item embedding PCA (Bucket E feature provider)
+#
+# Member 2 v5a's 49 cold-start features hit a ceiling around constant-
+# mean NLL (~0.66) because most features collapse on cold IDs (target
+# encodings shrink to global_mean, log1p counts are zero, unknown
+# flags are constant). The structural fix is to give the tree access
+# to the same INPUT signal Members 1/3/4 use -- the item embedding --
+# but in a low-rank projection trees can actually split on, AND
+# without ever feeding it M1's OUTPUT (which is what caused v3/v4's
+# saturation + correlation-with-M1).
+#
+# We fit a 32-D PCA on a random sample of training item embeddings
+# (cheap: ~50k x 4096 fits in ~800MB) and cache the mean + components.
+# Both the per-fold and global v5 fits then project every row's
+# item embedding through the same matrix and pass the 32-D vector as
+# the new Bucket E columns of build_member2_v5_features.
+
+# %%
+if _M2V5_ENABLED:
+    import time as _v5_pca_time
+
+    _v5_pca_cfg = CFG.get("member2_v5", {})
+    _v5_pca_dim = int(_v5_pca_cfg.get("pca_dim", M2V5_PCA_DIMS))
+    if _v5_pca_dim != int(M2V5_PCA_DIMS):
+        _v5_warn.warn(
+            f"[Member 2 v5b] CFG pca_dim={_v5_pca_dim} != module "
+            f"M2V5_PCA_DIMS={int(M2V5_PCA_DIMS)}. The module constant is "
+            "what the X matrix layout is locked to; ignoring the CFG "
+            "override and using the module value. Edit src/member2_v5_"
+            "attr_nn.py to change the bucket size."
+        )
+        _v5_pca_dim = int(M2V5_PCA_DIMS)
+    _v5_pca_n_samples = int(_v5_pca_cfg.get("pca_fit_samples", 50_000))
+    _v5_pca_n_samples = min(_v5_pca_n_samples, len(train_item_keys))
+
+    print(
+        f"[Member 2 v5b] fitting {_v5_pca_dim}-D PCA on "
+        f"{_v5_pca_n_samples:,} sampled train item embeddings "
+        f"(of {len(train_item_keys):,} total)..."
+    )
+    _v5_pca_t0 = _v5_pca_time.time()
+    _v5_pca_rng = np.random.RandomState(SEED + 7919)
+    _v5_pca_sample_idx = _v5_pca_rng.choice(
+        len(train_item_keys), size=_v5_pca_n_samples, replace=False,
+    )
+    # Stack into a contiguous fp32 [N, D] buffer. At 50k x 4096 this is
+    # ~800MB; we free it as soon as Vt is extracted.
+    _v5_pca_sample_X = np.empty(
+        (_v5_pca_n_samples, int(ITEM_EMB_DIM)), dtype=np.float32,
+    )
+    for _i, _idx in enumerate(_v5_pca_sample_idx):
+        _v5_pca_sample_X[_i] = item_emb_lookup[train_item_keys[int(_idx)]]
+    _v5_pca_mean = _v5_pca_sample_X.mean(axis=0).astype(np.float32)
+    _v5_pca_sample_X -= _v5_pca_mean
+    # Truncated SVD via numpy. We only need the first M2V5_PCA_DIMS
+    # right-singular vectors; numpy gives all of them but the slice
+    # is cheap. ``full_matrices=False`` keeps both factors at
+    # min(N, D) shape so we don't allocate a [4096, 4096] block.
+    _U, _S, _Vt = np.linalg.svd(_v5_pca_sample_X, full_matrices=False)
+    _v5_pca_components = _Vt[: _v5_pca_dim].astype(np.float32)  # [pca_dim, D]
+    _v5_pca_explained_var = (_S[: _v5_pca_dim] ** 2 / max(_v5_pca_n_samples - 1, 1))
+    _v5_pca_total_var = float((_S ** 2 / max(_v5_pca_n_samples - 1, 1)).sum())
+    _v5_pca_explained_ratio = float(_v5_pca_explained_var.sum() / max(_v5_pca_total_var, 1e-12))
+    del _U, _S, _Vt, _v5_pca_sample_X
+    gc.collect()
+    print(
+        f"[Member 2 v5b] PCA fit: components={_v5_pca_components.shape}  "
+        f"mean={_v5_pca_mean.shape}  "
+        f"explained_var_ratio({_v5_pca_dim} dims)={_v5_pca_explained_ratio:.3f}  "
+        f"({_v5_pca_time.time() - _v5_pca_t0:.1f}s)"
+    )
+
+    # Digest the components so any cache key downstream can invalidate
+    # on a PCA refit. Short hash (16 hex chars) is plenty given we
+    # only need uniqueness within a single training run.
+    import hashlib as _v5_pca_hash_mod
+    _v5_pca_digest = _v5_pca_hash_mod.sha256(
+        np.ascontiguousarray(_v5_pca_components, dtype=np.float32).tobytes()
+        + np.ascontiguousarray(_v5_pca_mean, dtype=np.float32).tobytes()
+    ).hexdigest()[:16]
+
+    def _m2v5_pca_for_rows(rows_df) -> np.ndarray:
+        """Return ``[N, M2V5_PCA_DIMS]`` fp32 PCA projection in row order.
+
+        Unknown item_keys (cold items not in item_emb_lookup) get a
+        zero row. The v5 builder's ``_pca_columns`` finite-fill is a
+        no-op on already-finite zero rows. Memory: peak is one
+        [N, D] embedding buffer at a time (~ N * D * 4 bytes); for
+        large val sets prefer chunking the call.
+        """
+        N = int(len(rows_df))
+        if N == 0:
+            return np.zeros((0, int(M2V5_PCA_DIMS)), dtype=np.float32)
+        out = np.zeros((N, int(M2V5_PCA_DIMS)), dtype=np.float32)
+        # Build the [N, D] embedding buffer once; rows with missing
+        # item_keys stay zero. Chunk at 100k rows so we don't allocate
+        # 4+ GB on val for very large sets.
+        _CHUNK = 100_000
+        _emb_buf = np.zeros((min(_CHUNK, N), int(ITEM_EMB_DIM)), dtype=np.float32)
+        for _start in range(0, N, _CHUNK):
+            _end = min(_start + _CHUNK, N)
+            _b = _end - _start
+            if _b != _emb_buf.shape[0]:
+                _emb_buf = np.zeros((_b, int(ITEM_EMB_DIM)), dtype=np.float32)
+            else:
+                _emb_buf[:] = 0.0
+            for _i, _k in enumerate(rows_df["item_key"].iloc[_start:_end]):
+                _v = item_emb_lookup.get(str(_k))
+                if _v is not None:
+                    _emb_buf[_i] = _v
+            _emb_buf -= _v5_pca_mean
+            out[_start:_end] = _emb_buf @ _v5_pca_components.T
+        return out
+
+else:
+    # Define no-op stubs so downstream `if _M2V5_ENABLED` branches
+    # don't need to guard on these symbols' existence.
+    _v5_pca_components = None
+    _v5_pca_mean = None
+    _v5_pca_digest = "no_pca"
+    def _m2v5_pca_for_rows(rows_df) -> np.ndarray:
+        return np.zeros((len(rows_df), 0), dtype=np.float32)
 
 
 # %% [markdown]
@@ -4207,9 +4339,10 @@ for fold in folds:
             subject_to_family_id=s2fam,
             smoothing=_M2V5_SMOOTHING,
         )
-        # 2. Materialize per-row pool/age/NN inputs for fold-train.
+        # 2. Materialize per-row pool/age/NN/PCA inputs for fold-train.
         _v5_pool_train = _m2v5_pool_for_rows(fold_train_df)
         _v5_age_train = _m2v5_age_for_rows(fold_train_df)
+        _v5_pca_train = _m2v5_pca_for_rows(fold_train_df)
         X_v5_fold_train = build_member2_v5_features(
             _fold_v5_builder,
             subject_ids=_mef_subj_fold_train,
@@ -4219,14 +4352,15 @@ for fold in folds:
             pool_features=_v5_pool_train,
             benchmark_age=_v5_age_train,
             nn_features_matrix=nn_train_mat_fold,
+            item_pca_features=_v5_pca_train,
         )
-        del _v5_pool_train, _v5_age_train
+        del _v5_pool_train, _v5_age_train, _v5_pca_train
         gc.collect()
-        # 3. Cache key with FULL content fingerprints. Bump the prefix
-        #    (``v5_attr_nn_v1``) so v2/v3/v4 cache entries cannot be
-        #    silently misloaded -- those used different feature schemas
-        #    and an identical-shape collision would corrupt the stacker
-        #    (the v2 fold-0 NLL=0.778 bug all over again).
+        # 3. Cache key with FULL content fingerprints. The prefix bump
+        #    to ``v5b_attr_nn_pca_v1`` makes any pre-v5b cache entry
+        #    (49-col schema) impossible to load on top of the new 81-
+        #    col schema; the PCA digest invalidates if the embedding
+        #    PCA refits to different components on the same input.
         import hashlib as _m2v5_hashlib
         _m2v5_feat_names_hash = _m2v5_hashlib.sha256(
             "\0".join(MEMBER2_V5_FEATURE_NAMES).encode("utf-8")
@@ -4237,11 +4371,13 @@ for fold in folds:
         _fold_gbdt_state = cache_or_compute(
             "gbdt_state_oof_fold",
             key_inputs=(
-                "gbdt_oof_v5_attr_nn_v1",
+                "gbdt_oof_v5b_attr_nn_pca_v1",
                 fold.fold_id, fold_suffix,
                 int(M2V5_FEATURE_DIM), int(X_v5_fold_train.shape[0]),
                 int(SEED),
                 round(float(_M2V5_SMOOTHING), 4),
+                int(M2V5_PCA_DIMS),
+                _v5_pca_digest,
                 _m2v5_feat_names_hash,
                 _m2v5_X_train_hash,
             ),
@@ -4253,21 +4389,25 @@ for fold in folds:
                 # apply via gbdt_apply_batch.
                 init_pred_train=None,
                 holdout_group_id=_gbdt_train_item_id_fold,
-                # Tighter than v2 -- 49 features overfit easily if we
-                # don't constrain leaf size. The bounded-leaf property
-                # of the binary objective combined with min_data_in_leaf
-                # >=500 is what prevents the v4-style saturation.
+                # v5b defaults: regularization relaxed so the tree can
+                # actually exploit the 32-D PCA bucket. min_data_in_leaf
+                # 500 -> 100 (still constrains saturation: the binary
+                # objective's bounded leaf magnitude is the primary
+                # guardrail, not the leaf size cap); num_leaves 31 -> 63;
+                # early_stopping_rounds 30 -> 100 (PCA-fed trees take
+                # more iterations to plateau than the count-only trees
+                # in v5a); n_estimators 400 -> 800 to match.
                 n_estimators=int(
-                    CFG.get("member2_v5", {}).get("n_estimators", 400)
+                    CFG.get("member2_v5", {}).get("n_estimators", 800)
                 ),
                 learning_rate=float(
                     CFG.get("member2_v5", {}).get("learning_rate", 0.05)
                 ),
                 num_leaves=int(
-                    CFG.get("member2_v5", {}).get("num_leaves", 31)
+                    CFG.get("member2_v5", {}).get("num_leaves", 63)
                 ),
                 min_data_in_leaf=int(
-                    CFG.get("member2_v5", {}).get("min_data_in_leaf", 500)
+                    CFG.get("member2_v5", {}).get("min_data_in_leaf", 100)
                 ),
                 feature_fraction=float(
                     CFG.get("member2_v5", {}).get("feature_fraction", 0.8)
@@ -4279,7 +4419,7 @@ for fold in folds:
                     CFG.get("member2_v5", {}).get("bagging_freq", 5)
                 ),
                 early_stopping_rounds=int(
-                    CFG.get("member2_v5", {}).get("early_stopping_rounds", 30)
+                    CFG.get("member2_v5", {}).get("early_stopping_rounds", 100)
                 ),
                 seed=int(SEED) + 100 * (int(_ff.fold_id) + 1) + 17,
             ),
@@ -4304,6 +4444,7 @@ for fold in folds:
         gc.collect()
         _v5_pool_oof = _m2v5_pool_for_rows(fold_oof_df)
         _v5_age_oof = _m2v5_age_for_rows(fold_oof_df)
+        _v5_pca_oof = _m2v5_pca_for_rows(fold_oof_df)
         X_v5_fold_oof = build_member2_v5_features(
             _fold_v5_builder,
             subject_ids=_mef_subj_fold_oof,
@@ -4313,8 +4454,9 @@ for fold in folds:
             pool_features=_v5_pool_oof,
             benchmark_age=_v5_age_oof,
             nn_features_matrix=nn_oof_mat_fold,
+            item_pca_features=_v5_pca_oof,
         )
-        del _v5_pool_oof, _v5_age_oof
+        del _v5_pool_oof, _v5_age_oof, _v5_pca_oof
         gc.collect()
         # v5 is a direct binary GBDT, so its raw output IS the probability.
         p2_oof_fold = gbdt_apply_batch(_fold_gbdt_state, X_v5_fold_oof)
@@ -4331,6 +4473,63 @@ for fold in folds:
                 "raise a shape-mismatch error -- inspect the v5 builder "
                 "or the X_v5_fold_oof construction."
             )
+        # Tier 3 diagnostic: print the booster fit summary so the user
+        # can see, per fold, whether v5b's GBDT is actually splitting on
+        # the new PCA features or still collapsing to the constant-mean
+        # baseline. If you see (a) std(p2_oof) < 0.01, or (b) zero PCA
+        # cols in the top-10 split count, the structural problem from
+        # v5a hasn't been resolved -- inspect the PCA matrix and consider
+        # raising pca_dim or lowering smoothing further.
+        _v5b_q = np.quantile(p2_oof_fold, [0.0, 0.01, 0.5, 0.99, 1.0])
+        print(
+            f"[Member 2 v5b f{fold.fold_id}] booster fit:  "
+            f"n_trees={int(_fold_gbdt_state.n_trees)}  "
+            f"train_NLL={float(_fold_gbdt_state.train_loss):.5f}  "
+            f"val_NLL={float(_fold_gbdt_state.val_loss):.5f}"
+        )
+        print(
+            f"[Member 2 v5b f{fold.fold_id}] OOF pred quantiles:  "
+            f"min={_v5b_q[0]:.4f}  p1={_v5b_q[1]:.4f}  "
+            f"p50={_v5b_q[2]:.4f}  p99={_v5b_q[3]:.4f}  "
+            f"max={_v5b_q[4]:.4f}  std={float(p2_oof_fold.std()):.4f}"
+        )
+        # Split-count "importance" from the compiled state. The GBDT
+        # walker stores feature indices in `feature_concat` with -1 at
+        # leaf nodes; counting non-leaf occurrences per feature gives
+        # a proxy for how often each column is used as a split. (LGBM
+        # `gain` importance would be richer but isn't preserved through
+        # the pure-NumPy walker compilation.)
+        _v5b_fc = np.asarray(_fold_gbdt_state.feature_concat).reshape(-1)
+        _v5b_split_counts = np.bincount(
+            _v5b_fc[_v5b_fc >= 0].astype(np.int64),
+            minlength=int(M2V5_FEATURE_DIM),
+        )
+        _v5b_top = np.argsort(_v5b_split_counts)[::-1][:10]
+        _v5b_total_splits = int(_v5b_split_counts.sum())
+        _v5b_pca_splits = int(
+            _v5b_split_counts[M2V5_BUCKET_D_END:M2V5_BUCKET_D_END + M2V5_PCA_DIMS].sum()
+        )
+        _v5b_pca_frac = (
+            float(_v5b_pca_splits) / max(_v5b_total_splits, 1)
+        )
+        print(
+            f"[Member 2 v5b f{fold.fold_id}] top-10 features by split count "
+            f"(of {_v5b_total_splits:,} total splits across "
+            f"{int(_fold_gbdt_state.n_trees)} trees):"
+        )
+        for _v5b_i in _v5b_top:
+            print(
+                f"    {MEMBER2_V5_FEATURE_NAMES[int(_v5b_i)]:36s} "
+                f"splits={int(_v5b_split_counts[int(_v5b_i)]):6d}"
+            )
+        print(
+            f"[Member 2 v5b f{fold.fold_id}] PCA-bucket usage:  "
+            f"{_v5b_pca_splits:,}/{_v5b_total_splits:,} splits "
+            f"({100.0 * _v5b_pca_frac:.1f}%) landed on item_pca_* "
+            f"columns; if this is <5% the PCA bucket is dead weight "
+            "and the structural fix didn't help."
+        )
+        del _v5b_q, _v5b_fc, _v5b_split_counts, _v5b_top
         del X_v5_fold_oof
         gc.collect()
         # Gate 3d (NLL vs baseline) -- warn instead of halt so a borderline
@@ -5339,6 +5538,7 @@ if _M2V5_ENABLED:
     )
     _v5_pool_train_global = _m2v5_pool_for_rows(primary.train)
     _v5_age_train_global = _m2v5_age_for_rows(primary.train)
+    _v5_pca_train_global = _m2v5_pca_for_rows(primary.train)
     X_train_v5_global = build_member2_v5_features(
         member2_v5_global_builder,
         subject_ids=_mef_train_subj,
@@ -5348,8 +5548,9 @@ if _M2V5_ENABLED:
         pool_features=_v5_pool_train_global,
         benchmark_age=_v5_age_train_global,
         nn_features_matrix=nn_train_mat,
+        item_pca_features=_v5_pca_train_global,
     )
-    del _v5_pool_train_global, _v5_age_train_global
+    del _v5_pool_train_global, _v5_age_train_global, _v5_pca_train_global
     gc.collect()
     print(
         f"[Member 2 v5 / 9.5c] X_train_v5_global: {X_train_v5_global.shape}  "
@@ -5375,20 +5576,22 @@ if _M2V5_ENABLED:
             y=y_train,
             feature_names=MEMBER2_V5_FEATURE_NAMES,
             init_pred_train=None,
+            # v5b global defaults mirror the per-fold bumps. See the
+            # per-fold lambda above for rationale.
             n_estimators=int(
-                CFG.get("member2_v5", {}).get("n_estimators_global", 500)
+                CFG.get("member2_v5", {}).get("n_estimators_global", 1000)
             ),
             learning_rate=float(
                 CFG.get("member2_v5", {}).get("learning_rate", 0.05)
             ),
             num_leaves=int(
-                CFG.get("member2_v5", {}).get("num_leaves", 31)
+                CFG.get("member2_v5", {}).get("num_leaves", 63)
             ),
             min_data_in_leaf=int(
-                CFG.get("member2_v5", {}).get("min_data_in_leaf", 500)
+                CFG.get("member2_v5", {}).get("min_data_in_leaf", 100)
             ),
             early_stopping_rounds=int(
-                CFG.get("member2_v5", {}).get("early_stopping_rounds_global", 30)
+                CFG.get("member2_v5", {}).get("early_stopping_rounds_global", 100)
             ),
             seed=SEED,
             parity_atol=1.0e-5,
@@ -5411,12 +5614,15 @@ if _M2V5_ENABLED:
     member2_v5_gbdt_state = cache_or_compute(
         "gbdt_state",
         key_inputs=(
-            # ``v5_attr_nn_global_v1`` never collides with v2/v3/v4 keys
-            # (different prefix string).
-            "member2_v5_attr_nn_global_v1",
+            # ``v5b_attr_nn_pca_v1`` never collides with v5a / v2 / v3 /
+            # v4 keys (different prefix string) AND the PCA digest
+            # invalidates if the embedding PCA refits to different
+            # components on the same input.
+            "member2_v5b_attr_nn_pca_v1",
             int(M2V5_FEATURE_DIM), len(primary.train), SEED,
             round(BC_REDACT_FRAC, 3), _bc_redact_seed,
             round(float(_M2V5_SMOOTHING), 4),
+            int(M2V5_PCA_DIMS), _v5_pca_digest,
             int(OOF_N_FOLDS), int(OOF_SEED), bool(OOF_RETRAIN_M1),
             _m2v5g_feat_names_hash, _m2v5g_X_hash,
         ),
@@ -5461,6 +5667,7 @@ if _M2V5_ENABLED:
     # signals stay informative for cold items.
     _v5_pool_val_global = _m2v5_pool_for_rows(primary.val)
     _v5_age_val_global = _m2v5_age_for_rows(primary.val)
+    _v5_pca_val_global = _m2v5_pca_for_rows(primary.val)
     X_val_v5 = build_member2_v5_features(
         member2_v5_global_builder,
         subject_ids=_mef_val_subj,
@@ -5470,8 +5677,9 @@ if _M2V5_ENABLED:
         pool_features=_v5_pool_val_global,
         benchmark_age=_v5_age_val_global,
         nn_features_matrix=nn_val_mat,
+        item_pca_features=_v5_pca_val_global,
     )
-    del _v5_pool_val_global, _v5_age_val_global
+    del _v5_pool_val_global, _v5_age_val_global, _v5_pca_val_global
     p_member2_val = gbdt_apply_batch(member2_v5_gbdt_state, X_val_v5)
     # Defense-in-depth: ensure 1-D shape and exact val-length. Catches
     # any apply_batch contract drift before the val stack-up below
@@ -5513,6 +5721,36 @@ if _M2V5_ENABLED:
         f"[Member 2 v5] n_trees={member2_v5_gbdt_state.n_trees}  "
         f"bias={member2_v5_gbdt_state.bias:+.4f}"
     )
+    # Tier 3 diagnostic on the SHIPPED global model: split-count
+    # importance + PCA-bucket usage. If PCA usage on the global model
+    # is materially different from the per-fold diagnostic (e.g.,
+    # per-fold says 30%, global says 5%) it's a cache / wiring drift.
+    _v5b_g_fc = np.asarray(member2_v5_gbdt_state.feature_concat).reshape(-1)
+    _v5b_g_split_counts = np.bincount(
+        _v5b_g_fc[_v5b_g_fc >= 0].astype(np.int64),
+        minlength=int(M2V5_FEATURE_DIM),
+    )
+    _v5b_g_top = np.argsort(_v5b_g_split_counts)[::-1][:10]
+    _v5b_g_total = int(_v5b_g_split_counts.sum())
+    _v5b_g_pca = int(
+        _v5b_g_split_counts[M2V5_BUCKET_D_END:M2V5_BUCKET_D_END + M2V5_PCA_DIMS].sum()
+    )
+    print(
+        f"[Member 2 v5b] GLOBAL top-10 features by split count "
+        f"(of {_v5b_g_total:,} total splits):"
+    )
+    for _v5b_g_i in _v5b_g_top:
+        print(
+            f"    {MEMBER2_V5_FEATURE_NAMES[int(_v5b_g_i)]:36s} "
+            f"splits={int(_v5b_g_split_counts[int(_v5b_g_i)]):6d}"
+        )
+    print(
+        f"[Member 2 v5b] GLOBAL PCA-bucket usage: "
+        f"{_v5b_g_pca:,}/{_v5b_g_total:,} splits "
+        f"({100.0 * _v5b_g_pca / max(_v5b_g_total, 1):.1f}%) on "
+        "item_pca_* columns."
+    )
+    del _v5b_g_fc, _v5b_g_split_counts, _v5b_g_top
     if abs(_corr_v5_m1_val) > 0.995:
         _v5g_warn.warn(
             f"Gate 3e WARN on val: |corr(M2v5, M1)|="
