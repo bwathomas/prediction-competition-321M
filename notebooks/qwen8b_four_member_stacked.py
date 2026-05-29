@@ -22,13 +22,9 @@
 #     coverage-conditional blend, trained with metadata dropout +
 #     bc-idx dropout). Heavy backbone, trained on Qwen embeddings
 #     directly.
-#   * **Member 2 (LightGBM)**: a gradient-boosted decision-tree
-#     classifier trained offline on the dense `member_features`
-#     schema (`theta_s`, `u_s`, subject metadata, pool features,
-#     centroid distances, cluster id, NN features, condition
-#     one-hot) and exported as flat NumPy tree arrays. Pure-NumPy
-#     traversal at inference -- **no `lightgbm` import in
-#     `model.py`**.
+#   * **Member 2 (metadata MLP)**: GLU MLP on subject / benchmark /
+#     cluster IDs plus 14 mean-encoded marginals (no item embeddings).
+#     Pure-NumPy inference -- **no `torch` import in `model.py`**.
 #   * **Member 3 (FAISS-free kNN-similarity)**: pure-NumPy
 #     similarity-weighted nearest-neighbor classifier on PCA-
 #     compressed + quantized item embeddings. Two-stage Bayesian
@@ -61,7 +57,7 @@
 #
 # **What ships in the bundle**:
 #   - `artifacts/checkpoint.pt` -- IRT-MLP coverage-blend ensemble.
-#   - `artifacts/member2_gbdt/` -- Member 2 trees + bias + feature schema.
+#   - `artifacts/member2_metadata_mlp/` -- Member 2 GLU MLP weights + marginal scaler.
 #   - `artifacts/member3_knn/` -- Member 3 PCA basis, quantized embeddings,
 #     pass-rate table.
 #   - `artifacts/member4_logreg/` -- Member 4 weights + bias.
@@ -69,7 +65,7 @@
 #   - `artifacts/nn_calibrator_stacked/` + `artifacts/residual_table/`
 #     -- post-stacker calibrator state + per-(subject, item) residual
 #     table.
-#   - `_pure/{gbdt,knn,logreg,stacker,nn_calibration,member_features}.py`
+#   - `_pure/{member2_metadata_mlp,knn,logreg,stacker,nn_calibration,member_features}.py`
 #     -- pure-NumPy runtime modules (no torch/faiss/lightgbm/sklearn).
 #   - `cache/` -- training-item cache for runtime NN feature lookup.
 #
@@ -383,30 +379,25 @@ CFG["oof"].setdefault("shuffled_label_seed", 12345)
 CFG["oof"].setdefault("nn_neighbor_probe_sample_size", 2000)
 CFG["oof"].setdefault("optimism_threshold_nats", 0.03)
 
-# Member 2 v2 (Task 3 of the diversification plan): subject-mean residual
-# GBDT trained on NON-EMBEDDING features only. The original Member 2
-# shared the full 1210-dim X_train_dense with Member 1 (theta, u, pool,
-# centroid, NN features) and used Member 1's prediction as the residual
-# anchor -- the two failure modes that made its val errors heavily
-# correlated with Member 1's (the stacker downweighted it to ~0.02).
-# Task 3 fixes BOTH at once:
-#   1. New feature view: subject_idx, cluster_id, bench_condition_id,
-#      bc_redacted_mask, subject_obs_count_log1p, subject/bench cat+num
-#      metadata, and the 8 mean-encoded interaction columns. The
-#      no-embedding schema is audited by Gate 3d before training.
-#   2. New anchor: logit(subject_mean) instead of logit(Member 1).
-#      subject_mean is a much WEAKER baseline (just per-subject mean
-#      pass-rate with Bayesian shrinkage), so the GBDT has to learn
-#      real per-row item-cluster interactions to beat it. Anchors are
-#      computed OUT OF FOLD: fold-train labels only for per-fold
-#      Member 2 training (Gate 3a), and the same K-fold OOF accumulator
-#      gives subject_mean_train_oof for the GLOBAL Member 2 fit's
-#      anchor, so the row's own label NEVER enters its own anchor.
-# Set `enabled=False` to revert to the legacy Member 2 (Member 1 anchor +
-# full embedding schema) for A/B comparison.
-CFG.setdefault("member2_v2", {})
-CFG["member2_v2"].setdefault("enabled", True)
-CFG["member2_v2"].setdefault("subject_mean_smoothing", 30.0)
+# Member 2: metadata-only GLU MLP (subject / bc / cluster embeddings +
+# 14 mean-encoded marginals). No item embeddings -- structurally orthogonal
+# to M1/M3/M4/M6.
+CFG.setdefault("member2_mlp", {})
+CFG["member2_mlp"].setdefault("d_subj", 32)
+CFG["member2_mlp"].setdefault("d_bc", 32)
+CFG["member2_mlp"].setdefault("d_cluster", 16)
+CFG["member2_mlp"].setdefault("hid1", 256)
+CFG["member2_mlp"].setdefault("hid2", 128)
+CFG["member2_mlp"].setdefault("learning_rate", 1.0e-3)
+CFG["member2_mlp"].setdefault("weight_decay", 1.0e-5)
+CFG["member2_mlp"].setdefault("epochs", 40)
+CFG["member2_mlp"].setdefault("batch_size", 16384)
+CFG["member2_mlp"].setdefault("early_stopping_patience", 5)
+CFG["member2_mlp"].setdefault("val_fraction", 0.1)
+CFG["member2_mlp"].setdefault("cat_dropout_subject", 0.05)
+CFG["member2_mlp"].setdefault("cat_dropout_bc", 0.10)
+CFG["member2_mlp"].setdefault("cat_dropout_cluster", 0.10)
+CFG["member2_mlp"].setdefault("feat_dropout", 0.10)
 # --- Member 5: kNN on a 1-D supervised difficulty projection (Task 4) ---
 # Member 3 already does kNN on raw item embeddings (semantic similarity).
 # Member 5 builds neighborhoods in PREDICTED DIFFICULTY space instead --
@@ -424,6 +415,15 @@ CFG["member2_v2"].setdefault("subject_mean_smoothing", 30.0)
 # (legacy / Task-3 behavior) for A/B comparison.
 CFG.setdefault("member5", {})
 CFG["member5"].setdefault("enabled", True)
+# v2: pick the Member 5 *variant*. The legacy "difficulty_knn" path is
+# kept for A/B comparison; "residual_cluster" is the new default and
+# uses src/member5_subject_cluster_residual.py -- a pure-lookup
+# subject x item-cluster residual passrate predictor with zero learned
+# weights at inference, structurally orthogonal to the embedding-based
+# Members 1/3 and the additive-linear Member 4.
+CFG["member5"].setdefault("variant", "residual_cluster")
+# Legacy (difficulty_knn) hyperparameters -- still consumed when
+# variant == "difficulty_knn".
 CFG["member5"].setdefault("k", 32)
 CFG["member5"].setdefault("tau", 0.05)
 CFG["member5"].setdefault("ridge_alpha", 10.0)
@@ -431,6 +431,48 @@ CFG["member5"].setdefault("item_fallback_weight", 0.3)
 CFG["member5"].setdefault("min_subjects_per_item", 3)
 # Sample size for Gate 4d's apply round-trip probe.
 CFG["member5"].setdefault("gate4d_sample_size", 64)
+# New (residual_cluster) hyperparameters. ``smoothing_cell`` controls
+# how strongly the per-(subject, cluster) cell mean shrinks toward the
+# additive (subject + cluster - global) baseline -- larger = more
+# shrinkage = residual closer to 0. ``smoothing_marginal`` shrinks the
+# 1-D marginals (subject mean, cluster mean) toward the global mean.
+# ``residual_scale`` is a final scalar multiplier on the residual term
+# at fit time (baked into the saved table); 1.0 means use the full
+# residual, smaller values further damp it relative to the marginals.
+CFG["member5"].setdefault("smoothing_cell", 30.0)
+CFG["member5"].setdefault("smoothing_marginal", 10.0)
+CFG["member5"].setdefault("residual_scale", 1.0)
+# --- Member 6: Field-weighted Factorization Machine on the M4 dense
+# matrix (the same hybrid features Members 2/4 use). FwFM provides a
+# bilinear-interaction inductive bias that none of M1/M3/M4 can
+# express: M1 is non-linear-on-embeddings, M3 is locally-constant kNN,
+# M4 is strictly additive linear. The same dense matrix M4 already
+# consumes is fed to M6 unchanged; the *only* difference is the
+# pairwise <v_i, v_j> x_i x_j term FwFM adds on top of the linear part.
+#
+# field_ids defaults to all-zero (single field -> classic FM with a
+# single scalar r[0, 0]). To enable true field weighting, the notebook
+# cell that fits M6 can pass a 2-field assignment splitting the
+# embedding-derived columns from the mean-encoded marginal columns.
+#
+# Set enabled=False to skip Member 6 entirely (revert to 5-member
+# stacker). All downstream cells (stacker, calibrator, heatmaps,
+# bundle) detect this flag and act accordingly.
+CFG.setdefault("member6", {})
+CFG["member6"].setdefault("enabled", True)
+CFG["member6"].setdefault("k", 8)
+CFG["member6"].setdefault("learning_rate", 1.0e-3)
+CFG["member6"].setdefault("weight_decay_w", 1.0e-5)
+CFG["member6"].setdefault("weight_decay_V", 1.0e-4)
+CFG["member6"].setdefault("weight_decay_r", 1.0e-4)
+CFG["member6"].setdefault("epochs", 40)
+CFG["member6"].setdefault("batch_size", 16384)
+CFG["member6"].setdefault("early_stopping_patience", 5)
+CFG["member6"].setdefault("val_fraction", 0.1)
+# field_split_mode: "single" (classic FM, all cols in field 0) or
+# "embedding_vs_marginal" (2 fields: 0=embedding-derived M2 columns,
+# 1=mean-encoded marginal columns from MEMBER4_MARGINAL_FEATURE_NAMES).
+CFG["member6"].setdefault("field_split_mode", "embedding_vs_marginal")
 CFG.setdefault("judge", {})
 CFG["judge"]["enabled"] = False
 CFG.setdefault("lora", {})
@@ -1865,7 +1907,7 @@ print(
 # ("Model B") with `p_bench=1.0` + `q_bc=0.15` and combined it with
 # Model A through a coverage-conditional blend. The four-member
 # stacker downstream now provides cross-architecture diversity
-# (LightGBM, kNN-similarity, logistic regression on top of Model A),
+# (metadata MLP, kNN-similarity, logistic regression on top of Model A),
 # so a second IRT head is redundant and only inflates the bundle.
 # Member 1 of the stacker is therefore Model A directly.
 
@@ -2418,603 +2460,29 @@ print(
 # to the existing 1202-feature schema). Member 2 sees BOTH the original
 # embedding-derived features AND the new mean-encoded interactions.
 #
-# MEMORY: only the LEGACY global Member 2 fit consumes these (~19 GB
-# combined for the train+val matrices). On the Task 3 path (default)
-# the global Member 2 uses ``X_*_dense_m2v2`` instead and these are
-# pure waste; gate construction behind ``_M2V2_ENABLED`` so we don't
-# blow ~19 GB of resident memory just to hold them through the OOF
-# loop (which built fresh fold-scoped matrices anyway).
-member2_feature_names = tuple(member_feat_schema.feature_names) + tuple(
-    MEMBER2_INTERACTION_FEATURE_NAMES
-)
-# ``_M2V2_ENABLED`` is defined further down in section 9b-ter; peek at
-# the same CFG value here so we don't pre-allocate the legacy matrices
-# when the Task 3 path is active.
-_m2v2_enabled_early = bool(CFG.get("member2_v2", {}).get("enabled", True))
-if not _m2v2_enabled_early:
-    X_train_dense_m2 = np.concatenate(
-        [X_train_dense, member2_interaction_train], axis=1
-    ).astype(np.float32, copy=False)
-    X_val_dense_m2 = np.concatenate(
-        [X_val_dense, member2_interaction_val], axis=1
-    ).astype(np.float32, copy=False)
-    print(
-        f"[mean-enc] Member 2 augmented X: "
-        f"train {X_train_dense_m2.shape}  val {X_val_dense_m2.shape}  "
-        f"(was {X_train_dense.shape[1]} cols, now {X_train_dense_m2.shape[1]} cols)"
-    )
-else:
-    X_train_dense_m2 = None
-    X_val_dense_m2 = None
-    print(
-        "[mean-enc] Member 2 augmented X: NOT built (Task 3 path uses "
-        "X_*_dense_m2v2 instead -- saves ~19 GB resident memory)."
-    )
+# Member 2 uses metadata IDs + M4 marginals only (no dense embedding matrix).
+X_train_dense_m2 = None
+X_val_dense_m2 = None
+print("[mean-enc] Member 2: metadata MLP path (no dense_m2 matrices).")
 
 # %% [markdown]
-# ## 9b-ter. Member 2 v2 setup: non-embedding schema + subject-mean anchor
+# ## 9c. Train Member 2 (metadata GLU MLP)
 #
-# Builds the Task 3 artifacts that decouple Member 2 from Member 1:
-#
-#   1. `member2_v2_schema` -- the locked NON-EMBEDDING feature schema
-#      (subject_idx, cluster_id, bc_id, bc_redacted_mask,
-#      subject_obs_count_log1p, subject/bench cat+num metadata, and
-#      the 8 mean-encoded interaction columns). Gate 3d audits the
-#      schema for any embedding-derived columns (pool_, centroid_dist,
-#      nn_, theta, u__) and raises on detection.
-#
-#   2. `subject_mean_table_global` -- per-subject mean pass-rate with
-#      Bayesian shrinkage (`smoothing` param controls cold-subject
-#      pull-toward-prior). This is the INFERENCE-TIME anchor used at
-#      val and at runtime: each row's prediction is composed via
-#      `gbdt_compose_residual_batch(state, X_row, subject_mean[row.subj])`.
-#
-#   3. `X_val_dense_m2v2` + `subject_mean_val` -- the val-side feature
-#      matrix and anchor, materialized once here and reused at val
-#      reporting (section 9.5c).
-#
-# The TRAINING-TIME anchors come from OOF subject_mean tables computed
-# inside the per-fold loop (section 9.5) -- this avoids the trivial
-# leakage where logit(subject_mean[s_r]) includes row r's own label.
-# Skipped entirely when `CFG["member2_v2"]["enabled"]=False` (legacy
-# Member 2 path stays active).
+# Small metadata-only MLP: subject / bc / cluster embeddings plus the
+# same 14 mean-encoded marginals Member 4 uses. No item embedding columns
+# so errors stay structurally orthogonal to M1/M3/M4/M6.
 
 # %%
-_M2V2_ENABLED = bool(CFG.get("member2_v2", {}).get("enabled", True))
-_M2V2_SMOOTHING = float(
-    CFG.get("member2_v2", {}).get("subject_mean_smoothing", 30.0)
+from src.member2_metadata_mlp import (
+    apply_state_batch as m2_apply_state_batch,
+    fit_member2_metadata_mlp,
 )
 
-if _M2V2_ENABLED:
-    from src.member2_features import (
-        Member2FeatureSchema,
-        audit_no_embedding_features,
-        build_member2_feature_matrix,
-        build_member2_schema,
-    )
-    from src.subject_mean import (
-        SubjectMeanTable,
-        apply_subject_mean,
-        apply_subject_obs_count,
-        assert_oof_subject_mean,
-        fit_subject_mean_table,
-    )
+_m2_cfg = CFG.get("member2_mlp", {})
+_bc_keys_ordered = tuple(f"bc_{i}" for i in range(int(indexer.n_bc)))
 
-    member2_v2_schema = build_member2_schema(
-        subject_cat_field_names=tuple(_meta_schema.subject_categorical),
-        subject_num_field_names=tuple(_meta_schema.subject_numeric),
-        bench_cat_field_names=tuple(_meta_schema.benchmark_categorical),
-        bench_num_field_names=tuple(_meta_schema.benchmark_numeric),
-        interaction_feature_names=tuple(MEMBER2_INTERACTION_FEATURE_NAMES),
-    )
-    # Gate 3d (RED-TEAM): no-embedding audit. Catches the failure mode
-    # where the schema accidentally bundles in theta/u/pool/centroid/NN
-    # columns (which would re-correlate Member 2 with Member 1).
-    audit_no_embedding_features(member2_v2_schema)
-    print(
-        f"[Member 2 v2] Gate 3d PASS: schema dim={member2_v2_schema.feature_dim}, "
-        f"{len(member2_v2_schema.categorical_indices)} categorical cols, "
-        f"no embedding-derived columns detected."
-    )
-
-    # Materialize per-id lookup tables from meta_id_tables (torch -> numpy).
-    _m2v2_subj_cat_lookup = meta_id_tables.subject_cat_ids.cpu().numpy().astype(np.int64)
-    _m2v2_subj_num_lookup = meta_id_tables.subject_num.cpu().numpy().astype(np.float32)
-    _m2v2_bench_cat_lookup = meta_id_tables.bc_cat_ids.cpu().numpy().astype(np.int64)
-    _m2v2_bench_num_lookup = meta_id_tables.bc_num.cpu().numpy().astype(np.float32)
-    print(
-        f"[Member 2 v2] lookup tables: "
-        f"subj_cat={_m2v2_subj_cat_lookup.shape}  subj_num={_m2v2_subj_num_lookup.shape}  "
-        f"bench_cat={_m2v2_bench_cat_lookup.shape}  bench_num={_m2v2_bench_num_lookup.shape}"
-    )
-
-    # Global subject_mean table (full train labels). This is the
-    # INFERENCE-TIME anchor -- val/test rows look up subject_mean[s]
-    # which does NOT include their own labels (val rows aren't in
-    # train).
-    subject_mean_table_global = fit_subject_mean_table(
-        subject_ids=_mef_train_subj,
-        labels=y_train,
-        n_subjects=int(indexer.n_subjects),
-        smoothing=_M2V2_SMOOTHING,
-    )
-    print(
-        f"[Member 2 v2] global subject_mean table: "
-        f"n_subjects={subject_mean_table_global.subject_mean.shape[0]}  "
-        f"global_mean={subject_mean_table_global.global_mean:.4f}  "
-        f"smoothing={subject_mean_table_global.smoothing:.1f}  "
-        f"n_zero_obs_subjects={int((subject_mean_table_global.subject_obs_count == 0).sum())}"
-    )
-
-    _global_subj_obs_count_train_log1p = apply_subject_obs_count(
-        subject_mean_table_global, _mef_train_subj, log1p=True,
-    ).astype(np.float32)
-    _global_subj_obs_count_val_log1p = apply_subject_obs_count(
-        subject_mean_table_global, _mef_val_subj, log1p=True,
-    ).astype(np.float32)
-
-    X_val_dense_m2v2 = build_member2_feature_matrix(
-        member2_v2_schema,
-        subject_ids=_mef_val_subj,
-        cluster_ids=_mef_val_cluster,
-        bc_ids=_mef_val_bc,
-        bc_redacted_mask=bc_redacted_val.astype(np.float32),
-        subject_obs_count_log1p=_global_subj_obs_count_val_log1p,
-        subject_cat_lookup=_m2v2_subj_cat_lookup,
-        subject_num_lookup=_m2v2_subj_num_lookup,
-        bench_cat_lookup=_m2v2_bench_cat_lookup,
-        bench_num_lookup=_m2v2_bench_num_lookup,
-        interaction_matrix=member2_interaction_val.astype(np.float32),
-    )
-    subject_mean_val = apply_subject_mean(
-        subject_mean_table_global, _mef_val_subj,
-    ).astype(np.float64)
-    print(
-        f"[Member 2 v2] X_val_dense_m2v2: {X_val_dense_m2v2.shape}  "
-        f"subject_mean_val: shape={subject_mean_val.shape}  "
-        f"min={subject_mean_val.min():.4f}  mean={subject_mean_val.mean():.4f}  "
-        f"max={subject_mean_val.max():.4f}"
-    )
-else:
-    print(
-        "[Member 2 v2] DISABLED via CFG['member2_v2']['enabled']=False. "
-        "Falling back to legacy Member 2 (Member 1 anchor + full schema)."
-    )
-
-
-# %% [markdown]
-# ### 9b'. Member 2 v4 (direct-binary tree on v3 features) setup
-#
-# v4 is the same feature builder as v3 (25 numeric columns: per-id obs
-# counts, mean-encoded passrates, is_unknown_* flags, plus p_m1 and
-# subject_mean as logits) but trained as a STANDARD binary-objective
-# GBDT on y directly -- no residual framing, no subject_mean anchor at
-# apply time, output is sigmoid(tree_raw).
-#
-# Why v4 not v3: v3's residual-on-subject_mean composition was a
-# blowup hazard -- on rows where the tree fit a large +5 logit
-# correction on top of subject_mean=0.7, the composed prediction
-# collapsed toward sigmoid(0.85 + 5) = 0.997 and a single wrong row
-# contributed ~5.8 nats of loss. v3 failed Gate 3d at full scale
-# (OOF NLL > constant-mean baseline) for exactly this reason. v4
-# eliminates the failure mode by construction: a binary-objective
-# tree's per-leaf output is bounded by the in-leaf label averages,
-# so it mathematically cannot produce a 0.997-confident prediction on
-# a row where the leaf's labels averaged 0.5.
-#
-# Why this still adds stacker value: M2 v4's job isn't to beat M1's
-# individual NLL -- the stacker doesn't care about that. Its job is
-# to produce errors UNCORRELATED with M1 (bilinear), M3 (neighbor avg),
-# M4 (linear), and M5 (projection kNN). A tree on (p_m1, subject_mean,
-# per-id passrates, obs counts) has tree-shaped step-function decision
-# boundaries that no other member can produce, so its errors are
-# structurally diverse and the stacker can extract value even when
-# v4's standalone NLL is modest.
-#
-# v4 reuses v2's subject_mean infrastructure (only because subject_mean
-# appears as a FEATURE in the v3 builder; it is no longer an anchor at
-# apply time). v2's GBDT itself is still skipped when v4 is enabled.
-
-# %%
-_M2V4_ENABLED = bool(CFG.get("member2_v4", {}).get("enabled", True))
-_M2V4_SMOOTHING = float(CFG.get("member2_v4", {}).get("smoothing", 30.0))
-# Chunk size for M1 scoring on fold-train rows. ~256k rows * 4096 dim *
-# 4 bytes = ~4 GB peak per chunk for the LookupDataset item_emb stack.
-_M2V4_M1_CHUNK_ROWS = int(CFG.get("member2_v4", {}).get("m1_chunk_rows", 256_000))
-
-if _M2V4_ENABLED:
-    if not _M2V2_ENABLED:
-        import warnings as _v4_warn
-        _v4_warn.warn(
-            "Member 2 v4 currently piggybacks on v2's subject_mean setup "
-            "(subject_mean_table_global, subject_mean_val, the per-fold "
-            "fold_subject_mean_table) -- the v3 feature builder pulls "
-            "subject_mean as a per-row FEATURE (not an anchor). Either "
-            "keep _M2V2_ENABLED=True and let v4 replace its GBDT output, "
-            "or implement a v4-only subject_mean setup path before "
-            "disabling v2. Forcing _M2V4_ENABLED=False so the pipeline "
-            "does not silently produce garbage."
-        )
-        _M2V4_ENABLED = False
-    else:
-        from src.member2_v3_calibration import (
-            MEMBER2_V3_FEATURE_NAMES,
-            M2V3_FEATURE_DIM,
-            Member2V3FeatureBuilder,
-            Member2V3State,
-            build_member2_v3_features,
-            fit_member2_v3_feature_builder,
-        )
-        print(
-            f"[Member 2 v4] direct-binary GBDT ENABLED (smoothing={_M2V4_SMOOTHING}, "
-            f"F={M2V3_FEATURE_DIM} features = v3 builder, trained as binary "
-            "classifier on y directly -- no residual framing, no subject_mean "
-            "anchor at apply time, output = sigmoid(tree_raw). REPLACES v2/v3 "
-            "GBDT output."
-        )
-else:
-    print("[Member 2 v4] DISABLED via CFG['member2_v4']['enabled']=False.")
-
-
-# %% [markdown]
-# ### 9b''. Member 2 v5 (attribute + neighborhood tree, no M1 leakage) setup
-#
-# v5 is the literature-recommended cold-start tree recipe. It removes ALL
-# M1-derived inputs (``logit_p_m1``, ``logit_subject_mean``,
-# ``logit_disagreement``, ``abs_logit_disagreement``, ``p_m1_uncertainty``)
-# that caused v3/v4 to memorize Member 1's prediction (corr=0.96, NLL=0.71
-# vs constant-mean baseline of 0.63). In their place v5 adds three
-# orthogonal signal families:
-#
-#   * **Item content** (19 cols): 9 pool/text features + 8 centroid
-#     distances + benchmark_age value/mask. Cold-item-stable signals
-#     that the tree can split on at inference time even when the item
-#     was never seen at training time.
-#   * **Honest historical counts** (9 cols): per-id and 2-D cell
-#     ``log1p(observation_count)`` plus bc_redacted_mask. No target
-#     leakage (just counts, not means), and they sharpen the obs-count
-#     interactions that mean-encoding alone misses.
-#   * **Neighborhood aggregates** (7 cols): the 7 most-useful columns
-#     from the existing 23-col NN feature matrix
-#     (passrate_weighted_mean, coverage, mean_similarity,
-#     effective_neighbor_count, passrate_subject_conditional,
-#     passrate_benchmark_conditional, distance_to_kth_neighbor). These
-#     give the tree neighborhood-derived predictions that overlap
-#     minimally with M3's kNN voting member.
-#
-# Plus the original 14 Bayes-shrunk mean-encoded passrates + unknown-id
-# flags (subject/cluster/bc/macro_family/organization/family and the
-# two 2-D subj_x_cluster / subj_x_bc cells), with subject-level mean
-# encoding added (v3/v4 omitted it as collinear with subject_mean used
-# as anchor; v5 has no anchor, so subject_passrate IS the signal).
-#
-# Total: 49 numeric features. NO categorical_feature= to LightGBM
-# because the compiled numpy walker only supports numeric splits; the
-# builder does Bayesian-shrunk OOF target encoding manually.
-#
-# Trained as a DIRECT binary GBDT (no init_score, output = sigmoid(tree_raw))
-# so leaf outputs are bounded by in-leaf label averages -- prevents the
-# cumulative-logit saturation that broke v4. When v5 is enabled it
-# REPLACES v4's output via the same ``gbdt_state`` alias that the
-# exporter consumes.
-#
-# v5 retains v2's setup as a soft dependency for the per-fold mean-
-# encoded id arrays (``_mef_*``) and the global ``bc_redacted_train``
-# mask; if v2 is disabled, v5 falls back to v4 (and warns).
-
-# %%
-_M2V5_ENABLED = bool(CFG.get("member2_v5", {}).get("enabled", True))
-# v5b defaults: smoothing relaxed 30 -> 10 (cold-start TE features now
-# have meaningful spread when an id has even a handful of obs, instead
-# of collapsing to the global mean until ~100+ obs accumulate). This
-# pairs with the GBDT min_data_in_leaf bump from 500 -> 100 to let the
-# tree exploit the 32-D PCA bucket at finer leaf resolution.
-_M2V5_SMOOTHING = float(CFG.get("member2_v5", {}).get("smoothing", 10.0))
-
-if _M2V5_ENABLED:
-    import warnings as _v5_warn
-    if not _M2V2_ENABLED:
-        _v5_warn.warn(
-            "Member 2 v5 reuses v2's per-fold mean-encoded id arrays "
-            "(_mef_subj_fold_*, _mef_cluster_fold_*, _mef_bc_fold_*) "
-            "as inputs. v2 is currently disabled, which means those "
-            "id arrays may not be constructed in the per-fold loop. "
-            "Either keep _M2V2_ENABLED=True or implement a v5-only "
-            "id construction path. Forcing _M2V5_ENABLED=False so the "
-            "pipeline falls back to v4/v2/legacy gracefully."
-        )
-        _M2V5_ENABLED = False
-
-if _M2V5_ENABLED:
-    # v5 supersedes v4 -- disable the v4 path so we don't pay for M1
-    # fold-train scoring (only v4 needs that) and so the per-fold /
-    # global branches don't both run.
-    if _M2V4_ENABLED:
-        print(
-            "[Member 2 v5] superseding _M2V4_ENABLED=True with v5; v4 "
-            "branches will be skipped in the per-fold and global fits."
-        )
-    _M2V4_ENABLED = False
-
-    from src.member2_v5_attr_nn import (
-        M2V5_BUCKET_D_END,
-        M2V5_FEATURE_DIM,
-        M2V5_PCA_DIMS,
-        MEMBER2_V5_FEATURE_NAMES,
-        Member2V5FeatureBuilder,
-        Member2V5State,
-        Member2V5Warning,
-        build_member2_v5_features,
-        fit_member2_v5_feature_builder,
-    )
-    print(
-        f"[Member 2 v5b] attribute+NN+PCA tree ENABLED "
-        f"(smoothing={_M2V5_SMOOTHING}, F={M2V5_FEATURE_DIM} features "
-        f"= 49 cold-start + {M2V5_PCA_DIMS} item-embedding PCA cols; "
-        "NO M1-derived inputs). Trained as direct binary GBDT on y; "
-        "output = sigmoid(tree_raw). REPLACES v2/v3/v4 GBDT output."
-    )
-else:
-    print("[Member 2 v5] DISABLED via CFG['member2_v5']['enabled']=False.")
-
-
-# %% [markdown]
-# ### 9b''''. v5b item embedding PCA (Bucket E feature provider)
-#
-# Member 2 v5a's 49 cold-start features hit a ceiling around constant-
-# mean NLL (~0.66) because most features collapse on cold IDs (target
-# encodings shrink to global_mean, log1p counts are zero, unknown
-# flags are constant). The structural fix is to give the tree access
-# to the same INPUT signal Members 1/3/4 use -- the item embedding --
-# but in a low-rank projection trees can actually split on, AND
-# without ever feeding it M1's OUTPUT (which is what caused v3/v4's
-# saturation + correlation-with-M1).
-#
-# We fit a 32-D PCA on a random sample of training item embeddings
-# (cheap: ~50k x 4096 fits in ~800MB) and cache the mean + components.
-# Both the per-fold and global v5 fits then project every row's
-# item embedding through the same matrix and pass the 32-D vector as
-# the new Bucket E columns of build_member2_v5_features.
-
-# %%
-if _M2V5_ENABLED:
-    import time as _v5_pca_time
-
-    _v5_pca_cfg = CFG.get("member2_v5", {})
-    _v5_pca_dim = int(_v5_pca_cfg.get("pca_dim", M2V5_PCA_DIMS))
-    if _v5_pca_dim != int(M2V5_PCA_DIMS):
-        _v5_warn.warn(
-            f"[Member 2 v5b] CFG pca_dim={_v5_pca_dim} != module "
-            f"M2V5_PCA_DIMS={int(M2V5_PCA_DIMS)}. The module constant is "
-            "what the X matrix layout is locked to; ignoring the CFG "
-            "override and using the module value. Edit src/member2_v5_"
-            "attr_nn.py to change the bucket size."
-        )
-        _v5_pca_dim = int(M2V5_PCA_DIMS)
-    _v5_pca_n_samples = int(_v5_pca_cfg.get("pca_fit_samples", 50_000))
-    _v5_pca_n_samples = min(_v5_pca_n_samples, len(train_item_keys))
-
-    print(
-        f"[Member 2 v5b] fitting {_v5_pca_dim}-D PCA on "
-        f"{_v5_pca_n_samples:,} sampled train item embeddings "
-        f"(of {len(train_item_keys):,} total)..."
-    )
-    _v5_pca_t0 = _v5_pca_time.time()
-    _v5_pca_rng = np.random.RandomState(SEED + 7919)
-    _v5_pca_sample_idx = _v5_pca_rng.choice(
-        len(train_item_keys), size=_v5_pca_n_samples, replace=False,
-    )
-    # Stack into a contiguous fp32 [N, D] buffer. At 50k x 4096 this is
-    # ~800MB; we free it as soon as Vt is extracted.
-    _v5_pca_sample_X = np.empty(
-        (_v5_pca_n_samples, int(ITEM_EMB_DIM)), dtype=np.float32,
-    )
-    for _i, _idx in enumerate(_v5_pca_sample_idx):
-        _v5_pca_sample_X[_i] = item_emb_lookup[train_item_keys[int(_idx)]]
-    _v5_pca_mean = _v5_pca_sample_X.mean(axis=0).astype(np.float32)
-    _v5_pca_sample_X -= _v5_pca_mean
-    # Truncated SVD via numpy. We only need the first M2V5_PCA_DIMS
-    # right-singular vectors; numpy gives all of them but the slice
-    # is cheap. ``full_matrices=False`` keeps both factors at
-    # min(N, D) shape so we don't allocate a [4096, 4096] block.
-    _U, _S, _Vt = np.linalg.svd(_v5_pca_sample_X, full_matrices=False)
-    _v5_pca_components = _Vt[: _v5_pca_dim].astype(np.float32)  # [pca_dim, D]
-    _v5_pca_explained_var = (_S[: _v5_pca_dim] ** 2 / max(_v5_pca_n_samples - 1, 1))
-    _v5_pca_total_var = float((_S ** 2 / max(_v5_pca_n_samples - 1, 1)).sum())
-    _v5_pca_explained_ratio = float(_v5_pca_explained_var.sum() / max(_v5_pca_total_var, 1e-12))
-    del _U, _S, _Vt, _v5_pca_sample_X
-    gc.collect()
-    print(
-        f"[Member 2 v5b] PCA fit: components={_v5_pca_components.shape}  "
-        f"mean={_v5_pca_mean.shape}  "
-        f"explained_var_ratio({_v5_pca_dim} dims)={_v5_pca_explained_ratio:.3f}  "
-        f"({_v5_pca_time.time() - _v5_pca_t0:.1f}s)"
-    )
-
-    # Digest the components so any cache key downstream can invalidate
-    # on a PCA refit. Short hash (16 hex chars) is plenty given we
-    # only need uniqueness within a single training run.
-    import hashlib as _v5_pca_hash_mod
-    _v5_pca_digest = _v5_pca_hash_mod.sha256(
-        np.ascontiguousarray(_v5_pca_components, dtype=np.float32).tobytes()
-        + np.ascontiguousarray(_v5_pca_mean, dtype=np.float32).tobytes()
-    ).hexdigest()[:16]
-
-    def _m2v5_pca_for_rows(rows_df) -> np.ndarray:
-        """Return ``[N, M2V5_PCA_DIMS]`` fp32 PCA projection in row order.
-
-        Unknown item_keys (cold items not in item_emb_lookup) get a
-        zero row. The v5 builder's ``_pca_columns`` finite-fill is a
-        no-op on already-finite zero rows. Memory: peak is one
-        [N, D] embedding buffer at a time (~ N * D * 4 bytes); for
-        large val sets prefer chunking the call.
-        """
-        N = int(len(rows_df))
-        if N == 0:
-            return np.zeros((0, int(M2V5_PCA_DIMS)), dtype=np.float32)
-        out = np.zeros((N, int(M2V5_PCA_DIMS)), dtype=np.float32)
-        # Build the [N, D] embedding buffer once; rows with missing
-        # item_keys stay zero. Chunk at 100k rows so we don't allocate
-        # 4+ GB on val for very large sets.
-        _CHUNK = 100_000
-        _emb_buf = np.zeros((min(_CHUNK, N), int(ITEM_EMB_DIM)), dtype=np.float32)
-        for _start in range(0, N, _CHUNK):
-            _end = min(_start + _CHUNK, N)
-            _b = _end - _start
-            if _b != _emb_buf.shape[0]:
-                _emb_buf = np.zeros((_b, int(ITEM_EMB_DIM)), dtype=np.float32)
-            else:
-                _emb_buf[:] = 0.0
-            for _i, _k in enumerate(rows_df["item_key"].iloc[_start:_end]):
-                _v = item_emb_lookup.get(str(_k))
-                if _v is not None:
-                    _emb_buf[_i] = _v
-            _emb_buf -= _v5_pca_mean
-            out[_start:_end] = _emb_buf @ _v5_pca_components.T
-        return out
-
-else:
-    # Define no-op stubs so downstream `if _M2V5_ENABLED` branches
-    # don't need to guard on these symbols' existence.
-    _v5_pca_components = None
-    _v5_pca_mean = None
-    _v5_pca_digest = "no_pca"
-    def _m2v5_pca_for_rows(rows_df) -> np.ndarray:
-        return np.zeros((len(rows_df), 0), dtype=np.float32)
-
-
-# %% [markdown]
-# ### 9b'''. v5 per-row pool / centroid / benchmark_age lookups
-#
-# v5 needs three per-row arrays that aren't already exposed in the
-# per-fold loop:
-#   * a [N_rows, 17] dense slice of ``pool_features_z`` aligned to a
-#     row DataFrame's ``item_key`` order (9 pool cols + 8 centroid_dist cols)
-#   * a [N_rows] benchmark_age array (NaN for unknown)
-# We build small helpers here so both the per-fold OOF branch and the
-# global 9.5c branch use the same code path -- prevents silent
-# train/inference feature-pipeline drift.
-
-# %%
-if _M2V5_ENABLED:
-    # v5's locked column order: 9 pool cols (from item_features.POOL_FEATURE_NAMES
-    # with a "pool_" prefix added for clarity) + 8 centroid_dist cols.
-    # ``pool_features_z`` stores the pool cols WITHOUT the "pool_" prefix
-    # (because that's the raw output of ``item_features.feature_names()``)
-    # plus the 8 centroid_dist cols. We map between the two namespaces
-    # at build time WITHOUT mutating ``pool_features_z`` -- mutation
-    # would break the per-fold M1 builder's ``_pool_matrix`` consumer
-    # which expects the raw POOL_FEATURE_NAMES_EXT column names.
-    _M2V5_POOL_RAW_COLS = (
-        "token_len", "char_len", "has_latex", "has_code",
-        "n_questions", "n_numbers", "is_multiple_choice",
-        "n_choices", "lang_en",
-    )
-    _M2V5_CENTROID_COLS = tuple(f"centroid_dist_{k}" for k in range(8))
-    _M2V5_POOL_SOURCE_COLS = _M2V5_POOL_RAW_COLS + _M2V5_CENTROID_COLS
-    _m2v5_missing_cols = [
-        c for c in _M2V5_POOL_SOURCE_COLS if c not in pool_features_z.columns
-    ]
-    if _m2v5_missing_cols:
-        import warnings as _v5_col_warn
-        _v5_col_warn.warn(
-            f"[Member 2 v5] pool_features_z is missing columns "
-            f"{_m2v5_missing_cols}; those columns will be zero-filled "
-            "at v5 build time. Tree loses some item-content signal but "
-            "does not crash."
-        )
-    # Build a fixed [N_items, 17] dense matrix indexed by item_key once,
-    # then slice it per fold via positional indexing. Faster than a
-    # per-row dict lookup and uses ~13 MB at full scale (197114 items x
-    # 17 cols x 4 bytes).
-    _m2v5_pool_idx_df = pool_features_z.set_index("item_key")
-    _m2v5_pool_full_matrix = np.zeros(
-        (len(_m2v5_pool_idx_df), len(_M2V5_POOL_SOURCE_COLS)),
-        dtype=np.float32,
-    )
-    for _k, _c in enumerate(_M2V5_POOL_SOURCE_COLS):
-        if _c in _m2v5_pool_idx_df.columns:
-            _m2v5_pool_full_matrix[:, _k] = (
-                _m2v5_pool_idx_df[_c].astype(np.float32).fillna(0.0).to_numpy()
-            )
-    _m2v5_item_key_to_pos = {
-        str(k): i for i, k in enumerate(_m2v5_pool_idx_df.index.tolist())
-    }
-
-    def _m2v5_pool_for_rows(rows_df) -> np.ndarray:
-        """Return ``[N, 17]`` fp32 pool/centroid matrix in row order.
-
-        Unknown item_keys (cold items not in ``pool_features_z``) get a
-        zero row. The v5 builder's ``_pool_columns`` finite-fill is a
-        no-op on already-finite zero rows.
-        """
-        positions = np.array(
-            [_m2v5_item_key_to_pos.get(str(k), -1)
-             for k in rows_df["item_key"]],
-            dtype=np.int64,
-        )
-        out = np.zeros(
-            (len(rows_df), len(_M2V5_POOL_SOURCE_COLS)), dtype=np.float32
-        )
-        known = positions >= 0
-        if int(known.sum()) > 0:
-            out[known] = _m2v5_pool_full_matrix[positions[known]]
-        return out
-
-    # Item-key -> benchmark_age lookup (NaN for unknown). Built once.
-    _m2v5_item_age_lookup = dict(
-        zip(train_item_keys, item_benchmark_age_arr.astype(np.float64).tolist())
-    )
-
-    def _m2v5_age_for_rows(rows_df) -> np.ndarray:
-        """Return ``[N]`` float64 benchmark_age (NaN for unknown items)."""
-        return np.array(
-            [_m2v5_item_age_lookup.get(str(k), np.nan)
-             for k in rows_df["item_key"]],
-            dtype=np.float64,
-        )
-
-# %% [markdown]
-# ## 9c. Train Member 2 (LightGBM)
-#
-# Offline LightGBM training; we ship the compiled tree arrays + bias
-# for pure-NumPy traversal at runtime. The internal parity check (in
-# `fit_gbdt_member`) ensures the NumPy walker matches LightGBM's
-# `predict(raw_score=True)` to within `parity_atol=1e-5`.
-#
-# **Residual-learner mode (post-2026-05-26):** instead of training the
-# GBDT to predict the label directly, we train it to predict
-# `logit(y) - logit(p_member1_train)` under a `regression_l2`
-# objective. At inference the walker emits a tree residual; the
-# composer combines it with Member 1's current-row logit to recover
-# a probability. The math is just an additive shift in logit space.
-# Why: a direct-label GBDT will largely re-learn whatever Member 1
-# already captures (the stacker correctly downweighted the legacy
-# member 2 to ~0.018, i.e. it contributed nothing), so we force it
-# to spend capacity on the residual the anchor missed. `init_pred`
-# is Member 1's IN-SAMPLE train predictions -- not technically OOF,
-# but Member 1 is regularized enough that this is good enough; a
-# proper k-fold OOF Member 1 would be cleaner if we re-run.
-
-# %%
-from src.gbdt_member import (
-    apply_batch as gbdt_apply_batch,
-    compose_residual_batch as gbdt_compose_residual_batch,
-    fit_gbdt_member,
-)
-
-
-# Per-row item_id for the cold-start internal val split. We map each
-# train row to the integer position of its item in ``train_item_keys``
-# (the kNN/Indexer's item ordering); items with no match get -1, which
-# lands in their own catch-all group. The split picks ~10% of distinct
-# items and routes EVERY row of those items to LightGBM's internal
-# val. Without this the booster's early stopping fires on rows from
-# items it has already memorized -- val NLL diverges from the actual
-# cold-start val NLL (the user observed 0.33 internal vs 0.65 reported,
-# i.e. 100% optimism).
 _item_to_train_idx = {str(k): i for i, k in enumerate(train_item_keys)}
-gbdt_train_item_id = np.fromiter(
+m2_holdout_item_id = np.fromiter(
     (
         _item_to_train_idx.get(str(k), -1)
         for k in primary.train["item_key"].astype(str).tolist()
@@ -3023,95 +2491,93 @@ gbdt_train_item_id = np.fromiter(
     dtype=np.int64,
 )
 print(
-    f"[Member 2] item-cold split groups: "
-    f"{int(np.unique(gbdt_train_item_id).size):,} unique items"
+    f"[Member 2 MLP] item-cold holdout groups: "
+    f"{int(np.unique(m2_holdout_item_id).size):,} unique items"
+)
+# Shared item-cold holdout id (Members 4/6 early stopping use the same split).
+holdout_item_id = m2_holdout_item_id
+
+_m2_n_clusters = max(
+    int(_N_CLUSTERS_ME),
+    int(_mef_train_cluster.max()) + 1 if _mef_train_cluster.size else 0,
+    int(_mef_val_cluster.max()) + 1 if _mef_val_cluster.size else 0,
 )
 
 
-def _fit_member2():
-    # ~1.5-2.5 min on the 5M x ~1210 feature schema with the speed
-    # knobs below (max_bin=63, force_col_wise=True). The default
-    # LightGBM params (max_bin=255, no force_col_wise) take 5-10 min
-    # at this scale; the speed knobs are bit-exact under
-    # ``deterministic=True``.
+def _fit_member2_mlp_global():
     print(
-        "[Member 2] training LightGBM in RESIDUAL mode "
-        f"(X cols={X_train_dense_m2.shape[1]}, anchor=Member 1, "
-        "objective=regression_l2 on logit-residual)..."
+        "[Member 2 MLP] training metadata GLU MLP on full train "
+        f"(N={len(primary.train):,}, marginals={member4_marginal_train.shape[1]})..."
     )
-    return fit_gbdt_member(
-        X=X_train_dense_m2,
+    return fit_member2_metadata_mlp(
+        subject_ids=_mef_train_subj,
+        bc_ids=_mef_train_bc,
+        cluster_ids=_mef_train_cluster,
+        marginals=member4_marginal_train.astype(np.float32, copy=False),
         y=y_train,
-        feature_names=member2_feature_names,
-        # Residual-learner anchor: Member 1's in-sample train preds.
-        # The trees learn logit(y) - logit(p_a_train) instead of y,
-        # so they MUST contribute orthogonal signal to be useful.
-        init_pred_train=p_a_train.astype(np.float64, copy=False),
-        n_estimators=int(CFG.get("member2_gbdt", {}).get("n_estimators", 400)),
-        learning_rate=float(CFG.get("member2_gbdt", {}).get("learning_rate", 0.05)),
-        num_leaves=int(CFG.get("member2_gbdt", {}).get("num_leaves", 31)),
-        min_data_in_leaf=int(CFG.get("member2_gbdt", {}).get("min_data_in_leaf", 50)),
-        early_stopping_rounds=int(CFG.get("member2_gbdt", {}).get("early_stopping_rounds", 30)),
-        seed=SEED,
-        parity_atol=1.0e-5,
-        # Hold out 10% of train for LightGBM's own early-stopping val.
-        val_fraction=float(CFG.get("member2_gbdt", {}).get("val_fraction", 0.1)),
-        # Speed knobs (see fit_gbdt_member docstring for details).
-        max_bin=int(CFG.get("member2_gbdt", {}).get("max_bin", 63)),
-        force_col_wise=bool(CFG.get("member2_gbdt", {}).get("force_col_wise", True)),
-        log_period=int(CFG.get("member2_gbdt", {}).get("log_period", 25)),
-        num_threads=CFG.get("member2_gbdt", {}).get("num_threads", None),
-        # Item-stratified cold-start internal val split (see comment above).
-        holdout_group_id=gbdt_train_item_id,
+        subject_keys=_subject_keys_ordered,
+        bc_keys=_bc_keys_ordered,
+        marg_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+        n_subjects=int(indexer.n_subjects),
+        n_bcs=int(indexer.n_bc),
+        n_clusters=int(_m2_n_clusters),
+        d_subj=int(_m2_cfg.get("d_subj", 32)),
+        d_bc=int(_m2_cfg.get("d_bc", 32)),
+        d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+        hid1=int(_m2_cfg.get("hid1", 256)),
+        hid2=int(_m2_cfg.get("hid2", 128)),
+        learning_rate=float(_m2_cfg.get("learning_rate", 1.0e-3)),
+        weight_decay=float(_m2_cfg.get("weight_decay", 1.0e-5)),
+        epochs=int(_m2_cfg.get("epochs", 40)),
+        batch_size=int(_m2_cfg.get("batch_size", 16384)),
+        val_fraction=float(_m2_cfg.get("val_fraction", 0.1)),
+        early_stopping_patience=int(_m2_cfg.get("early_stopping_patience", 5)),
+        cat_dropout_subject=float(_m2_cfg.get("cat_dropout_subject", 0.05)),
+        cat_dropout_bc=float(_m2_cfg.get("cat_dropout_bc", 0.10)),
+        cat_dropout_cluster=float(_m2_cfg.get("cat_dropout_cluster", 0.10)),
+        feat_dropout=float(_m2_cfg.get("feat_dropout", 0.10)),
+        seed=int(SEED),
+        holdout_group_id=m2_holdout_item_id,
+        show_progress=True,
     )
 
 
-if _M2V2_ENABLED:
-    # Task 3: defer the GLOBAL Member 2 fit to section 9.5c. It needs
-    # `subject_mean_train_oof` (an OOF-anchor array) as `init_pred_train`,
-    # which only exists AFTER the per-fold OOF loop in section 9.5
-    # populates `subject_mean_train_oof_acc`. Using the global
-    # subject_mean as the training anchor instead would be leakage:
-    # logit(subject_mean_global[s_r]) includes y_r in its aggregate,
-    # so the GBDT could trivially recover the label from the anchor.
-    print(
-        "[Member 2 v2] Global Member 2 fit DEFERRED to section 9.5c "
-        "(requires OOF subject_mean from section 9.5)."
-    )
-    gbdt_state = None  # placeholder; populated in section 9.5c
-    p_member2_val = None  # populated in section 9.5c
-    nll_m2 = float("nan")
-else:
-    # Legacy Member 2 path (Member 1 anchor + full embedding schema).
-    # Cache key versions: ``init_v2`` (broken init_score recovery fix),
-    # ``speed_v1`` (LGBM speed knobs), ``honest_loss_v1`` (manual NLL
-    # instead of LGBM-reported), ``coldsplit_v1`` (item-stratified ES
-    # val split), ``redact_v1`` (bc-redacted feature matrix tie-in),
-    # ``residual_v1`` (residual-learner mode + mean-enc interactions).
-    gbdt_state = cache_or_compute(
-        "gbdt_state",
-        key_inputs=(int(X_train_dense_m2.shape[1]), len(primary.train), SEED,
-                    "speed_v1", "init_v2", "honest_loss_v1",
-                    "coldsplit_v1", "redact_v1", "residual_v1",
-                    round(BC_REDACT_FRAC, 3), _bc_redact_seed),
-        compute_fn=_fit_member2,
-    )
-    if str(gbdt_state.output_mode) != "residual_logit":
-        raise RuntimeError(
-            f"Expected gbdt_state.output_mode='residual_logit' (residual-learner "
-            f"mode), got {gbdt_state.output_mode!r}. The cache key bump should "
-            "have invalidated the legacy binary-mode entry; delete the cache "
-            "file manually if this fires."
-        )
-    p_member2_val = gbdt_compose_residual_batch(
-        gbdt_state, X_val_dense_m2, p_a_val.astype(np.float64, copy=False)
-    )
-    nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
-                     + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
-    print(f"[Member 2] residual val log-loss (cold-start primary.val):    {nll_m2:.6f}")
-    print(f"[Member 2] residual val NLL stored in state (LGBM val split): {gbdt_state.val_loss:.6f}")
-    print(f"[Member 2] train NLL stored in state (manual):       {gbdt_state.train_loss:.6f}")
-    print(f"[Member 2] n_trees={gbdt_state.n_trees}  bias={gbdt_state.bias:+.4f}")
+import hashlib as _m2_hashlib
+
+_m2_marg_digest = _m2_hashlib.sha256(
+    np.ascontiguousarray(member4_marginal_train, dtype=np.float32).tobytes()
+).hexdigest()[:16]
+
+member2_mlp_state = cache_or_compute(
+    "member2_mlp_state",
+    key_inputs=(
+        "member2_metadata_mlp_v1",
+        int(len(primary.train)), int(SEED),
+        int(indexer.n_subjects), int(indexer.n_bc), int(_m2_n_clusters),
+        int(member4_marginal_train.shape[1]),
+        round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+        _m2_marg_digest,
+        tuple(sorted(_m2_cfg.items())),
+    ),
+    compute_fn=_fit_member2_mlp_global,
+)
+
+p_member2_val = m2_apply_state_batch(
+    member2_mlp_state,
+    subject_ids=_mef_val_subj,
+    bc_ids=_mef_val_bc,
+    cluster_ids=_mef_val_cluster,
+    marginals=member4_marginal_val.astype(np.float32, copy=False),
+)
+nll_m2 = float(
+    -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
+      + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean()
+)
+print(f"[Member 2 MLP] val log-loss: {nll_m2:.6f}")
+print(
+    f"[Member 2 MLP] train/val NLL in state: "
+    f"{member2_mlp_state.train_loss:.6f} / {member2_mlp_state.val_loss:.6f}"
+)
 
 # %% [markdown]
 # ## 9d. Train Member 3 (FAISS-free kNN-similarity)
@@ -3297,6 +2763,149 @@ gc.collect()
 # %%
 if CFG.get("member5", {}).get("enabled", False):
     import time as _time_m5
+
+    _m5_cfg = CFG["member5"]
+    _M5_VARIANT = str(_m5_cfg.get("variant", "residual_cluster")).lower()
+    if _M5_VARIANT not in {"difficulty_knn", "residual_cluster"}:
+        raise ValueError(
+            f"CFG['member5']['variant']={_M5_VARIANT!r} unrecognized; "
+            "expected 'difficulty_knn' or 'residual_cluster'."
+        )
+
+    _M5_ENABLED = True
+    # Hyperparams for the legacy difficulty_knn path are kept around so
+    # the cache keys / per-fold OOF block can still consult them when
+    # _M5_VARIANT == 'difficulty_knn'. Unused under residual_cluster.
+    _M5_K = int(_m5_cfg.get("k", 32))
+    _M5_TAU = float(_m5_cfg.get("tau", 0.05))
+    _M5_RIDGE_ALPHA = float(_m5_cfg.get("ridge_alpha", 10.0))
+    _M5_ITEM_FB_WEIGHT = float(_m5_cfg.get("item_fallback_weight", 0.3))
+    _M5_MIN_SUBJ_PER_ITEM = int(_m5_cfg.get("min_subjects_per_item", 3))
+    _M5_GATE4D_SAMPLE_SIZE = int(_m5_cfg.get("gate4d_sample_size", 64))
+    # Hyperparams for the new residual_cluster path.
+    _M5_SMOOTH_CELL = float(_m5_cfg.get("smoothing_cell", 30.0))
+    _M5_SMOOTH_MARG = float(_m5_cfg.get("smoothing_marginal", 10.0))
+    _M5_RES_SCALE = float(_m5_cfg.get("residual_scale", 1.0))
+
+    print(
+        f"[Member 5] enabled. variant={_M5_VARIANT}  "
+        f"legacy(knn)[k={_M5_K} tau={_M5_TAU} ridge={_M5_RIDGE_ALPHA}]  "
+        f"residual[smooth_cell={_M5_SMOOTH_CELL} smooth_marg={_M5_SMOOTH_MARG} "
+        f"scale={_M5_RES_SCALE}]"
+    )
+
+# ---- Branch: residual_cluster variant (new default) ----------------------
+if CFG.get("member5", {}).get("enabled", False) and str(
+    CFG["member5"].get("variant", "residual_cluster")
+).lower() == "residual_cluster":
+    from src.member5_subject_cluster_residual import (
+        Member5ResidualState,
+        apply_state_batch as m5res_apply_state_batch,
+        fit_member5_residual,
+    )
+
+    _M5_KIND = "residual_cluster"
+    # We need per-row (subject_id, cluster_id, label) for train and val.
+    # These were already computed by section 9b-bis (the mean-encoded
+    # interaction features module), which builds _mef_train_cluster /
+    # _mef_val_cluster from `query_cluster_ids` AND the train/val
+    # subject_id arrays from indexer.subject_to_id.
+    _m5res_train_subj = np.fromiter(
+        (
+            int(indexer.subject_to_id.get(str(s), -1))
+            for s in primary.train["subject_key"]
+        ),
+        dtype=np.int64, count=len(primary.train),
+    )
+    _m5res_val_subj = np.fromiter(
+        (
+            int(indexer.subject_to_id.get(str(s), -1))
+            for s in primary.val["subject_key"]
+        ),
+        dtype=np.int64, count=len(primary.val),
+    )
+    _m5res_train_cluster = np.asarray(_mef_train_cluster, dtype=np.int64)
+    _m5res_val_cluster = np.asarray(_mef_val_cluster, dtype=np.int64)
+    _m5res_train_y = primary.train["label"].astype(float).to_numpy().astype(np.float64)
+
+    def _fit_member5_residual_global():
+        return fit_member5_residual(
+            subject_ids=_m5res_train_subj,
+            cluster_ids=_m5res_train_cluster,
+            labels=_m5res_train_y,
+            subject_keys=list(_subject_keys_ordered),
+            n_clusters=int(N_CLUSTERS_CTX),
+            smoothing_cell=_M5_SMOOTH_CELL,
+            smoothing_marginal=_M5_SMOOTH_MARG,
+            residual_scale=_M5_RES_SCALE,
+            seed=int(SEED),
+        )
+
+    member5_state = cache_or_compute(
+        "member5_residual_state",
+        key_inputs=(
+            "m5_residual_v1",
+            int(len(primary.train)),
+            int(indexer.n_subjects),
+            int(N_CLUSTERS_CTX),
+            round(_M5_SMOOTH_CELL, 4),
+            round(_M5_SMOOTH_MARG, 4),
+            round(_M5_RES_SCALE, 4),
+            int(SEED),
+        ),
+        compute_fn=_fit_member5_residual_global,
+    )
+    print(
+        f"[Member 5/residual] state: n_subjects={member5_state.n_subjects:,}  "
+        f"n_clusters={member5_state.n_clusters:,}  "
+        f"smoothing_cell={member5_state.smoothing_cell:.1f}  "
+        f"global_mean_logit={member5_state.global_mean_logit:+.4f}  "
+        f"train_loss(sample)={member5_state.train_loss:.5f}  "
+        f"max|residual_logit|={float(np.max(np.abs(member5_state.residual_logit))):.3f}  "
+        f"mean|residual_logit|={float(np.mean(np.abs(member5_state.residual_logit))):.4f}"
+    )
+
+    # Val scoring -- pure lookup, fast.
+    p_member5_val = m5res_apply_state_batch(
+        member5_state,
+        subject_ids=_m5res_val_subj,
+        cluster_ids=_m5res_val_cluster,
+    )
+    nll_m5 = float(-(
+        ylab_val * np.log(np.clip(p_member5_val, 1e-6, 1 - 1e-6))
+        + (1 - ylab_val) * np.log(1 - np.clip(p_member5_val, 1e-6, 1 - 1e-6))
+    ).mean())
+    print(
+        f"[Member 5/residual] val log-loss: {nll_m5:.6f}  "
+        f"p stats: min={float(p_member5_val.min()):.4f} "
+        f"mean={float(p_member5_val.mean()):.4f} "
+        f"max={float(p_member5_val.max()):.4f}"
+    )
+    # Sanity: if val NLL is worse than the prior, the residual is wrong.
+    _p_prior_m5 = float(np.clip(ylab_val.mean(), 1e-6, 1 - 1e-6))
+    _nll_prior_m5 = -(
+        _p_prior_m5 * math.log(_p_prior_m5)
+        + (1 - _p_prior_m5) * math.log(1 - _p_prior_m5)
+    )
+    if nll_m5 > _nll_prior_m5 + 0.01:
+        print(
+            f"  >>> WARNING: Member 5/residual val NLL {nll_m5:.4f} is "
+            f"worse than prior {_nll_prior_m5:.4f}; check cluster/subject "
+            "id alignment."
+        )
+    else:
+        print(
+            f"  [OK] beats prior NLL {_nll_prior_m5:.4f} by "
+            f"{_nll_prior_m5 - nll_m5:+.4f} nats"
+        )
+
+# ---- Branch: legacy difficulty_knn variant -------------------------------
+_M5_RUN_DIFFICULTY = (
+    CFG.get("member5", {}).get("enabled", False)
+    and str(CFG["member5"].get("variant", "residual_cluster")).lower()
+        == "difficulty_knn"
+)
+if _M5_RUN_DIFFICULTY:
     from src.member5_difficulty_knn import (
         Member5State,
         assert_projection_disjoint_from_val,
@@ -3306,19 +2915,7 @@ if CFG.get("member5", {}).get("enabled", False):
         fit_member5,
     )
 
-    _m5_cfg = CFG["member5"]
-    _M5_ENABLED = True
-    _M5_K = int(_m5_cfg.get("k", 32))
-    _M5_TAU = float(_m5_cfg.get("tau", 0.05))
-    _M5_RIDGE_ALPHA = float(_m5_cfg.get("ridge_alpha", 10.0))
-    _M5_ITEM_FB_WEIGHT = float(_m5_cfg.get("item_fallback_weight", 0.3))
-    _M5_MIN_SUBJ_PER_ITEM = int(_m5_cfg.get("min_subjects_per_item", 3))
-    _M5_GATE4D_SAMPLE_SIZE = int(_m5_cfg.get("gate4d_sample_size", 64))
-
-    print(
-        f"[Member 5] enabled. k={_M5_K} tau={_M5_TAU} ridge_alpha={_M5_RIDGE_ALPHA} "
-        f"item_fb_w={_M5_ITEM_FB_WEIGHT} min_subj_per_item={_M5_MIN_SUBJ_PER_ITEM}"
-    )
+    _M5_KIND = "difficulty_knn"
 
     # --- Gate 4c (global): projection-leakage probe vs val items ---
     # Member 5 is FIT on `train_item_keys` only; val items are excluded
@@ -3485,8 +3082,12 @@ if CFG.get("member5", {}).get("enabled", False):
     # own stack from item_emb_lookup, the same way Member 3 does.
     del _m5_val_item_emb
     gc.collect()
-else:
+
+# ---- Disabled branch: bind all the names so downstream cells don't NameError.
+if not CFG.get("member5", {}).get("enabled", False):
     _M5_ENABLED = False
+    _M5_VARIANT = "disabled"
+    _M5_KIND = "disabled"
     member5_state = None
     p_member5_val = None
     nll_m5 = float("nan")
@@ -3550,7 +3151,7 @@ def _fit_member4():
         early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
         seed=SEED,
         val_fraction=0.1,
-        holdout_group_id=gbdt_train_item_id,
+        holdout_group_id=holdout_item_id,
     )
 
 
@@ -3585,6 +3186,127 @@ if nll_m4 > _nll_prior + 0.01:
           f"{_nll_prior:.4f}. Saturation likely. Check feature scales / lr.")
 else:
     print(f"  [OK] beats prior NLL {_nll_prior:.4f} by {_nll_prior - nll_m4:+.4f} nats")
+
+# %% [markdown]
+# ## 9e-ter. Train Member 6 (Field-weighted Factorization Machine)
+#
+# FwFM consumes the SAME hybrid feature matrix Member 4 uses
+# (X_train_dense_m4, shape ``[N_train, 1216]``); the inductive
+# difference vs M4 is the bilinear ``sum_{i<j} r[F(i), F(j)]
+# <v_i, v_j> x_i x_j`` interaction term. None of M1 / M3 / M4 can
+# express that on its own (M1 only via deep nonlinearity of the
+# embedding; M3 via cosine kNN which is locally-constant; M4 strictly
+# additive linear). The fit shares the M4 dense matrices so we do not
+# allocate a second 16 GB / 3 GB copy.
+#
+# field_split_mode="single" treats every column as one field -> classic
+# FM with a single scalar r[0, 0]. field_split_mode="embedding_vs_marginal"
+# splits at the boundary between the M2-style embedding columns and the
+# 14 mean-encoded marginal columns -> a 2-field FwFM that can up- or
+# down-weight cross-bucket interactions vs within-bucket.
+
+# %%
+_M6_ENABLED = bool(CFG.get("member6", {}).get("enabled", False))
+if _M6_ENABLED:
+    from src.fwfm_member import (
+        FwFMState,
+        apply_state_batch as fwfm_apply_state_batch,
+        fit_fwfm_member,
+    )
+
+    _m6_cfg = CFG["member6"]
+    _M6_K = int(_m6_cfg.get("k", 8))
+    _M6_LR = float(_m6_cfg.get("learning_rate", 1.0e-3))
+    _M6_WD_W = float(_m6_cfg.get("weight_decay_w", 1.0e-5))
+    _M6_WD_V = float(_m6_cfg.get("weight_decay_V", 1.0e-4))
+    _M6_WD_R = float(_m6_cfg.get("weight_decay_r", 1.0e-4))
+    _M6_EPOCHS = int(_m6_cfg.get("epochs", 40))
+    _M6_BS = int(_m6_cfg.get("batch_size", 16384))
+    _M6_PATIENCE = int(_m6_cfg.get("early_stopping_patience", 5))
+    _M6_VAL_FRAC = float(_m6_cfg.get("val_fraction", 0.1))
+    _M6_FIELD_MODE = str(_m6_cfg.get("field_split_mode", "embedding_vs_marginal")).lower()
+
+    _F_M4_TOTAL = int(X_train_dense_m4.shape[1])
+    _F_M4_BASE = int(member_feat_schema.feature_dim)
+    if _M6_FIELD_MODE == "single":
+        _m6_field_ids = np.zeros(_F_M4_TOTAL, dtype=np.int32)
+        _m6_n_fields = 1
+    elif _M6_FIELD_MODE == "embedding_vs_marginal":
+        _m6_field_ids = np.zeros(_F_M4_TOTAL, dtype=np.int32)
+        _m6_field_ids[_F_M4_BASE:] = 1
+        _m6_n_fields = 2
+    else:
+        raise ValueError(
+            f"CFG['member6']['field_split_mode']={_M6_FIELD_MODE!r} not in "
+            "{'single', 'embedding_vs_marginal'}"
+        )
+    print(
+        f"[Member 6] FwFM enabled. X cols={_F_M4_TOTAL}  k={_M6_K}  "
+        f"field_split={_M6_FIELD_MODE} -> n_fields={_m6_n_fields}  "
+        f"lr={_M6_LR}  wd_w={_M6_WD_W} wd_V={_M6_WD_V} wd_r={_M6_WD_R}  "
+        f"epochs={_M6_EPOCHS} batch={_M6_BS} patience={_M6_PATIENCE}"
+    )
+
+    def _fit_member6():
+        return fit_fwfm_member(
+            X=X_train_dense_m4,
+            y=y_train,
+            feature_names=member4_feature_names,
+            field_ids=_m6_field_ids,
+            k=_M6_K,
+            learning_rate=_M6_LR,
+            weight_decay_w=_M6_WD_W,
+            weight_decay_V=_M6_WD_V,
+            weight_decay_r=_M6_WD_R,
+            epochs=_M6_EPOCHS,
+            batch_size=_M6_BS,
+            val_fraction=_M6_VAL_FRAC,
+            early_stopping_patience=_M6_PATIENCE,
+            seed=int(SEED),
+            standardize=True,
+            holdout_group_id=holdout_item_id,
+        )
+
+    fwfm_state = cache_or_compute(
+        "fwfm_state",
+        key_inputs=(
+            "m6_fwfm_v1",
+            int(X_train_dense_m4.shape[1]), len(primary.train), int(SEED),
+            int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
+            round(_M6_LR, 6), round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
+            int(_M6_EPOCHS), int(_M6_BS), int(_M6_PATIENCE),
+            round(_M6_VAL_FRAC, 4),
+        ),
+        compute_fn=_fit_member6,
+    )
+    p_member6_val = fwfm_apply_state_batch(fwfm_state, X_val_dense_m4)
+    nll_m6 = float(-(
+        ylab_val * np.log(np.clip(p_member6_val, 1e-6, 1 - 1e-6))
+        + (1 - ylab_val) * np.log(1 - np.clip(p_member6_val, 1e-6, 1 - 1e-6))
+    ).mean())
+    print(
+        f"[Member 6] val log-loss: {nll_m6:.6f}  "
+        f"||w||={float(np.linalg.norm(fwfm_state.w)):.3f}  "
+        f"||V||={float(np.linalg.norm(fwfm_state.V)):.3f}  "
+        f"r={np.round(fwfm_state.r, 3).tolist()}  w0={fwfm_state.w0:+.3f}  "
+        f"fit_method={fwfm_state.fit_method}"
+    )
+    if nll_m6 > _nll_prior + 0.01:
+        print(
+            f"  >>> WARNING: Member 6 val NLL {nll_m6:.4f} is worse than "
+            f"prior {_nll_prior:.4f}. The bilinear regularization may be "
+            "too weak / strong, or k is wrong for this scale."
+        )
+    else:
+        print(
+            f"  [OK] beats prior NLL {_nll_prior:.4f} by "
+            f"{_nll_prior - nll_m6:+.4f} nats"
+        )
+else:
+    fwfm_state = None
+    p_member6_val = None
+    nll_m6 = float("nan")
+    print("[Member 6] DISABLED via CFG['member6']['enabled']=False")
 
 # %% [markdown]
 # ## 9e-bis. Pre-OOF memory reclamation
@@ -3721,24 +3443,21 @@ centroid_dist_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="centroid_dist_o
 if _M5_ENABLED:
     p5_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p5_train_oof")
     # Per-fold Gate 4c results (printed in aggregate after the loop).
+    # Only the difficulty_knn variant populates this; the residual_cluster
+    # variant uses categorical ids only and has no projection-leakage
+    # surface, so its per-fold dict stays empty.
     _gate4c_per_fold: dict[int, dict] = {}
 else:
     p5_train_oof_acc = None
     _gate4c_per_fold = {}
 
-# Task 3 (Member 2 v2): accumulate per-row OOF subject_mean (computed
-# from each fold's train labels only) so the GLOBAL Member 2 fit in
-# section 9.5c can use it as an honest init_score anchor. Per-fold
-# Gate 3a results are tracked in a separate dict for the post-loop
-# summary print.
-if _M2V2_ENABLED:
-    subject_mean_train_oof_acc = OofPredictionAccumulator(
-        _N_TRAIN, name="subject_mean_train_oof"
-    )
-    _gate3a_per_fold: dict[int, dict] = {}
+# Member 6 (FwFM) OOF accumulator -- created only when M6 is enabled.
+_M6_ENABLED = bool(CFG.get("member6", {}).get("enabled", False))
+if _M6_ENABLED:
+    p6_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p6_train_oof")
 else:
-    subject_mean_train_oof_acc = None
-    _gate3a_per_fold = {}
+    p6_train_oof_acc = None
+
 
 # Gate 1b tracker: for each fold we'll save a sample of OOF-row top-k
 # neighbor item_keys so we can assert (after the loop) that none of them
@@ -3958,101 +3677,6 @@ for fold in folds:
     del fold_mean_encoded_stats
     gc.collect()
 
-    # ----- Fold subject_mean table + Gate 3a + Member 2 v2 features (Task 3) -----
-    if _M2V2_ENABLED:
-        print(f"[OOF f{fold.fold_id}] Fitting fold subject_mean table (Task 3 Member 2 v2)...")
-        fold_subject_mean_table = fit_subject_mean_table(
-            subject_ids=_mef_subj_fold_train,
-            labels=_y_fold_train,
-            n_subjects=int(indexer.n_subjects),
-            smoothing=_M2V2_SMOOTHING,
-        )
-        # Per-row subject_mean anchors. fold-train anchor is in-sample (matches
-        # standard training-time anchor convention; fold-train rows ARE the
-        # training set for this fold's Member 2). fold-OOF anchor is OUT OF
-        # FOLD by construction -- fold_subject_mean_table was fit on
-        # fold-train labels only, and fold-OOF subjects are queried against
-        # that table without their own labels having contributed to it.
-        subject_mean_train_fold = apply_subject_mean(
-            fold_subject_mean_table, _mef_subj_fold_train,
-        ).astype(np.float64)
-        subject_mean_oof_fold = apply_subject_mean(
-            fold_subject_mean_table, _mef_subj_fold_oof,
-        ).astype(np.float64)
-
-        # Gate 3a (RED-TEAM): assert subject_mean_oof_fold was computed from
-        # the fold-train table (not the global table). Catches the failure
-        # mode where someone uses subject_mean_table_global for fold OOF
-        # anchors -- that table includes fold-OOF labels in its aggregates
-        # which would let the GBDT trivially recover the label.
-        _gate3a_result = assert_oof_subject_mean(
-            subject_mean_oof_for_fold=subject_mean_oof_fold,
-            fold_subject_ids=_mef_subj_fold_oof,
-            fold_train_subject_mean_table=fold_subject_mean_table,
-        )
-        _gate3a_per_fold[int(fold.fold_id)] = _gate3a_result
-        # Diagnostic: mean abs delta between fold-train table and global table
-        # on this fold's OOF rows. Should be small but NONZERO (if exactly
-        # zero, the fold table somehow used the global label set -- bug).
-        _diff_vs_global = float(np.abs(
-            subject_mean_oof_fold
-            - apply_subject_mean(subject_mean_table_global, _mef_subj_fold_oof)
-        ).mean())
-        print(
-            f"  [Gate 3a fold {fold.fold_id}] PASS: "
-            f"{_gate3a_result['n_checked']:,} OOF rows checked, "
-            f"max_abs_delta={_gate3a_result['max_abs_delta']:.2e}, "
-            f"fold-vs-global mean abs diff on OOF rows={_diff_vs_global:.5f} "
-            "(nonzero confirms the fold table differs from the global table)"
-        )
-
-        # Build the Member 2 v2 feature matrices for fold-train and fold-OOF.
-        # OOM/compute discipline: when v4 or v5 is enabled the v2 GBDT will
-        # be SKIPPED below, so these matrices have no consumer and would
-        # burn ~280 MB (train) + ~140 MB (OOF) for nothing. Skip in that
-        # case so the per-fold loop stays tight.
-        if (not _M2V4_ENABLED) and (not _M2V5_ENABLED):
-            _fold_subj_obs_count_train_log1p = apply_subject_obs_count(
-                fold_subject_mean_table, _mef_subj_fold_train, log1p=True,
-            ).astype(np.float32)
-            _fold_subj_obs_count_oof_log1p = apply_subject_obs_count(
-                fold_subject_mean_table, _mef_subj_fold_oof, log1p=True,
-            ).astype(np.float32)
-            X_fold_train_m2v2 = build_member2_feature_matrix(
-                member2_v2_schema,
-                subject_ids=_mef_subj_fold_train,
-                cluster_ids=_mef_cluster_fold_train,
-                bc_ids=_mef_bc_fold_train,
-                bc_redacted_mask=bc_redacted_train[fold.train_row_idx].astype(np.float32),
-                subject_obs_count_log1p=_fold_subj_obs_count_train_log1p,
-                subject_cat_lookup=_m2v2_subj_cat_lookup,
-                subject_num_lookup=_m2v2_subj_num_lookup,
-                bench_cat_lookup=_m2v2_bench_cat_lookup,
-                bench_num_lookup=_m2v2_bench_num_lookup,
-                interaction_matrix=fold_member2_interaction_train.astype(np.float32),
-            )
-            X_fold_oof_m2v2 = build_member2_feature_matrix(
-                member2_v2_schema,
-                subject_ids=_mef_subj_fold_oof,
-                cluster_ids=_mef_cluster_fold_oof,
-                bc_ids=_mef_bc_fold_oof,
-                bc_redacted_mask=bc_redacted_train[fold.oof_row_idx].astype(np.float32),
-                subject_obs_count_log1p=_fold_subj_obs_count_oof_log1p,
-                subject_cat_lookup=_m2v2_subj_cat_lookup,
-                subject_num_lookup=_m2v2_subj_num_lookup,
-                bench_cat_lookup=_m2v2_bench_cat_lookup,
-                bench_num_lookup=_m2v2_bench_num_lookup,
-                interaction_matrix=fold_member2_interaction_oof.astype(np.float32),
-            )
-        else:
-            # v4 or v5 owns Member 2; v2 matrices are dead weight on this path.
-            X_fold_train_m2v2 = None
-            X_fold_oof_m2v2 = None
-        # Accumulate OOF subject_mean for the GLOBAL Member 2 v2 / v3 fit
-        # in 9.5c. Both v2 and v3 globals use it as the inference-time
-        # anchor for honest OOF training of the booster.
-        subject_mean_train_oof_acc.write_fold(fold.oof_row_idx, subject_mean_oof_fold)
-
     # ----- Fold X_train_dense / X_oof_dense (uses GLOBAL schema -- ack'd leak) -----
     # MEMORY DISCIPLINE: at full scale these are ~16 GB (train) + ~8 GB
     # (oof) per fold. On the Task 3 path the legacy Member 2 path is
@@ -4063,21 +3687,12 @@ for fold in folds:
     # Member 2 and Member 4, so build it eagerly there.
     _bc_redacted_fold_train = bc_redacted_train[fold.train_row_idx]
     _bc_redacted_fold_oof = bc_redacted_train[fold.oof_row_idx]
-    if _M2V2_ENABLED:
-        print(
-            f"[OOF f{fold.fold_id}] DEFERRING X_fold_*_dense build "
-            "(Task 3 path: only Member 4 consumes them; built JIT below)."
-        )
-        X_fold_train_dense = None
-        X_fold_oof_dense = None
-    else:
-        print(f"[OOF f{fold.fold_id}] Building fold X_*_dense (legacy path)...")
-        X_fold_train_dense = _build_X(
-            fold_train_df, nn_train_mat_fold, _bc_redacted_fold_train,
-        )
-        X_fold_oof_dense = _build_X(
-            fold_oof_df, nn_oof_mat_fold, _bc_redacted_fold_oof,
-        )
+    print(
+        f"[OOF f{fold.fold_id}] DEFERRING X_fold_*_dense build "
+        "(Member 4 consumes them; built JIT below)."
+    )
+    X_fold_train_dense = None
+    X_fold_oof_dense = None
     gc.collect()
     # ``X_fold_*_dense_m2`` / ``X_fold_*_dense_m4`` are built lazily below
     # near their consumer (see Member 2 legacy branch and Member 4 block).
@@ -4204,46 +3819,7 @@ for fold in folds:
         _fold_model.load_state_dict(_fold_ckpt["model_state"])
         _fold_model = _fold_model.to(device).eval()
         p_a_oof_fold = _score_dataset(_oof_ds_fold, _fold_model)
-        # Whether we need M1's predictions on every fold-train row:
-        #   - LEGACY Member 2 (no v2, no v4, no v5): yes -- residual anchor.
-        #   - v2-only (no v4/v5): no -- v2 uses subject_mean.
-        #   - v4 enabled (no v5): YES -- v4's tree consumes p_m1 as a per-row
-        #     feature.
-        #   - v5 enabled: NO -- v5 removes all M1-derived features by
-        #     design (the v3/v4 saturation fix). Skipping this scoring
-        #     pass also saves ~30-90s per fold of M1 inference.
-        _need_fold_train_m1_anchor = (
-            (not _M2V2_ENABLED) and (not _M2V5_ENABLED)
-        ) or (_M2V4_ENABLED and not _M2V5_ENABLED)
-        if _need_fold_train_m1_anchor:
-            # MEMORY: scoring all fold-train rows at once allocates a
-            # ~50 GB LookupDataset (rows * 4096 * 4 bytes). Chunk it so
-            # peak is ~chunk_rows * 4096 * 4 ~= 4 GB per chunk.
-            _chunk_rows_m1 = int(
-                CFG.get("member2_v4", {}).get("m1_chunk_rows", 256_000)
-            )
-            import time as _m1_time_local
-            p_a_anchor_fold_train = np.empty(len(fold_train_df), dtype=np.float32)
-            _m1_t0 = _m1_time_local.time()
-            for _cs in range(0, len(fold_train_df), _chunk_rows_m1):
-                _ce = min(_cs + _chunk_rows_m1, len(fold_train_df))
-                _chunk_df = fold_train_df.iloc[_cs:_ce]
-                _chunk_nn = nn_train_mat_fold[_cs:_ce]
-                _chunk_ds = _build(_chunk_df, _chunk_nn)
-                p_a_anchor_fold_train[_cs:_ce] = _score_dataset(
-                    _chunk_ds, _fold_model,
-                )
-                del _chunk_ds, _chunk_nn, _chunk_df
-                gc.collect()
-                if (_ce % (_chunk_rows_m1 * 2)) == 0 or _ce == len(fold_train_df):
-                    _rps = _ce / max(_m1_time_local.time() - _m1_t0, 1e-6)
-                    print(
-                        f"[OOF f{fold.fold_id}] M1 fold-train scoring "
-                        f"{_ce:,}/{len(fold_train_df):,} rows "
-                        f"({_rps:,.0f} rows/s)"
-                    )
-        else:
-            p_a_anchor_fold_train = None
+        p_a_anchor_fold_train = None
         _fold_model = _fold_model.to("cpu")
         del _fold_model, _oof_ds_fold
         gc.collect()
@@ -4251,13 +3827,7 @@ for fold in folds:
     else:
         # Use global p_a_train (saw all train items -- documented small leak).
         p_a_oof_fold = p_a_train[fold.oof_row_idx]
-        _need_fold_train_m1_anchor = (
-            (not _M2V2_ENABLED) and (not _M2V5_ENABLED)
-        ) or (_M2V4_ENABLED and not _M2V5_ENABLED)
-        if _need_fold_train_m1_anchor:
-            p_a_anchor_fold_train = p_a_train[fold.train_row_idx]
-        else:
-            p_a_anchor_fold_train = None
+        p_a_anchor_fold_train = None
     p_a_train_oof_acc.write_fold(fold.oof_row_idx, p_a_oof_fold)
 
     # The NN feature matrices are no longer needed *on the legacy
@@ -4275,707 +3845,72 @@ for fold in folds:
         del nn_train_mat_fold, nn_oof_mat_fold
         gc.collect()
 
-    # ----- Fold Member 2 (GBDT residual) -----
-    _y_fold_train_np = _y_fold_train
-    _gbdt_train_item_id_fold = np.array(
+    # ----- Fold Member 2 (metadata MLP) -----
+    print(f"[OOF f{fold.fold_id}] Training fold Member 2 (metadata MLP)...")
+    _m2_holdout_fold = np.array(
         [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
         dtype=np.int64,
     )
-    if _M2V5_ENABLED:
-        # Task v5: direct-binary GBDT on the v5 feature set (no M1, no
-        # subject_mean as anchor). 49 features = 19 item content + 9
-        # honest counts + 8 mean-encoded passrates + 6 unknown flags +
-        # 7 NN aggregates. Trained as a binary classifier on y directly
-        # -- no init_score, no residual framing, output = sigmoid(tree_raw).
-        # The literature-standard cold-start tree recipe (Facebook 2014;
-        # LightGBM PR #3234; Wang 2023; AliBoost 2025).
-        print(
-            f"[OOF f{fold.fold_id}] Training fold Member 2 v5 "
-            f"(direct-binary GBDT, F={M2V5_FEATURE_DIM} features = item attrs "
-            "+ counts + meanenc + NN aggregates, NO M1 features)..."
-        )
-        # Vocab sizing: same canonical bounds as v3/v4 -- the conditional
-        # passrate context auto-grew clusters beyond CFG['clustering']['k']
-        # in fold 0 (64 -> 65), and bc ids can drift if OOF subjects
-        # touch unseen benchmarks. Bound n_subjects / n_clusters / n_bcs
-        # by ``max(declared, observed_max + 1)`` over fold-train + fold-OOF
-        # ids so the builder never raises on undersized vocab.
-        def _safe_n_ids_v5(declared_lb, *id_arrs):
-            n = int(declared_lb)
-            for arr in id_arrs:
-                arr = np.asarray(arr)
-                if arr.size > 0 and bool((arr >= 0).any()):
-                    n = max(n, int(arr.max()) + 1)
-            return n
-        _fold_v5_n_subjects = _safe_n_ids_v5(
-            int(indexer.n_subjects),
-            _mef_subj_fold_train, _mef_subj_fold_oof,
-        )
-        _fold_v5_n_clusters = _safe_n_ids_v5(
-            int(fold_cond_context.n_clusters),
-            _mef_cluster_fold_train, _mef_cluster_fold_oof,
-        )
-        _fold_v5_n_bcs = _safe_n_ids_v5(
-            int(indexer.n_bc),
-            _mef_bc_fold_train, _mef_bc_fold_oof,
-        )
-        # 1. Fit the v5 feature builder on fold-train (per-id obs counts +
-        #    Bayes-shrunk mean-encoded passrates + 2-D cell counts/means,
-        #    restricted to this fold's training rows so OOF rows are
-        #    NEVER in the aggregates).
-        _fold_v5_builder = fit_member2_v5_feature_builder(
+    _m2_fold_n_clusters = max(
+        int(_N_CLUSTERS_ME),
+        int(_mef_cluster_fold_train.max()) + 1 if _mef_cluster_fold_train.size else 0,
+        int(_mef_cluster_fold_oof.max()) + 1 if _mef_cluster_fold_oof.size else 0,
+    )
+
+    def _fit_fold_m2_mlp(_ff=fold):
+        return fit_member2_metadata_mlp(
             subject_ids=_mef_subj_fold_train,
-            cluster_ids=_mef_cluster_fold_train,
             bc_ids=_mef_bc_fold_train,
-            labels=_y_fold_train_np,
-            n_subjects=_fold_v5_n_subjects,
-            n_clusters=_fold_v5_n_clusters,
-            n_bcs=_fold_v5_n_bcs,
-            n_macro_families=int(N_MACRO_FAMILIES),
-            n_organizations=int(N_ORGANIZATIONS),
-            n_families=int(N_FAMILIES),
-            subject_to_macro_family_id=s2macro,
-            subject_to_organization_id=s2org,
-            subject_to_family_id=s2fam,
-            smoothing=_M2V5_SMOOTHING,
-        )
-        # 2. Materialize per-row pool/age/NN/PCA inputs for fold-train.
-        _v5_pool_train = _m2v5_pool_for_rows(fold_train_df)
-        _v5_age_train = _m2v5_age_for_rows(fold_train_df)
-        _v5_pca_train = _m2v5_pca_for_rows(fold_train_df)
-        X_v5_fold_train = build_member2_v5_features(
-            _fold_v5_builder,
-            subject_ids=_mef_subj_fold_train,
             cluster_ids=_mef_cluster_fold_train,
-            bc_ids=_mef_bc_fold_train,
-            bc_redacted_mask=bc_redacted_train[fold.train_row_idx].astype(np.float32),
-            pool_features=_v5_pool_train,
-            benchmark_age=_v5_age_train,
-            nn_features_matrix=nn_train_mat_fold,
-            item_pca_features=_v5_pca_train,
-        )
-        del _v5_pool_train, _v5_age_train, _v5_pca_train
-        gc.collect()
-        # 3. Cache key with FULL content fingerprints. The prefix bump
-        #    to ``v5b_attr_nn_pca_v1`` makes any pre-v5b cache entry
-        #    (49-col schema) impossible to load on top of the new 81-
-        #    col schema; the PCA digest invalidates if the embedding
-        #    PCA refits to different components on the same input.
-        import hashlib as _m2v5_hashlib
-        _m2v5_feat_names_hash = _m2v5_hashlib.sha256(
-            "\0".join(MEMBER2_V5_FEATURE_NAMES).encode("utf-8")
-        ).hexdigest()[:16]
-        _m2v5_X_train_hash = _m2v5_hashlib.sha256(
-            np.ascontiguousarray(X_v5_fold_train, dtype=np.float32).tobytes()
-        ).hexdigest()[:16]
-        _fold_gbdt_state = cache_or_compute(
-            "gbdt_state_oof_fold",
-            key_inputs=(
-                "gbdt_oof_v5b_attr_nn_pca_v1",
-                fold.fold_id, fold_suffix,
-                int(M2V5_FEATURE_DIM), int(X_v5_fold_train.shape[0]),
-                int(SEED),
-                round(float(_M2V5_SMOOTHING), 4),
-                int(M2V5_PCA_DIMS),
-                _v5_pca_digest,
-                _m2v5_feat_names_hash,
-                _m2v5_X_train_hash,
-            ),
-            compute_fn=lambda _ff=fold: fit_gbdt_member(
-                X=X_v5_fold_train,
-                y=_y_fold_train_np,
-                feature_names=MEMBER2_V5_FEATURE_NAMES,
-                # Direct binary: no init_score, output_mode='probability',
-                # apply via gbdt_apply_batch.
-                init_pred_train=None,
-                holdout_group_id=_gbdt_train_item_id_fold,
-                # v5b defaults: regularization relaxed so the tree can
-                # actually exploit the 32-D PCA bucket. min_data_in_leaf
-                # 500 -> 100 (still constrains saturation: the binary
-                # objective's bounded leaf magnitude is the primary
-                # guardrail, not the leaf size cap); num_leaves 31 -> 63;
-                # early_stopping_rounds 30 -> 100 (PCA-fed trees take
-                # more iterations to plateau than the count-only trees
-                # in v5a); n_estimators 400 -> 800 to match.
-                n_estimators=int(
-                    CFG.get("member2_v5", {}).get("n_estimators", 800)
-                ),
-                learning_rate=float(
-                    CFG.get("member2_v5", {}).get("learning_rate", 0.05)
-                ),
-                num_leaves=int(
-                    CFG.get("member2_v5", {}).get("num_leaves", 63)
-                ),
-                min_data_in_leaf=int(
-                    CFG.get("member2_v5", {}).get("min_data_in_leaf", 100)
-                ),
-                feature_fraction=float(
-                    CFG.get("member2_v5", {}).get("feature_fraction", 0.8)
-                ),
-                bagging_fraction=float(
-                    CFG.get("member2_v5", {}).get("bagging_fraction", 0.8)
-                ),
-                bagging_freq=int(
-                    CFG.get("member2_v5", {}).get("bagging_freq", 5)
-                ),
-                early_stopping_rounds=int(
-                    CFG.get("member2_v5", {}).get("early_stopping_rounds", 100)
-                ),
-                seed=int(SEED) + 100 * (int(_ff.fold_id) + 1) + 17,
-            ),
-        )
-        # Defense-in-depth: a v2/v3 residual state must never be applied
-        # via gbdt_apply_batch. The prefix change makes a collision very
-        # unlikely, but if a stale state somehow squeaks through the cache
-        # key, warn loudly and surface it.
-        import warnings as _v5_state_warn
-        if str(_fold_gbdt_state.output_mode) != "probability":
-            _v5_state_warn.warn(
-                f"Expected _fold_gbdt_state.output_mode='probability' (v5 "
-                f"direct binary), got {_fold_gbdt_state.output_mode!r}. "
-                "A stale residual_logit state may have been loaded -- "
-                "delete the matching gbdt_state_oof_fold__*.pkl cache "
-                "entry and rerun. Continuing anyway; predictions on "
-                "this fold may be corrupted."
-            )
-        # Free the train-side X matrix BEFORE building the OOF one so peak
-        # memory is one X matrix at a time.
-        del X_v5_fold_train
-        gc.collect()
-        _v5_pool_oof = _m2v5_pool_for_rows(fold_oof_df)
-        _v5_age_oof = _m2v5_age_for_rows(fold_oof_df)
-        _v5_pca_oof = _m2v5_pca_for_rows(fold_oof_df)
-        X_v5_fold_oof = build_member2_v5_features(
-            _fold_v5_builder,
-            subject_ids=_mef_subj_fold_oof,
-            cluster_ids=_mef_cluster_fold_oof,
-            bc_ids=_mef_bc_fold_oof,
-            bc_redacted_mask=bc_redacted_train[fold.oof_row_idx].astype(np.float32),
-            pool_features=_v5_pool_oof,
-            benchmark_age=_v5_age_oof,
-            nn_features_matrix=nn_oof_mat_fold,
-            item_pca_features=_v5_pca_oof,
-        )
-        del _v5_pool_oof, _v5_age_oof, _v5_pca_oof
-        gc.collect()
-        # v5 is a direct binary GBDT, so its raw output IS the probability.
-        p2_oof_fold = gbdt_apply_batch(_fold_gbdt_state, X_v5_fold_oof)
-        # Defense-in-depth: enforce 1-D + correct length so the OOF
-        # accumulator's per-fold write_fold (which sanity-checks shape)
-        # never sees a column-vector or off-length array.
-        p2_oof_fold = np.asarray(p2_oof_fold, dtype=np.float32).reshape(-1)
-        if p2_oof_fold.shape[0] != int(len(fold_oof_df)):
-            import warnings as _v5_pof_warn
-            _v5_pof_warn.warn(
-                f"[OOF f{fold.fold_id}] M2 v5 OOF length "
-                f"{p2_oof_fold.shape[0]} != fold_oof_df length "
-                f"{len(fold_oof_df)}. The accumulator write below will "
-                "raise a shape-mismatch error -- inspect the v5 builder "
-                "or the X_v5_fold_oof construction."
-            )
-        # Tier 3 diagnostic: print the booster fit summary so the user
-        # can see, per fold, whether v5b's GBDT is actually splitting on
-        # the new PCA features or still collapsing to the constant-mean
-        # baseline. If you see (a) std(p2_oof) < 0.01, or (b) zero PCA
-        # cols in the top-10 split count, the structural problem from
-        # v5a hasn't been resolved -- inspect the PCA matrix and consider
-        # raising pca_dim or lowering smoothing further.
-        _v5b_q = np.quantile(p2_oof_fold, [0.0, 0.01, 0.5, 0.99, 1.0])
-        print(
-            f"[Member 2 v5b f{fold.fold_id}] booster fit:  "
-            f"n_trees={int(_fold_gbdt_state.n_trees)}  "
-            f"train_NLL={float(_fold_gbdt_state.train_loss):.5f}  "
-            f"val_NLL={float(_fold_gbdt_state.val_loss):.5f}"
-        )
-        print(
-            f"[Member 2 v5b f{fold.fold_id}] OOF pred quantiles:  "
-            f"min={_v5b_q[0]:.4f}  p1={_v5b_q[1]:.4f}  "
-            f"p50={_v5b_q[2]:.4f}  p99={_v5b_q[3]:.4f}  "
-            f"max={_v5b_q[4]:.4f}  std={float(p2_oof_fold.std()):.4f}"
-        )
-        # Split-count "importance" from the compiled state. The GBDT
-        # walker stores feature indices in `feature_concat` with -1 at
-        # leaf nodes; counting non-leaf occurrences per feature gives
-        # a proxy for how often each column is used as a split. (LGBM
-        # `gain` importance would be richer but isn't preserved through
-        # the pure-NumPy walker compilation.)
-        _v5b_fc = np.asarray(_fold_gbdt_state.feature_concat).reshape(-1)
-        _v5b_split_counts = np.bincount(
-            _v5b_fc[_v5b_fc >= 0].astype(np.int64),
-            minlength=int(M2V5_FEATURE_DIM),
-        )
-        _v5b_top = np.argsort(_v5b_split_counts)[::-1][:10]
-        _v5b_total_splits = int(_v5b_split_counts.sum())
-        _v5b_pca_splits = int(
-            _v5b_split_counts[M2V5_BUCKET_D_END:M2V5_BUCKET_D_END + M2V5_PCA_DIMS].sum()
-        )
-        _v5b_pca_frac = (
-            float(_v5b_pca_splits) / max(_v5b_total_splits, 1)
-        )
-        print(
-            f"[Member 2 v5b f{fold.fold_id}] top-10 features by split count "
-            f"(of {_v5b_total_splits:,} total splits across "
-            f"{int(_fold_gbdt_state.n_trees)} trees):"
-        )
-        for _v5b_i in _v5b_top:
-            print(
-                f"    {MEMBER2_V5_FEATURE_NAMES[int(_v5b_i)]:36s} "
-                f"splits={int(_v5b_split_counts[int(_v5b_i)]):6d}"
-            )
-        print(
-            f"[Member 2 v5b f{fold.fold_id}] PCA-bucket usage:  "
-            f"{_v5b_pca_splits:,}/{_v5b_total_splits:,} splits "
-            f"({100.0 * _v5b_pca_frac:.1f}%) landed on item_pca_* "
-            f"columns; if this is <5% the PCA bucket is dead weight "
-            "and the structural fix didn't help."
-        )
-        del _v5b_q, _v5b_fc, _v5b_split_counts, _v5b_top
-        del X_v5_fold_oof
-        gc.collect()
-        # Gate 3d (NLL vs baseline) -- warn instead of halt so a borderline
-        # NLL doesn't kill the whole pipeline.
-        _p2_oof_clip = np.clip(p2_oof_fold, 1e-6, 1.0 - 1e-6)
-        _yfold_oof = fold_oof_df["label"].astype(float).to_numpy()
-        _p2_oof_nll = float(
-            -(_yfold_oof * np.log(_p2_oof_clip)
-              + (1.0 - _yfold_oof) * np.log(1.0 - _p2_oof_clip)).mean()
-        )
-        _p2_q = np.quantile(p2_oof_fold, [0.0, 0.01, 0.5, 0.99, 1.0])
-        _baseline_mean = float(_yfold_oof.mean())
-        _p2_baseline = float(
-            -(_baseline_mean * np.log(_baseline_mean)
-              + (1.0 - _baseline_mean) * np.log(1.0 - _baseline_mean))
-        )
-        # Gate 3e: structural orthogonality with M1. v5 has NO M1
-        # features so a sky-high corr is conceptually impossible, but
-        # we still track the number for diagnostic visibility.
-        _corr_v5_m1 = float(
-            np.corrcoef(p2_oof_fold.astype(np.float64),
-                        p_a_oof_fold.astype(np.float64))[0, 1]
-        )
-        print(
-            f"  [Gate 3d fold {fold.fold_id}] M2 v5 OOF NLL={_p2_oof_nll:.5f}  "
-            f"baseline(constant_mean)={_p2_baseline:.5f}  "
-            f"corr(M2v5, M1)={_corr_v5_m1:+.4f}  "
-            f"p2 quantiles min/1%/50%/99%/max="
-            f"{_p2_q[0]:.4f}/{_p2_q[1]:.4f}/{_p2_q[2]:.4f}/{_p2_q[3]:.4f}/{_p2_q[4]:.4f}"
-        )
-        if _p2_oof_nll > _p2_baseline + 0.05:
-            _v5_state_warn.warn(
-                f"Gate 3d WARN fold {fold.fold_id}: M2 v5 OOF NLL="
-                f"{_p2_oof_nll:.5f} is materially WORSE than the "
-                f"constant-mean baseline ({_p2_baseline:.5f}). With "
-                "v5's bounded-leaf direct-binary output this is "
-                "unexpected; inspect the feature pipeline. Continuing "
-                "anyway so the stacker can still down-weight Member 2."
-            )
-        if abs(_corr_v5_m1) > 0.995:
-            _v5_state_warn.warn(
-                f"Gate 3e WARN fold {fold.fold_id}: "
-                f"|corr(M2v5, M1)|={abs(_corr_v5_m1):.4f} > 0.995. "
-                "v5 has no M1 features so this is suspicious -- check "
-                "the per-id mean-encoding for accidental leakage."
-            )
-        del _p2_oof_clip, _yfold_oof, _p2_q, _baseline_mean, _p2_baseline
-        del _p2_oof_nll, _corr_v5_m1, _fold_v5_builder
-        gc.collect()
-    elif _M2V4_ENABLED:
-        # Task 3b: direct-binary GBDT on the v3 feature set. Same 25
-        # features as v3 (p_m1 + subject_mean + per-id obs counts /
-        # mean-encoded passrates + unknown_* flags) but trained as a
-        # binary classifier on y directly -- no init_score, no
-        # residual framing, output = sigmoid(tree_raw). This eliminates
-        # v3's blow-up failure mode (composed (anchor_logit + tree_logit)
-        # producing 0.997-confident predictions on rows where the
-        # leaf's labels averaged 0.5) by construction: a binary-objective
-        # leaf output is bounded by in-leaf label averages, so the
-        # worst-case calibration error is on the same order as v2's
-        # OOF NLL ~ 0.69, not v3's blow-up ~ 0.78+.
-        print(
-            f"[OOF f{fold.fold_id}] Training fold Member 2 v4 "
-            f"(direct-binary GBDT, F={M2V3_FEATURE_DIM} features incl. p_m1 + subject_mean)..."
-        )
-        # Sanity: v4 needs M1's per-row prediction on fold-train rows
-        # because it appears as a feature in the v3 builder. We force
-        # the scoring above when _M2V4_ENABLED, so this should always pass.
-        if p_a_anchor_fold_train is None or len(p_a_anchor_fold_train) != len(fold_train_df):
-            raise RuntimeError(
-                f"v4 needs p_a_anchor_fold_train sized {len(fold_train_df)}; "
-                f"got {None if p_a_anchor_fold_train is None else len(p_a_anchor_fold_train)}. "
-                "Check the M1-anchor scoring branch above (_need_fold_train_m1_anchor)."
-            )
-        # 1. Fit the v3 feature builder on fold-train (per-id obs counts +
-        #    shrunken passrates, restricted to this fold's training rows
-        #    so OOF rows are NEVER in the aggregates).
-        #
-        # Vocab sizing: the clustering's CFG['clustering']['k']
-        # (N_CLUSTERS_CTX) is a LOWER bound -- ``build_conditional_passrate_context``
-        # auto-grows it when the k-means partition produces an extra
-        # cluster (we've seen 64 -> 65 in fold 0). Use
-        # ``fold_cond_context.n_clusters`` which already encodes the
-        # grown size, and also include the OOF cluster ids in the max
-        # so the same builder safely scores fold-OOF rows below.
-        # Bound n_bcs the same way against observed train+OOF ids.
-        def _safe_n_ids(declared_lb, *id_arrs):
-            n = int(declared_lb)
-            for arr in id_arrs:
-                arr = np.asarray(arr)
-                if arr.size > 0 and bool((arr >= 0).any()):
-                    n = max(n, int(arr.max()) + 1)
-            return n
-        _fold_v3_n_clusters = _safe_n_ids(
-            int(fold_cond_context.n_clusters),
-            _mef_cluster_fold_train, _mef_cluster_fold_oof,
-        )
-        _fold_v3_n_bcs = _safe_n_ids(
-            int(indexer.n_bc),
-            _mef_bc_fold_train, _mef_bc_fold_oof,
-        )
-        _fold_v3_builder = fit_member2_v3_feature_builder(
-            subject_ids=_mef_subj_fold_train,
-            cluster_ids=_mef_cluster_fold_train,
-            bc_ids=_mef_bc_fold_train,
-            labels=_y_fold_train_np,
+            marginals=fold_member4_marginal_train.astype(np.float32, copy=False),
+            y=_y_fold_train,
+            subject_keys=_subject_keys_ordered,
+            bc_keys=_bc_keys_ordered,
+            marg_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
             n_subjects=int(indexer.n_subjects),
-            n_clusters=_fold_v3_n_clusters,
-            n_bcs=_fold_v3_n_bcs,
-            n_macro_families=int(N_MACRO_FAMILIES),
-            n_organizations=int(N_ORGANIZATIONS),
-            n_families=int(N_FAMILIES),
-            subject_to_macro_family_id=s2macro,
-            subject_to_organization_id=s2org,
-            subject_to_family_id=s2fam,
-            smoothing=_M2V4_SMOOTHING,
+            n_bcs=int(indexer.n_bc),
+            n_clusters=int(_m2_fold_n_clusters),
+            d_subj=int(_m2_cfg.get("d_subj", 32)),
+            d_bc=int(_m2_cfg.get("d_bc", 32)),
+            d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+            hid1=int(_m2_cfg.get("hid1", 256)),
+            hid2=int(_m2_cfg.get("hid2", 128)),
+            learning_rate=float(_m2_cfg.get("learning_rate", 1.0e-3)),
+            weight_decay=float(_m2_cfg.get("weight_decay", 1.0e-5)),
+            epochs=int(_m2_cfg.get("epochs", 40)),
+            batch_size=int(_m2_cfg.get("batch_size", 16384)),
+            val_fraction=float(_m2_cfg.get("val_fraction", 0.1)),
+            early_stopping_patience=int(_m2_cfg.get("early_stopping_patience", 5)),
+            cat_dropout_subject=float(_m2_cfg.get("cat_dropout_subject", 0.05)),
+            cat_dropout_bc=float(_m2_cfg.get("cat_dropout_bc", 0.10)),
+            cat_dropout_cluster=float(_m2_cfg.get("cat_dropout_cluster", 0.10)),
+            feat_dropout=float(_m2_cfg.get("feat_dropout", 0.10)),
+            seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
+            holdout_group_id=_m2_holdout_fold,
+            show_progress=False,
         )
-        # 2. Materialize the v3 feature matrix for fold-train rows.
-        X_v3_fold_train = build_member2_v3_features(
-            _fold_v3_builder,
-            p_m1=p_a_anchor_fold_train,
-            subject_mean=subject_mean_train_fold,
-            subject_ids=_mef_subj_fold_train,
-            cluster_ids=_mef_cluster_fold_train,
-            bc_ids=_mef_bc_fold_train,
-            bc_redacted_mask=bc_redacted_train[fold.train_row_idx].astype(np.float32),
-        )
-        # 3. Cache key with FULL content fingerprints. Same defense-in-depth
-        #    as the v2 strengthening: shape alone hides feature-pipeline
-        #    drift, and a cache HIT on stale state silently corrupts the
-        #    stacker (the v2 0.778 NLL bug).
-        import hashlib as _m2v3_hashlib
-        _m2v3_feat_names_hash = _m2v3_hashlib.sha256(
-            "\0".join(MEMBER2_V3_FEATURE_NAMES).encode("utf-8")
-        ).hexdigest()[:16]
-        _m2v3_X_train_hash = _m2v3_hashlib.sha256(
-            np.ascontiguousarray(X_v3_fold_train, dtype=np.float32).tobytes()
-        ).hexdigest()[:16]
-        _m2v3_anchor_hash = _m2v3_hashlib.sha256(
-            np.ascontiguousarray(subject_mean_train_fold, dtype=np.float64).tobytes()
-        ).hexdigest()[:16]
-        _m2v3_pm1_hash = _m2v3_hashlib.sha256(
-            np.ascontiguousarray(p_a_anchor_fold_train, dtype=np.float32).tobytes()
-        ).hexdigest()[:16]
-        _fold_gbdt_state = cache_or_compute(
-            "gbdt_state_oof_fold",
-            key_inputs=(
-                # ``v4_direct_v1`` is distinct from any v2/v3 key prefix
-                # so old residual entries don't collide. Bump the suffix
-                # here when changing the v3 feature schema or v4 GBDT
-                # hyperparams below.
-                "gbdt_oof_v4_direct_v1",
-                fold.fold_id, fold_suffix,
-                int(M2V3_FEATURE_DIM), int(X_v3_fold_train.shape[0]),
-                int(SEED),
-                round(float(_M2V4_SMOOTHING), 4),
-                _m2v3_feat_names_hash,
-                _m2v3_X_train_hash,
-                _m2v3_anchor_hash,
-                _m2v3_pm1_hash,
-            ),
-            compute_fn=lambda _ff=fold: fit_gbdt_member(
-                X=X_v3_fold_train,
-                y=_y_fold_train_np,
-                feature_names=MEMBER2_V3_FEATURE_NAMES,
-                # init_pred_train=None -> standard binary objective,
-                # output_mode='probability', apply via gbdt_apply_batch.
-                # See gbdt_member.fit_gbdt_member docstring on residual
-                # mode for why this matters: with init_pred_train set,
-                # the tree learns logit-residuals on top of a per-row
-                # anchor and a wrong leaf can compose to an extreme
-                # probability. Direct binary mode is bounded.
-                init_pred_train=None,
-                holdout_group_id=_gbdt_train_item_id_fold,
-                # Tighter than v2: 25 features overfit easily without
-                # aggressive regularization. min_data_in_leaf bumped to
-                # 500 and num_leaves halved to 15 (vs v2/v3 defaults)
-                # to keep per-leaf label averages stable -- this is what
-                # bounds the binary-objective leaf output and makes v4
-                # safe against the v3 blow-up.
-                n_estimators=int(
-                    CFG.get("member2_v4", {}).get("n_estimators", 300)
-                ),
-                learning_rate=float(
-                    CFG.get("member2_v4", {}).get("learning_rate", 0.05)
-                ),
-                num_leaves=int(
-                    CFG.get("member2_v4", {}).get("num_leaves", 15)
-                ),
-                min_data_in_leaf=int(
-                    CFG.get("member2_v4", {}).get("min_data_in_leaf", 500)
-                ),
-                feature_fraction=float(
-                    CFG.get("member2_v4", {}).get("feature_fraction", 0.9)
-                ),
-                bagging_fraction=float(
-                    CFG.get("member2_v4", {}).get("bagging_fraction", 0.8)
-                ),
-                bagging_freq=int(
-                    CFG.get("member2_v4", {}).get("bagging_freq", 5)
-                ),
-                early_stopping_rounds=int(
-                    CFG.get("member2_v4", {}).get("early_stopping_rounds", 30)
-                ),
-                seed=int(SEED) + 100 * (int(_ff.fold_id) + 1) + 17,
-            ),
-        )
-        # Defense-in-depth: a v3 residual state must never be applied via
-        # gbdt_apply_batch. Catch this if a stale cache pickle from the
-        # v3 era is somehow picked up despite the cache-key bump.
-        if str(_fold_gbdt_state.output_mode) != "probability":
-            raise RuntimeError(
-                f"Expected _fold_gbdt_state.output_mode='probability' (v4 "
-                f"direct binary), got {_fold_gbdt_state.output_mode!r}. "
-                "A stale v3 residual_logit state was loaded -- delete the "
-                "matching gbdt_state_oof_fold__*.pkl cache entry and rerun."
-            )
-        # Free the train-side X matrix BEFORE building the OOF one so peak
-        # memory is one X matrix at a time. Each is ~3M rows * 25 cols *
-        # 4 bytes = ~300 MB, but tight is tight.
-        del X_v3_fold_train
-        gc.collect()
-        X_v3_fold_oof = build_member2_v3_features(
-            _fold_v3_builder,
-            p_m1=p_a_oof_fold,
-            subject_mean=subject_mean_oof_fold,
-            subject_ids=_mef_subj_fold_oof,
-            cluster_ids=_mef_cluster_fold_oof,
-            bc_ids=_mef_bc_fold_oof,
-            bc_redacted_mask=bc_redacted_train[fold.oof_row_idx].astype(np.float32),
-        )
-        # v4 is a direct binary GBDT, so its raw output IS the probability.
-        # No residual composition with subject_mean here -- that was v3's
-        # blow-up failure mode.
-        p2_oof_fold = gbdt_apply_batch(_fold_gbdt_state, X_v3_fold_oof)
-        del X_v3_fold_oof
-        gc.collect()
-        # Gate 3d (NLL vs baseline) -- identical guard to v2 but pointed
-        # at the v4 output. With direct binary the bounded-leaf property
-        # should put NLL between baseline and M1; if it doesn't, the
-        # feature pipeline is broken.
-        _p2_oof_clip = np.clip(p2_oof_fold, 1e-6, 1.0 - 1e-6)
-        _yfold_oof = fold_oof_df["label"].astype(float).to_numpy()
-        _p2_oof_nll = float(
-            -(_yfold_oof * np.log(_p2_oof_clip)
-              + (1.0 - _yfold_oof) * np.log(1.0 - _p2_oof_clip)).mean()
-        )
-        _p2_q = np.quantile(p2_oof_fold, [0.0, 0.01, 0.5, 0.99, 1.0])
-        _baseline_mean = float(_yfold_oof.mean())
-        _p2_baseline = float(
-            -(_baseline_mean * np.log(_baseline_mean)
-              + (1.0 - _baseline_mean) * np.log(1.0 - _baseline_mean))
-        )
-        # Gate 3e (NEW): decorrelation from M1. The v4 tree must NOT
-        # collapse into "predict whatever M1 predicts" -- if it does, it
-        # is contributing no incremental signal and the stacker weight
-        # will pin to zero. Some correlation is expected (M1 is a feature),
-        # but a correlation above 0.995 means the tree memorized M1.
-        _corr_v4_m1 = float(
-            np.corrcoef(p2_oof_fold.astype(np.float64),
-                        p_a_oof_fold.astype(np.float64))[0, 1]
-        )
-        print(
-            f"  [Gate 3d fold {fold.fold_id}] M2 v4 OOF NLL={_p2_oof_nll:.5f}  "
-            f"baseline(constant_mean)={_p2_baseline:.5f}  "
-            f"corr(M2v4, M1)={_corr_v4_m1:+.4f}  "
-            f"p2 quantiles min/1%/50%/99%/max="
-            f"{_p2_q[0]:.4f}/{_p2_q[1]:.4f}/{_p2_q[2]:.4f}/{_p2_q[3]:.4f}/{_p2_q[4]:.4f}"
-        )
-        import warnings as _v4_gate_warn
-        if _p2_oof_nll > _p2_baseline + 0.05:
-            _v4_gate_warn.warn(
-                f"Gate 3d WARN fold {fold.fold_id}: M2 v4 OOF NLL="
-                f"{_p2_oof_nll:.5f} is materially WORSE than the "
-                f"constant-mean baseline ({_p2_baseline:.5f}). The "
-                "bounded-leaf property of a direct binary GBDT means "
-                "this can only fail if the v3 feature pipeline is "
-                "broken or the GBDT hyperparams are pathological. "
-                "Inspect both. Continuing anyway."
-            )
-        if abs(_corr_v4_m1) > 0.995:
-            _v4_gate_warn.warn(
-                f"Gate 3e WARN fold {fold.fold_id}: "
-                f"|corr(M2v4, M1)|={abs(_corr_v4_m1):.4f} > 0.995. "
-                "The tree just memorized Member 1 -- no incremental "
-                "signal. Try increasing min_data_in_leaf, lowering "
-                "n_estimators, or dropping the logit_p_m1 feature. "
-                "Continuing anyway."
-            )
-        del _p2_oof_clip, _yfold_oof, _p2_q, _baseline_mean, _p2_baseline
-        del _p2_oof_nll, _corr_v4_m1, _fold_v3_builder
-        gc.collect()
-    elif _M2V2_ENABLED:
-        # Task 3: non-embedding schema + subject_mean anchor.
-        print(
-            f"[OOF f{fold.fold_id}] Training fold Member 2 v2 (GBDT residual, "
-            f"subject_mean anchor, non-embedding schema X cols={X_fold_train_m2v2.shape[1]})..."
-        )
-        # Cache key fingerprints that catch silent-stale-state failures:
-        #   - ``feature_names_hash``: detects column reorder/rename/add/drop
-        #     within the v2 schema (shape alone misses these).
-        #   - ``X_train_content_hash``: 16-byte digest of the full
-        #     fp32 X matrix bytes. Detects any change to the upstream
-        #     feature pipeline (mean-encoding, interaction matrix,
-        #     bc_redacted mask, subject_obs_count) that produces the
-        #     same shape but different values.
-        #   - ``init_pred_train_hash``: detects silent subject_mean
-        #     anchor changes (smoothing, label set used to fit the table).
-        # M2 v2 fold-0 NLL=0.778 (worse than constant!) on a cache HIT
-        # is exactly the failure mode these guard against -- a state
-        # trained on different inputs was loaded and scored against
-        # mismatched current inputs.
-        import hashlib as _m2v2_hashlib
-        _m2v2_feat_names_hash = _m2v2_hashlib.sha256(
-            "\0".join(member2_v2_schema.feature_names).encode("utf-8")
-        ).hexdigest()[:16]
-        _m2v2_X_train_hash = _m2v2_hashlib.sha256(
-            np.ascontiguousarray(X_fold_train_m2v2, dtype=np.float32).tobytes()
-        ).hexdigest()[:16]
-        _m2v2_anchor_hash = _m2v2_hashlib.sha256(
-            np.ascontiguousarray(subject_mean_train_fold, dtype=np.float64).tobytes()
-        ).hexdigest()[:16]
-        _fold_gbdt_state = cache_or_compute(
-            "gbdt_state_oof_fold",
-            key_inputs=(
-                # ``subjmean_v3_contenthash`` invalidates earlier v2 entries
-                # (which lacked feature_names / X content / anchor fingerprints
-                # and produced the M2 fold-0 OOF NLL=0.778 silent-corruption bug).
-                "gbdt_oof_v3_subjmean_contenthash",
-                fold.fold_id, fold_suffix,
-                int(X_fold_train_m2v2.shape[1]), int(X_fold_train_m2v2.shape[0]),
-                int(SEED),
-                round(float(_M2V2_SMOOTHING), 4),
-                _m2v2_feat_names_hash,
-                _m2v2_X_train_hash,
-                _m2v2_anchor_hash,
-            ),
-            compute_fn=lambda _ff=fold: fit_gbdt_member(
-                X=X_fold_train_m2v2,
-                y=_y_fold_train_np,
-                feature_names=member2_v2_schema.feature_names,
-                init_pred_train=subject_mean_train_fold,
-                holdout_group_id=_gbdt_train_item_id_fold,
-                n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
-                learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
-                num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
-                min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
-                feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
-                bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
-                bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
-                early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
-                seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
-            ),
-        )
-        p2_oof_fold = gbdt_compose_residual_batch(
-            _fold_gbdt_state, X_fold_oof_m2v2, subject_mean_oof_fold,
-        )
-        # Diagnostic: catch extreme-prediction blowups (the 0.778 NLL signature).
-        # If MOST predictions are calibrated near the OOF passrate but a tail
-        # is wildly extreme (sigmoid(logit(anchor) + big_residual)), the NLL
-        # gets dominated by the tail. We report quantiles + an OOF NLL preview.
-        _p2_oof_clip = np.clip(p2_oof_fold, 1e-6, 1.0 - 1e-6)
-        _yfold_oof = fold_oof_df["label"].astype(float).to_numpy()
-        _p2_oof_nll = float(
-            -(_yfold_oof * np.log(_p2_oof_clip)
-              + (1.0 - _yfold_oof) * np.log(1.0 - _p2_oof_clip)).mean()
-        )
-        _p2_q = np.quantile(p2_oof_fold, [0.0, 0.01, 0.5, 0.99, 1.0])
-        # NLL of the constant-mean predictor = entropy of the label mean.
-        _baseline_mean = float(_yfold_oof.mean())
-        _p2_baseline = float(
-            -(_baseline_mean * np.log(_baseline_mean)
-              + (1.0 - _baseline_mean) * np.log(1.0 - _baseline_mean))
-        )
-        print(
-            f"  [Gate 3d fold {fold.fold_id}] M2 v2 OOF NLL={_p2_oof_nll:.5f}  "
-            f"baseline(constant_mean)={_p2_baseline:.5f}  "
-            f"p2 quantiles min/1%/50%/99%/max="
-            f"{_p2_q[0]:.4f}/{_p2_q[1]:.4f}/{_p2_q[2]:.4f}/{_p2_q[3]:.4f}/{_p2_q[4]:.4f}"
-        )
-        if _p2_oof_nll > _p2_baseline + 0.05:
-            # 0.05 nat is generous; in a healthy run M2 should beat
-            # baseline by a few nats. Worse-than-baseline used to halt
-            # the pipeline; we now warn loudly and continue so the
-            # stacker can still down-weight a bad Member 2.
-            import warnings as _v2_gate_warn
-            _v2_gate_warn.warn(
-                f"Gate 3d WARN fold {fold.fold_id}: M2 v2 OOF NLL="
-                f"{_p2_oof_nll:.5f} is materially WORSE than the "
-                f"constant-mean baseline ({_p2_baseline:.5f}). This is "
-                "the cache-stale / extreme-prediction blowup signature. "
-                f"Quantile spread: min={_p2_q[0]:.4f} max={_p2_q[4]:.4f}. "
-                "Wipe gbdt_state_oof_fold__*.pkl and retry, or inspect "
-                "the feature pipeline. Continuing anyway."
-            )
-        del _p2_oof_clip, _yfold_oof, _p2_q, _baseline_mean, _p2_baseline, _p2_oof_nll
-    else:
-        # Legacy: full-schema Member 2 with Member 1 anchor.
-        # MEMORY: build the m2 matrices JIT (now), train, score, free.
-        # They are not used anywhere else; keeping them around through
-        # M3/M5/M4 like the old structure did wastes ~24 GB peak per fold.
-        print(f"[OOF f{fold.fold_id}] Building Member 2 legacy matrices (JIT)...")
-        X_fold_train_dense_m2 = np.concatenate(
-            [X_fold_train_dense, fold_member2_interaction_train], axis=1,
-        ).astype(np.float32, copy=False)
-        X_fold_oof_dense_m2 = np.concatenate(
-            [X_fold_oof_dense, fold_member2_interaction_oof], axis=1,
-        ).astype(np.float32, copy=False)
-        gc.collect()
-        print(f"[OOF f{fold.fold_id}] Training fold Member 2 (legacy: GBDT residual)...")
-        _fold_m2_feature_names = (
-            tuple(member_feat_schema.feature_names)
-            + tuple(MEMBER2_INTERACTION_FEATURE_NAMES)
-        )
-        _fold_gbdt_state = cache_or_compute(
-            "gbdt_state_oof_fold",
-            key_inputs=(
-                "gbdt_oof_v1", fold.fold_id, fold_suffix,
-                int(X_fold_train_dense_m2.shape[1]), int(X_fold_train_dense_m2.shape[0]),
-                int(SEED),
-            ),
-            compute_fn=lambda _ff=fold: fit_gbdt_member(
-                X=X_fold_train_dense_m2,
-                y=_y_fold_train_np,
-                feature_names=_fold_m2_feature_names,
-                init_pred_train=p_a_anchor_fold_train,
-                holdout_group_id=_gbdt_train_item_id_fold,
-                n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
-                learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
-                num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
-                min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
-                feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
-                bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
-                bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
-                early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
-                seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
-            ),
-        )
-        # Free training matrix the moment scoring starts -- p_a_anchor too.
-        del X_fold_train_dense_m2
-        gc.collect()
-        p2_oof_fold = gbdt_compose_residual_batch(
-            _fold_gbdt_state, X_fold_oof_dense_m2, p_a_oof_fold,
-        )
-        del X_fold_oof_dense_m2
-        gc.collect()
+
+    _fold_m2_state = cache_or_compute(
+        "member2_mlp_oof_fold",
+        key_inputs=(
+            "member2_metadata_mlp_oof_v1",
+            fold.fold_id, fold_suffix,
+            int(len(fold.train_row_idx)), int(len(fold.oof_row_idx)),
+            int(indexer.n_subjects), int(indexer.n_bc), int(_m2_fold_n_clusters),
+            int(fold_member4_marginal_train.shape[1]),
+            round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+            tuple(sorted(_m2_cfg.items())),
+            int(SEED),
+        ),
+        compute_fn=_fit_fold_m2_mlp,
+    )
+    p2_oof_fold = m2_apply_state_batch(
+        _fold_m2_state,
+        subject_ids=_mef_subj_fold_oof,
+        bc_ids=_mef_bc_fold_oof,
+        cluster_ids=_mef_cluster_fold_oof,
+        marginals=fold_member4_marginal_oof.astype(np.float32, copy=False),
+    )
     p2_train_oof_acc.write_fold(fold.oof_row_idx, p2_oof_fold)
 
     # ----- Fold Member 3 (kNN-similarity) -----
@@ -5052,16 +3987,82 @@ for fold in folds:
     del _fold_knn_state, _m3_oof_query_emb
     gc.collect()
 
-    # ----- Fold Member 5 (difficulty-projected kNN) -----
-    # Trained from scratch per fold on fold-train items + fold-train rows
-    # so OOF predictions on fold-OOF rows are genuinely "model never saw
-    # this item's label" (Gate 4a). The projection regression uses only
-    # fold-train items' per-item passrate, which is itself derived from
-    # the SAME `_fold_passrate_dense` / `_fold_passrate_mask_dense`
-    # matrices Member 3 already built (so we skip ~3 GB of [S, N]
-    # intermediates that the row-aggregation path would allocate -- the
-    # root cause of the Section 9.5 fold 0 OOM in the first Task-4 build).
-    if _M5_ENABLED:
+    # ----- Fold Member 5 (variant-dependent) -----
+    # Two variants share this block. Both produce a [N_oof_fold] float32
+    # ``p5_oof_fold`` written into the global accumulator, and both must
+    # release any per-fold state before Member 4's training tensors land.
+    #   - "residual_cluster" (new default): refit the subject x cluster
+    #     residual passrate state on fold-train rows. Pure lookup, no
+    #     embedding stack needed; cheap to fit, cheap to score.
+    #   - "difficulty_knn" (legacy): the original 1-D difficulty kNN.
+    if _M5_ENABLED and _M5_VARIANT == "residual_cluster":
+        print(f"[OOF f{fold.fold_id}] Fitting fold Member 5 (residual_cluster)...")
+        # Free the M3-built fold passrate/embeddings; the residual M5
+        # only needs row-level (subject_id, cluster_id, label) arrays.
+        del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
+        gc.collect()
+
+        _fold_m5res_train_subj = np.fromiter(
+            (
+                int(indexer.subject_to_id.get(str(s), -1))
+                for s in fold_train_df["subject_key"]
+            ),
+            dtype=np.int64, count=len(fold_train_df),
+        )
+        _fold_m5res_train_cluster = np.asarray(
+            _mef_cluster_fold_train, dtype=np.int64,
+        )
+        _fold_m5res_train_y = fold_train_df["label"].astype(float).to_numpy().astype(np.float64)
+        _fold_m5res_state = cache_or_compute(
+            "member5_residual_state_oof_fold",
+            key_inputs=(
+                "m5res_oof_v1", fold.fold_id, fold_suffix,
+                int(len(fold_train_df)), int(indexer.n_subjects),
+                int(N_CLUSTERS_CTX),
+                round(_M5_SMOOTH_CELL, 4),
+                round(_M5_SMOOTH_MARG, 4),
+                round(_M5_RES_SCALE, 4),
+                int(SEED),
+            ),
+            compute_fn=lambda: fit_member5_residual(
+                subject_ids=_fold_m5res_train_subj,
+                cluster_ids=_fold_m5res_train_cluster,
+                labels=_fold_m5res_train_y,
+                subject_keys=list(_subject_keys_ordered),
+                n_clusters=int(N_CLUSTERS_CTX),
+                smoothing_cell=_M5_SMOOTH_CELL,
+                smoothing_marginal=_M5_SMOOTH_MARG,
+                residual_scale=_M5_RES_SCALE,
+                seed=int(SEED) + 400 * (int(fold.fold_id) + 1),
+            ),
+        )
+        del _fold_m5res_train_subj, _fold_m5res_train_cluster, _fold_m5res_train_y
+        gc.collect()
+
+        # Score fold Member 5 on OOF rows -- pure lookup, fast.
+        _fold_oof_subj_ids_m5 = np.fromiter(
+            (
+                int(indexer.subject_to_id.get(str(s), -1))
+                for s in fold_oof_df["subject_key"]
+            ),
+            dtype=np.int64, count=len(fold_oof_df),
+        )
+        _fold_oof_cluster_ids_m5 = np.asarray(
+            _mef_cluster_fold_oof, dtype=np.int64,
+        )
+        p5_oof_fold = m5res_apply_state_batch(
+            _fold_m5res_state,
+            subject_ids=_fold_oof_subj_ids_m5,
+            cluster_ids=_fold_oof_cluster_ids_m5,
+        )
+        p5_train_oof_acc.write_fold(fold.oof_row_idx, p5_oof_fold)
+        del (
+            _fold_oof_subj_ids_m5, _fold_oof_cluster_ids_m5,
+            _fold_m5res_state,
+        )
+        gc.collect()
+
+    elif _M5_ENABLED and _M5_VARIANT == "difficulty_knn":
         print(f"[OOF f{fold.fold_id}] Training fold Member 5 (difficulty-kNN)...")
 
         # --- Gate 4c (per-fold): projection-leakage probe vs OOF items ---
@@ -5277,9 +4278,47 @@ for fold in folds:
             early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
             seed=int(SEED) + 300 * (int(_ff.fold_id) + 1),
             val_fraction=0.1,
-            holdout_group_id=_gbdt_train_item_id_fold,
+            holdout_group_id=_m2_holdout_fold,
         ),
     )
+    # ----- Fold Member 6 (FwFM) -- reuses the M4 train matrix -----
+    # We fit FwFM on the SAME [N_train, F+14] matrix that M4 just used.
+    # Holding it for the duration of one more torch fit is cheaper than
+    # rematerializing the matrix later for an isolated M6 path.
+    if _M6_ENABLED:
+        print(f"[OOF f{fold.fold_id}] Training fold Member 6 (FwFM)...")
+        _fold_fwfm_state = cache_or_compute(
+            "fwfm_state_oof_fold",
+            key_inputs=(
+                "m6_fwfm_oof_v1", fold.fold_id, fold_suffix,
+                int(X_fold_train_dense_m4.shape[1]),
+                int(X_fold_train_dense_m4.shape[0]),
+                int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
+                round(_M6_LR, 6),
+                round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
+                int(_M6_EPOCHS), int(_M6_BS), int(_M6_PATIENCE),
+                int(SEED),
+            ),
+            compute_fn=lambda _ff=fold: fit_fwfm_member(
+                X=X_fold_train_dense_m4,
+                y=_y_fold_train_np,
+                feature_names=_fold_m4_feature_names,
+                field_ids=_m6_field_ids,
+                k=_M6_K,
+                learning_rate=_M6_LR,
+                weight_decay_w=_M6_WD_W,
+                weight_decay_V=_M6_WD_V,
+                weight_decay_r=_M6_WD_R,
+                epochs=_M6_EPOCHS,
+                batch_size=_M6_BS,
+                val_fraction=_M6_VAL_FRAC,
+                early_stopping_patience=_M6_PATIENCE,
+                seed=int(SEED) + 500 * (int(_ff.fold_id) + 1),
+                standardize=True,
+                holdout_group_id=_m2_holdout_fold,
+            ),
+        )
+
     # Training done. Free the [N_train, F+14] matrix BEFORE building the
     # OOF matrix so they don't both live during scoring.
     del X_fold_train_dense_m4
@@ -5314,6 +4353,15 @@ for fold in folds:
     gc.collect()
     p4_oof_fold = logreg_apply_state_batch(_fold_logreg_state, X_fold_oof_dense_m4)
     p4_train_oof_acc.write_fold(fold.oof_row_idx, p4_oof_fold)
+
+    # M6 (FwFM) OOF score on the same OOF matrix M4 just consumed.
+    if _M6_ENABLED:
+        p6_oof_fold = fwfm_apply_state_batch(_fold_fwfm_state, X_fold_oof_dense_m4)
+        p6_train_oof_acc.write_fold(fold.oof_row_idx, p6_oof_fold)
+        del _fold_fwfm_state
+    else:
+        p6_oof_fold = None
+
     del X_fold_oof_dense_m4
     gc.collect()
 
@@ -5338,6 +4386,7 @@ for fold in folds:
         f"  M1={_nll(p_a_oof_fold):.5f}  M2={_nll(p2_oof_fold):.5f}  "
         f"M3={_nll(p3_oof_fold):.5f}  M4={_nll(p4_oof_fold):.5f}"
         + (f"  M5={_nll(p5_oof_fold):.5f}" if _M5_ENABLED else "")
+        + (f"  M6={_nll(p6_oof_fold):.5f}" if _M6_ENABLED else "")
     )
 
     # Free fold-scoped artifacts before next iteration (keep RAM bounded).
@@ -5359,13 +4408,6 @@ for fold in folds:
     # were all freed at their last consumer.
     del fold_passrate_csr, fold_passrate_mask_csr, fold_cond_context
     del fold_member2_interaction_train, fold_member2_interaction_oof
-    if _M2V2_ENABLED:
-        # On v4 / v5 paths the v2 matrices were never materialized (set
-        # to None); skip the explicit del to avoid a NameError-by-del.
-        if (not _M2V4_ENABLED) and (not _M2V5_ENABLED):
-            del X_fold_train_m2v2, X_fold_oof_m2v2
-        del subject_mean_train_fold, subject_mean_oof_fold
-        del fold_subject_mean_table
     gc.collect()
 
 # Finalize OOF accumulators -- raises if anything is missing / non-finite.
@@ -5378,6 +4420,10 @@ if _M5_ENABLED:
     p5_train_oof = p5_train_oof_acc.finalize()
 else:
     p5_train_oof = None
+if _M6_ENABLED:
+    p6_train_oof = p6_train_oof_acc.finalize()
+else:
+    p6_train_oof = None
 nn_mean_sim_oof = nn_mean_sim_oof_acc.finalize().astype(np.float32)
 nn_support_oof = nn_support_oof_acc.finalize().astype(np.float32)
 centroid_dist_oof = centroid_dist_oof_acc.finalize().astype(np.float32)
@@ -5394,6 +4440,8 @@ print(f"  M3 OOF: {_nll_full(p3_train_oof):.5f}")
 print(f"  M4 OOF: {_nll_full(p4_train_oof):.5f}")
 if _M5_ENABLED:
     print(f"  M5 OOF: {_nll_full(p5_train_oof):.5f}")
+if _M6_ENABLED:
+    print(f"  M6 OOF: {_nll_full(p6_train_oof):.5f}")
 print(f"[OOF] All accumulators finalized OK ({_N_TRAIN:,} rows each, all finite, single-write).")
 
 # Task 4: Aggregate Gate 4c (per-fold projection-leakage probe) results.
@@ -5409,36 +4457,6 @@ if _M5_ENABLED and len(_gate4c_per_fold) > 0:
         + ("PASS." if _g4c_total_overlap == 0
            else f"FAIL: {_g4c_total_overlap} item overlaps found.")
     )
-
-# Finalize Task 3 OOF subject_mean accumulator + aggregate Gate 3a summary.
-if _M2V2_ENABLED:
-    subject_mean_train_oof = subject_mean_train_oof_acc.finalize().astype(np.float64)
-    print(
-        f"\n[Member 2 v2] OOF subject_mean: shape={subject_mean_train_oof.shape}  "
-        f"min={subject_mean_train_oof.min():.4f}  "
-        f"mean={subject_mean_train_oof.mean():.4f}  "
-        f"max={subject_mean_train_oof.max():.4f}"
-    )
-    # Aggregate Gate 3a summary (per-fold passes already printed inline).
-    _total_3a_checked = sum(r["n_checked"] for r in _gate3a_per_fold.values())
-    _total_3a_violations = sum(r["n_violations"] for r in _gate3a_per_fold.values())
-    _max_3a_delta = max(r["max_abs_delta"] for r in _gate3a_per_fold.values())
-    if _total_3a_violations > 0:
-        import warnings as _g3a_warn
-        _g3a_warn.warn(
-            f"[Gate 3a aggregate] WARN: "
-            f"{_total_3a_violations:,}/{_total_3a_checked:,} fold-OOF "
-            "rows had subject_mean anchors that didn't match their "
-            "fold-train table. Pipeline continues; downstream OOF "
-            "metrics may be inflated by leakage."
-        )
-    print(
-        f"[Gate 3a aggregate] PASS: {_total_3a_checked:,} fold-OOF rows across "
-        f"{len(_gate3a_per_fold)} folds, 0 violations, "
-        f"max_abs_delta_across_folds={_max_3a_delta:.2e}."
-    )
-else:
-    subject_mean_train_oof = None
 
 # %% [markdown]
 # ## 9.5b. Gate 1b: NN-neighbor-in-fold-train probe (post-loop assertion)
@@ -5463,677 +4481,6 @@ for fold in folds:
     _probe_summary.append((fold.fold_id, result))
     print(f"  fold {fold.fold_id}: checked={result['n_checked']:,} violations={result['n_violations']}")
 print("[OOF Gate 1b] PASS: zero NN-neighbor leakage across all folds.")
-
-# %% [markdown]
-# ## 9.5c. Global Member 2 v2 fit (Task 3): subject-mean residual + non-embedding schema
-#
-# Fits the SHIPPED Member 2 booster on the FULL training set with the
-# OOF subject_mean anchor accumulated in section 9.5. The anchor is
-# OOF per-row (each row's `subject_mean_train_oof[r]` was computed from
-# the fold-train labels of the fold that holds r in its OOF set, so
-# row r's own label is never in its own anchor). At val / runtime
-# inference the anchor switches to `subject_mean_table_global` (full
-# train labels, which honestly excludes val rows since they aren't in
-# train).
-#
-# Gates run here:
-#   * Gate 3b (parity): fit_gbdt_member already asserts
-#     `parity_atol=1e-5` between LightGBM's `predict(raw_score=True)`
-#     and the pure-NumPy tree walker on the residual target. A line
-#     is printed below confirming the assertion fired.
-#   * Gate 3c (composer round-trip): a synthetic case verifies that
-#     adding a zero tree-residual to a known subject_mean anchor
-#     recovers the anchor probability exactly, AND that the composer
-#     is numerically stable for subject_mean values near 0 and 1.
-
-# %%
-member2_v4_global_state = None  # populated below when _M2V4_ENABLED
-member2_v5_global_state = None  # populated below when _M2V5_ENABLED
-
-if _M2V5_ENABLED:
-    # v5 GLOBAL fit: trains the SHIPPED direct-binary GBDT on the full
-    # training set. v5 uses NO M1 anchor and NO subject_mean anchor
-    # (both were the source of v3/v4 saturation); instead it consumes
-    # item attributes, honest historical counts, mean-encoded passrates,
-    # and 7 NN aggregates as features. This makes the trained tree
-    # structurally orthogonal to Member 1 by construction.
-    print(
-        "\n[Member 2 v5 / 9.5c] Fitting GLOBAL v5 feature builder + "
-        "training direct-binary GBDT on full train (no M1, no subject_mean)..."
-    )
-    def _safe_n_ids_v5_global(declared_lb, *id_arrs):
-        n = int(declared_lb)
-        for arr in id_arrs:
-            arr = np.asarray(arr)
-            if arr.size > 0 and bool((arr >= 0).any()):
-                n = max(n, int(arr.max()) + 1)
-        return n
-    _global_v5_n_subjects = _safe_n_ids_v5_global(
-        int(indexer.n_subjects),
-        _mef_train_subj, _mef_val_subj,
-    )
-    _global_v5_n_clusters = _safe_n_ids_v5_global(
-        int(cond_context.n_clusters),
-        _mef_train_cluster, _mef_val_cluster,
-    )
-    _global_v5_n_bcs = _safe_n_ids_v5_global(
-        int(indexer.n_bc),
-        _mef_train_bc, _mef_val_bc,
-    )
-    member2_v5_global_builder = fit_member2_v5_feature_builder(
-        subject_ids=_mef_train_subj,
-        cluster_ids=_mef_train_cluster,
-        bc_ids=_mef_train_bc,
-        labels=y_train,
-        n_subjects=_global_v5_n_subjects,
-        n_clusters=_global_v5_n_clusters,
-        n_bcs=_global_v5_n_bcs,
-        n_macro_families=int(N_MACRO_FAMILIES),
-        n_organizations=int(N_ORGANIZATIONS),
-        n_families=int(N_FAMILIES),
-        subject_to_macro_family_id=s2macro,
-        subject_to_organization_id=s2org,
-        subject_to_family_id=s2fam,
-        smoothing=_M2V5_SMOOTHING,
-    )
-    _v5_pool_train_global = _m2v5_pool_for_rows(primary.train)
-    _v5_age_train_global = _m2v5_age_for_rows(primary.train)
-    _v5_pca_train_global = _m2v5_pca_for_rows(primary.train)
-    X_train_v5_global = build_member2_v5_features(
-        member2_v5_global_builder,
-        subject_ids=_mef_train_subj,
-        cluster_ids=_mef_train_cluster,
-        bc_ids=_mef_train_bc,
-        bc_redacted_mask=bc_redacted_train.astype(np.float32),
-        pool_features=_v5_pool_train_global,
-        benchmark_age=_v5_age_train_global,
-        nn_features_matrix=nn_train_mat,
-        item_pca_features=_v5_pca_train_global,
-    )
-    del _v5_pool_train_global, _v5_age_train_global, _v5_pca_train_global
-    gc.collect()
-    print(
-        f"[Member 2 v5 / 9.5c] X_train_v5_global: {X_train_v5_global.shape}  "
-        "(no M1 / subject_mean anchor; label leakage = 0 by feature design)"
-    )
-
-    import hashlib as _m2v5g_hashlib
-    _m2v5g_feat_names_hash = _m2v5g_hashlib.sha256(
-        "\0".join(MEMBER2_V5_FEATURE_NAMES).encode("utf-8")
-    ).hexdigest()[:16]
-    _m2v5g_X_hash = _m2v5g_hashlib.sha256(
-        np.ascontiguousarray(X_train_v5_global, dtype=np.float32).tobytes()
-    ).hexdigest()[:16]
-
-    def _fit_member2_v5_global():
-        print(
-            "[Member 2 v5 / 9.5c] training LightGBM DIRECT BINARY "
-            f"(X cols={X_train_v5_global.shape[1]}, no init_score, "
-            "objective=binary on y directly, no M1-derived features)..."
-        )
-        return fit_gbdt_member(
-            X=X_train_v5_global,
-            y=y_train,
-            feature_names=MEMBER2_V5_FEATURE_NAMES,
-            init_pred_train=None,
-            # v5b global defaults mirror the per-fold bumps. See the
-            # per-fold lambda above for rationale.
-            n_estimators=int(
-                CFG.get("member2_v5", {}).get("n_estimators_global", 1000)
-            ),
-            learning_rate=float(
-                CFG.get("member2_v5", {}).get("learning_rate", 0.05)
-            ),
-            num_leaves=int(
-                CFG.get("member2_v5", {}).get("num_leaves", 63)
-            ),
-            min_data_in_leaf=int(
-                CFG.get("member2_v5", {}).get("min_data_in_leaf", 100)
-            ),
-            early_stopping_rounds=int(
-                CFG.get("member2_v5", {}).get("early_stopping_rounds_global", 100)
-            ),
-            seed=SEED,
-            parity_atol=1.0e-5,
-            val_fraction=float(
-                CFG.get("member2_v5", {}).get("val_fraction", 0.1)
-            ),
-            max_bin=int(
-                CFG.get("member2_v5", {}).get("max_bin", 63)
-            ),
-            force_col_wise=bool(
-                CFG.get("member2_v5", {}).get("force_col_wise", True)
-            ),
-            log_period=int(
-                CFG.get("member2_v5", {}).get("log_period", 25)
-            ),
-            num_threads=CFG.get("member2_v5", {}).get("num_threads", None),
-            holdout_group_id=gbdt_train_item_id,
-        )
-
-    member2_v5_gbdt_state = cache_or_compute(
-        "gbdt_state",
-        key_inputs=(
-            # ``v5b_attr_nn_pca_v1`` never collides with v5a / v2 / v3 /
-            # v4 keys (different prefix string) AND the PCA digest
-            # invalidates if the embedding PCA refits to different
-            # components on the same input.
-            "member2_v5b_attr_nn_pca_v1",
-            int(M2V5_FEATURE_DIM), len(primary.train), SEED,
-            round(BC_REDACT_FRAC, 3), _bc_redact_seed,
-            round(float(_M2V5_SMOOTHING), 4),
-            int(M2V5_PCA_DIMS), _v5_pca_digest,
-            int(OOF_N_FOLDS), int(OOF_SEED), bool(OOF_RETRAIN_M1),
-            _m2v5g_feat_names_hash, _m2v5g_X_hash,
-        ),
-        compute_fn=_fit_member2_v5_global,
-    )
-    import warnings as _v5g_warn
-    if str(member2_v5_gbdt_state.output_mode) != "probability":
-        _v5g_warn.warn(
-            "Expected member2_v5_gbdt_state.output_mode='probability' (v5 "
-            f"direct binary), got {member2_v5_gbdt_state.output_mode!r}. "
-            "A stale residual_logit state was loaded -- delete the "
-            "matching gbdt_state__*.pkl cache entry and rerun. "
-            "Continuing; val predictions may be corrupted."
-        )
-    # Build the shipped state. Downstream (export, smoke tests) treats
-    # ``gbdt_state`` as the LightGBM booster -- alias here so the rest
-    # of the pipeline works without per-module branching.
-    member2_v5_global_state = Member2V5State(
-        gbdt=member2_v5_gbdt_state,
-        builder=member2_v5_global_builder,
-    )
-    gbdt_state = member2_v5_gbdt_state
-
-    # Gate 3b parity (re-verified on a small sample).
-    print("\n[Gate 3b v5] verifying pure-NumPy tree walker parity vs LightGBM raw_score...")
-    _gate3b_sample = int(min(2000, X_train_v5_global.shape[0]))
-    _gate3b_idx = np.random.default_rng(0).choice(
-        X_train_v5_global.shape[0], size=_gate3b_sample, replace=False,
-    )
-    from src.gbdt_member import predict_raw as _gbdt_predict_raw_g3b_v5
-    _walker_raw = _gbdt_predict_raw_g3b_v5(
-        member2_v5_gbdt_state, X_train_v5_global[_gate3b_idx]
-    )
-    print(
-        f"[Gate 3b v5] PASS: implicit during fit (parity_atol=1e-5); "
-        f"re-verified pure-NumPy walker on {_gate3b_sample:,}-row sample "
-        f"raw_score range [{float(_walker_raw.min()):.4f}, {float(_walker_raw.max()):.4f}]."
-    )
-
-    # Apply Member 2 v5 to val rows. Val item embeddings may be cold,
-    # which is exactly what v5 was designed for: pool/centroid/NN
-    # signals stay informative for cold items.
-    _v5_pool_val_global = _m2v5_pool_for_rows(primary.val)
-    _v5_age_val_global = _m2v5_age_for_rows(primary.val)
-    _v5_pca_val_global = _m2v5_pca_for_rows(primary.val)
-    X_val_v5 = build_member2_v5_features(
-        member2_v5_global_builder,
-        subject_ids=_mef_val_subj,
-        cluster_ids=_mef_val_cluster,
-        bc_ids=_mef_val_bc,
-        bc_redacted_mask=bc_redacted_val.astype(np.float32),
-        pool_features=_v5_pool_val_global,
-        benchmark_age=_v5_age_val_global,
-        nn_features_matrix=nn_val_mat,
-        item_pca_features=_v5_pca_val_global,
-    )
-    del _v5_pool_val_global, _v5_age_val_global, _v5_pca_val_global
-    p_member2_val = gbdt_apply_batch(member2_v5_gbdt_state, X_val_v5)
-    # Defense-in-depth: ensure 1-D shape and exact val-length. Catches
-    # any apply_batch contract drift before the val stack-up below
-    # (which would otherwise fail with a generic np.stack ValueError
-    # that doesn't point at Member 2).
-    p_member2_val = np.asarray(p_member2_val, dtype=np.float32).reshape(-1)
-    if p_member2_val.shape[0] != int(len(primary.val)):
-        import warnings as _v5_pmv_warn
-        _v5_pmv_warn.warn(
-            f"[Member 2 v5] p_member2_val length {p_member2_val.shape[0]} "
-            f"!= primary.val length {len(primary.val)}. The val stack-up "
-            "in section 10 will reject the mismatch with a clearer error."
-        )
-    print(
-        f"[Member 2 v5] p_member2_val shape={p_member2_val.shape}  "
-        f"dtype={p_member2_val.dtype}  "
-        f"(expected ({int(len(primary.val))},) fp32)"
-    )
-    nll_m2 = float(
-        -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
-          + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean()
-    )
-    # Gate 3e at val scale: confirm v5 hasn't accidentally relearned M1
-    # (it shouldn't, since v5 has no M1 features).
-    _corr_v5_m1_val = float(
-        np.corrcoef(
-            p_member2_val.astype(np.float64), p_a_val.astype(np.float64)
-        )[0, 1]
-    )
-    print(
-        f"\n[Member 2 v5] val log-loss: {nll_m2:.6f}  "
-        f"corr(M2v5, M1) on val={_corr_v5_m1_val:+.4f}"
-    )
-    print(
-        f"[Member 2 v5] train NLL stored in state: {member2_v5_gbdt_state.train_loss:.6f}  "
-        f"booster's internal val NLL (item-cold split): {member2_v5_gbdt_state.val_loss:.6f}"
-    )
-    print(
-        f"[Member 2 v5] n_trees={member2_v5_gbdt_state.n_trees}  "
-        f"bias={member2_v5_gbdt_state.bias:+.4f}"
-    )
-    # Tier 3 diagnostic on the SHIPPED global model: split-count
-    # importance + PCA-bucket usage. If PCA usage on the global model
-    # is materially different from the per-fold diagnostic (e.g.,
-    # per-fold says 30%, global says 5%) it's a cache / wiring drift.
-    _v5b_g_fc = np.asarray(member2_v5_gbdt_state.feature_concat).reshape(-1)
-    _v5b_g_split_counts = np.bincount(
-        _v5b_g_fc[_v5b_g_fc >= 0].astype(np.int64),
-        minlength=int(M2V5_FEATURE_DIM),
-    )
-    _v5b_g_top = np.argsort(_v5b_g_split_counts)[::-1][:10]
-    _v5b_g_total = int(_v5b_g_split_counts.sum())
-    _v5b_g_pca = int(
-        _v5b_g_split_counts[M2V5_BUCKET_D_END:M2V5_BUCKET_D_END + M2V5_PCA_DIMS].sum()
-    )
-    print(
-        f"[Member 2 v5b] GLOBAL top-10 features by split count "
-        f"(of {_v5b_g_total:,} total splits):"
-    )
-    for _v5b_g_i in _v5b_g_top:
-        print(
-            f"    {MEMBER2_V5_FEATURE_NAMES[int(_v5b_g_i)]:36s} "
-            f"splits={int(_v5b_g_split_counts[int(_v5b_g_i)]):6d}"
-        )
-    print(
-        f"[Member 2 v5b] GLOBAL PCA-bucket usage: "
-        f"{_v5b_g_pca:,}/{_v5b_g_total:,} splits "
-        f"({100.0 * _v5b_g_pca / max(_v5b_g_total, 1):.1f}%) on "
-        "item_pca_* columns."
-    )
-    del _v5b_g_fc, _v5b_g_split_counts, _v5b_g_top
-    if abs(_corr_v5_m1_val) > 0.995:
-        _v5g_warn.warn(
-            f"Gate 3e WARN on val: |corr(M2v5, M1)|="
-            f"{abs(_corr_v5_m1_val):.4f} > 0.995. v5 has no M1 features "
-            "so this is suspicious -- check the per-id mean-encoding "
-            "for accidental leakage. Continuing anyway."
-        )
-    # Free the per-row v5 feature matrices we just used.
-    del X_train_v5_global, X_val_v5
-    gc.collect()
-
-elif _M2V4_ENABLED:
-    # v4 GLOBAL fit: trains the SHIPPED direct-binary GBDT on the full
-    # training set with OOF anchors for both M1 prediction (p_a_train_oof,
-    # accumulated by per-fold M1 retrains) AND the subject_mean baseline
-    # (subject_mean_train_oof). Both honest -> no label leakage into the
-    # training inputs, so the tree truly learns calibration patterns
-    # rather than memorizing the train labels via the anchors. v4 differs
-    # from v3 only in HOW it consumes those anchors: v4 uses them as
-    # features (p_m1, subject_mean) inside the v3 builder rather than as
-    # an init_score residual target, so the GBDT output stays bounded
-    # by in-leaf label averages.
-    print(
-        "\n[Member 2 v4 / 9.5c] Fitting GLOBAL v3 feature builder + "
-        "training direct-binary GBDT on full train (OOF M1 + OOF subject_mean as FEATURES)..."
-    )
-    # See per-fold v3 vocab-sizing comment: declared CFG['clustering']['k']
-    # is a lower bound; the conditional passrate context (and now the v3
-    # builder) must use the grown vocabulary. Also bound n_bcs by the
-    # max observed bc id across train + val so the apply path
-    # (which scores val rows below) never crashes on an unseen id.
-    def _safe_n_ids_global(declared_lb, *id_arrs):
-        n = int(declared_lb)
-        for arr in id_arrs:
-            arr = np.asarray(arr)
-            if arr.size > 0 and bool((arr >= 0).any()):
-                n = max(n, int(arr.max()) + 1)
-        return n
-    _global_v3_n_clusters = _safe_n_ids_global(
-        int(cond_context.n_clusters),
-        _mef_train_cluster, _mef_val_cluster,
-    )
-    _global_v3_n_bcs = _safe_n_ids_global(
-        int(indexer.n_bc),
-        _mef_train_bc, _mef_val_bc,
-    )
-    member2_v4_global_builder = fit_member2_v3_feature_builder(
-        subject_ids=_mef_train_subj,
-        cluster_ids=_mef_train_cluster,
-        bc_ids=_mef_train_bc,
-        labels=y_train,
-        n_subjects=int(indexer.n_subjects),
-        n_clusters=_global_v3_n_clusters,
-        n_bcs=_global_v3_n_bcs,
-        n_macro_families=int(N_MACRO_FAMILIES),
-        n_organizations=int(N_ORGANIZATIONS),
-        n_families=int(N_FAMILIES),
-        subject_to_macro_family_id=s2macro,
-        subject_to_organization_id=s2org,
-        subject_to_family_id=s2fam,
-        smoothing=_M2V4_SMOOTHING,
-    )
-    X_train_v3_global = build_member2_v3_features(
-        member2_v4_global_builder,
-        p_m1=p_a_train_oof,                  # honest OOF M1 anchors
-        subject_mean=subject_mean_train_oof,  # honest OOF subject_mean anchors
-        subject_ids=_mef_train_subj,
-        cluster_ids=_mef_train_cluster,
-        bc_ids=_mef_train_bc,
-        bc_redacted_mask=bc_redacted_train.astype(np.float32),
-    )
-    print(
-        f"[Member 2 v4 / 9.5c] X_train_v3_global: {X_train_v3_global.shape}  "
-        f"p_a_train_oof: {p_a_train_oof.shape}  "
-        f"subject_mean_train_oof: {subject_mean_train_oof.shape}  "
-        "(both anchors are OOF per-row; label leakage = 0)"
-    )
-
-    import hashlib as _m2v3g_hashlib
-    _m2v3g_feat_names_hash = _m2v3g_hashlib.sha256(
-        "\0".join(MEMBER2_V3_FEATURE_NAMES).encode("utf-8")
-    ).hexdigest()[:16]
-    _m2v3g_X_hash = _m2v3g_hashlib.sha256(
-        np.ascontiguousarray(X_train_v3_global, dtype=np.float32).tobytes()
-    ).hexdigest()[:16]
-    _m2v3g_anchor_hash = _m2v3g_hashlib.sha256(
-        np.ascontiguousarray(subject_mean_train_oof, dtype=np.float64).tobytes()
-    ).hexdigest()[:16]
-    _m2v3g_pm1_hash = _m2v3g_hashlib.sha256(
-        np.ascontiguousarray(p_a_train_oof, dtype=np.float32).tobytes()
-    ).hexdigest()[:16]
-
-    def _fit_member2_v4_global():
-        print(
-            "[Member 2 v4 / 9.5c] training LightGBM DIRECT BINARY "
-            f"(X cols={X_train_v3_global.shape[1]}, no init_score, "
-            "objective=binary on y directly, features include p_m1 + "
-            "subject_mean as numeric columns)..."
-        )
-        return fit_gbdt_member(
-            X=X_train_v3_global,
-            y=y_train,
-            feature_names=MEMBER2_V3_FEATURE_NAMES,
-            # See per-fold v4 comment on init_pred_train=None.
-            init_pred_train=None,
-            n_estimators=int(
-                CFG.get("member2_v4", {}).get("n_estimators_global", 400)
-            ),
-            learning_rate=float(
-                CFG.get("member2_v4", {}).get("learning_rate", 0.05)
-            ),
-            num_leaves=int(
-                CFG.get("member2_v4", {}).get("num_leaves", 15)
-            ),
-            min_data_in_leaf=int(
-                CFG.get("member2_v4", {}).get("min_data_in_leaf", 500)
-            ),
-            early_stopping_rounds=int(
-                CFG.get("member2_v4", {}).get("early_stopping_rounds_global", 30)
-            ),
-            seed=SEED,
-            parity_atol=1.0e-5,
-            val_fraction=float(
-                CFG.get("member2_v4", {}).get("val_fraction", 0.1)
-            ),
-            max_bin=int(
-                CFG.get("member2_v4", {}).get("max_bin", 63)
-            ),
-            force_col_wise=bool(
-                CFG.get("member2_v4", {}).get("force_col_wise", True)
-            ),
-            log_period=int(
-                CFG.get("member2_v4", {}).get("log_period", 25)
-            ),
-            num_threads=CFG.get("member2_v4", {}).get("num_threads", None),
-            holdout_group_id=gbdt_train_item_id,
-        )
-
-    member2_v4_gbdt_state = cache_or_compute(
-        "gbdt_state",
-        key_inputs=(
-            # ``v4_direct_global_v1`` never collides with v2/v3 keys
-            "member2_v4_direct_global_v1",
-            int(M2V3_FEATURE_DIM), len(primary.train), SEED,
-            round(BC_REDACT_FRAC, 3), _bc_redact_seed,
-            round(float(_M2V4_SMOOTHING), 4),
-            int(OOF_N_FOLDS), int(OOF_SEED), bool(OOF_RETRAIN_M1),
-            _m2v3g_feat_names_hash, _m2v3g_X_hash,
-            _m2v3g_anchor_hash, _m2v3g_pm1_hash,
-        ),
-        compute_fn=_fit_member2_v4_global,
-    )
-    if str(member2_v4_gbdt_state.output_mode) != "probability":
-        raise RuntimeError(
-            "Expected member2_v4_gbdt_state.output_mode='probability' (v4 "
-            f"direct binary), got {member2_v4_gbdt_state.output_mode!r}. "
-            "A stale v3 residual_logit state was loaded -- delete the "
-            "matching gbdt_state__*.pkl cache entry and rerun."
-        )
-    # Build the shipped state. Downstream code (export, smoke tests)
-    # treats ``gbdt_state`` as the LightGBM booster -- alias here so
-    # everything that worked for v2 keeps working without per-module
-    # branching. The full v3 state (booster + builder) lives in
-    # ``member2_v4_global_state``.
-    member2_v4_global_state = Member2V3State(
-        gbdt=member2_v4_gbdt_state,
-        builder=member2_v4_global_builder,
-    )
-    gbdt_state = member2_v4_gbdt_state
-
-    # Gate 3b parity (re-verified on a small sample, same as v2 branch).
-    print("\n[Gate 3b v4] verifying pure-NumPy tree walker parity vs LightGBM raw_score...")
-    _gate3b_sample = int(min(2000, X_train_v3_global.shape[0]))
-    _gate3b_idx = np.random.default_rng(0).choice(
-        X_train_v3_global.shape[0], size=_gate3b_sample, replace=False,
-    )
-    from src.gbdt_member import predict_raw as _gbdt_predict_raw_g3b
-    _walker_raw = _gbdt_predict_raw_g3b(member2_v4_gbdt_state, X_train_v3_global[_gate3b_idx])
-    print(
-        f"[Gate 3b v4] PASS: implicit during fit (parity_atol=1e-5); "
-        f"re-verified pure-NumPy walker on {_gate3b_sample:,}-row sample "
-        f"raw_score range [{float(_walker_raw.min()):.4f}, {float(_walker_raw.max()):.4f}]."
-    )
-
-    # Apply Member 2 v4 to val rows. p_a_val comes from M1's val scoring
-    # (computed in section 9a/9b); subject_mean_val from M2 v2 setup
-    # (which was kept enabled as a prerequisite of v4 -- it appears as
-    # a FEATURE here, not an apply-time anchor).
-    X_val_v3 = build_member2_v3_features(
-        member2_v4_global_builder,
-        p_m1=p_a_val,
-        subject_mean=subject_mean_val,
-        subject_ids=_mef_val_subj,
-        cluster_ids=_mef_val_cluster,
-        bc_ids=_mef_val_bc,
-        bc_redacted_mask=bc_redacted_val.astype(np.float32),
-    )
-    # Direct binary apply: GBDT output IS the probability. No composition
-    # with subject_mean (subject_mean was already consumed as a column of
-    # X_val_v3 by the v3 builder).
-    p_member2_val = gbdt_apply_batch(member2_v4_gbdt_state, X_val_v3)
-    nll_m2 = float(
-        -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
-          + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean()
-    )
-    # Gate 3e at val scale: confirm v4 hasn't collapsed into pure M1.
-    _corr_v4_m1_val = float(
-        np.corrcoef(
-            p_member2_val.astype(np.float64), p_a_val.astype(np.float64)
-        )[0, 1]
-    )
-    print(
-        f"\n[Member 2 v4] val log-loss: {nll_m2:.6f}  "
-        f"corr(M2v4, M1) on val={_corr_v4_m1_val:+.4f}"
-    )
-    print(
-        f"[Member 2 v4] train NLL stored in state: {member2_v4_gbdt_state.train_loss:.6f}  "
-        f"booster's internal val NLL (item-cold split): {member2_v4_gbdt_state.val_loss:.6f}"
-    )
-    print(
-        f"[Member 2 v4] n_trees={member2_v4_gbdt_state.n_trees}  "
-        f"bias={member2_v4_gbdt_state.bias:+.4f}"
-    )
-    if abs(_corr_v4_m1_val) > 0.995:
-        import warnings as _v4g_warn
-        _v4g_warn.warn(
-            f"Gate 3e WARN on val: "
-            f"|corr(M2v4, M1)|={abs(_corr_v4_m1_val):.4f} > 0.995. "
-            "Global v4 collapsed into Member 1; tree contributed no "
-            "incremental signal. Continuing anyway -- the stacker will "
-            "naturally down-weight a non-orthogonal member."
-        )
-    # Free the per-row v3 feature matrices we just used.
-    del X_train_v3_global, X_val_v3
-    gc.collect()
-
-elif _M2V2_ENABLED:
-    print("\n[Member 2 v2 / 9.5c] Building GLOBAL X_train_m2v2 (full train, OOF anchor)...")
-    X_train_m2v2_global = build_member2_feature_matrix(
-        member2_v2_schema,
-        subject_ids=_mef_train_subj,
-        cluster_ids=_mef_train_cluster,
-        bc_ids=_mef_train_bc,
-        bc_redacted_mask=bc_redacted_train.astype(np.float32),
-        subject_obs_count_log1p=_global_subj_obs_count_train_log1p,
-        subject_cat_lookup=_m2v2_subj_cat_lookup,
-        subject_num_lookup=_m2v2_subj_num_lookup,
-        bench_cat_lookup=_m2v2_bench_cat_lookup,
-        bench_num_lookup=_m2v2_bench_num_lookup,
-        interaction_matrix=member2_interaction_train.astype(np.float32),
-    )
-    print(
-        f"[Member 2 v2 / 9.5c] X_train_m2v2_global: {X_train_m2v2_global.shape}  "
-        f"subject_mean_train_oof: {subject_mean_train_oof.shape}  "
-        f"(anchor is OOF per-row, label leakage = 0 by Gate 3a)"
-    )
-
-    def _fit_member2_v2_global():
-        print(
-            "[Member 2 v2 / 9.5c] training LightGBM RESIDUAL "
-            f"(X cols={X_train_m2v2_global.shape[1]}, anchor=subject_mean OOF, "
-            "objective=binary with logit(anchor) as init_score)..."
-        )
-        return fit_gbdt_member(
-            X=X_train_m2v2_global,
-            y=y_train,
-            feature_names=member2_v2_schema.feature_names,
-            init_pred_train=subject_mean_train_oof,
-            n_estimators=int(CFG.get("member2_gbdt", {}).get("n_estimators", 400)),
-            learning_rate=float(CFG.get("member2_gbdt", {}).get("learning_rate", 0.05)),
-            num_leaves=int(CFG.get("member2_gbdt", {}).get("num_leaves", 31)),
-            min_data_in_leaf=int(CFG.get("member2_gbdt", {}).get("min_data_in_leaf", 50)),
-            early_stopping_rounds=int(CFG.get("member2_gbdt", {}).get("early_stopping_rounds", 30)),
-            seed=SEED,
-            parity_atol=1.0e-5,
-            val_fraction=float(CFG.get("member2_gbdt", {}).get("val_fraction", 0.1)),
-            max_bin=int(CFG.get("member2_gbdt", {}).get("max_bin", 63)),
-            force_col_wise=bool(CFG.get("member2_gbdt", {}).get("force_col_wise", True)),
-            log_period=int(CFG.get("member2_gbdt", {}).get("log_period", 25)),
-            num_threads=CFG.get("member2_gbdt", {}).get("num_threads", None),
-            holdout_group_id=gbdt_train_item_id,
-        )
-
-    # Cache key digests: tie the cache to subject_mean inputs + the new
-    # feature matrix shape + smoothing param. ``subjmean_anchor_v2`` is
-    # the version tag; bumping it forces a refit. The subject_mean digest
-    # ensures swapping the anchor (e.g., different smoothing) invalidates.
-    import hashlib as _hashlib_m2v2
-    _m2v2_anchor_digest = _hashlib_m2v2.sha256(
-        np.ascontiguousarray(subject_mean_train_oof, dtype=np.float64).tobytes()
-    ).hexdigest()[:16]
-    _m2v2_X_digest = _hashlib_m2v2.sha256(
-        np.ascontiguousarray(X_train_m2v2_global, dtype=np.float32).tobytes()
-    ).hexdigest()[:16]
-    gbdt_state = cache_or_compute(
-        "gbdt_state",
-        key_inputs=(
-            int(X_train_m2v2_global.shape[1]), len(primary.train), SEED,
-            "subjmean_anchor_v2",     # Task 3 invalidator
-            "non_embedding_schema_v1",  # Task 3 invalidator
-            "speed_v1", "init_v2", "honest_loss_v1",
-            "coldsplit_v1", "redact_v1",
-            round(BC_REDACT_FRAC, 3), _bc_redact_seed,
-            round(float(_M2V2_SMOOTHING), 4),
-            int(OOF_N_FOLDS), int(OOF_SEED), bool(OOF_RETRAIN_M1),
-            _m2v2_anchor_digest, _m2v2_X_digest,
-        ),
-        compute_fn=_fit_member2_v2_global,
-    )
-    if str(gbdt_state.output_mode) != "residual_logit":
-        raise RuntimeError(
-            f"Expected gbdt_state.output_mode='residual_logit', got "
-            f"{gbdt_state.output_mode!r}. Cache invalidation likely failed."
-        )
-
-    # Gate 3b: parity. ``fit_gbdt_member`` internally asserts
-    # parity_atol=1e-5 between LGBM raw_score and the pure-NumPy walker
-    # on the residual target. If the assertion fired without raising,
-    # parity is OK. We re-verify on a small batch to be explicit.
-    print("\n[Gate 3b] verifying pure-NumPy tree walker parity vs LightGBM raw_score...")
-    _gate3b_sample = int(min(2000, X_train_m2v2_global.shape[0]))
-    _gate3b_idx = np.random.default_rng(0).choice(
-        X_train_m2v2_global.shape[0], size=_gate3b_sample, replace=False,
-    )
-    from src.gbdt_member import predict_raw as _gbdt_predict_raw_g3b
-    _walker_raw = _gbdt_predict_raw_g3b(gbdt_state, X_train_m2v2_global[_gate3b_idx])
-    print(
-        f"[Gate 3b] PASS (implicit from fit_gbdt_member): parity_atol=1e-5 "
-        f"asserted on full train during fit. Re-verified pure-NumPy walker "
-        f"on {_gate3b_sample:,}-row sample: raw_score range "
-        f"[{float(_walker_raw.min()):.4f}, {float(_walker_raw.max()):.4f}]."
-    )
-
-    # Gate 3c: composer round-trip. Verify that the composer
-    # `sigmoid(logit(anchor) + tree_raw)` is numerically stable for
-    # extreme anchors and equals the closed-form composition.
-    print("\n[Gate 3c] composer round-trip on extreme subject_mean anchors...")
-    _gate3c_X = X_train_m2v2_global[_gate3b_idx[:5]]
-    _gate3c_anchors = np.array([1e-6, 1e-3, 0.5, 1 - 1e-3, 1 - 1e-6], dtype=np.float64)
-    _gate3c_compose = gbdt_compose_residual_batch(gbdt_state, _gate3c_X, _gate3c_anchors)
-    import warnings as _g3c_warn
-    for _i, (_a, _p) in enumerate(zip(_gate3c_anchors, _gate3c_compose)):
-        if not np.isfinite(_p):
-            _g3c_warn.warn(
-                f"Gate 3c WARN: composer emitted non-finite for anchor={_a}"
-            )
-        if not (0.0 < float(_p) < 1.0):
-            _g3c_warn.warn(
-                f"Gate 3c WARN: composer emitted out-of-range {_p} for anchor={_a}"
-            )
-    # Round-trip identity: verify p_compose == sigmoid(logit(anchor) + tree_raw).
-    _gate3c_raw = _gbdt_predict_raw_g3b(gbdt_state, _gate3c_X)
-    _gate3c_logit_anchor = np.log(_gate3c_anchors / (1.0 - _gate3c_anchors))
-    _gate3c_expected = 1.0 / (1.0 + np.exp(-(_gate3c_logit_anchor + _gate3c_raw)))
-    _gate3c_delta = float(np.abs(_gate3c_compose - _gate3c_expected).max())
-    if _gate3c_delta > 1e-6:
-        _g3c_warn.warn(
-            f"[Gate 3c] WARN: composer disagreed with "
-            "sigmoid(logit(anchor) + tree_raw) by max "
-            f"{_gate3c_delta:.2e} (tolerance 1e-6). Composer may be broken."
-        )
-    print(
-        f"[Gate 3c] PASS: composer round-trip max delta = {_gate3c_delta:.2e} "
-        f"(tolerance 1e-6); composer emits valid probabilities for anchors in "
-        f"[1e-6, 1-1e-6]."
-    )
-
-    # Apply Member 2 v2 to val rows -- this OVERRIDES the placeholder set
-    # in section 9c.
-    p_member2_val = gbdt_compose_residual_batch(
-        gbdt_state, X_val_dense_m2v2, subject_mean_val,
-    )
-    nll_m2 = float(-(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
-                     + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean())
-    print(
-        f"\n[Member 2 v2] val log-loss: {nll_m2:.6f}  "
-        f"(compare to Member 1 val below in section 9f summary)"
-    )
-    print(
-        f"[Member 2 v2] train NLL stored in state: {gbdt_state.train_loss:.6f}  "
-        f"booster's internal val NLL (item-cold split): {gbdt_state.val_loss:.6f}"
-    )
-    print(f"[Member 2 v2] n_trees={gbdt_state.n_trees}  bias={gbdt_state.bias:+.4f}")
 
 # %% [markdown]
 # ## 9f. Train the stacker (ridge logistic regression on OOF train predictions)
@@ -6174,14 +4521,18 @@ if _centroid_cols:
 else:
     val_centroid_dist = np.full(len(primary.val), 0.5, dtype=np.float32)
 
-# Task 4: when Member 5 is enabled, build a [N, 5] member_probs stack
-# (M1, M2, M3, M4, M5); the column order is LOCKED across val and OOF-train
-# so the runtime's stacker.apply_one sees the same column ordering.
+# Build the per-row [N, n_members] member-probability stack. Column order
+# is LOCKED across val and OOF-train so the runtime's stacker.apply_one
+# sees a consistent ordering. The stacker column order is always:
+# M1, M2, M3, M4, [M5], [M6]. Disabled members are silently skipped.
 _stacker_member_list_val = [p_a_val, p_member2_val, p_member3_val, p_member4_val]
 _stacker_member_names_val = ["M1 (p_a_val)", "M2 (p_member2_val)", "M3 (p_member3_val)", "M4 (p_member4_val)"]
 if _M5_ENABLED:
     _stacker_member_list_val.append(p_member5_val)
     _stacker_member_names_val.append("M5 (p_member5_val)")
+if _M6_ENABLED:
+    _stacker_member_list_val.append(p_member6_val)
+    _stacker_member_names_val.append("M6 (p_member6_val)")
 
 # Defensive shape audit + 1-D coercion. ``np.stack`` raises a generic
 # ``ValueError: all input arrays must have the same shape`` when any of
@@ -6253,8 +4604,9 @@ stacker_X_val = build_stacker_features(
     nn_mean_similarity=val_nn_mean_sim,
     centroid_distance=val_centroid_dist,
 )
+_n_members_dyn = 4 + int(_M5_ENABLED) + int(_M6_ENABLED)
 print(f"[Stacker] X_val (final-reporting view): {stacker_X_val.shape} "
-      f"(n_members={'5' if _M5_ENABLED else '4'})")
+      f"(n_members={_n_members_dyn})")
 
 # ---------- OOF training side: build the stacker's TRAIN inputs from per-fold OOF preds ----------
 print("[Stacker] computing OOF-train aux features + member prob stack...")
@@ -6278,6 +4630,9 @@ _stacker_oof_names = [
 if _M5_ENABLED:
     _stacker_member_list_train_oof.append(p5_train_oof.astype(np.float32))
     _stacker_oof_names.append("M5 (p5_train_oof)")
+if _M6_ENABLED:
+    _stacker_member_list_train_oof.append(p6_train_oof.astype(np.float32))
+    _stacker_oof_names.append("M6 (p6_train_oof)")
 
 # Mirror the val-side defensive audit: same generic ``np.stack`` error,
 # same need to surface WHICH OOF member is the offender. Length mismatch
@@ -6337,7 +4692,7 @@ ylab_train_np = primary.train["label"].astype(float).to_numpy().astype(np.float3
 print(f"[Stacker] X_train_oof: {stacker_X_train_oof.shape}  ylab_train: {ylab_train_np.shape}")
 
 
-_n_stacker_members = 5 if _M5_ENABLED else 4
+_n_stacker_members = 4 + int(_M5_ENABLED) + int(_M6_ENABLED)
 _stacker_feature_names = stacker_feature_names(_n_stacker_members)
 assert int(stacker_X_train_oof.shape[1]) == len(_stacker_feature_names), (
     f"stacker_X_train_oof has {stacker_X_train_oof.shape[1]} cols but "
@@ -6378,11 +4733,15 @@ stacker_state = cache_or_compute(
     "stacker_state",
     key_inputs=(
         stacker_X_train_oof.shape[1], len(ylab_train_np), SEED,
-        # Cache invalidators: OOF (Task 1) and Member 5 (Task 4). The
-        # m5 tag bumps the key when Member 5 is added/removed so we
-        # never silently reuse a 4-member stacker on 5-member features.
+        # Cache invalidators: OOF (Task 1), Member 5 (Task 4), Member 6
+        # (FwFM), and the chosen M5 variant. The m5_variant tag bumps
+        # the key whenever the residual_cluster vs difficulty_knn
+        # selection flips so a stale stacker can never be reused on
+        # numerically-different M5 OOF preds. The m6 tag does the same
+        # for Member 6 add/remove.
         "oof_v1",
-        "m5_v1" if _M5_ENABLED else "no_m5",
+        f"m5_{_M5_VARIANT}" if _M5_ENABLED else "no_m5",
+        "m6_v1" if _M6_ENABLED else "no_m6",
         int(_n_stacker_members),
         int(OOF_N_FOLDS), int(OOF_SEED),
         bool(OOF_RETRAIN_M1),
@@ -6408,11 +4767,17 @@ nll_uniform_val = _bce(ylab_val, stacker_member_probs_val.mean(axis=1))
 
 print(f"\n[Stacker] val log-loss summary (OOF-fit stacker, val is TRUE holdout):")
 print(f"  Member 1 (Model A IRT-MLP, val):    {_bce(ylab_val, p_a_val):.6f}")
-print(f"  Member 2 (LightGBM, val):           {nll_m2:.6f}")
+print(f"  Member 2 (metadata MLP, val):       {nll_m2:.6f}")
 print(f"  Member 3 (kNN-similarity, val):     {nll_m3:.6f}")
 print(f"  Member 4 (LogReg, val):             {nll_m4:.6f}")
 if _M5_ENABLED:
-    print(f"  Member 5 (difficulty-kNN, val):     {nll_m5:.6f}")
+    _m5_label = (
+        "residual subj-cluster" if _M5_VARIANT == "residual_cluster"
+        else "difficulty-kNN"
+    )
+    print(f"  Member 5 ({_m5_label}, val):  {nll_m5:.6f}")
+if _M6_ENABLED:
+    print(f"  Member 6 (FwFM, val):               {nll_m6:.6f}")
 print(f"  Uniform avg of {_n_stacker_members} members (val):     {nll_uniform_val:.6f}")
 print(f"  STACKER (val, OOF-fit):             {nll_stack_val:.6f}")
 print(f"  STACKER (OOF-train, in-sample):     {nll_stack_train_oof:.6f}")
@@ -6423,39 +4788,28 @@ if nll_stack_val > nll_uniform_val + 1e-3:
         "diverse enough."
     )
 
-# Gate 3e (RED-TEAM, Task 3): error-correlation between Member 2 and
-# Member 1 on val. If the new Member 2 (subject-mean residual + non-
-# embedding schema) is still highly correlated with Member 1's errors,
+# Gate 3e (RED-TEAM): error-correlation between Member 2 and Member 1 on val.
+# If the metadata MLP is still highly correlated with Member 1's errors,
 # it's contributing redundant signal to the stacker and Task 3 didn't
 # achieve its decorrelation goal.
-if _M2V2_ENABLED:
-    _y64 = ylab_val.astype(np.float64)
-    _err_m1 = p_a_val.astype(np.float64) - _y64
-    _err_m2 = p_member2_val.astype(np.float64) - _y64
-    _corr_m2_m1 = float(np.corrcoef(_err_m2, _err_m1)[0, 1])
+_y64 = ylab_val.astype(np.float64)
+_err_m1 = p_a_val.astype(np.float64) - _y64
+_err_m2 = p_member2_val.astype(np.float64) - _y64
+_corr_m2_m1 = float(np.corrcoef(_err_m2, _err_m1)[0, 1])
+print(
+    f"\n[Gate 3e] Member 2 MLP vs Member 1 error correlation (val): "
+    f"corr(err_m2, err_m1) = {_corr_m2_m1:+.4f}"
+)
+if abs(_corr_m2_m1) > 0.85:
     print(
-        f"\n[Gate 3e] Member 2 v2 vs Member 1 error correlation (val): "
-        f"corr(err_m2, err_m1) = {_corr_m2_m1:+.4f}"
+        f"[Gate 3e] FLAG: |corr|={abs(_corr_m2_m1):.4f} > 0.85 -- Member 2 is still "
+        "strongly correlated with Member 1."
     )
-    if abs(_corr_m2_m1) > 0.85:
-        print(
-            f"[Gate 3e] FLAG: |corr|={abs(_corr_m2_m1):.4f} > 0.85 -- Member 2 v2 "
-            "is still strongly correlated with Member 1. Possible causes:\n"
-            "  1. Subject_obs_count_log1p is dominating splits (it's monotonic\n"
-            "     with subject confidence which Member 1 also captures).\n"
-            "  2. Mean-encoded interaction columns are recapturing the\n"
-            "     subject-by-cluster signal Member 1 learns via theta x u.\n"
-            "  3. Bench/subject metadata one-hots are correlated with the\n"
-            "     IRT-MLP's metadata embeddings.\n"
-            "  Consider: lower lr / num_leaves, drop subject_obs_count_log1p,\n"
-            "  or move some interaction cols to Member 5 (Task 4)."
-        )
-    else:
-        print(
-            f"[Gate 3e] PASS: |corr|={abs(_corr_m2_m1):.4f} <= 0.85; Member 2 "
-            "errors are sufficiently decorrelated from Member 1's. Task 3 met "
-            "its decorrelation goal."
-        )
+else:
+    print(
+        f"[Gate 3e] PASS: |corr|={abs(_corr_m2_m1):.4f} <= 0.85; Member 2 errors are "
+        "sufficiently decorrelated from Member 1."
+    )
 
 # Gate 4b (RED-TEAM, Task 4): error-correlation between Member 5
 # (difficulty-projected kNN) and Member 3 (raw-embedding kNN) on val.
@@ -6485,22 +4839,34 @@ if _M5_ENABLED and p_member5_val is not None:
         f"corr(err_m5, err_m1) = {_corr_m5_m1:+.4f}"
     )
     if abs(_corr_m5_m3) >= 0.90:
-        print(
-            f"[Gate 4b] FLAG: |corr(err_m5, err_m3)|={abs(_corr_m5_m3):.4f} "
-            ">= 0.90 -- Member 5 is essentially redundant with Member 3 "
-            "(difficulty-projected kNN and raw-embedding kNN are finding the "
-            "same neighborhoods). Possible fixes:\n"
-            "  1. Lower CFG['member5']['tau'] so the kernel is sharper and\n"
-            "     the difficulty distance distinguishes neighbors more.\n"
-            "  2. Increase CFG['member5']['ridge_alpha'] to suppress the\n"
-            "     low-signal embedding dimensions in the projection.\n"
-            "  3. Drop Member 5 if the diversity gain doesn't justify it."
-        )
+        if _M5_VARIANT == "difficulty_knn":
+            print(
+                f"[Gate 4b] FLAG: |corr(err_m5, err_m3)|={abs(_corr_m5_m3):.4f} "
+                ">= 0.90 -- Member 5 (difficulty-kNN) is essentially redundant "
+                "with Member 3. Possible fixes:\n"
+                "  1. Lower CFG['member5']['tau'] so the kernel is sharper and\n"
+                "     the difficulty distance distinguishes neighbors more.\n"
+                "  2. Increase CFG['member5']['ridge_alpha'] to suppress the\n"
+                "     low-signal embedding dimensions in the projection.\n"
+                "  3. Switch to CFG['member5']['variant']='residual_cluster'\n"
+                "     to use the categorical-only subject x cluster predictor."
+            )
+        else:
+            print(
+                f"[Gate 4b] FLAG: |corr(err_m5, err_m3)|={abs(_corr_m5_m3):.4f} "
+                ">= 0.90 -- Member 5 (residual subj-cluster) is unexpectedly "
+                "correlated with the embedding kNN. Possible causes:\n"
+                "  1. The cluster ids are tracking embedding geometry too\n"
+                "     closely (try a larger n_clusters or different basis).\n"
+                "  2. The residual_scale is too high; lower\n"
+                "     CFG['member5']['residual_scale'] toward 0.5.\n"
+                "  3. Drop Member 5 if the diversity gain doesn't justify it."
+            )
     else:
         print(
             f"[Gate 4b] PASS: |corr(err_m5, err_m3)|={abs(_corr_m5_m3):.4f} "
-            "< 0.90; Member 5's neighborhoods are sufficiently distinct from "
-            "Member 3's. Task 4 met its decorrelation goal."
+            "< 0.90; Member 5's signal is sufficiently distinct from "
+            "Member 3's."
         )
     # Report Member 5's stacker weight as a final diversity diagnostic:
     # a weight near zero means the stacker found nothing to add.
@@ -6512,6 +4878,180 @@ if _M5_ENABLED and p_member5_val is not None:
            if abs(_w5) < 0.05
            else "(non-trivial -- Member 5 is contributing)")
     )
+
+# Gate 6 (RED-TEAM, FwFM): error-correlation between Member 6 (FwFM)
+# and Member 4 (LogReg). M6 and M4 consume the SAME feature matrix;
+# the inductive difference is purely the bilinear interaction term.
+# If their val errors are >= 0.95 correlated, FwFM's bilinear term is
+# contributing only noise relative to the linear baseline -- raise k,
+# loosen weight_decay_V, or drop M6.
+if _M6_ENABLED and p_member6_val is not None:
+    _y64_g6 = ylab_val.astype(np.float64)
+    _err_m4 = p_member4_val.astype(np.float64) - _y64_g6
+    _err_m6 = p_member6_val.astype(np.float64) - _y64_g6
+    _err_m1 = p_a_val.astype(np.float64) - _y64_g6
+    _err_m2 = p_member2_val.astype(np.float64) - _y64_g6
+    _corr_m6_m4 = float(np.corrcoef(_err_m6, _err_m4)[0, 1])
+    _corr_m6_m2 = float(np.corrcoef(_err_m6, _err_m2)[0, 1])
+    _corr_m6_m1 = float(np.corrcoef(_err_m6, _err_m1)[0, 1])
+    print(
+        f"\n[Gate 6] Member 6 (FwFM) error correlations on val:\n"
+        f"  corr(err_m6, err_m4) = {_corr_m6_m4:+.4f}  "
+        f"corr(err_m6, err_m2) = {_corr_m6_m2:+.4f}  "
+        f"corr(err_m6, err_m1) = {_corr_m6_m1:+.4f}"
+    )
+    if abs(_corr_m6_m4) >= 0.95:
+        print(
+            f"[Gate 6] FLAG: |corr(err_m6, err_m4)|={abs(_corr_m6_m4):.4f} "
+            ">= 0.95 -- FwFM's bilinear term is barely adding any signal "
+            "beyond the linear LogReg baseline. Try:\n"
+            "  1. Raise CFG['member6']['k'] (8 -> 16) to give V more capacity\n"
+            "  2. Lower CFG['member6']['weight_decay_V'] to let V grow\n"
+            "  3. Switch CFG['member6']['field_split_mode'] = 'single' or\n"
+            "     a richer field schema (multiple buckets)\n"
+            "  4. Drop Member 6 if the cost outweighs the gain."
+        )
+    else:
+        print(
+            f"[Gate 6] PASS: |corr(err_m6, err_m4)|={abs(_corr_m6_m4):.4f} "
+            "< 0.95; FwFM's bilinear term provides signal independent of M4."
+        )
+    # M6 stacker weight (column index = 4 + int(_M5_ENABLED)).
+    _w6_col = 4 + int(_M5_ENABLED)
+    _w6 = float(stacker_state.weights[_w6_col])
+    print(
+        f"[Member 6] stacker weight (col {_w6_col}) = {_w6:+.4f} "
+        + ("(close to zero -- the stacker found little to add from FwFM; "
+           "consider tuning weight_decay_V or dropping M6)"
+           if abs(_w6) < 0.05
+           else "(non-trivial -- FwFM is contributing)")
+    )
+
+# %% [markdown]
+# ## 9f-quad. Member-correlation heatmaps (val)
+#
+# Two heatmaps to make ensemble redundancy visible at a glance:
+#
+# 1. **Prediction correlation**: Pearson correlation of each pair of
+#    members' val probabilities. High values mean the members produce
+#    similar score *patterns* -- which is not the same as "correlated
+#    errors" but is a useful directional read.
+# 2. **Joint-error correlation**: Pearson correlation of each pair of
+#    members' *signed errors* (``p - y``). This is the metric that
+#    actually drives stacker diversity. We also print the *joint-wrong
+#    rate*: for each pair, what fraction of val rows do both members
+#    misclassify (using p > 0.5 as the decision boundary). High
+#    joint-wrong rate means the pair's mistakes coincide, which the
+#    stacker cannot fix.
+#
+# Both plots are saved to ``CACHE_DIR / "diagnostics" / "*.png"`` and
+# returned inline. Skip silently when matplotlib is unavailable.
+
+# %%
+try:
+    import matplotlib  # noqa: F401
+    import matplotlib.pyplot as plt
+    _HEATMAP_OK = True
+except Exception as _hm_exc:
+    _HEATMAP_OK = False
+    print(f"[Heatmaps] SKIP: matplotlib unavailable ({_hm_exc!r})")
+
+if _HEATMAP_OK:
+    _hm_names = ["M1", "M2", "M3", "M4"]
+    _hm_preds = [
+        p_a_val.astype(np.float64),
+        p_member2_val.astype(np.float64),
+        p_member3_val.astype(np.float64),
+        p_member4_val.astype(np.float64),
+    ]
+    if _M5_ENABLED and p_member5_val is not None:
+        _hm_names.append("M5")
+        _hm_preds.append(p_member5_val.astype(np.float64))
+    if _M6_ENABLED and p_member6_val is not None:
+        _hm_names.append("M6")
+        _hm_preds.append(p_member6_val.astype(np.float64))
+    # Validate alignment defensively.
+    _hm_n = int(ylab_val.shape[0])
+    _hm_clean_names, _hm_clean_preds = [], []
+    for _nm, _arr in zip(_hm_names, _hm_preds):
+        _flat = np.asarray(_arr).reshape(-1)
+        if int(_flat.shape[0]) != _hm_n:
+            print(
+                f"[Heatmaps] WARN: {_nm} length {_flat.shape[0]} != "
+                f"ylab_val {_hm_n}; skipping this member."
+            )
+            continue
+        _hm_clean_names.append(_nm)
+        _hm_clean_preds.append(_flat.astype(np.float64))
+    if len(_hm_clean_preds) < 2:
+        print("[Heatmaps] SKIP: need at least 2 members with matching length.")
+    else:
+        _hm_stack = np.stack(_hm_clean_preds, axis=0)  # [M, N]
+        _hm_M = int(_hm_stack.shape[0])
+        _y_hm = ylab_val.astype(np.float64).reshape(-1)
+
+        # Per-pair: Pearson correlation of predictions.
+        _pred_corr = np.corrcoef(_hm_stack)            # [M, M]
+
+        # Per-pair: Pearson correlation of signed errors (p - y).
+        _err_stack = _hm_stack - _y_hm[None, :]
+        _err_corr = np.corrcoef(_err_stack)            # [M, M]
+
+        # Per-pair: joint-wrong rate. ``wrong[m] = (p_m > 0.5) != y``.
+        # ``joint[m1, m2] = mean(wrong[m1] AND wrong[m2])``.
+        _wrong = (_hm_stack > 0.5) != _y_hm[None, :].astype(bool)
+        _joint_wrong = (_wrong[:, None, :] & _wrong[None, :, :]).mean(axis=2)
+
+        # Per-member solo error rate (the diagonal of joint_wrong).
+        _solo_wrong_rate = _wrong.mean(axis=1)
+        print(
+            "[Heatmaps] per-member val error rate (p>0.5 vs y): "
+            + ", ".join(
+                f"{nm}={r:.3f}" for nm, r in zip(_hm_clean_names, _solo_wrong_rate)
+            )
+        )
+
+        # --- Plot helper ---
+        def _plot_heatmap(M_, title_, ax_, fmt_=".2f", cmap_="RdBu_r", vmin_=None, vmax_=None):
+            im = ax_.imshow(M_, cmap=cmap_, vmin=vmin_, vmax=vmax_, aspect="equal")
+            ax_.set_xticks(range(len(_hm_clean_names)))
+            ax_.set_yticks(range(len(_hm_clean_names)))
+            ax_.set_xticklabels(_hm_clean_names)
+            ax_.set_yticklabels(_hm_clean_names)
+            ax_.set_title(title_, fontsize=10)
+            for ii in range(M_.shape[0]):
+                for jj in range(M_.shape[1]):
+                    ax_.text(jj, ii, format(float(M_[ii, jj]), fmt_),
+                             ha="center", va="center",
+                             color="black", fontsize=8)
+            return im
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+        _plot_heatmap(_pred_corr, "Pearson corr of val predictions",
+                      axes[0], cmap_="RdBu_r", vmin_=-1.0, vmax_=1.0)
+        _plot_heatmap(_err_corr, "Pearson corr of val signed errors (p - y)",
+                      axes[1], cmap_="RdBu_r", vmin_=-1.0, vmax_=1.0)
+        # Joint-wrong rate is bounded in [0, 1] but typical values are
+        # ~0.1-0.3; use a sequential cmap and let imshow auto-scale so
+        # the contrast is informative.
+        _plot_heatmap(_joint_wrong, "Joint wrong-rate (both members wrong, p>0.5)",
+                      axes[2], cmap_="Oranges")
+        fig.suptitle(
+            f"Member correlation diagnostics on val "
+            f"(N={_hm_n:,}, members={_hm_clean_names})",
+            fontsize=11,
+        )
+        fig.tight_layout()
+        try:
+            _diag_dir = Path(CACHE_DIR) / "diagnostics"
+            _diag_dir.mkdir(parents=True, exist_ok=True)
+            _out_png = _diag_dir / "member_correlation_heatmaps.png"
+            fig.savefig(_out_png, dpi=120, bbox_inches="tight")
+            print(f"[Heatmaps] saved to {_out_png}")
+        except Exception as _save_exc:
+            print(f"[Heatmaps] WARN: failed to save figure ({_save_exc!r})")
+        plt.show()
+        plt.close(fig)
 
 # %% [markdown]
 # ## 9f-bis. Gate 1d: train-vs-val optimism check
@@ -6614,6 +5154,10 @@ else:
         p5_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p5_train_shuf")
     else:
         p5_train_shuf_acc = None
+    if _M6_ENABLED:
+        p6_train_shuf_acc = OofPredictionAccumulator(_N_TRAIN, name="p6_train_shuf")
+    else:
+        p6_train_shuf_acc = None
 
     for fold in folds:
         print(f"\n[OOF Gate 1c] === fold {fold.fold_id} (shuffled labels) ===")
@@ -6744,27 +5288,54 @@ else:
         p_a_oof_shuf = p_a_train[fold.oof_row_idx]   # real-label M1, used as feature
         p_a_anchor_shuf = p_a_train[fold.train_row_idx]
 
-        # Fold Member 2 on shuffled labels.
-        _gbdt_train_item_id_fold = np.array(
+        # Fold Member 2 (metadata MLP) on shuffled labels.
+        _m2_holdout_shuf = np.array(
             [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
             dtype=np.int64,
         )
-        _fold_gbdt_shuf = fit_gbdt_member(
-            X=X_ft_m2, y=_y_ft_shuf,
-            feature_names=tuple(member_feat_schema.feature_names) + tuple(MEMBER2_INTERACTION_FEATURE_NAMES),
-            init_pred_train=p_a_anchor_shuf,
-            holdout_group_id=_gbdt_train_item_id_fold,
-            n_estimators=int(CFG.get("gbdt", {}).get("n_estimators", 400)),
-            learning_rate=float(CFG.get("gbdt", {}).get("learning_rate", 0.05)),
-            num_leaves=int(CFG.get("gbdt", {}).get("num_leaves", 63)),
-            min_data_in_leaf=int(CFG.get("gbdt", {}).get("min_data_in_leaf", 100)),
-            feature_fraction=float(CFG.get("gbdt", {}).get("feature_fraction", 0.8)),
-            bagging_fraction=float(CFG.get("gbdt", {}).get("bagging_fraction", 0.8)),
-            bagging_freq=int(CFG.get("gbdt", {}).get("bagging_freq", 5)),
-            early_stopping_rounds=int(CFG.get("gbdt", {}).get("early_stopping_rounds", 25)),
-            seed=int(SEED) + 100 * (int(fold.fold_id) + 1) + 99999,
+        _m2_shuf_n_clusters = max(
+            int(_N_CLUSTERS_ME),
+            int(_mef_cluster_ft.max()) + 1 if _mef_cluster_ft.size else 0,
+            int(_mef_cluster_fo.max()) + 1 if _mef_cluster_fo.size else 0,
         )
-        p2_shuf_fold = gbdt_compose_residual_batch(_fold_gbdt_shuf, X_fo_m2, p_a_oof_shuf)
+        _fold_m2_shuf = fit_member2_metadata_mlp(
+            subject_ids=_mef_subj_ft,
+            bc_ids=_mef_bc_ft,
+            cluster_ids=_mef_cluster_ft,
+            marginals=_m4_mg_ft_shuf.astype(np.float32, copy=False),
+            y=_y_ft_shuf,
+            subject_keys=_subject_keys_ordered,
+            bc_keys=_bc_keys_ordered,
+            marg_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+            n_subjects=int(indexer.n_subjects),
+            n_bcs=int(indexer.n_bc),
+            n_clusters=int(_m2_shuf_n_clusters),
+            d_subj=int(_m2_cfg.get("d_subj", 32)),
+            d_bc=int(_m2_cfg.get("d_bc", 32)),
+            d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+            hid1=int(_m2_cfg.get("hid1", 256)),
+            hid2=int(_m2_cfg.get("hid2", 128)),
+            learning_rate=float(_m2_cfg.get("learning_rate", 1.0e-3)),
+            weight_decay=float(_m2_cfg.get("weight_decay", 1.0e-5)),
+            epochs=int(_m2_cfg.get("epochs", 40)),
+            batch_size=int(_m2_cfg.get("batch_size", 16384)),
+            val_fraction=float(_m2_cfg.get("val_fraction", 0.1)),
+            early_stopping_patience=int(_m2_cfg.get("early_stopping_patience", 5)),
+            cat_dropout_subject=float(_m2_cfg.get("cat_dropout_subject", 0.05)),
+            cat_dropout_bc=float(_m2_cfg.get("cat_dropout_bc", 0.10)),
+            cat_dropout_cluster=float(_m2_cfg.get("cat_dropout_cluster", 0.10)),
+            feat_dropout=float(_m2_cfg.get("feat_dropout", 0.10)),
+            seed=int(SEED) + 100 * (int(fold.fold_id) + 1) + 99999,
+            holdout_group_id=_m2_holdout_shuf,
+            show_progress=False,
+        )
+        p2_shuf_fold = m2_apply_state_batch(
+            _fold_m2_shuf,
+            subject_ids=_mef_subj_fo,
+            bc_ids=_mef_bc_fo,
+            cluster_ids=_mef_cluster_fo,
+            marginals=_m4_mg_fo_shuf.astype(np.float32, copy=False),
+        )
         p2_train_shuf_acc.write_fold(fold.oof_row_idx, p2_shuf_fold)
 
         # Fold Member 3 on shuffled labels (passrate already uses shuffled labels).
@@ -6815,16 +5386,18 @@ else:
             early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
             seed=int(SEED) + 300 * (int(fold.fold_id) + 1) + 99999,
             val_fraction=0.1,
-            holdout_group_id=_gbdt_train_item_id_fold,
+            holdout_group_id=_m2_holdout_shuf,
         )
         p4_shuf_fold = logreg_apply_state_batch(_fold_logreg_shuf, X_fo_m4)
         p4_train_shuf_acc.write_fold(fold.oof_row_idx, p4_shuf_fold)
 
-        # Task 4: Fold Member 5 on shuffled labels. The shuffled labels
-        # break any difficulty signal in the projection's regression
-        # target -- if the resulting Member 5 still beats chance on val
-        # we've found leakage in the difficulty pipeline.
-        if _M5_ENABLED:
+        # Task 4: Fold Member 5 on shuffled labels. Two variants:
+        #   - difficulty_knn: refit the difficulty-projected kNN on
+        #     shuffled labels. If it beats chance on val we've found
+        #     leakage in the difficulty pipeline.
+        #   - residual_cluster: refit the subject x cluster lookup on
+        #     shuffled labels; same null-detection rationale.
+        if _M5_ENABLED and _M5_VARIANT == "difficulty_knn":
             _fold_train_subj_ids_shuf = np.fromiter(
                 (int(indexer.subject_to_id.get(str(s), -1))
                  for s in fold_train_df["subject_key"]),
@@ -6868,6 +5441,66 @@ else:
             del _fold_m5_shuf, _fold_oof_item_emb_shuf
             del _fold_train_subj_ids_shuf, _fold_train_item_ids_shuf
             del _fold_oof_subj_ids_shuf, _fold_item_key_to_pos_shuf
+        elif _M5_ENABLED and _M5_VARIANT == "residual_cluster":
+            _fold_train_subj_ids_shuf = np.fromiter(
+                (int(indexer.subject_to_id.get(str(s), -1))
+                 for s in fold_train_df["subject_key"]),
+                dtype=np.int64, count=len(fold_train_df),
+            )
+            _fold_train_cluster_shuf = np.asarray(
+                _mef_cluster_fold_train, dtype=np.int64,
+            )
+            _fold_oof_subj_ids_shuf = np.fromiter(
+                (int(indexer.subject_to_id.get(str(s), -1))
+                 for s in fold_oof_df["subject_key"]),
+                dtype=np.int64, count=len(fold_oof_df),
+            )
+            _fold_oof_cluster_shuf = np.asarray(
+                _mef_cluster_fold_oof, dtype=np.int64,
+            )
+            _fold_m5res_shuf = fit_member5_residual(
+                subject_ids=_fold_train_subj_ids_shuf,
+                cluster_ids=_fold_train_cluster_shuf,
+                labels=_y_ft_shuf.astype(np.float64),  # SHUFFLED labels
+                subject_keys=list(_subject_keys_ordered),
+                n_clusters=int(N_CLUSTERS_CTX),
+                smoothing_cell=_M5_SMOOTH_CELL,
+                smoothing_marginal=_M5_SMOOTH_MARG,
+                residual_scale=_M5_RES_SCALE,
+                seed=int(SEED) + 400 * (int(fold.fold_id) + 1) + 99999,
+            )
+            p5_shuf_fold = m5res_apply_state_batch(
+                _fold_m5res_shuf,
+                subject_ids=_fold_oof_subj_ids_shuf,
+                cluster_ids=_fold_oof_cluster_shuf,
+            )
+            p5_train_shuf_acc.write_fold(fold.oof_row_idx, p5_shuf_fold)
+            del _fold_m5res_shuf, _fold_train_subj_ids_shuf
+            del _fold_train_cluster_shuf, _fold_oof_subj_ids_shuf
+            del _fold_oof_cluster_shuf
+
+        # Member 6 (FwFM) on shuffled labels.
+        if _M6_ENABLED:
+            _fold_fwfm_shuf = fit_fwfm_member(
+                X=X_ft_m4, y=_y_ft_shuf,
+                feature_names=(
+                    tuple(member_feat_schema.feature_names)
+                    + tuple(MEMBER4_MARGINAL_FEATURE_NAMES)
+                ),
+                field_ids=_m6_field_ids,
+                k=_M6_K, learning_rate=_M6_LR,
+                weight_decay_w=_M6_WD_W, weight_decay_V=_M6_WD_V,
+                weight_decay_r=_M6_WD_R,
+                epochs=_M6_EPOCHS, batch_size=_M6_BS,
+                early_stopping_patience=_M6_PATIENCE,
+                val_fraction=_M6_VAL_FRAC,
+                seed=int(SEED) + 500 * (int(fold.fold_id) + 1) + 99999,
+                standardize=True,
+                holdout_group_id=_m2_holdout_shuf,
+            )
+            p6_shuf_fold = fwfm_apply_state_batch(_fold_fwfm_shuf, X_fo_m4)
+            p6_train_shuf_acc.write_fold(fold.oof_row_idx, p6_shuf_fold)
+            del _fold_fwfm_shuf
 
         # M1 real (passed through as feature).
         p_a_train_shuf_acc.write_fold(fold.oof_row_idx, p_a_oof_shuf)
@@ -6876,7 +5509,7 @@ else:
         del nn_train_mat_fold_shuf, nn_oof_mat_fold_shuf, X_ft, X_fo
         del X_ft_m2, X_fo_m2, X_ft_m4, X_fo_m4
         del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
-        del _fold_gbdt_shuf, _fold_knn_shuf, _fold_logreg_shuf
+        del _fold_m2_shuf, _fold_knn_shuf, _fold_logreg_shuf
         gc.collect()
 
     p_a_shuf = p_a_train_shuf_acc.finalize()
@@ -6885,6 +5518,8 @@ else:
     p4_shuf = p4_train_shuf_acc.finalize()
     if _M5_ENABLED:
         p5_shuf = p5_train_shuf_acc.finalize()
+    if _M6_ENABLED:
+        p6_shuf = p6_train_shuf_acc.finalize()
 
     # Fit a stacker on shuffled-label OOF predictions and apply to val.
     # Match the live stacker's [N, n_members] column layout exactly so the
@@ -6892,6 +5527,8 @@ else:
     _shuf_member_list = [p_a_shuf, p2_shuf, p3_shuf, p4_shuf]
     if _M5_ENABLED:
         _shuf_member_list.append(p5_shuf)
+    if _M6_ENABLED:
+        _shuf_member_list.append(p6_shuf)
     stacker_member_probs_train_shuf = np.stack(_shuf_member_list, axis=1).astype(np.float32)
     stacker_X_train_shuf = build_stacker_features(
         member_probs=stacker_member_probs_train_shuf,
@@ -7094,6 +5731,8 @@ _oof_member_preds_for_digest = [
 ]
 if _M5_ENABLED:
     _oof_member_preds_for_digest.append(p5_train_oof)
+if _M6_ENABLED:
+    _oof_member_preds_for_digest.append(p6_train_oof)
 _oof_member_preds_digest = _hashlib.sha256(
     np.ascontiguousarray(
         np.stack(_oof_member_preds_for_digest, axis=1),
@@ -7103,7 +5742,7 @@ _oof_member_preds_digest = _hashlib.sha256(
 CALIBRATOR_KEY_INPUTS = (
     "nn_calibrator_oof_v1",
     state_fingerprint(ckpt_a_cached["model_state"]),
-    state_fingerprint(gbdt_state),
+    state_fingerprint(member2_mlp_state),
     state_fingerprint(knn_state),
     state_fingerprint(logreg_state),
     state_fingerprint(stacker_state),
@@ -7111,8 +5750,12 @@ CALIBRATOR_KEY_INPUTS = (
     # Member-5-on/off toggle (or any retuning of k/tau/ridge_alpha)
     # invalidates the calibrator entry. Without this, a stale calibrator
     # fit on 4-member stacker outputs would silently apply to 5-member
-    # stacker outputs.
+    # stacker outputs. The variant tag distinguishes residual_cluster
+    # vs difficulty_knn so flipping between them busts the cache too.
     state_fingerprint(member5_state) if _M5_ENABLED else "no_m5",
+    f"m5_variant_{_M5_VARIANT}",
+    # Member 6 (FwFM) cache invalidator -- same discipline.
+    state_fingerprint(fwfm_state) if _M6_ENABLED else "no_m6",
     int(CFG["nn_calibration"]["k"]),
     str(CFG["nn_calibration"].get("similarity", "cosine")),
     float(CFG["nn_calibration"].get("temperature", 1.0)),
@@ -7170,7 +5813,7 @@ print(f"[Calibrator] residual table saved to {RESIDUAL_DIR}")
 #   2. Wrap the Member 1 bundle with `export_four_member_stacked_run`,
 #      which:
 #        - copies Members 2-4 + stacker + post-calibrator state into
-#          ``artifacts/{member2_gbdt,member3_knn,member4_logreg,
+#          ``artifacts/{member2_metadata_mlp,member3_knn,member4_logreg,
 #          stacker,nn_calibrator_stacked,residual_table}/``,
 #        - copies the pure-NumPy runtime modules into ``_pure/``,
 #        - patches ``model.py`` to strip ``import faiss`` and append
@@ -7178,6 +5821,33 @@ print(f"[Calibrator] residual table saved to {RESIDUAL_DIR}")
 #          to the four-member orchestration,
 #        - audits the resulting bundle for forbidden imports and
 #          enforces the 1500 MB ZIP cap.
+#
+# The exporter currently bundles Members 1-5 (legacy difficulty_knn
+# variant of M5) only. Member 6 (FwFM) and the residual_cluster variant
+# of M5 do not yet have runtime templates in src/_pure/, so we gate
+# the export below when either is active. The training pipeline keeps
+# producing val/OOF predictions and the stacker / heatmaps still work
+# end-to-end -- only the Codabench bundle build is skipped. To ship,
+# set CFG['member5']['variant']='difficulty_knn' and
+# CFG['member6']['enabled']=False, re-run, and rerun this section.
+
+# %%
+_EXPORT_BUNDLE_OK = not _M6_ENABLED and (
+    (not _M5_ENABLED) or _M5_VARIANT == "difficulty_knn"
+)
+if not _EXPORT_BUNDLE_OK:
+    import warnings as _exp_warn
+    _exp_warn.warn(
+        "[Export] SKIPPING bundle build: the active configuration includes "
+        f"Member 6 ({_M6_ENABLED=}) or the residual_cluster variant of "
+        f"Member 5 ({_M5_VARIANT=}), and src/_pure/ has no runtime template "
+        "for either yet. Stacker quality / heatmap diagnostics above remain "
+        "valid; only the Codabench bundle is skipped."
+    )
+    print(
+        "[Export] SKIPPED. _M5_ENABLED="
+        f"{_M5_ENABLED} _M5_VARIANT={_M5_VARIANT!r} _M6_ENABLED={_M6_ENABLED}"
+    )
 
 # %%
 import shutil
@@ -7198,6 +5868,22 @@ from src.export_stacked_submission import (
 SUBMISSION_DIR_M1 = ROOT / "submission" / "qwen8b_4member_stacked_member1"
 SUBMISSION_DIR = ROOT / "submission" / "qwen8b_4member_stacked"
 TRAINING_CACHE_DIR = ROOT / "artifacts" / "training_cache"
+
+# Hard gate: when M6 (FwFM) is enabled or M5 is using the new
+# residual_cluster variant, the runtime in src/_pure/ does NOT yet
+# ship a matching template, so the produced bundle would crash on
+# Codabench. We raise SystemExit here so that running as a script
+# stops cleanly and Jupyter Run All halts at this cell.
+if not _EXPORT_BUNDLE_OK:
+    print(
+        "[Export] SKIPPED bundle build. _M5_ENABLED="
+        f"{_M5_ENABLED} _M5_VARIANT={_M5_VARIANT!r} _M6_ENABLED={_M6_ENABLED}."
+    )
+    print(
+        "[Export] To ship, set CFG['member5']['variant']='difficulty_knn' and "
+        "CFG['member6']['enabled']=False, then rerun this section."
+    )
+    raise SystemExit(0)
 
 print("[Export] Step 1: building Member 1 (Model A only) bundle...")
 training_cache_result = bundle_training_cache(
@@ -7307,7 +5993,7 @@ print(
 )
 sub_dir = export_four_member_stacked_run(
     member1_bundle_dir=sub_dir_m1,
-    gbdt_state=gbdt_state,
+    member2_mlp_state=member2_mlp_state,
     knn_state=knn_state,
     logreg_state=logreg_state,
     stacker_state=stacker_state,
@@ -7321,7 +6007,7 @@ sub_dir = export_four_member_stacked_run(
     # (matches training-time convention). Without this, the runtime
     # would fall back to Member 1's prediction as the anchor, which
     # would silently mis-compose the val-fit Member 2 booster's trees.
-    subject_mean_table=(subject_mean_table_global if _M2V2_ENABLED else None),
+    mean_encoded_stats=mean_encoded_stats,
     # Task 4: ship Member 5 (difficulty-projected kNN). The exporter
     # raises if member5_state is non-None and stacker_state has only 4
     # member columns -- that misconfig would silently drop Member 5 at
@@ -7387,7 +6073,7 @@ def _ll(p):
 
 
 print(f"  Member 1 (Model A IRT-MLP)        : {_ll(p_a_val):.6f}")
-print(f"  Member 2 (LightGBM)               : {_ll(p_member2_val):.6f}")
+print(f"  Member 2 (metadata MLP)           : {_ll(p_member2_val):.6f}")
 print(f"  Member 3 (kNN-similarity)         : {_ll(p_member3_val):.6f}")
 print(f"  Member 4 (LogReg)                 : {_ll(p_member4_val):.6f}")
 if _M5_ENABLED:
@@ -7519,11 +6205,16 @@ print(f"  [PASS] calibrator.apply determinism (max delta: {float(np.abs(p_cal_a 
 print("\n" + "=" * 72)
 print("RED-TEAM SECTION E: edge cases on member apply functions")
 print("=" * 72)
-# All-NaN feature row -> Member 2 (GBDT) handles via default_left.
-nan_feats = np.full(member_feat_schema.feature_dim, np.nan, dtype=np.float32)
-from src.gbdt_member import apply_one as _g_apply_one
-p2_nan = _g_apply_one(gbdt_state, nan_feats)
-print(f"  [PASS] GBDT NaN-features -> {p2_nan:.4f} (finite={np.isfinite(p2_nan)})")
+# Member 2 MLP: cold-start UNK ids + zero marginals -> finite probability.
+from src.member2_metadata_mlp import apply_state_one as _m2_apply_one
+p2_cold = _m2_apply_one(
+    member2_mlp_state,
+    subject_id=-1,
+    bc_id=-1,
+    cluster_id=-1,
+    marginals=np.zeros(int(member2_mlp_state.n_marginals), dtype=np.float32),
+)
+print(f"  [PASS] M2 cold-start UNK -> {p2_cold:.4f} (finite={np.isfinite(p2_cold)})")
 
 # All-Inf feature row -> Member 4 (LogReg) clamps.
 inf_feats = np.full(member_feat_schema.feature_dim, np.inf, dtype=np.float32)

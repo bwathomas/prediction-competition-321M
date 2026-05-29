@@ -34,7 +34,6 @@ from src.export_stacked_submission import (
     measure_bundle_size_bytes,
     zip_bundle,
 )
-from src.gbdt_member import fit_gbdt_member
 from src.knn_member import fit_knn_member
 from src.logreg_member import fit_logreg_member
 from src.nn_calibration import NNCalibrator, NNCalibratorState, SubjectResidualTable
@@ -189,7 +188,42 @@ def _make_synthetic_states(tmp_path: Path):
         k=5,
     )
 
-    # Member 2: GBDT on synthetic features.
+    # Member 2: metadata MLP on synthetic ids + marginals.
+    from src.member2_metadata_mlp import fit_member2_metadata_mlp
+
+    N = 400
+    n_subjects, n_bcs, n_clusters = 8, 5, 4
+    n_marginals = 6
+    subj_ids = rng.integers(0, n_subjects, size=N).astype(np.int64)
+    bc_ids = rng.integers(0, n_bcs, size=N).astype(np.int64)
+    cl_ids = rng.integers(0, n_clusters, size=N).astype(np.int64)
+    marginals = rng.normal(size=(N, n_marginals)).astype(np.float32)
+    z_m2 = marginals[:, 0] + 0.5 * (subj_ids % 3) - 0.3 * (bc_ids % 2)
+    y = (rng.uniform(size=N) < (1 / (1 + np.exp(-z_m2)))).astype(np.float32)
+    member2_mlp_state = fit_member2_metadata_mlp(
+        subject_ids=subj_ids,
+        bc_ids=bc_ids,
+        cluster_ids=cl_ids,
+        marginals=marginals,
+        y=y,
+        subject_keys=tuple(f"s{i}" for i in range(n_subjects)),
+        bc_keys=tuple(f"b{i}" for i in range(n_bcs)),
+        marg_feature_names=tuple(f"m{i}" for i in range(n_marginals)),
+        n_subjects=n_subjects,
+        n_bcs=n_bcs,
+        n_clusters=n_clusters,
+        d_subj=8,
+        d_bc=8,
+        d_cluster=4,
+        hid1=32,
+        hid2=16,
+        epochs=5,
+        batch_size=128,
+        seed=1,
+        show_progress=False,
+    )
+
+    # Member 4: LogReg on dense features (independent of M2).
     F = 12
     feature_names = tuple(f"f{i}" for i in range(F))
     X = rng.normal(size=(400, F)).astype(np.float32)
@@ -197,24 +231,10 @@ def _make_synthetic_states(tmp_path: Path):
         2.0 * X[:, 0] * (X[:, 1] > 0).astype(np.float32) + 0.5 * X[:, 2]
     )
     p_true = 1 / (1 + np.exp(-y_signal.astype(np.float64)))
-    y = (rng.uniform(size=400) < p_true).astype(np.float32)
-    gbdt_state = fit_gbdt_member(
-        X=X,
-        y=y,
-        feature_names=feature_names,
-        n_estimators=20,
-        learning_rate=0.1,
-        num_leaves=8,
-        min_data_in_leaf=10,
-        early_stopping_rounds=5,
-        seed=1,
-        parity_atol=1.0e-5,
-    )
-
-    # Member 4: LogReg on the same features.
+    y_lr = (rng.uniform(size=400) < p_true).astype(np.float32)
     logreg_state = fit_logreg_member(
         X=X,
-        y=y,
+        y=y_lr,
         feature_names=feature_names,
         epochs=50,
         learning_rate=0.05,
@@ -262,7 +282,7 @@ def _make_synthetic_states(tmp_path: Path):
         n_training_items=knn_state.n_items,
     )
 
-    return gbdt_state, knn_state, logreg_state, stacker_state, cal, rt
+    return member2_mlp_state, knn_state, logreg_state, stacker_state, cal, rt
 
 
 # ---------------------------------------------------------------------------
@@ -329,11 +349,11 @@ def test_export_assembles_bundle_layout(tmp_path):
     file should exist."""
     member1 = _build_minimal_member1_bundle(tmp_path)
     states = _make_synthetic_states(tmp_path)
-    gbdt_state, knn_state, logreg_state, stacker_state, cal, rt = states
+    m2_state, knn_state, logreg_state, stacker_state, cal, rt = states
 
     out = export_four_member_stacked_run(
         member1_bundle_dir=member1,
-        gbdt_state=gbdt_state,
+        member2_mlp_state=m2_state,
         knn_state=knn_state,
         logreg_state=logreg_state,
         stacker_state=stacker_state,
@@ -349,8 +369,8 @@ def test_export_assembles_bundle_layout(tmp_path):
         assert (out / "_pure" / f"{name}.py").exists()
     assert (out / "_pure" / "__init__.py").exists()
     # Member states.
-    assert (out / "artifacts" / "member2_gbdt" / "trees.npz").exists()
-    assert (out / "artifacts" / "member2_gbdt" / "meta.json").exists()
+    assert (out / "artifacts" / "member2_metadata_mlp" / "weights.npz").exists()
+    assert (out / "artifacts" / "member2_metadata_mlp" / "meta.json").exists()
     assert (out / "artifacts" / "member3_knn" / "knn_state.npz").exists()
     assert (out / "artifacts" / "member3_knn" / "knn_meta.json").exists()
     assert (out / "artifacts" / "member4_logreg" / "weights.npz").exists()
@@ -362,73 +382,51 @@ def test_export_assembles_bundle_layout(tmp_path):
     assert (out / "artifacts" / "residual_table" / "meta.json").exists()
 
 
-def test_export_ships_subject_mean_table_when_provided(tmp_path):
-    """Task 3: when subject_mean_table is passed, the exporter must
-    materialize artifacts/subject_mean/{subject_mean.npy, meta.json}
-    AND the runtime template must reference the table-aware anchor
-    selection block.
-
-    When subject_mean_table=None, the artifacts dir must NOT exist and
-    the template still works (legacy: Member 1 anchor)."""
-    from src.subject_mean import fit_subject_mean_table
+def test_export_ships_mean_encoded_stats_when_provided(tmp_path):
+    """When mean_encoded_stats is passed, artifacts/mean_encoded/ is shipped."""
+    from src.mean_encoded_features import fit_mean_encoded_stats
 
     member1 = _build_minimal_member1_bundle(tmp_path)
     states = _make_synthetic_states(tmp_path)
-    sm_table = fit_subject_mean_table(
+    mes = fit_mean_encoded_stats(
         subject_ids=np.array([0, 0, 1, 1, 2], dtype=np.int64),
-        labels=np.array([1.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float64),
+        cluster_ids=np.array([0, 1, 0, 1, 0], dtype=np.int64),
+        bc_ids=np.array([0, 1, 0, 1, 0], dtype=np.int64),
+        labels=np.array([1.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float32),
         n_subjects=3,
+        n_clusters=2,
+        n_bcs=2,
         smoothing=5.0,
     )
 
     out_with = export_four_member_stacked_run(
         member1_bundle_dir=member1,
-        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        member2_mlp_state=states[0], knn_state=states[1], logreg_state=states[2],
         stacker_state=states[3], nn_calibrator=states[4], residual_table=states[5],
-        out_dir=tmp_path / "submission_with_sm",
+        out_dir=tmp_path / "submission_with_me",
         src_dir=Path("src"),
-        subject_mean_table=sm_table,
+        mean_encoded_stats=mes,
     )
-    sm_dir = out_with / "artifacts" / "subject_mean"
-    assert sm_dir.exists()
-    assert (sm_dir / "subject_mean.npy").exists()
-    assert (sm_dir / "subject_obs_count.npy").exists()
-    assert (sm_dir / "meta.json").exists()
-    meta = json.loads((sm_dir / "meta.json").read_text(encoding="utf-8"))
-    assert meta["n_subjects"] == 3
-    assert math.isclose(meta["smoothing"], 5.0, abs_tol=1e-9)
-    assert 0.0 <= meta["global_mean"] <= 1.0
-    # Re-load the saved .npy and confirm values round-trip.
-    saved = np.load(sm_dir / "subject_mean.npy")
-    np.testing.assert_allclose(saved, sm_table.subject_mean, rtol=1e-10)
+    me_dir = out_with / "artifacts" / "mean_encoded"
+    assert me_dir.exists()
+    assert (me_dir / "mean_encoded_stats.npz").exists()
+    assert (me_dir / "mean_encoded_meta.json").exists()
 
-    # Runtime template must include the table-aware anchor branch.
     txt = (out_with / "model.py").read_text(encoding="utf-8")
-    assert "_SUBJECT_MEAN_TABLE" in txt
-    assert "_SUBJECT_MEAN_GLOBAL" in txt
-    # The Task-3 anchor selection logic must be present.
-    assert "subject_mean[subject_id]" in txt or "_SUBJECT_MEAN_TABLE[_s_id]" in txt
+    assert "_ME_STATS" in txt
+    assert "apply_member4_marginal_features_one" in txt
 
-    # And: without the table, the artifacts dir must NOT exist and the
-    # template should still load (the legacy Member 1 anchor branch
-    # kicks in via _SUBJECT_MEAN_TABLE is None).
-    second_root = tmp_path / "second_run"
-    second_root.mkdir()
-    member1_b = _build_minimal_member1_bundle(second_root)
+    m1b = tmp_path / "m1b"
+    m1b.mkdir(parents=True, exist_ok=True)
     out_without = export_four_member_stacked_run(
-        member1_bundle_dir=member1_b,
-        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        member1_bundle_dir=_build_minimal_member1_bundle(m1b),
+        member2_mlp_state=states[0], knn_state=states[1], logreg_state=states[2],
         stacker_state=states[3], nn_calibrator=states[4], residual_table=states[5],
-        out_dir=tmp_path / "submission_no_sm",
+        out_dir=tmp_path / "submission_no_me",
         src_dir=Path("src"),
-        subject_mean_table=None,
+        mean_encoded_stats=None,
     )
-    assert not (out_without / "artifacts" / "subject_mean").exists()
-    # Template still loads the table-aware block (with fallback to None).
-    txt2 = (out_without / "model.py").read_text(encoding="utf-8")
-    assert "_SUBJECT_MEAN_TABLE" in txt2
-    # Fallback comment must be present so future readers know it's intentional.
-    assert "legacy / pre-Task-3" in txt2 or "fall back" in txt2
+    assert not (out_without / "artifacts" / "mean_encoded").exists()
 
 
 def _make_synthetic_member5_state(tmp_path: Path):
@@ -515,7 +513,7 @@ def test_export_ships_member5_state_when_provided_and_5col_stacker(tmp_path):
 
     out = export_four_member_stacked_run(
         member1_bundle_dir=member1,
-        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        member2_mlp_state=states[0], knn_state=states[1], logreg_state=states[2],
         stacker_state=stacker_5,
         nn_calibrator=states[4], residual_table=states[5],
         out_dir=tmp_path / "submission_with_m5",
@@ -548,7 +546,7 @@ def test_export_omits_member5_dir_when_not_provided(tmp_path):
     states = _make_synthetic_states(tmp_path)
     out = export_four_member_stacked_run(
         member1_bundle_dir=member1,
-        gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+        member2_mlp_state=states[0], knn_state=states[1], logreg_state=states[2],
         stacker_state=states[3],
         nn_calibrator=states[4], residual_table=states[5],
         out_dir=tmp_path / "submission_no_m5",
@@ -575,7 +573,7 @@ def test_export_rejects_member5_with_4col_stacker(tmp_path):
     with pytest.raises(ValueError, match="member5_state was provided"):
         export_four_member_stacked_run(
             member1_bundle_dir=member1,
-            gbdt_state=states[0], knn_state=states[1], logreg_state=states[2],
+            member2_mlp_state=states[0], knn_state=states[1], logreg_state=states[2],
             stacker_state=states[3],
             nn_calibrator=states[4], residual_table=states[5],
             out_dir=tmp_path / "submission_mismatched",
@@ -586,11 +584,11 @@ def test_export_rejects_member5_with_4col_stacker(tmp_path):
 
 def test_export_strips_faiss_and_appends_stacker_block(tmp_path):
     member1 = _build_minimal_member1_bundle(tmp_path)
-    gbdt_state, knn_state, logreg_state, stacker_state, cal, rt = _make_synthetic_states(tmp_path)
+    m2_state, knn_state, logreg_state, stacker_state, cal, rt = _make_synthetic_states(tmp_path)
 
     out = export_four_member_stacked_run(
         member1_bundle_dir=member1,
-        gbdt_state=gbdt_state,
+        member2_mlp_state=m2_state,
         knn_state=knn_state,
         logreg_state=logreg_state,
         stacker_state=stacker_state,
@@ -623,7 +621,7 @@ def test_export_audit_blocks_bundle_with_forbidden_imports(tmp_path):
     with pytest.raises(RuntimeError, match="forbidden imports"):
         export_four_member_stacked_run(
             member1_bundle_dir=member1,
-            gbdt_state=states[0],
+            member2_mlp_state=states[0],
             knn_state=states[1],
             logreg_state=states[2],
             stacker_state=states[3],
@@ -643,7 +641,7 @@ def test_export_zip_size_under_cap(tmp_path):
     states = _make_synthetic_states(tmp_path)
     out = export_four_member_stacked_run(
         member1_bundle_dir=member1,
-        gbdt_state=states[0],
+        member2_mlp_state=states[0],
         knn_state=states[1],
         logreg_state=states[2],
         stacker_state=states[3],
@@ -668,7 +666,7 @@ def test_export_zip_cap_audit_raises_when_too_large(tmp_path):
     with pytest.raises(RuntimeError, match="uncompressed size"):
         export_four_member_stacked_run(
             member1_bundle_dir=member1,
-            gbdt_state=states[0],
+            member2_mlp_state=states[0],
             knn_state=states[1],
             logreg_state=states[2],
             stacker_state=states[3],

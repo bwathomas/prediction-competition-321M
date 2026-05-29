@@ -1,7 +1,7 @@
 """Phase 5 of the four-member stacked-ensemble upgrade.
 
 Bundle a four-member stacked ensemble (Member 1 IRT-MLP + Member 2
-GBDT + Member 3 FAISS-free kNN + Member 4 LogReg, fused by an OOF
+metadata MLP + Member 3 FAISS-free kNN + Member 4 LogReg, fused by an OOF
 ridge stacker and post-calibrated by a single shrinkage NN-residual
 calibrator) into a Codabench submission directory.
 
@@ -18,14 +18,15 @@ features, and per-batch caching), we **wrap** the existing
      per-batch caching) with code paths that are already tested.
 
   2. Add new artifact directories beside the ensemble checkpoint:
-     ``artifacts/member2_gbdt/``, ``artifacts/member3_knn/``,
+     ``artifacts/member2_metadata_mlp/``, ``artifacts/member3_knn/``,
      ``artifacts/member4_logreg/``, ``artifacts/stacker/``,
      ``artifacts/nn_calibrator_stacked/``,
      ``artifacts/residual_table/``.
 
   3. Copy the pure-numpy runtime modules into
      ``submission/_pure/``:
-       - ``gbdt_member.py``        (apply_one for Member 2)
+       - ``member2_metadata_mlp.py`` (apply_state_one for Member 2)
+       - ``mean_encoded_features.py`` (marginal features for Member 2)
        - ``knn_member.py``         (apply_one for Member 3)
        - ``logreg_member.py``      (apply_one for Member 4)
        - ``stacker.py``            (apply_one for the stacker)
@@ -104,7 +105,7 @@ _STACKED_ROOT = HERE / "artifacts"
 _PURE_DIR = HERE / "_pure"
 _HAS_STACKED_BUNDLE = (
     (_STACKED_ROOT / "stacker").exists()
-    and (_STACKED_ROOT / "member2_gbdt").exists()
+    and (_STACKED_ROOT / "member2_metadata_mlp").exists()
     and (_STACKED_ROOT / "member3_knn").exists()
     and (_STACKED_ROOT / "member4_logreg").exists()
     and _PURE_DIR.exists()
@@ -118,7 +119,8 @@ if _HAS_STACKED_BUNDLE:
     # faiss / sklearn at module scope; the offline-only fit functions
     # have those imports inside the function body and never fire at
     # runtime.
-    import gbdt_member as _gbdt_mod
+    import member2_metadata_mlp as _m2_mod
+    import mean_encoded_features as _me_mod
     import knn_member as _knn_mod
     import logreg_member as _logreg_mod
     import stacker as _stacker_mod
@@ -126,7 +128,13 @@ if _HAS_STACKED_BUNDLE:
     import member_features as _mfeat_mod
 
     LOG.info("[stacked] loading 4-member ensemble state")
-    _GBDT_STATE = _gbdt_mod.GBDTMemberState.load(_STACKED_ROOT / "member2_gbdt")
+    _M2_STATE = _m2_mod.Member2MLPState.load(_STACKED_ROOT / "member2_metadata_mlp")
+    _ME_DIR = _STACKED_ROOT / "mean_encoded"
+    _ME_STATS = (
+        _me_mod.MeanEncodedStats.load(_ME_DIR)
+        if _ME_DIR.exists()
+        else None
+    )
     _KNN_STATE = _knn_mod.KNNMemberState.load(_STACKED_ROOT / "member3_knn")
     _LOGREG_STATE = _logreg_mod.LogRegMemberState.load(_STACKED_ROOT / "member4_logreg")
     _STACKER_STATE = _stacker_mod.StackerState.load(_STACKED_ROOT / "stacker")
@@ -175,26 +183,6 @@ if _HAS_STACKED_BUNDLE:
             n_subjects=int(_KNN_STATE.n_subjects),
             n_training_items=int(_KNN_STATE.n_items),
         )
-
-    # Task 3: optional subject_mean table for Member 2's residual anchor.
-    # When present, Member 2 composes against `subject_mean[subject_id]`
-    # instead of Member 1's prediction (the legacy anchor). When absent,
-    # the runtime falls back to Member 1 -- safe for pre-Task-3 bundles.
-    _SUBJECT_MEAN_DIR = _STACKED_ROOT / "subject_mean"
-    if _SUBJECT_MEAN_DIR.exists():
-        _SUBJECT_MEAN_TABLE = np.load(_SUBJECT_MEAN_DIR / "subject_mean.npy").astype(np.float64)
-        _SUBJECT_MEAN_META = json.loads(
-            (_SUBJECT_MEAN_DIR / "meta.json").read_text(encoding="utf-8")
-        )
-        _SUBJECT_MEAN_GLOBAL = float(_SUBJECT_MEAN_META.get("global_mean", 0.5))
-        LOG.info(
-            "[stacked] loaded subject_mean table (n=%d, global_mean=%.4f) "
-            "for Member 2 residual anchor (Task 3).",
-            int(_SUBJECT_MEAN_TABLE.shape[0]), _SUBJECT_MEAN_GLOBAL,
-        )
-    else:
-        _SUBJECT_MEAN_TABLE = None
-        _SUBJECT_MEAN_GLOBAL = 0.5
 
     # Reuse Member 3's FAISS-free top-k for the calibrator's
     # neighbor lookup. The neighbor IDs returned are indices into
@@ -255,51 +243,33 @@ if _HAS_STACKED_BUNDLE:
             except NameError:
                 feats_m24 = np.zeros(_GBDT_STATE.feature_dim, dtype=np.float32)
 
-            # ---- Member 2 (GBDT) ----
-            # Residual-mode states (output_mode='residual_logit') were
-            # trained to predict logit(y) - logit(p_member1); the
-            # runtime composer adds p1's logit back to recover a
-            # probability. Legacy binary-mode states return the
-            # probability directly via apply_one. The output_mode
-            # attribute defaults to 'probability' for states saved
-            # before the residual mode was introduced, so this branch
-            # is safe for old artifacts too.
-            _gbdt_mode = getattr(_GBDT_STATE, "output_mode", "probability")
-            if int(_GBDT_STATE.feature_dim) == int(feats_m24.shape[0]):
-                feats_for_gbdt = feats_m24
-            else:
-                # Feature-dim mismatch -- the runtime feature builder isn't
-                # wired up. In residual mode with zero features and bias
-                # near 0 the tree contribution is small, so composing
-                # with p1 still yields a sensible probability (~p1).
-                feats_for_gbdt = np.zeros(
-                    int(_GBDT_STATE.feature_dim), dtype=np.float32
-                )
-            if _gbdt_mode == "residual_logit":
-                # ``compose_residual_one`` is only present in
-                # post-2026-05-26 builds. ``getattr`` keeps this defensive
-                # if a frozen older copy of gbdt_member.py is in the
-                # bundle for some reason.
-                _compose = getattr(_gbdt_mod, "compose_residual_one", None)
-                if _compose is None:
-                    p2 = float(p1)
+            # ---- Member 2 (metadata MLP) ----
+            try:
+                _s_id_m2 = int(_SUBJECT_TO_ID.get(subject_key, -1))
+                _bc_id_m2 = int(_BC_TO_ID.get(benchmark, -1))
+                _cl_lookup = globals().get("_CLUSTER_TO_ID", {})
+                if isinstance(_cl_lookup, dict):
+                    _cl_id_m2 = int(_cl_lookup.get(condition, -1))
                 else:
-                    # Task 3: prefer subject_mean[subject_id] as the
-                    # residual anchor (when the subject_mean table was
-                    # shipped). Pre-Task-3 bundles ship no subject_mean
-                    # table, in which case fall back to Member 1's
-                    # prediction as the anchor (legacy behavior).
-                    if _SUBJECT_MEAN_TABLE is not None:
-                        _s_id = int(_SUBJECT_TO_ID.get(subject_key, 0))
-                        if 0 <= _s_id < int(_SUBJECT_MEAN_TABLE.shape[0]):
-                            _gbdt_anchor = float(_SUBJECT_MEAN_TABLE[_s_id])
-                        else:
-                            _gbdt_anchor = _SUBJECT_MEAN_GLOBAL
-                    else:
-                        _gbdt_anchor = float(p1)
-                    p2 = float(_compose(_GBDT_STATE, feats_for_gbdt, _gbdt_anchor))
+                    _cl_id_m2 = -1
+            except Exception:
+                _s_id_m2, _bc_id_m2, _cl_id_m2 = -1, -1, -1
+            if _ME_STATS is not None:
+                _m2_marg = _me_mod.apply_member4_marginal_features_one(
+                    _ME_STATS,
+                    subject_id=_s_id_m2,
+                    cluster_id=_cl_id_m2,
+                    bc_id=_bc_id_m2,
+                ).astype(np.float32, copy=False)
             else:
-                p2 = float(_gbdt_mod.apply_one(_GBDT_STATE, feats_for_gbdt))
+                _m2_marg = np.zeros(int(_M2_STATE.n_marginals), dtype=np.float32)
+            p2 = float(_m2_mod.apply_state_one(
+                _M2_STATE,
+                subject_id=_s_id_m2,
+                bc_id=_bc_id_m2,
+                cluster_id=_cl_id_m2,
+                marginals=_m2_marg,
+            ))
 
             # ---- Member 4 (LogReg) ----
             if int(_LOGREG_STATE.feature_dim) == int(feats_m24.shape[0]):
@@ -439,7 +409,8 @@ def _strip_faiss_imports(model_py_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _PURE_MODULE_NAMES: tuple[str, ...] = (
-    "gbdt_member",
+    "member2_metadata_mlp",
+    "mean_encoded_features",
     "knn_member",
     "logreg_member",
     "stacker",
@@ -550,7 +521,7 @@ def measure_bundle_size_bytes(submission_dir: Path) -> int:
 def export_four_member_stacked_run(
     *,
     member1_bundle_dir: Path | str,
-    gbdt_state: Any,
+    member2_mlp_state: Any,
     knn_state: Any,
     logreg_state: Any,
     stacker_state: Any,
@@ -559,7 +530,7 @@ def export_four_member_stacked_run(
     out_dir: Path | str,
     src_dir: Path | str = "src",
     runtime_feature_builder_py: str | None = None,
-    subject_mean_table: Any | None = None,
+    mean_encoded_stats: Any | None = None,
     member5_state: Any | None = None,
     zip_cap_bytes: int = _DEFAULT_ZIP_CAP_BYTES,
     audit: bool = True,
@@ -573,8 +544,8 @@ def export_four_member_stacked_run(
         :func:`src.export_submission.export_ensemble_run`. The
         contents are copied into ``out_dir`` and then patched in
         place. The original bundle is NOT modified.
-    gbdt_state : GBDTMemberState
-        Member 2 fitted state.
+    member2_mlp_state : Member2MLPState
+        Member 2 metadata MLP fitted state.
     knn_state : KNNMemberState
         Member 3 fitted state.
     logreg_state : LogRegMemberState
@@ -597,13 +568,10 @@ def export_four_member_stacked_run(
         See module docstring; if omitted, Members 2 & 4 fall back to
         their bias predictions and the stacker downweights them
         accordingly. Phase 6's notebook supplies this.
-    subject_mean_table : SubjectMeanTable | None
-        Task 3 (Member 2 v2): the per-subject mean pass-rate table used
-        as the GBDT residual anchor. When provided, shipped to
-        ``artifacts/subject_mean/`` and the runtime uses
-        ``subject_mean[subject_id]`` as the Member-2 anchor instead of
-        Member 1's prediction. When ``None``, the runtime falls back
-        to Member 1 as the anchor (legacy / pre-Task-3 behavior).
+    mean_encoded_stats : MeanEncodedStats | None
+        Global mean-encoded statistics used to build Member 2's marginal
+        features at runtime. When provided, shipped to
+        ``artifacts/mean_encoded/``.
     member5_state : Member5State | None
         Task 4: Member 5 (difficulty-projected kNN). When provided AND
         the stacker was fit with 5 member columns (feature_dim == 9),
@@ -643,7 +611,9 @@ def export_four_member_stacked_run(
     # Step 2: write member states.
     artifacts_dir = out_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    gbdt_state.save(artifacts_dir / "member2_gbdt")
+    member2_mlp_state.save(artifacts_dir / "member2_metadata_mlp")
+    if mean_encoded_stats is not None:
+        mean_encoded_stats.save(artifacts_dir / "mean_encoded")
     knn_state.save(artifacts_dir / "member3_knn")
     logreg_state.save(artifacts_dir / "member4_logreg")
     stacker_state.save(artifacts_dir / "stacker")
@@ -674,30 +644,6 @@ def export_four_member_stacked_run(
                 "export call."
             )
         member5_state.save(artifacts_dir / "member5_dknn")
-
-    # Task 3: ship the subject_mean table so the runtime can use it as
-    # the Member-2 residual anchor (instead of Member 1's prediction).
-    if subject_mean_table is not None:
-        sm_dir = artifacts_dir / "subject_mean"
-        sm_dir.mkdir(parents=True, exist_ok=True)
-        import json as _json_sm
-        import numpy as _np_sm
-        _np_sm.save(sm_dir / "subject_mean.npy",
-                    _np_sm.asarray(subject_mean_table.subject_mean, dtype=_np_sm.float64))
-        _np_sm.save(sm_dir / "subject_obs_count.npy",
-                    _np_sm.asarray(subject_mean_table.subject_obs_count, dtype=_np_sm.float64))
-        (sm_dir / "meta.json").write_text(
-            _json_sm.dumps(
-                {
-                    "global_mean": float(subject_mean_table.global_mean),
-                    "smoothing": float(subject_mean_table.smoothing),
-                    "n_subjects": int(subject_mean_table.subject_mean.shape[0]),
-                    "schema_version": 1,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
 
     # Step 3: copy pure-numpy modules.
     _copy_pure_modules(src_dir, out_dir / "_pure")
