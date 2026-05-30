@@ -520,6 +520,291 @@ def fit_stacker(
 
 
 # ---------------------------------------------------------------------------
+# Bucketed stacker (two coarse buckets: known vs unknown benchmark)
+# ---------------------------------------------------------------------------
+#
+# Motivation
+# ----------
+# The single-stacker design entered ``bench_present`` as a per-row
+# feature, so the meta-learner could only fit a global slope on the
+# coverage dimension. In practice the cold-benchmark and well-known
+# regimes call for sharply different member weightings (cold rows
+# should down-weight bc-conditional members like M2 and lean harder
+# on the embedding-based members). The user spec is "two coarse
+# buckets, not some complicated linear situation" -- so we fit TWO
+# independent ``StackerState``s and route at apply time on a binary
+# gate.
+#
+# Bucket gate semantics
+# ---------------------
+# The gate is ``bench_known`` (True == well-known benchmark, False
+# == unknown / cold). The choice of which per-row signal to derive
+# it from belongs to the caller; the natural choices are:
+#
+#   * Train-time:  ``bc_redacted_flag == 0``  -- the synthetic
+#     redaction mask is the closest training-time analog of cold
+#     benchmarks at inference time. Most members were trained on
+#     the real bc info for these rows, but M2's bc input was
+#     zero'd out, which approximates the inference-time
+#     bench_present == 0 condition for at least the M2 column.
+#   * Inference-time:  ``bench_key in indexer.bc_to_id`` (i.e. the
+#     stacker's ``bench_present`` aux feature itself).
+#
+# The two are not equivalent, but they share intent: "is the
+# benchmark's identity known to the ensemble for this row?" The
+# bucketed stacker's job is just to learn a separate logistic
+# weight vector for each regime.
+
+
+@dataclass
+class BucketedStackerState:
+    """Two-bucket stacker: one ``StackerState`` per benchmark regime.
+
+    ``known`` is fit on rows where ``bench_known == True`` (the well-
+    known-benchmark regime). ``unknown`` is fit on rows where
+    ``bench_known == False`` (cold / synthetically-redacted regime).
+
+    Both inner states use the SAME ``feature_dim`` and ``feature_names``
+    so the caller can build one ``stacker_X`` matrix and route per row
+    at apply time without rebuilding features.
+    """
+
+    known: StackerState
+    unknown: StackerState
+    # Gate metadata: counts at fit time, recorded for diagnostics
+    # and for the per-bundle audit at runtime load.
+    n_train_known: int = 0
+    n_train_unknown: int = 0
+    # Tag for cache / save provenance. Lets the loader sanity-check
+    # the bundle came from a compatible writer.
+    format_version: int = 1
+
+    def __post_init__(self) -> None:
+        if int(self.known.feature_dim) != int(self.unknown.feature_dim):
+            raise ValueError(
+                "BucketedStackerState: known.feature_dim "
+                f"{self.known.feature_dim} != unknown.feature_dim "
+                f"{self.unknown.feature_dim}; the two stackers must "
+                "share the same feature schema."
+            )
+        if tuple(self.known.feature_names) != tuple(self.unknown.feature_names):
+            raise ValueError(
+                "BucketedStackerState: known.feature_names != "
+                "unknown.feature_names; the two stackers must share "
+                "the same feature schema."
+            )
+
+    @property
+    def feature_dim(self) -> int:
+        return int(self.known.feature_dim)
+
+    @property
+    def feature_names(self) -> tuple[str, ...]:
+        return tuple(self.known.feature_names)
+
+    def save(self, out_dir: Path | str) -> Path:
+        """Save as ``out_dir/known/`` and ``out_dir/unknown/`` plus a meta file."""
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        self.known.save(out / "known")
+        self.unknown.save(out / "unknown")
+        meta = {
+            "format_version": int(self.format_version),
+            "feature_dim": int(self.feature_dim),
+            "feature_names": list(self.feature_names),
+            "n_train_known": int(self.n_train_known),
+            "n_train_unknown": int(self.n_train_unknown),
+            "bucket_layout": "two_dirs:known,unknown",
+        }
+        (out / "bucketed_meta.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
+        return out
+
+    @classmethod
+    def load(cls, in_dir: Path | str) -> "BucketedStackerState":
+        d = Path(in_dir)
+        meta_path = d / "bucketed_meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"BucketedStackerState.load: missing {meta_path}. "
+                "Did you load a single-stacker bundle by mistake?"
+            )
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        known = StackerState.load(d / "known")
+        unknown = StackerState.load(d / "unknown")
+        return cls(
+            known=known,
+            unknown=unknown,
+            n_train_known=int(meta.get("n_train_known", 0)),
+            n_train_unknown=int(meta.get("n_train_unknown", 0)),
+            format_version=int(meta.get("format_version", 1)),
+        )
+
+
+def fit_bucketed_stacker(
+    *,
+    X: np.ndarray,
+    y: np.ndarray,
+    bench_known: np.ndarray,
+    feature_names: Sequence[str] | None = None,
+    sample_weights: np.ndarray | None = None,
+    val_fraction: float = 0.15,
+    n_iters: int = 4000,
+    learning_rate: float = 0.05,
+    l2: float = 1.0,
+    early_stopping_patience: int = 200,
+    device: str = "cpu",
+    seed: int = 0,
+    min_rows_per_bucket: int = 1024,
+) -> BucketedStackerState:
+    """Fit two independent ``StackerState``s, one per coarse bucket.
+
+    Parameters
+    ----------
+    X, y, feature_names, sample_weights, val_fraction, n_iters,
+    learning_rate, l2, early_stopping_patience, device, seed
+        Forwarded to :func:`fit_stacker` for each per-bucket fit.
+    bench_known
+        ``[N]`` boolean / int array; ``True`` (or non-zero) routes the
+        row to the ``known`` bucket, ``False`` to the ``unknown``
+        bucket. The same gate must be applied at inference time for
+        the two stackers to address the regimes they were trained on.
+    min_rows_per_bucket
+        Defensive minimum. Raises if either bucket has fewer rows
+        than this -- a degenerate bucket would either underfit
+        catastrophically or, worse, learn the prior and silently
+        outperform a sensibly-fit stacker on its tiny slice. The
+        notebook should clamp the gate definition rather than lower
+        this threshold blindly.
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    bk = np.asarray(bench_known).reshape(-1)
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D, got {X.shape}")
+    N = int(X.shape[0])
+    if int(y.shape[0]) != N or int(bk.shape[0]) != N:
+        raise ValueError(
+            f"y / bench_known length mismatch: X={N}, y={y.shape[0]}, "
+            f"bench_known={bk.shape[0]}"
+        )
+    bk_bool = bk.astype(bool)
+    known_idx = np.flatnonzero(bk_bool)
+    unknown_idx = np.flatnonzero(~bk_bool)
+    n_known = int(known_idx.shape[0])
+    n_unknown = int(unknown_idx.shape[0])
+    if n_known < int(min_rows_per_bucket):
+        raise ValueError(
+            f"fit_bucketed_stacker: known bucket has {n_known} rows; "
+            f"need >= {min_rows_per_bucket}. The gate definition is "
+            "probably wrong (or the dataset is too small for bucketing)."
+        )
+    if n_unknown < int(min_rows_per_bucket):
+        raise ValueError(
+            f"fit_bucketed_stacker: unknown bucket has {n_unknown} rows; "
+            f"need >= {min_rows_per_bucket}. The gate definition is "
+            "probably wrong (or the dataset has no synthetic redaction)."
+        )
+    sw = None if sample_weights is None else np.asarray(sample_weights).reshape(-1)
+    if sw is not None and int(sw.shape[0]) != N:
+        raise ValueError(
+            f"sample_weights len {sw.shape[0]} != N {N}"
+        )
+
+    LOG.info(
+        "fit_bucketed_stacker: %d known rows, %d unknown rows "
+        "(ratio unknown=%.3f)",
+        n_known, n_unknown, float(n_unknown) / max(float(N), 1.0),
+    )
+
+    # Different RNG seeds per bucket so the two fits don't share an
+    # accidental selection bias (e.g. picking the same val slice
+    # row indices inside ``fit_stacker``'s train/val permutation).
+    known_state = fit_stacker(
+        X=X[known_idx],
+        y=y[known_idx],
+        feature_names=feature_names,
+        sample_weights=None if sw is None else sw[known_idx],
+        val_fraction=float(val_fraction),
+        n_iters=int(n_iters),
+        learning_rate=float(learning_rate),
+        l2=float(l2),
+        early_stopping_patience=int(early_stopping_patience),
+        device=device,
+        seed=int(seed),
+    )
+    unknown_state = fit_stacker(
+        X=X[unknown_idx],
+        y=y[unknown_idx],
+        feature_names=feature_names,
+        sample_weights=None if sw is None else sw[unknown_idx],
+        val_fraction=float(val_fraction),
+        n_iters=int(n_iters),
+        learning_rate=float(learning_rate),
+        l2=float(l2),
+        early_stopping_patience=int(early_stopping_patience),
+        device=device,
+        # Offset seed so the unknown stacker's internal train/val
+        # split is independent of the known stacker's. Otherwise
+        # bucket-dependent biases in the val split could correlate
+        # the two early-stops.
+        seed=int(seed) + 0x5EED,
+    )
+    return BucketedStackerState(
+        known=known_state,
+        unknown=unknown_state,
+        n_train_known=n_known,
+        n_train_unknown=n_unknown,
+    )
+
+
+def apply_bucketed_one(
+    state: BucketedStackerState,
+    features: np.ndarray,
+    bench_known: bool | int | float,
+) -> float:
+    """Single-row inference; routes to ``known`` or ``unknown`` per ``bench_known``."""
+    inner = state.known if bool(bench_known) else state.unknown
+    return apply_one(inner, features)
+
+
+def apply_bucketed_batch(
+    state: BucketedStackerState,
+    features_matrix: np.ndarray,
+    bench_known: np.ndarray,
+) -> np.ndarray:
+    """Batch inference with per-row routing.
+
+    Two ``apply_batch`` calls (one per bucket) + a scatter back into
+    the original row order. Cost is identical to a single stacker
+    forward on N rows up to an inexpensive scatter.
+    """
+    X = np.asarray(features_matrix)
+    if X.ndim != 2:
+        raise ValueError(f"features_matrix must be 2D, got {X.shape}")
+    bk = np.asarray(bench_known).reshape(-1).astype(bool)
+    N = int(X.shape[0])
+    if int(bk.shape[0]) != N:
+        raise ValueError(
+            f"bench_known length {bk.shape[0]} != N {N}"
+        )
+    if int(X.shape[1]) != int(state.feature_dim):
+        raise ValueError(
+            f"features_matrix dim {X.shape[1]} != "
+            f"state.feature_dim {state.feature_dim}"
+        )
+    out = np.empty(N, dtype=np.float32)
+    known_idx = np.flatnonzero(bk)
+    unknown_idx = np.flatnonzero(~bk)
+    if known_idx.size:
+        out[known_idx] = apply_batch(state.known, X[known_idx])
+    if unknown_idx.size:
+        out[unknown_idx] = apply_batch(state.unknown, X[unknown_idx])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Out-of-fold helpers (no leakage)
 # ---------------------------------------------------------------------------
 
@@ -596,11 +881,15 @@ __all__ = [
     "STACKER_FEATURE_NAMES",
     "STACKER_FEATURE_DIM",
     "StackerState",
+    "BucketedStackerState",
     "apply_one",
     "apply_batch",
+    "apply_bucketed_one",
+    "apply_bucketed_batch",
     "build_stacker_features",
     "build_stacker_features_one",
     "fit_stacker",
+    "fit_bucketed_stacker",
     "logit_clipped",
     "make_kfold_split",
     "assert_no_item_leakage",

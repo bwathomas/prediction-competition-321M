@@ -23,13 +23,17 @@ torch = pytest.importorskip("torch")
 from src.stacker import (
     STACKER_FEATURE_DIM,
     STACKER_FEATURE_NAMES,
+    BucketedStackerState,
     StackerState,
     apply_batch,
+    apply_bucketed_batch,
+    apply_bucketed_one,
     apply_one,
     assert_no_item_leakage,
     assert_oof_covers_all_rows,
     build_stacker_features,
     build_stacker_features_one,
+    fit_bucketed_stacker,
     fit_stacker,
     logit_clipped,
     make_kfold_split,
@@ -522,3 +526,201 @@ def test_determinism_two_runs_same_inputs():
     p1 = apply_batch(state, test_feats)
     p2 = apply_batch(state, test_feats)
     np.testing.assert_array_equal(p1, p2)
+
+
+# ---------------------------------------------------------------------------
+# Bucketed stacker (known vs unknown benchmark)
+# ---------------------------------------------------------------------------
+
+
+def _make_two_regime_oof(
+    N_known: int = 1500, N_unknown: int = 800, seed: int = 11,
+):
+    """Build synthetic OOF data where the OPTIMAL stacker weights are
+    deliberately DIFFERENT in the two buckets.
+
+    In the "known" regime the strong member is M1.
+    In the "unknown" regime the strong member is M3, M1 is noisy.
+
+    A single-regime stacker has to compromise; a bucketed stacker
+    can learn both regimes' true weights cleanly. The bucketed val
+    loss must therefore be <= the single stacker's val loss.
+    """
+    rng = np.random.default_rng(int(seed))
+    N = int(N_known + N_unknown)
+    z = rng.normal(size=N).astype(np.float64)
+    p_true = 1.0 / (1.0 + np.exp(-z))
+    y = (rng.random(N) < p_true).astype(np.float32)
+    bench_known = np.zeros(N, dtype=bool)
+    bench_known[:N_known] = True
+    # Member predictions: regime-dependent noise / signal strength.
+    p1 = np.empty(N, dtype=np.float32)
+    p2 = np.empty(N, dtype=np.float32)
+    p3 = np.empty(N, dtype=np.float32)
+    p4 = np.empty(N, dtype=np.float32)
+    # Known regime: M1 strong, M3 noisy.
+    k = bench_known
+    p1[k] = 1.0 / (1.0 + np.exp(-(z[k] + rng.normal(0, 0.15, k.sum()))))
+    p2[k] = 1.0 / (1.0 + np.exp(-(z[k] * 0.4 + rng.normal(0, 0.5, k.sum()))))
+    p3[k] = 1.0 / (1.0 + np.exp(-(z[k] * 0.2 + rng.normal(0, 0.9, k.sum()))))
+    p4[k] = 1.0 / (1.0 + np.exp(-(z[k] * 0.5 + rng.normal(0, 0.5, k.sum()))))
+    # Unknown regime: M1 noisy, M3 strong.
+    u = ~bench_known
+    p1[u] = 1.0 / (1.0 + np.exp(-(z[u] * 0.2 + rng.normal(0, 0.9, u.sum()))))
+    p2[u] = 1.0 / (1.0 + np.exp(-(z[u] * 0.4 + rng.normal(0, 0.6, u.sum()))))
+    p3[u] = 1.0 / (1.0 + np.exp(-(z[u] + rng.normal(0, 0.15, u.sum()))))
+    p4[u] = 1.0 / (1.0 + np.exp(-(z[u] * 0.5 + rng.normal(0, 0.5, u.sum()))))
+    member_probs = np.stack([p1, p2, p3, p4], axis=1).astype(np.float32)
+    bench_present = bench_known.astype(np.float32)
+    nn_neighbor_support = np.log1p(rng.uniform(0, 16, N)).astype(np.float32)
+    nn_mean_similarity = rng.uniform(-0.1, 0.95, N).astype(np.float32)
+    centroid_distance = rng.uniform(0.1, 2.0, N).astype(np.float32)
+    feats = build_stacker_features(
+        member_probs=member_probs,
+        bench_present=bench_present,
+        nn_neighbor_support=nn_neighbor_support,
+        nn_mean_similarity=nn_mean_similarity,
+        centroid_distance=centroid_distance,
+    )
+    return feats, y, bench_known
+
+
+def _bce(y, p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
+
+
+def test_bucketed_stacker_fits_independent_weights_per_bucket():
+    """The two buckets should learn structurally different weight
+    vectors -- if they don't, the bucketed apply is just a more
+    expensive copy of the single stacker."""
+    feats, y, bench_known = _make_two_regime_oof()
+    state = fit_bucketed_stacker(
+        X=feats, y=y, bench_known=bench_known,
+        n_iters=600, learning_rate=0.05, l2=0.5, seed=0,
+        min_rows_per_bucket=200,
+    )
+    assert isinstance(state, BucketedStackerState)
+    assert state.n_train_known == int(bench_known.sum())
+    assert state.n_train_unknown == int((~bench_known).sum())
+    # Each bucket's weight on column 0 (logit_member1) and column 2
+    # (logit_member3) should reflect that bucket's strong member.
+    w_known = state.known.weights
+    w_unknown = state.unknown.weights
+    # In the synthetic data M1 is the strong member in "known" rows,
+    # M3 is the strong member in "unknown" rows. The bucket-wise
+    # weight on the strong member should beat the weight on the
+    # noisy member by a clear margin.
+    assert float(w_known[0]) > float(w_known[2]) + 0.1, (
+        f"known bucket should weight M1 > M3; got w_M1={w_known[0]:.3f}, "
+        f"w_M3={w_known[2]:.3f}"
+    )
+    assert float(w_unknown[2]) > float(w_unknown[0]) + 0.1, (
+        f"unknown bucket should weight M3 > M1; got w_M1={w_unknown[0]:.3f}, "
+        f"w_M3={w_unknown[2]:.3f}"
+    )
+
+
+def test_bucketed_stacker_beats_single_when_regimes_differ():
+    """Sanity: when the optimal weighting really does differ per
+    bucket (as in _make_two_regime_oof), the bucketed stacker has
+    to be no worse than the single stacker on per-row val NLL.
+    """
+    feats, y, bench_known = _make_two_regime_oof(N_known=2000, N_unknown=1000)
+    single = fit_stacker(
+        X=feats, y=y, n_iters=600, learning_rate=0.05, l2=0.5, seed=0,
+    )
+    bucketed = fit_bucketed_stacker(
+        X=feats, y=y, bench_known=bench_known,
+        n_iters=600, learning_rate=0.05, l2=0.5, seed=0,
+        min_rows_per_bucket=200,
+    )
+    p_single = apply_batch(single, feats)
+    p_bucketed = apply_bucketed_batch(bucketed, feats, bench_known)
+    nll_single = _bce(y, p_single)
+    nll_bucketed = _bce(y, p_bucketed)
+    # Bucketed should be at least as good; allow a small tolerance
+    # since training noise can leave a tiny gap either way.
+    assert nll_bucketed <= nll_single + 1e-2, (
+        f"bucketed NLL {nll_bucketed:.5f} should be <= single NLL "
+        f"{nll_single:.5f} (tolerance 0.01) when regimes truly differ."
+    )
+
+
+def test_bucketed_apply_batch_matches_apply_one():
+    feats, y, bench_known = _make_two_regime_oof(N_known=400, N_unknown=200)
+    state = fit_bucketed_stacker(
+        X=feats, y=y, bench_known=bench_known,
+        n_iters=200, learning_rate=0.05, l2=1.0, seed=0,
+        min_rows_per_bucket=100,
+    )
+    p_batch = apply_bucketed_batch(state, feats, bench_known)
+    p_one = np.array(
+        [
+            apply_bucketed_one(state, feats[i], bool(bench_known[i]))
+            for i in range(int(feats.shape[0]))
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(p_batch, p_one, atol=1e-6)
+
+
+def test_bucketed_save_load_roundtrip(tmp_path):
+    feats, y, bench_known = _make_two_regime_oof(N_known=600, N_unknown=400)
+    state = fit_bucketed_stacker(
+        X=feats, y=y, bench_known=bench_known,
+        n_iters=150, learning_rate=0.05, l2=1.0, seed=2,
+        min_rows_per_bucket=100,
+    )
+    out_dir = tmp_path / "bucketed_stacker"
+    state.save(out_dir)
+    # Round-trip both expected sub-bundles exist.
+    assert (out_dir / "known" / "stacker_state.npz").exists()
+    assert (out_dir / "known" / "stacker_meta.json").exists()
+    assert (out_dir / "unknown" / "stacker_state.npz").exists()
+    assert (out_dir / "unknown" / "stacker_meta.json").exists()
+    assert (out_dir / "bucketed_meta.json").exists()
+    # Reload + verify equivalent outputs.
+    state2 = BucketedStackerState.load(out_dir)
+    assert state2.feature_dim == state.feature_dim
+    assert state2.feature_names == state.feature_names
+    assert state2.n_train_known == state.n_train_known
+    assert state2.n_train_unknown == state.n_train_unknown
+    p1 = apply_bucketed_batch(state, feats, bench_known)
+    p2 = apply_bucketed_batch(state2, feats, bench_known)
+    np.testing.assert_array_equal(p1, p2)
+
+
+def test_bucketed_raises_when_bucket_too_small():
+    """min_rows_per_bucket is the only knob that protects against
+    silently fitting on a degenerate bucket -- make sure it actually
+    raises when violated."""
+    feats, y, bench_known = _make_two_regime_oof(N_known=1500, N_unknown=50)
+    with pytest.raises(ValueError, match="unknown bucket has"):
+        fit_bucketed_stacker(
+            X=feats, y=y, bench_known=bench_known,
+            n_iters=50, seed=0, min_rows_per_bucket=1024,
+        )
+
+
+def test_bucketed_state_rejects_mismatched_feature_dim():
+    """Construction-time invariant: two inner stackers must agree on
+    feature_dim and feature_names; otherwise the apply path would
+    crash on a routed row."""
+    feats, y, bk = _make_two_regime_oof(N_known=500, N_unknown=400)
+    known = fit_stacker(
+        X=feats[bk], y=y[bk], n_iters=80, seed=0,
+    )
+    # Build a wider feature matrix (extra zero column) and fit on it.
+    feats_wide = np.concatenate(
+        [feats[~bk], np.zeros((int((~bk).sum()), 1), dtype=np.float32)],
+        axis=1,
+    )
+    unknown_wider = fit_stacker(
+        X=feats_wide,
+        y=y[~bk],
+        feature_names=tuple(STACKER_FEATURE_NAMES) + ("extra",),
+        n_iters=80, seed=0,
+    )
+    with pytest.raises(ValueError, match="feature_dim"):
+        BucketedStackerState(known=known, unknown=unknown_wider)

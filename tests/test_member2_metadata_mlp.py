@@ -622,3 +622,199 @@ def test_constant_numerical_column_handled():
     assert math.isfinite(state.train_loss)
     assert math.isfinite(state.val_loss)
     assert state.num_std[constant_col] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Metadata-only feature mode (d_subj == d_bc == d_cluster == 0, n_marginals == 0)
+# ---------------------------------------------------------------------------
+#
+# The notebook's CFG["member2_mlp"]["feature_mode"] = "metadata_only"
+# mode forces the subject / bc / cluster embedding tables to width 0
+# and feeds an empty marginals slab + always-zero bc_redacted_flag
+# to the trainer. The model collapses to a pure-metadata predictor
+# (family / macro / org / topic embeddings + subject_numerical +
+# bench_numerical). These tests prove:
+#
+#   1. fit + apply + save/load all survive d=0 embedding tables and
+#      n_marginals=0 without NaN, shape mismatch, or runtime crash.
+#   2. The "metadata-only" composition is genuinely a strict subset
+#      of the "full" composition (no smuggled-in non-metadata signal).
+#   3. Standardisation of the always-zero bc_redacted column does not
+#      poison the rest of the numerical channel.
+
+
+def _make_metadata_only_synthetic(
+    *,
+    N: int = 4000,
+    n_subjects: int = 25,
+    n_bcs: int = 12,
+    n_clusters: int = 8,
+    n_families: int = 7,
+    n_macro_families: int = 4,
+    n_organizations: int = 5,
+    n_bench_topics: int = 9,
+    n_subj_num: int = 2,
+    n_bench_num: int = 2,
+    seed: int = 0,
+) -> dict:
+    """Synthetic data where the label is driven by family + topic +
+    benchmark_num only. Subject / bc / cluster IDs and marginals are
+    pure noise so we can confirm the metadata-only model still
+    learns the metadata-driven signal."""
+    rng = np.random.default_rng(int(seed))
+    s = rng.integers(0, n_subjects, size=N).astype(np.int64)
+    b = rng.integers(0, n_bcs, size=N).astype(np.int64)
+    c = rng.integers(0, n_clusters, size=N).astype(np.int64)
+    f = rng.integers(0, n_families, size=N).astype(np.int64)
+    mf = rng.integers(0, n_macro_families, size=N).astype(np.int64)
+    o = rng.integers(0, n_organizations, size=N).astype(np.int64)
+    t = rng.integers(0, n_bench_topics, size=N).astype(np.int64)
+    subj_num = rng.normal(0.0, 1.0, size=(N, n_subj_num)).astype(np.float32)
+    bench_num = rng.normal(0.0, 1.0, size=(N, n_bench_num)).astype(np.float32)
+    # Metadata-only numerical channel: no marginals, redact always 0.
+    redact = np.zeros(N, dtype=np.float32)
+    marg = np.zeros((N, 0), dtype=np.float32)
+    numerical = assemble_numerical(
+        subject_numerical=subj_num,
+        bench_numerical=bench_num,
+        bc_redacted_flag=redact,
+        marginals=marg,
+    )
+    num_names = numerical_feature_names(
+        subj_num_names=tuple(f"sn{i}" for i in range(n_subj_num)),
+        bench_num_names=tuple(f"bn{i}" for i in range(n_bench_num)),
+        marginal_names=(),
+    )
+    # Label depends on family, topic, and benchmark_num[0] only -- a
+    # clean metadata signal that the M2-metadata-only model can fit
+    # but a "subject_id + bc_id"-only model cannot.
+    fam_eff = rng.normal(0.0, 0.9, size=n_families)
+    topic_eff = rng.normal(0.0, 0.9, size=n_bench_topics)
+    z = fam_eff[f] + topic_eff[t] + 0.6 * bench_num[:, 0]
+    p_true = 1.0 / (1.0 + np.exp(-z.astype(np.float64)))
+    y = (rng.random(N) < p_true).astype(np.float32)
+    return {
+        "subject_ids": s, "bc_ids": b, "cluster_ids": c,
+        "family_ids": f, "macro_family_ids": mf,
+        "organization_ids": o, "bench_topic_ids": t,
+        "numerical": numerical, "y": y,
+        "n_subjects": n_subjects, "n_bcs": n_bcs, "n_clusters": n_clusters,
+        "n_families": n_families, "n_macro_families": n_macro_families,
+        "n_organizations": n_organizations, "n_bench_topics": n_bench_topics,
+        "n_subj_num": n_subj_num, "n_bench_num": n_bench_num,
+        "n_marginals": 0, "num_feature_names": num_names,
+    }
+
+
+def test_metadata_only_fit_and_apply_no_nan():
+    """End-to-end: fit + apply with d_subj=d_bc=d_cluster=0 and
+    n_marginals=0. The model has zero-width tables for those fields
+    and the inference path must short-circuit to a [N, 0] slice
+    rather than crashing."""
+    data = _make_metadata_only_synthetic(N=2000, seed=21)
+    state = _fit(
+        data,
+        epochs=12,
+        d_subj=0, d_bc=0, d_cluster=0,
+        d_family=8, d_macro=4, d_org=4, d_topic=8,
+        cross_rank=8,
+    )
+    assert math.isfinite(state.train_loss)
+    assert math.isfinite(state.val_loss)
+    assert state.d_subj == 0
+    assert state.d_bc == 0
+    assert state.d_cluster == 0
+    assert state.n_marginals == 0
+    # The zero-width embedding tables still have to round-trip in
+    # the state's shape contract (n_cat + 1 rows, 0 cols).
+    assert state.subject_emb.shape == (int(data["n_subjects"]) + 1, 0)
+    assert state.bc_emb.shape == (int(data["n_bcs"]) + 1, 0)
+    assert state.cluster_emb.shape == (int(data["n_clusters"]) + 1, 0)
+    # And inference must produce finite probabilities in (0, 1).
+    p = apply_batch(state=state, **_apply_kwargs(data))
+    assert p.shape == (int(data["y"].shape[0]),)
+    assert np.all(np.isfinite(p))
+    assert np.all((p > 0.0) & (p < 1.0))
+
+
+def test_metadata_only_learns_metadata_signal():
+    """A metadata-only model on data whose label is driven by
+    family + topic + bench_num should beat the dataset prior. If
+    the test fails the d=0 path is dropping the family/topic/
+    bench_num signal somewhere along the train loop."""
+    data = _make_metadata_only_synthetic(N=4000, seed=22)
+    prior = float(data["y"].mean())
+    prior_nll = float(
+        -(prior * math.log(max(prior, 1e-9))
+          + (1.0 - prior) * math.log(max(1.0 - prior, 1e-9)))
+    )
+    state = _fit(
+        data,
+        epochs=25,
+        d_subj=0, d_bc=0, d_cluster=0,
+        d_family=12, d_macro=4, d_org=4, d_topic=12,
+        cross_rank=16,
+        learning_rate=1.0e-2,
+    )
+    p = apply_batch(state=state, **_apply_kwargs(data))
+    nll = _bce(data["y"], p)
+    assert nll < prior_nll - 0.02, (
+        f"metadata-only model: nll={nll:.4f} should beat prior="
+        f"{prior_nll:.4f} by >0.02 (the label is metadata-driven)"
+    )
+
+
+def test_metadata_only_save_load_roundtrip(tmp_path):
+    data = _make_metadata_only_synthetic(N=1500, seed=23)
+    state = _fit(
+        data,
+        epochs=8,
+        d_subj=0, d_bc=0, d_cluster=0,
+        d_family=8, d_macro=4, d_org=4, d_topic=8,
+        cross_rank=8,
+    )
+    out = tmp_path / "m2_meta_only"
+    state.save(out)
+    state2 = Member2MLPState.load(out)
+    # Width-0 tables must survive the npz round-trip with shape intact.
+    assert state2.subject_emb.shape == state.subject_emb.shape
+    assert state2.bc_emb.shape == state.bc_emb.shape
+    assert state2.cluster_emb.shape == state.cluster_emb.shape
+    assert state2.n_marginals == 0
+    # Forward pass equivalence.
+    p1 = apply_batch(state=state, **_apply_kwargs(data))
+    p2 = apply_batch(state=state2, **_apply_kwargs(data))
+    np.testing.assert_allclose(p1, p2, atol=1e-6)
+
+
+def test_metadata_only_subject_id_has_no_effect():
+    """If d_subj=0, swapping every subject id at apply time must
+    change *nothing* in the predictions (the subject embedding has
+    no parameters to contribute). This is the structural guarantee
+    that justifies calling the mode "metadata-only" -- the model
+    cannot anchor on subject identity even if asked to."""
+    data = _make_metadata_only_synthetic(N=800, seed=24)
+    state = _fit(
+        data,
+        epochs=4,
+        d_subj=0, d_bc=0, d_cluster=0,
+        d_family=4, d_macro=2, d_org=2, d_topic=4,
+        cross_rank=4,
+    )
+    base_kwargs = _apply_kwargs(data)
+    p_orig = apply_batch(state=state, **base_kwargs)
+    # Replace every subject id with 0; with d_subj=0 the embedding
+    # output is [N, 0] regardless of input so the predictions must
+    # be byte-identical to the original.
+    shuffled_kwargs = dict(base_kwargs)
+    shuffled_kwargs["subject_ids"] = np.zeros_like(base_kwargs["subject_ids"])
+    p_shuffled = apply_batch(state=state, **shuffled_kwargs)
+    np.testing.assert_array_equal(p_orig, p_shuffled)
+    # Same for bc_id and cluster_id.
+    shuffled_kwargs2 = dict(base_kwargs)
+    shuffled_kwargs2["bc_ids"] = np.full_like(base_kwargs["bc_ids"], -1)
+    shuffled_kwargs2["cluster_ids"] = np.full_like(
+        base_kwargs["cluster_ids"], -1
+    )
+    p_shuffled2 = apply_batch(state=state, **shuffled_kwargs2)
+    np.testing.assert_array_equal(p_orig, p_shuffled2)

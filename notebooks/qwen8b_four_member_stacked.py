@@ -384,7 +384,29 @@ CFG["oof"].setdefault("optimism_threshold_nats", 0.03)
 # 14 mean-encoded marginals). No item embeddings -- structurally orthogonal
 # to M1/M3/M4/M6.
 CFG.setdefault("member2_mlp", {})
-# Categorical-embedding widths.
+# Feature-composition mode.
+#
+# "metadata_only" (default after the May 2026 diagnostic):
+#   M2 sees ONLY subject/benchmark metadata: family, macro_family,
+#   organization, bench_topic (categorical) plus subject_numerical
+#   (log_params, release_date + missing flags) and bench_numerical
+#   (benchmark_age + missing flag). Subject_id, bc_id, cluster_id,
+#   bc_redacted_flag, and the 14 mean-encoded marginals are all
+#   DROPPED. This forces M2's signal to come strictly from group-
+#   level metadata, which is structurally disjoint from M1
+#   (subject/bc embeddings) and M4/M6 (which use marginals).
+#
+# "full" (legacy, pre-2026-05-30):
+#   Includes subject_id, bc_id, cluster_id embeddings + bc_redacted
+#   + marginals on top of the metadata block. This was the v2_dcnv2
+#   architecture; it left M2 with err-corr 0.87 against M1 and only
+#   +0.012 stacker weight on the last full run, so we restrict
+#   composition rather than throw more capacity at it.
+CFG["member2_mlp"].setdefault("feature_mode", "metadata_only")
+# Categorical-embedding widths. In metadata_only mode the subject /
+# bc / cluster widths are forced to 0 below (those embedding tables
+# vanish from the model entirely; the saved state still serialises
+# their [n+1, 0] empty slabs for runtime API compatibility).
 CFG["member2_mlp"].setdefault("d_subj", 32)
 CFG["member2_mlp"].setdefault("d_bc", 32)
 CFG["member2_mlp"].setdefault("d_cluster", 16)
@@ -485,18 +507,29 @@ CFG["member5"].setdefault("residual_scale", 1.0)
 # bundle) detect this flag and act accordingly.
 CFG.setdefault("member6", {})
 CFG["member6"].setdefault("enabled", True)
-CFG["member6"].setdefault("k", 8)
+# k bumped 8 -> 16. The post-run diagnostic (Gate 6 PASS,
+# stacker weight +0.627, second-best individual NLL) shows FwFM is
+# the highest-leverage member in the ensemble and Gate 6 explicitly
+# suggested raising k. Doubling k doubles the V matrix [F, k] from
+# ~10k to ~20k floats -- still trivial in absolute terms but gives
+# the bilinear term enough capacity to keep pulling its weight as the
+# rest of the ensemble gets refined.
+CFG["member6"].setdefault("k", 16)
 CFG["member6"].setdefault("learning_rate", 1.0e-3)
 CFG["member6"].setdefault("weight_decay_w", 1.0e-5)
-CFG["member6"].setdefault("weight_decay_V", 1.0e-4)
+# weight_decay_V bumped 1e-4 -> 1.5e-4 because V has 2x params now;
+# matching the regularizer scale keeps the effective shrinkage per
+# parameter constant.
+CFG["member6"].setdefault("weight_decay_V", 1.5e-4)
 CFG["member6"].setdefault("weight_decay_r", 1.0e-4)
-# Bumped from 40 -> 100 because val-loss was still trending down at 40
-# in the last full run. ``early_stopping_patience`` keeps us honest:
-# we'll exit early when val-loss plateaus rather than burning the full
-# budget every time.
-CFG["member6"].setdefault("epochs", 100)
+# epochs bumped 100 -> 140 and patience 10 -> 15 because the larger
+# k=16 model has more parameters to fit and the last run was still
+# improving past epoch 40. ``early_stopping_patience`` keeps us
+# honest: we'll exit early when val-loss plateaus rather than burning
+# the full budget every time.
+CFG["member6"].setdefault("epochs", 140)
 CFG["member6"].setdefault("batch_size", 16384)
-CFG["member6"].setdefault("early_stopping_patience", 10)
+CFG["member6"].setdefault("early_stopping_patience", 15)
 CFG["member6"].setdefault("val_fraction", 0.1)
 # field_split_mode: "single" (classic FM, all cols in field 0) or
 # "embedding_vs_marginal" (2 fields: 0=embedding-derived M2 columns,
@@ -2685,34 +2718,79 @@ def _m2_gather_metadata(subj_ids: np.ndarray, bc_ids: np.ndarray) -> dict:
     }
 
 
-# Build canonical M2 numerical-feature-name tuple once.
-_M2_NUM_FEATURE_NAMES = m2_numerical_feature_names(
-    subj_num_names=_M2_SUBJ_NUM_FEATURE_NAMES,
-    bench_num_names=_M2_BENCH_NUM_FEATURE_NAMES,
-    marginal_names=MEMBER4_MARGINAL_FEATURE_NAMES,
-)
+# ---- Resolve metadata-only vs full feature composition --------------------
+# CFG["member2_mlp"]["feature_mode"] controls whether M2 sees only the
+# pure metadata block (default after Gate-3e diagnostic) or the full
+# legacy v2_dcnv2 block (subject/bc/cluster embeddings + marginals +
+# bc_redacted_flag). The same toggle has to apply to both the global
+# fit and every OOF fold; we resolve it once here so the two callers
+# can't drift apart.
+_M2_FEATURE_MODE = str(CFG.get("member2_mlp", {}).get("feature_mode", "metadata_only"))
+if _M2_FEATURE_MODE not in {"metadata_only", "full"}:
+    raise ValueError(
+        f"CFG['member2_mlp']['feature_mode'] must be 'metadata_only' or "
+        f"'full', got {_M2_FEATURE_MODE!r}"
+    )
+_M2_METADATA_ONLY = (_M2_FEATURE_MODE == "metadata_only")
+# In metadata_only mode the numerical block excludes the marginals so
+# _M2_NUM_FEATURE_NAMES has to match (its length is part of the state
+# contract via num_feature_names).
+if _M2_METADATA_ONLY:
+    _M2_NUM_FEATURE_NAMES = m2_numerical_feature_names(
+        subj_num_names=_M2_SUBJ_NUM_FEATURE_NAMES,
+        bench_num_names=_M2_BENCH_NUM_FEATURE_NAMES,
+        marginal_names=(),
+    )
+else:
+    _M2_NUM_FEATURE_NAMES = m2_numerical_feature_names(
+        subj_num_names=_M2_SUBJ_NUM_FEATURE_NAMES,
+        bench_num_names=_M2_BENCH_NUM_FEATURE_NAMES,
+        marginal_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+    )
 
 # Per-row train / val metadata (built once at module scope).
 _m2_meta_train = _m2_gather_metadata(_mef_train_subj, _mef_train_bc)
 _m2_meta_val = _m2_gather_metadata(_mef_val_subj, _mef_val_bc)
+# In metadata_only mode every per-row marginal is replaced with an
+# empty [N, 0] slab so the assembled numerical channel becomes
+# subj_num | bench_num | bc_redacted(=0) | <no marginals>.  The
+# bc_redacted column itself is still emitted (the state's numerical
+# block-sum hard-codes a "+1 redact" slot, and runtime always ships
+# it as 0.0); we just clamp it to zero on every row so the model
+# can't anchor to a synthetic train-time mask.
+if _M2_METADATA_ONLY:
+    _N_train_rows = int(_m2_meta_train["subject_numerical"].shape[0])
+    _N_val_rows = int(_m2_meta_val["subject_numerical"].shape[0])
+    _m2_marginal_train_active = np.zeros((_N_train_rows, 0), dtype=np.float32)
+    _m2_marginal_val_active = np.zeros((_N_val_rows, 0), dtype=np.float32)
+    _m2_bc_redact_train_active = np.zeros(_N_train_rows, dtype=np.float32)
+    _m2_bc_redact_val_active = np.zeros(_N_val_rows, dtype=np.float32)
+    _M2_N_MARGINALS_ACTIVE = 0
+else:
+    _m2_marginal_train_active = member4_marginal_train
+    _m2_marginal_val_active = member4_marginal_val
+    _m2_bc_redact_train_active = bc_redacted_train
+    _m2_bc_redact_val_active = bc_redacted_val
+    _M2_N_MARGINALS_ACTIVE = int(MEMBER4_MARGINAL_FEATURE_DIM)
 
 m2_numerical_train = m2_assemble_numerical(
     subject_numerical=_m2_meta_train["subject_numerical"],
     bench_numerical=_m2_meta_train["bench_numerical"],
-    bc_redacted_flag=bc_redacted_train,
-    marginals=member4_marginal_train,
+    bc_redacted_flag=_m2_bc_redact_train_active,
+    marginals=_m2_marginal_train_active,
 )
 m2_numerical_val = m2_assemble_numerical(
     subject_numerical=_m2_meta_val["subject_numerical"],
     bench_numerical=_m2_meta_val["bench_numerical"],
-    bc_redacted_flag=bc_redacted_val,
-    marginals=member4_marginal_val,
+    bc_redacted_flag=_m2_bc_redact_val_active,
+    marginals=_m2_marginal_val_active,
 )
 print(
-    f"[Member 2 MLP] dense metadata channel built: "
+    f"[Member 2 MLP] feature_mode={_M2_FEATURE_MODE!r}; "
+    f"dense metadata channel built: "
     f"n_num={m2_numerical_train.shape[1]} "
     f"(subj={_M2_N_SUBJ_NUM}, bench={_M2_N_BENCH_NUM}, "
-    f"redact=1, marg={MEMBER4_MARGINAL_FEATURE_DIM})"
+    f"redact=1, marg={_M2_N_MARGINALS_ACTIVE})"
 )
 print(
     f"[Member 2 MLP] cat cardinalities: "
@@ -2781,10 +2859,10 @@ def _fit_member2_mlp_global():
         n_bench_topics=int(_M2_N_BENCH_TOPICS),
         n_subj_num=int(_M2_N_SUBJ_NUM),
         n_bench_num=int(_M2_N_BENCH_NUM),
-        n_marginals=int(MEMBER4_MARGINAL_FEATURE_DIM),
-        d_subj=int(_m2_cfg.get("d_subj", 32)),
-        d_bc=int(_m2_cfg.get("d_bc", 32)),
-        d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+        n_marginals=int(_M2_N_MARGINALS_ACTIVE),
+        d_subj=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_subj", 32))),
+        d_bc=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_bc", 32))),
+        d_cluster=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_cluster", 16))),
         d_family=int(_m2_cfg.get("d_family", 16)),
         d_macro=int(_m2_cfg.get("d_macro", 8)),
         d_org=int(_m2_cfg.get("d_org", 16)),
@@ -2799,6 +2877,11 @@ def _fit_member2_mlp_global():
         batch_size=int(_m2_cfg.get("batch_size", 16384)),
         val_fraction=float(_m2_cfg.get("val_fraction", 0.1)),
         early_stopping_patience=int(_m2_cfg.get("early_stopping_patience", 5)),
+        # In metadata_only mode the subject/bc/cluster embeddings have
+        # width 0 so their cat-dropout knobs are no-ops; we still pass
+        # them through so the state object's saved meta is identical
+        # in shape to the "full" mode and the runtime loader doesn't
+        # need to special-case the metadata_only bundle.
         cat_dropout_subject=float(_m2_cfg.get("cat_dropout_subject", 0.05)),
         cat_dropout_bc=float(_m2_cfg.get("cat_dropout_bc", 0.10)),
         cat_dropout_cluster=float(_m2_cfg.get("cat_dropout_cluster", 0.10)),
@@ -2937,19 +3020,22 @@ _m2_cat_digest = _content_digest(
 member2_mlp_state = cache_or_compute(
     "member2_mlp_state",
     key_inputs=(
-        # Bumped tag: the v2_dcnv2 module + the new (num, cat,
-        # y, holdout) content digests defensively invalidate any
-        # prior M2 cache that predates the audit. The version
-        # string explicitly encodes the digest schema so that
-        # *any* future change to the digest helper invalidates
-        # all M2 caches built before that change.
-        "member2_metadata_mlp_v2_dcnv2_audit1",
+        # v3_metadata_mode: the v2_dcnv2_audit1 tag covered the
+        # cross-tower + audit. v3 explicitly encodes the new
+        # feature_mode toggle ("metadata_only" vs "full") so a
+        # mode flip can never silently reuse the other mode's
+        # cached weights. The (num, cat, y, holdout) content
+        # digests already invalidate on any data drift; the
+        # mode tag adds belt-and-braces invalidation on the
+        # composition change itself.
+        "member2_metadata_mlp_v3_metadata_mode",
+        _M2_FEATURE_MODE,
         int(len(primary.train)), int(SEED),
         int(indexer.n_subjects), int(indexer.n_bc), int(_m2_n_clusters),
         int(_M2_N_FAMILIES), int(_M2_N_MACRO_FAMILIES),
         int(_M2_N_ORGANIZATIONS), int(_M2_N_BENCH_TOPICS),
         int(_M2_N_SUBJ_NUM), int(_M2_N_BENCH_NUM),
-        int(MEMBER4_MARGINAL_FEATURE_DIM),
+        int(_M2_N_MARGINALS_ACTIVE),
         int(m2_numerical_train.shape[1]),
         round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
         _m2_num_digest,
@@ -3691,7 +3777,7 @@ if _M6_ENABLED:
             # on the same data. Bumping defensively so the
             # first run after this notebook update trains from
             # scratch.
-            "m6_fwfm_v2_streaming",
+            "m6_fwfm_v3_scaled_k16",
             int(X_train_dense_m4.shape[1]), len(primary.train), int(SEED),
             int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
             round(_M6_LR, 6), round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
@@ -4293,17 +4379,34 @@ for fold in folds:
     _m2_meta_fold_oof = _m2_gather_metadata(
         _mef_subj_fold_oof, _mef_bc_fold_oof,
     )
+    # Mirror the global path's metadata_only handling: zero out the
+    # marginals and bc_redacted flag so the fold fit sees the exact
+    # same composition as the global fit. Any drift here would silently
+    # invalidate the OOF -> stacker pipeline for M2.
+    if _M2_METADATA_ONLY:
+        _n_fold_train_rows = int(_m2_meta_fold_train["subject_numerical"].shape[0])
+        _n_fold_oof_rows = int(_m2_meta_fold_oof["subject_numerical"].shape[0])
+        _m2_fold_marg_train = np.zeros((_n_fold_train_rows, 0), dtype=np.float32)
+        _m2_fold_marg_oof = np.zeros((_n_fold_oof_rows, 0), dtype=np.float32)
+        _m2_fold_redact_train = np.zeros(_n_fold_train_rows, dtype=np.float32)
+        _m2_fold_redact_oof = np.zeros(_n_fold_oof_rows, dtype=np.float32)
+    else:
+        _m2_fold_marg_train = fold_member4_marginal_train
+        _m2_fold_marg_oof = fold_member4_marginal_oof
+        _m2_fold_redact_train = bc_redacted_train[fold.train_row_idx]
+        _m2_fold_redact_oof = bc_redacted_train[fold.oof_row_idx]
+
     _m2_num_fold_train = m2_assemble_numerical(
         subject_numerical=_m2_meta_fold_train["subject_numerical"],
         bench_numerical=_m2_meta_fold_train["bench_numerical"],
-        bc_redacted_flag=bc_redacted_train[fold.train_row_idx],
-        marginals=fold_member4_marginal_train,
+        bc_redacted_flag=_m2_fold_redact_train,
+        marginals=_m2_fold_marg_train,
     )
     _m2_num_fold_oof = m2_assemble_numerical(
         subject_numerical=_m2_meta_fold_oof["subject_numerical"],
         bench_numerical=_m2_meta_fold_oof["bench_numerical"],
-        bc_redacted_flag=bc_redacted_train[fold.oof_row_idx],
-        marginals=fold_member4_marginal_oof,
+        bc_redacted_flag=_m2_fold_redact_oof,
+        marginals=_m2_fold_marg_oof,
     )
 
     def _fit_fold_m2_mlp(_ff=fold):
@@ -4329,10 +4432,10 @@ for fold in folds:
             n_bench_topics=int(_M2_N_BENCH_TOPICS),
             n_subj_num=int(_M2_N_SUBJ_NUM),
             n_bench_num=int(_M2_N_BENCH_NUM),
-            n_marginals=int(MEMBER4_MARGINAL_FEATURE_DIM),
-            d_subj=int(_m2_cfg.get("d_subj", 32)),
-            d_bc=int(_m2_cfg.get("d_bc", 32)),
-            d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+            n_marginals=int(_M2_N_MARGINALS_ACTIVE),
+            d_subj=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_subj", 32))),
+            d_bc=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_bc", 32))),
+            d_cluster=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_cluster", 16))),
             d_family=int(_m2_cfg.get("d_family", 16)),
             d_macro=int(_m2_cfg.get("d_macro", 8)),
             d_org=int(_m2_cfg.get("d_org", 16)),
@@ -4387,16 +4490,18 @@ for fold in folds:
     _fold_m2_state = cache_or_compute(
         "member2_mlp_oof_fold",
         key_inputs=(
-            # v2_dcnv2_audit1: positively invalidates any pre-audit
-            # OOF M2 cache and explicitly encodes the digest schema.
-            "member2_metadata_mlp_oof_v2_dcnv2_audit1",
+            # v3_metadata_mode: matches the global key bump; the
+            # _M2_FEATURE_MODE token explicitly forbids cross-mode
+            # cache reuse even if every other key matched.
+            "member2_metadata_mlp_oof_v3_metadata_mode",
+            _M2_FEATURE_MODE,
             fold.fold_id, fold_suffix,
             int(len(fold.train_row_idx)), int(len(fold.oof_row_idx)),
             int(indexer.n_subjects), int(indexer.n_bc), int(_m2_fold_n_clusters),
             int(_M2_N_FAMILIES), int(_M2_N_MACRO_FAMILIES),
             int(_M2_N_ORGANIZATIONS), int(_M2_N_BENCH_TOPICS),
             int(_M2_N_SUBJ_NUM), int(_M2_N_BENCH_NUM),
-            int(MEMBER4_MARGINAL_FEATURE_DIM),
+            int(_M2_N_MARGINALS_ACTIVE),
             int(_m2_num_fold_train.shape[1]),
             round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
             _m2_num_digest_fold,
@@ -4809,7 +4914,7 @@ for fold in folds:
                 # key for the full reasoning). Same content
                 # digests, just a fresh version tag so any
                 # pre-rewrite per-fold state is rebuilt.
-                "m6_fwfm_oof_v2_streaming", fold.fold_id, fold_suffix,
+                "m6_fwfm_oof_v3_scaled_k16", fold.fold_id, fold_suffix,
                 int(X_fold_train_dense_m4.shape[1]),
                 int(X_fold_train_dense_m4.shape[0]),
                 int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
@@ -5025,7 +5130,9 @@ print("[OOF Gate 1b] PASS: zero NN-neighbor leakage across all folds.")
 # %%
 from src.stacker import (
     apply_batch as stacker_apply_batch,
+    apply_bucketed_batch as stacker_apply_bucketed_batch,
     build_stacker_features,
+    fit_bucketed_stacker,
     fit_stacker,
     stacker_feature_names,
 )
@@ -5232,20 +5339,48 @@ assert int(stacker_X_train_oof.shape[1]) == len(_stacker_feature_names), (
 )
 
 
+# ---------- Bucketed stacker gate ----------
+#
+# The user spec asks for "two coarse buckets" -- a separate
+# weight vector for well-known vs unknown benchmarks. The
+# training-time analog of "unknown benchmark" is the per-row
+# bc_redaction mask (``bc_redacted_train == 1`` simulates the
+# cold-bc condition by zeroing M2's bc input). At runtime the
+# equivalent signal is ``bench_present`` (1.0 == benchmark id
+# was in the trained indexer's vocab).
+#
+# We deliberately bucket on ``bc_redacted`` at training time
+# (not ``bench_present``, which is uniformly 1.0 on both
+# train and val for item-cold-start splits), because that is
+# the only per-row signal that actually has variance on the
+# offline dataset.
+_train_bench_known = (bc_redacted_train.astype(np.int8) == 0)
+_val_bench_known = (bc_redacted_val.astype(np.int8) == 0)
+print(
+    f"[Stacker] bucketed gate: train known={int(_train_bench_known.sum()):,} / "
+    f"unknown={int((~_train_bench_known).sum()):,} ; "
+    f"val known={int(_val_bench_known.sum()):,} / "
+    f"unknown={int((~_val_bench_known).sum()):,}"
+)
+
+
 def _fit_stacker_oof():
-    return fit_stacker(
+    return fit_bucketed_stacker(
         X=stacker_X_train_oof,
         y=ylab_train_np,
+        bench_known=_train_bench_known,
         feature_names=_stacker_feature_names,
         n_iters=int(CFG.get("stacker", {}).get("n_iters", 1500)),
         learning_rate=float(CFG.get("stacker", {}).get("learning_rate", 0.05)),
         l2=float(CFG.get("stacker", {}).get("l2", 1.0)),
         early_stopping_patience=int(CFG.get("stacker", {}).get("early_stopping_patience", 200)),
-        # Internal 80/20 item-grouped split inside fit_stacker for early
-        # stopping. We pass holdout_group_id when available so the early-
-        # stopping val is item-disjoint (matches the OOF discipline).
+        # Internal 80/20 split inside fit_stacker for early stopping;
+        # fit_bucketed_stacker forwards this per-bucket.
         val_fraction=0.2,
         seed=SEED,
+        min_rows_per_bucket=int(
+            CFG.get("stacker", {}).get("min_rows_per_bucket", 1024)
+        ),
     )
 
 
@@ -5261,6 +5396,12 @@ _stacker_Xtrain_digest = _hashlib.sha256(
 _stacker_ytrain_digest = _hashlib.sha256(
     np.ascontiguousarray(ylab_train_np, dtype=np.float32).tobytes()
 ).hexdigest()[:16]
+# Bucket gate is part of the cache key so any change to the gate
+# definition (e.g. swapping the bc_redaction signal for a count-
+# based proxy in the future) invalidates the stacker cache.
+_stacker_bucket_digest = _hashlib.sha256(
+    np.ascontiguousarray(_train_bench_known.astype(np.uint8)).tobytes()
+).hexdigest()[:16]
 stacker_state = cache_or_compute(
     "stacker_state",
     key_inputs=(
@@ -5270,24 +5411,45 @@ stacker_state = cache_or_compute(
         # the key whenever the residual_cluster vs difficulty_knn
         # selection flips so a stale stacker can never be reused on
         # numerically-different M5 OOF preds. The m6 tag does the same
-        # for Member 6 add/remove.
+        # for Member 6 add/remove. The "bucketed_v1" tag makes any
+        # legacy single-stacker cache miss explicitly (BucketedStackerState
+        # and StackerState are not interchangeable on the wire).
         "oof_v1",
+        "bucketed_v1",
         f"m5_{_M5_VARIANT}" if _M5_ENABLED else "no_m5",
         "m6_v1" if _M6_ENABLED else "no_m6",
         int(_n_stacker_members),
         int(OOF_N_FOLDS), int(OOF_SEED),
         bool(OOF_RETRAIN_M1),
         _stacker_Xtrain_digest, _stacker_ytrain_digest,
+        _stacker_bucket_digest,
+        int(CFG.get("stacker", {}).get("min_rows_per_bucket", 1024)),
     ),
     compute_fn=_fit_stacker_oof,
 )
-print(f"[Stacker] weights: {stacker_state.weights}")
-print(f"[Stacker] bias:    {stacker_state.bias:.4f}")
+print(
+    "[Stacker] bucketed stacker fit OK: "
+    f"known(n_train={stacker_state.n_train_known:,}, "
+    f"val_loss={stacker_state.known.val_loss:.5f}, "
+    f"bias={stacker_state.known.bias:+.4f}) "
+    f"unknown(n_train={stacker_state.n_train_unknown:,}, "
+    f"val_loss={stacker_state.unknown.val_loss:.5f}, "
+    f"bias={stacker_state.unknown.bias:+.4f})"
+)
+print(f"[Stacker] known weights:   {stacker_state.known.weights}")
+print(f"[Stacker] unknown weights: {stacker_state.unknown.weights}")
 
-# Apply the OOF-fit stacker on (a) OOF-train inputs -- for Gate 1d --
-# and (b) val inputs -- for final reporting (val never touched the fit).
-p_stacker_train_oof = stacker_apply_batch(stacker_state, stacker_X_train_oof)
-p_stacker_val = stacker_apply_batch(stacker_state, stacker_X_val)
+# Apply the OOF-fit bucketed stacker on (a) OOF-train inputs -- for
+# Gate 1d -- and (b) val inputs -- for final reporting (val never
+# touched the fit). The gate uses the same bc_redacted-derived
+# bench_known signal we trained on so val rows route to the bucket
+# they were learned for.
+p_stacker_train_oof = stacker_apply_bucketed_batch(
+    stacker_state, stacker_X_train_oof, _train_bench_known,
+)
+p_stacker_val = stacker_apply_bucketed_batch(
+    stacker_state, stacker_X_val, _val_bench_known,
+)
 
 def _bce(y, p):
     p = np.clip(p, 1e-6, 1 - 1e-6)
@@ -5400,15 +5562,19 @@ if _M5_ENABLED and p_member5_val is not None:
             "< 0.90; Member 5's signal is sufficiently distinct from "
             "Member 3's."
         )
-    # Report Member 5's stacker weight as a final diversity diagnostic:
-    # a weight near zero means the stacker found nothing to add.
-    _w5 = float(stacker_state.weights[4])  # logit_member5 is column 4
+    # Report Member 5's stacker weight per bucket as a final diversity
+    # diagnostic: a weight near zero (in BOTH buckets) means the
+    # stacker found nothing to add.
+    _w5_known = float(stacker_state.known.weights[4])  # logit_member5 is column 4
+    _w5_unknown = float(stacker_state.unknown.weights[4])
+    _w5_max = max(abs(_w5_known), abs(_w5_unknown))
     print(
-        f"[Task 4] Member 5 stacker weight = {_w5:+.4f} "
-        + ("(close to zero -- stacker found little to add; consider "
-           "dropping or retuning Member 5)"
-           if abs(_w5) < 0.05
-           else "(non-trivial -- Member 5 is contributing)")
+        f"[Task 4] Member 5 stacker weight: "
+        f"known={_w5_known:+.4f}  unknown={_w5_unknown:+.4f} "
+        + ("(close to zero in both buckets -- stacker found little to "
+           "add; consider dropping or retuning Member 5)"
+           if _w5_max < 0.05
+           else "(non-trivial in at least one bucket -- Member 5 is contributing)")
     )
 
 # Gate 6 (RED-TEAM, FwFM): error-correlation between Member 6 (FwFM)
@@ -5448,15 +5614,19 @@ if _M6_ENABLED and p_member6_val is not None:
             f"[Gate 6] PASS: |corr(err_m6, err_m4)|={abs(_corr_m6_m4):.4f} "
             "< 0.95; FwFM's bilinear term provides signal independent of M4."
         )
-    # M6 stacker weight (column index = 4 + int(_M5_ENABLED)).
+    # M6 stacker weight (column index = 4 + int(_M5_ENABLED)),
+    # reported per bucket.
     _w6_col = 4 + int(_M5_ENABLED)
-    _w6 = float(stacker_state.weights[_w6_col])
+    _w6_known = float(stacker_state.known.weights[_w6_col])
+    _w6_unknown = float(stacker_state.unknown.weights[_w6_col])
+    _w6_max = max(abs(_w6_known), abs(_w6_unknown))
     print(
-        f"[Member 6] stacker weight (col {_w6_col}) = {_w6:+.4f} "
-        + ("(close to zero -- the stacker found little to add from FwFM; "
-           "consider tuning weight_decay_V or dropping M6)"
-           if abs(_w6) < 0.05
-           else "(non-trivial -- FwFM is contributing)")
+        f"[Member 6] stacker weight (col {_w6_col}): "
+        f"known={_w6_known:+.4f}  unknown={_w6_unknown:+.4f} "
+        + ("(close to zero in both buckets -- the stacker found little "
+           "to add from FwFM; consider tuning weight_decay_V or dropping M6)"
+           if _w6_max < 0.05
+           else "(non-trivial in at least one bucket -- FwFM is contributing)")
     )
 
 # %% [markdown]
@@ -5822,17 +5992,31 @@ else:
         )
         _m2_meta_ft_shuf = _m2_gather_metadata(_mef_subj_ft, _mef_bc_ft)
         _m2_meta_fo_shuf = _m2_gather_metadata(_mef_subj_fo, _mef_bc_fo)
+        # Mirror the metadata_only composition the real M2 fit uses,
+        # so the shuffle-null sanity check tests the same architecture.
+        if _M2_METADATA_ONLY:
+            _n_ft_shuf = int(_m2_meta_ft_shuf["subject_numerical"].shape[0])
+            _n_fo_shuf = int(_m2_meta_fo_shuf["subject_numerical"].shape[0])
+            _m2_shuf_marg_ft = np.zeros((_n_ft_shuf, 0), dtype=np.float32)
+            _m2_shuf_marg_fo = np.zeros((_n_fo_shuf, 0), dtype=np.float32)
+            _m2_shuf_redact_ft = np.zeros(_n_ft_shuf, dtype=np.float32)
+            _m2_shuf_redact_fo = np.zeros(_n_fo_shuf, dtype=np.float32)
+        else:
+            _m2_shuf_marg_ft = _m4_mg_ft_shuf
+            _m2_shuf_marg_fo = _m4_mg_fo_shuf
+            _m2_shuf_redact_ft = _bc_redacted_ft
+            _m2_shuf_redact_fo = _bc_redacted_fo
         _m2_num_ft_shuf = m2_assemble_numerical(
             subject_numerical=_m2_meta_ft_shuf["subject_numerical"],
             bench_numerical=_m2_meta_ft_shuf["bench_numerical"],
-            bc_redacted_flag=_bc_redacted_ft,
-            marginals=_m4_mg_ft_shuf,
+            bc_redacted_flag=_m2_shuf_redact_ft,
+            marginals=_m2_shuf_marg_ft,
         )
         _m2_num_fo_shuf = m2_assemble_numerical(
             subject_numerical=_m2_meta_fo_shuf["subject_numerical"],
             bench_numerical=_m2_meta_fo_shuf["bench_numerical"],
-            bc_redacted_flag=_bc_redacted_fo,
-            marginals=_m4_mg_fo_shuf,
+            bc_redacted_flag=_m2_shuf_redact_fo,
+            marginals=_m2_shuf_marg_fo,
         )
         _fold_m2_shuf = fit_member2_metadata_mlp(
             subject_ids=_mef_subj_ft,
@@ -5856,10 +6040,10 @@ else:
             n_bench_topics=int(_M2_N_BENCH_TOPICS),
             n_subj_num=int(_M2_N_SUBJ_NUM),
             n_bench_num=int(_M2_N_BENCH_NUM),
-            n_marginals=int(MEMBER4_MARGINAL_FEATURE_DIM),
-            d_subj=int(_m2_cfg.get("d_subj", 32)),
-            d_bc=int(_m2_cfg.get("d_bc", 32)),
-            d_cluster=int(_m2_cfg.get("d_cluster", 16)),
+            n_marginals=int(_M2_N_MARGINALS_ACTIVE),
+            d_subj=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_subj", 32))),
+            d_bc=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_bc", 32))),
+            d_cluster=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_cluster", 16))),
             d_family=int(_m2_cfg.get("d_family", 16)),
             d_macro=int(_m2_cfg.get("d_macro", 8)),
             d_org=int(_m2_cfg.get("d_org", 16)),
@@ -6762,10 +6946,10 @@ finally:
 print("\n" + "=" * 72)
 print("RED-TEAM SECTION D: determinism of stacker + calibrator on val")
 print("=" * 72)
-p_stack_a = stacker_apply_batch(stacker_state, stacker_X_val)
-p_stack_b = stacker_apply_batch(stacker_state, stacker_X_val)
+p_stack_a = stacker_apply_bucketed_batch(stacker_state, stacker_X_val, _val_bench_known)
+p_stack_b = stacker_apply_bucketed_batch(stacker_state, stacker_X_val, _val_bench_known)
 assert np.array_equal(p_stack_a, p_stack_b)
-print(f"  [PASS] stacker_apply_batch determinism (max delta: {float(np.abs(p_stack_a - p_stack_b).max())})")
+print(f"  [PASS] stacker_apply_bucketed_batch determinism (max delta: {float(np.abs(p_stack_a - p_stack_b).max())})")
 p_cal_a = calibrator.apply(
     residual_table=residual_table,
     subject_ids=val_subj_ids_np,

@@ -228,7 +228,30 @@ if _HAS_STACKED_BUNDLE:
         )
     _KNN_STATE = _knn_mod.KNNMemberState.load(_STACKED_ROOT / "member3_knn")
     _LOGREG_STATE = _logreg_mod.LogRegMemberState.load(_STACKED_ROOT / "member4_logreg")
-    _STACKER_STATE = _stacker_mod.StackerState.load(_STACKED_ROOT / "stacker")
+    # Stacker loader: prefer the bucketed two-state bundle (the
+    # current writer) and fall back to the legacy single state for
+    # bundles produced before the bucketed stacker landed. We pin the
+    # _STACKER_BUCKETED flag so the apply path below can route per
+    # row without re-probing the filesystem on every prediction.
+    _STACKER_DIR = _STACKED_ROOT / "stacker"
+    if (_STACKER_DIR / "bucketed_meta.json").exists():
+        _STACKER_STATE = _stacker_mod.BucketedStackerState.load(_STACKER_DIR)
+        _STACKER_BUCKETED = True
+        LOG.info(
+            "[stacked] loaded BucketedStackerState: feature_dim=%d, "
+            "known(n_train=%d, val_loss=%.5f) unknown(n_train=%d, val_loss=%.5f)",
+            int(_STACKER_STATE.feature_dim),
+            int(_STACKER_STATE.n_train_known),
+            float(_STACKER_STATE.known.val_loss),
+            int(_STACKER_STATE.n_train_unknown),
+            float(_STACKER_STATE.unknown.val_loss),
+        )
+    else:
+        _STACKER_STATE = _stacker_mod.StackerState.load(_STACKER_DIR)
+        _STACKER_BUCKETED = False
+        LOG.info(
+            "[stacked] loaded legacy single StackerState (no bucketed_meta.json)"
+        )
 
     # Task 4: optional Member 5 (difficulty-projected kNN). When the
     # bundle ships an artifacts/member5_dknn/ directory AND the stacker
@@ -452,7 +475,22 @@ if _HAS_STACKED_BUNDLE:
                 nn_mean_similarity=mean_sim,
                 centroid_distance=centroid_dist,
             )
-            p_stacked = float(_stacker_mod.apply_one(_STACKER_STATE, stacker_feats))
+            # Per-row routing for the bucketed stacker: the runtime
+            # gate is ``bench_present == 1`` (the row's benchmark is
+            # in the trained indexer vocab). Cold-benchmark rows
+            # (bench_present == 0) go to the "unknown" stacker that
+            # was trained on synthetically-redacted training rows.
+            # Legacy single-state bundles stay on apply_one.
+            if _STACKER_BUCKETED:
+                p_stacked = float(_stacker_mod.apply_bucketed_one(
+                    _STACKER_STATE,
+                    stacker_feats,
+                    bench_known=bool(bench_present >= 0.5),
+                ))
+            else:
+                p_stacked = float(_stacker_mod.apply_one(
+                    _STACKER_STATE, stacker_feats,
+                ))
 
             # Single-shot post-stacker NN-residual calibration.
             try:
@@ -682,8 +720,11 @@ def export_four_member_stacked_run(
         Member 3 fitted state.
     logreg_state : LogRegMemberState
         Member 4 fitted state.
-    stacker_state : StackerState
-        Fitted stacker.
+    stacker_state : StackerState | BucketedStackerState
+        Fitted stacker. The BucketedStackerState bundle layout
+        writes two subdirectories (``known/`` and ``unknown/``) +
+        a ``bucketed_meta.json`` sidecar; the runtime loader
+        detects the bundle flavor automatically.
     nn_calibrator : NNCalibrator | None
         Post-stacker NN-residual calibrator. If ``None``, the
         bundle ships an alpha=0 (no-op) calibrator.
