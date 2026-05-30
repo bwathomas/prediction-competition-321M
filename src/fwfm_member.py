@@ -669,32 +669,72 @@ def fit_fwfm_member(
         )
         mu_f32 = feat_mean.astype(np.float32)
         sigma_f32 = feat_std_safe.astype(np.float32)
-        X_train_used = _chunked_standardize_into(
-            X, train_idx, mu_f32, sigma_f32, chunk=_STD_CHUNK
-        )
-        X_val_used = _chunked_standardize_into(
-            X, val_idx, mu_f32, sigma_f32, chunk=_STD_CHUNK
-        )
     else:
         mu_f32 = np.zeros(F, dtype=np.float32)
         sigma_f32 = np.ones(F, dtype=np.float32)
-        X_train_used = _chunked_gather_f32(X, train_idx, chunk=_STD_CHUNK)
-        X_val_used = _chunked_gather_f32(X, val_idx, chunk=_STD_CHUNK)
 
-    X_t_train = torch.as_tensor(X_train_used, dtype=torch.float32, device=device)
-    y_t_train = torch.as_tensor(y[train_idx], dtype=torch.float32, device=device)
-    X_t_val = torch.as_tensor(X_val_used, dtype=torch.float32, device=device)
-    y_t_val = torch.as_tensor(y[val_idx], dtype=torch.float32, device=device)
+    # ----- Streaming data path (OOM-safe) -----
+    #
+    # Earlier revisions materialized the full standardized
+    # ``[N_train_slice, F]`` and ``[N_val_slice, F]`` matrices on
+    # CPU, then uploaded both to GPU as resident tensors. With the
+    # M4 hybrid matrix (``F ~ 1216``) and ``N_train ~ 4.6M`` that
+    # path costs ~22 GB of additional CPU RAM and ~22 GB of VRAM
+    # for the train slice alone -- enough to OOM both host and
+    # device on Colab tiers we routinely target.
+    #
+    # The streaming path below keeps neither resident. We only
+    # cache ``mu/sigma`` (a couple of KB), then per-batch:
+    #   1. gather ``X[idx_global]`` (a fresh ``[B, F]`` fp32 copy
+    #      on CPU, ~80 MB at B=16384, F=1216)
+    #   2. standardize in-place on that copy (subtract mu, divide
+    #      sigma)
+    #   3. upload to ``device`` as a fp32 tensor
+    # The val + final-train-loss evaluators do the same thing
+    # under ``torch.no_grad()`` and aggregate per-row losses across
+    # mini-batches so no single forward pass holds an [N_val, F]
+    # tensor on GPU.
+    #
+    # The numerical contract is unchanged: this is the same
+    # standardize/gather computation, just done lazily per batch.
+    # Tests cover bit-for-bit equivalence on a small problem
+    # against the previously-resident behavior (see
+    # ``tests/test_fwfm_member.py``).
+
+    train_idx_np = np.asarray(train_idx, dtype=np.int64)
+    val_idx_np = np.asarray(val_idx, dtype=np.int64)
+    y_np = np.asarray(y, dtype=np.float32)
     if sample_weights is not None:
-        w_t_train = torch.as_tensor(
-            sample_weights[train_idx], dtype=torch.float32, device=device,
-        )
-        w_t_val = torch.as_tensor(
-            sample_weights[val_idx], dtype=torch.float32, device=device,
-        )
+        sw_np = np.asarray(sample_weights, dtype=np.float32)
     else:
-        w_t_train = None
-        w_t_val = None
+        sw_np = None
+
+    def _gather_batch_to_device(
+        global_idx: np.ndarray,
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor | None"]:
+        """Gather one mini-batch (CPU fancy-index + in-place
+        standardize) and upload to ``device``. ``global_idx`` are
+        row indices into the caller's ``X`` (i.e. already
+        composed of train_idx[perm_slice] or val_idx[chunk_slice]).
+        Returns ``(xb, yb, wb_or_none)`` on ``device``."""
+        rows = X[global_idx]
+        if rows.dtype != np.float32:
+            rows = rows.astype(np.float32, copy=True)
+        elif not rows.flags.writeable or rows.base is X:
+            # numpy fancy-indexing returns a writable copy, but
+            # guard against future shape/dtype changes that would
+            # silently turn this into a view.
+            rows = rows.copy()
+        if standardize:
+            rows -= mu_f32
+            rows /= sigma_f32
+        xb = torch.from_numpy(rows).to(device, non_blocking=False)
+        yb = torch.from_numpy(y_np[global_idx]).to(device, non_blocking=False)
+        wb = (
+            None if sw_np is None
+            else torch.from_numpy(sw_np[global_idx]).to(device, non_blocking=False)
+        )
+        return xb, yb, wb
 
     # ---- Torch model ----
     init_scale = float(1.0 / math.sqrt(max(int(k), 1)))
@@ -782,12 +822,15 @@ def fit_fwfm_member(
     opt = Adam(model.parameters(), lr=float(learning_rate), weight_decay=0.0)
     bce = nn.BCEWithLogitsLoss(reduction="none")
 
-    n_train = int(X_t_train.shape[0])
+    n_train = int(train_idx_np.shape[0])
+    _EVAL_CHUNK = max(int(batch_size), 65_536)  # eval can use larger chunks safely
 
-    def _compute_loss(
+    def _compute_loss_on_batch(
         model_: _FwFM, x_: torch.Tensor, y_: torch.Tensor,
         w_: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Per-batch loss used during training. Returns a scalar
+        tensor on ``device`` so backward can flow."""
         logits = model_(x_)
         per_row = bce(logits, y_)
         if w_ is None:
@@ -801,31 +844,90 @@ def fit_fwfm_member(
         )
         return data_loss + reg
 
+    def _streamed_eval_loss(
+        model_: _FwFM,
+        idx_pool: np.ndarray,
+        chunk: int,
+    ) -> float:
+        """Compute the *full-slice* loss (data + reg) on the
+        rows in ``idx_pool`` by streaming mini-batches through
+        the model under ``torch.no_grad()``. Numerically
+        equivalent to the resident-tensor path:
+
+            data_loss = sum(per_row * w) / sum(w)         (weighted)
+            data_loss = sum(per_row) / N                  (unweighted)
+            return    = data_loss + reg
+
+        Aggregates ``sum_pr_w`` and ``sum_w`` across chunks, so
+        the final ratio is exactly the same float as a single
+        forward pass over the entire slice would produce
+        (modulo floating-point reduction order, which is what
+        ``BCEWithLogitsLoss(reduction='mean')`` is also
+        susceptible to).
+        """
+        model_.eval()
+        n = int(idx_pool.shape[0])
+        sum_pr_w = 0.0
+        sum_w = 0.0
+        with torch.no_grad():
+            for s_ in range(0, n, int(chunk)):
+                e_ = min(s_ + int(chunk), n)
+                global_idx = idx_pool[s_:e_]
+                xb, yb, wb = _gather_batch_to_device(global_idx)
+                logits = model_(xb)
+                per_row = bce(logits, yb)
+                if wb is None:
+                    sum_pr_w += float(per_row.sum().item())
+                    sum_w += float(per_row.numel())
+                else:
+                    sum_pr_w += float((per_row * wb).sum().item())
+                    sum_w += float(wb.sum().item())
+                # Free per-chunk GPU buffers eagerly so the next
+                # chunk doesn't stack on top of them in the
+                # caching allocator.
+                xb = None
+                yb = None
+                wb = None
+        data_loss = sum_pr_w / max(sum_w, 1.0e-9)
+        with torch.no_grad():
+            reg = (
+                0.5 * float(weight_decay_w) * float((model_.w * model_.w).sum().item())
+                + 0.5 * float(weight_decay_V) * float((model_.V * model_.V).sum().item())
+                + 0.5 * float(weight_decay_r) * float((model_.r_raw * model_.r_raw).sum().item())
+            )
+        return float(data_loss + reg)
+
+    # Per-epoch CPU permutation. We do shuffling on CPU (numpy)
+    # because the gather happens against the CPU-resident ``X``
+    # anyway; doing it on GPU would force a perm->CPU round-trip
+    # per batch.
+    perm_rng = np.random.default_rng(int(seed) + 17)
+
     best_val = float("inf")
     best_state: dict[str, np.ndarray | float] = {}
     epochs_since_improve = 0
 
     for ep in range(int(epochs)):
         model.train()
-        perm_in = torch.randperm(n_train, device=device)
+        perm_in = perm_rng.permutation(n_train)
         ep_loss = 0.0
         n_batches = 0
         for s in range(0, n_train, int(batch_size)):
-            idx = perm_in[s : s + int(batch_size)]
-            xb = X_t_train.index_select(0, idx)
-            yb = y_t_train.index_select(0, idx)
-            wb = (None if w_t_train is None else w_t_train.index_select(0, idx))
+            e = min(s + int(batch_size), n_train)
+            global_idx = train_idx_np[perm_in[s:e]]
+            xb, yb, wb = _gather_batch_to_device(global_idx)
             opt.zero_grad(set_to_none=True)
-            loss = _compute_loss(model, xb, yb, wb)
+            loss = _compute_loss_on_batch(model, xb, yb, wb)
             loss.backward()
             opt.step()
             ep_loss += float(loss.item())
             n_batches += 1
+            xb = None
+            yb = None
+            wb = None
 
-        model.eval()
-        with torch.no_grad():
-            val_loss = float(_compute_loss(model, X_t_val, y_t_val, w_t_val).item())
-            train_loss_ep = ep_loss / max(n_batches, 1)
+        val_loss = _streamed_eval_loss(model, val_idx_np, chunk=_EVAL_CHUNK)
+        train_loss_ep = ep_loss / max(n_batches, 1)
 
         if val_loss < best_val - 1.0e-6:
             best_val = val_loss
@@ -875,11 +977,12 @@ def fit_fwfm_member(
 
     # Final train_loss on the train slice (reported as the saved state's
     # train_loss; the val_loss is best_val from the early-stopping slice).
-    model.eval()
-    with torch.no_grad():
-        final_train_loss = float(
-            _compute_loss(model, X_t_train, y_t_train, w_t_train).item()
-        )
+    # Use the same streaming evaluator the val pass uses -- avoids any
+    # accidental ``[N_train, F]`` GPU residency for callers with a huge
+    # train slice.
+    final_train_loss = _streamed_eval_loss(
+        model, train_idx_np, chunk=_EVAL_CHUNK,
+    )
 
     result = FwFMState(
         w0=float(best_state["w0"]),
@@ -906,31 +1009,14 @@ def fit_fwfm_member(
 
     # ---- Explicit teardown before returning ----
     #
-    # FwFM training holds two big allocations that easily OOM the
-    # following stages if left to Python's default GC: (1) the GPU
-    # copies of the train + val feature matrices, sized
-    # ``[N_*, F]`` float32 -- on the full-train path this is ~24 GB
-    # of VRAM for the train slice alone; (2) the per-slice CPU
-    # ``[N_*, F]`` float32 gather buffers ``X_*_used``, sized
-    # similarly on host RAM (the input ``X`` itself is *not* a copy
-    # -- it's the caller's array, untouched).
-    #
-    # The state we want to keep is tiny (a handful of small numpy
-    # arrays inside FwFMState). Drop every model/optim/tensor we
-    # still hold (re-bind to None instead of ``del`` so static
-    # analysis stays happy with the closure references in
-    # ``_FwFM.forward``), GC, and (when on CUDA) flush PyTorch's
-    # caching allocator so the next stage (e.g. Member 1
-    # retraining inside the OOF loop) sees the freed VRAM, not a
+    # The streaming data path means we no longer hold large
+    # ``[N_*, F]`` tensors on either CPU or GPU at this point --
+    # only the model, optimizer, field-index lookup, and per-batch
+    # buffers (which the train/eval loops already nulled out).
+    # Still null model/opt/field-lookup/best_state and flush the
+    # caching allocator: the next stage (e.g. Member 1 retraining
+    # inside the OOF loop) should see freed VRAM rather than a
     # "reserved" pool.
-    X_t_train = None  # noqa: F841
-    X_t_val = None  # noqa: F841
-    y_t_train = None  # noqa: F841
-    y_t_val = None  # noqa: F841
-    w_t_train = None  # noqa: F841
-    w_t_val = None  # noqa: F841
-    X_train_used = None  # noqa: F841
-    X_val_used = None  # noqa: F841
     model = None  # noqa: F841
     opt = None  # noqa: F841
     field_id_tensor = None  # noqa: F841

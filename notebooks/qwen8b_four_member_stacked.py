@@ -3651,11 +3651,20 @@ if _M6_ENABLED:
     fwfm_state = cache_or_compute(
         "fwfm_state",
         key_inputs=(
-            # v2_audit1: positively invalidate the v1 cache so the
-            # post-teardown / post-feature-digest FwFM is built
-            # from scratch on first run. Bumping defensively is
-            # cheap (FwFM trains in ~2-3 min on full data).
-            "m6_fwfm_v2_audit1",
+            # v2_streaming: bumps over v2_audit1 because the
+            # data path inside fit_fwfm_member was rewritten
+            # from "load full [N,F] standardized matrix into
+            # GPU memory" to a per-batch streaming gather +
+            # standardize. The bilinear math is unchanged, but
+            # the val + final-train losses now aggregate
+            # per-chunk float32 partial sums (vs one big
+            # tensor-wide sum); that's a different float
+            # reduction order, which can pick a different
+            # ``best_state`` for early stopping by 1-2 epochs
+            # on the same data. Bumping defensively so the
+            # first run after this notebook update trains from
+            # scratch.
+            "m6_fwfm_v2_streaming",
             int(X_train_dense_m4.shape[1]), len(primary.train), int(SEED),
             int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
             round(_M6_LR, 6), round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
@@ -4767,12 +4776,13 @@ for fold in folds:
         _fold_fwfm_state = cache_or_compute(
             "fwfm_state_oof_fold",
             key_inputs=(
-                # v2_audit1: positively invalidate any pre-audit
-                # OOF FwFM cache, and pin the fit to (X, y,
-                # holdout, smoothing) content digests so future
-                # changes upstream cannot quietly reuse a stale
-                # per-fold FwFM.
-                "m6_fwfm_oof_v2_audit1", fold.fold_id, fold_suffix,
+                # v2_streaming: bumps over v2_audit1 because
+                # ``fit_fwfm_member`` was rewritten to a
+                # streaming data path (see the global FwFM cache
+                # key for the full reasoning). Same content
+                # digests, just a fresh version tag so any
+                # pre-rewrite per-fold state is rebuilt.
+                "m6_fwfm_oof_v2_streaming", fold.fold_id, fold_suffix,
                 int(X_fold_train_dense_m4.shape[1]),
                 int(X_fold_train_dense_m4.shape[0]),
                 int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
