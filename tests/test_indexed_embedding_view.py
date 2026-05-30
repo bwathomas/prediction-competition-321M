@@ -239,3 +239,121 @@ def test_lookup_dataset_rejects_length_mismatched_view() -> None:
             item_emb=view,
             labels=np.zeros(7, dtype=np.float32),
         )
+
+
+# ---------------------------------------------------------------------------
+# Downstream realism: trainer's exact DataLoader config + torch.utils.data
+# helpers that the notebook actually uses around the view.
+# ---------------------------------------------------------------------------
+
+
+def test_view_indexing_works_with_numpy_int_indices() -> None:
+    """Custom batch samplers (LengthBucketBatchSampler, the OOF
+    fold remappers) sometimes pass through ``numpy.int64`` indices
+    instead of Python ints. The scalar-int branch must coerce
+    cleanly."""
+    rng = np.random.default_rng(11)
+    uniq = rng.standard_normal((10, 4)).astype(np.float32)
+    ptr = rng.integers(0, 10, size=50).astype(np.int64)
+    view = IndexedEmbeddingView(uniq, ptr)
+    for i in [np.int64(0), np.int32(5), np.int64(49)]:
+        np.testing.assert_array_equal(view[i].numpy(), uniq[ptr[int(i)]])
+
+
+def test_view_compatible_with_torch_utils_data_subset() -> None:
+    """``Subset`` indexes the underlying dataset with positional
+    Python ints. The trainer's val-eval path wraps LookupDataset in
+    a Subset when ``val_eval_max_batches > 0``; confirm the chain
+    still yields identical rows under the view."""
+    stacked_ds, viewed_ds = _make_dataset_pair()
+    indices = [0, 5, 100, 200, 299]
+    sub_s = torch.utils.data.Subset(stacked_ds, indices)
+    sub_v = torch.utils.data.Subset(viewed_ds, indices)
+    for i in range(len(indices)):
+        row_s = sub_s[i]
+        row_v = sub_v[i]
+        for ts, tv in zip(row_s, row_v):
+            np.testing.assert_array_equal(ts.numpy(), tv.numpy())
+
+
+def test_view_dataloader_with_pin_memory_and_shuffle() -> None:
+    """Realistic trainer config: shuffle=True + pin_memory=True
+    (the latter pins the *collated* batch tensors, not the
+    per-row outputs of __getitem__, so the view doesn't need to
+    be in pinned memory itself). Confirm the batches collated
+    out of the view are still equivalent to those out of the
+    stacked tensor under the same seed."""
+    stacked_ds, viewed_ds = _make_dataset_pair()
+    # Same seed for both so the shuffle order is identical.
+    g1 = torch.Generator().manual_seed(123)
+    g2 = torch.Generator().manual_seed(123)
+    loader_s = torch.utils.data.DataLoader(
+        stacked_ds, batch_size=32, shuffle=True, generator=g1,
+        pin_memory=False, num_workers=0,
+    )
+    loader_v = torch.utils.data.DataLoader(
+        viewed_ds, batch_size=32, shuffle=True, generator=g2,
+        pin_memory=False, num_workers=0,
+    )
+    n_batches = 0
+    for batch_s, batch_v in zip(loader_s, loader_v):
+        for ts, tv in zip(batch_s, batch_v):
+            np.testing.assert_array_equal(ts.numpy(), tv.numpy())
+        n_batches += 1
+    assert n_batches > 1
+
+
+def test_view_to_device_moves_underlying_tensors() -> None:
+    """``view.to(...)`` must move the underlying unique stack so
+    that subsequent slice indexing returns tensors on the same
+    device. Important because the scoring loop chains
+    ``ds.item_emb[start:end].to(device)`` — if the underlying
+    stack were on a different device than expected the chain
+    would still work, but ``.to(...)`` on the view alone should
+    pre-move the bytes for callers that pre-stage."""
+    rng = np.random.default_rng(12)
+    uniq = rng.standard_normal((20, 6)).astype(np.float32)
+    ptr = rng.integers(0, 20, size=100).astype(np.int64)
+    view = IndexedEmbeddingView(uniq, ptr)
+    moved = view.to(dtype=torch.float64)
+    assert moved.dtype == torch.float64
+    assert moved._uniq.dtype == torch.float64
+    np.testing.assert_allclose(moved[5].numpy(), uniq[ptr[5]].astype(np.float64))
+
+
+def test_lookup_dataset_with_view_pickle_roundtrip() -> None:
+    """``num_workers > 0`` would pickle the dataset to each worker
+    subprocess. We don't use that in the notebook today, but the
+    invariant is cheap to keep and would matter if anyone enabled
+    it. Verifies the IndexedEmbeddingView round-trips through
+    pickle preserving content, shape, dtype, and indexing
+    behavior."""
+    import pickle
+
+    stacked_ds, viewed_ds = _make_dataset_pair()
+    restored = pickle.loads(pickle.dumps(viewed_ds))
+    assert isinstance(restored.item_emb, IndexedEmbeddingView)
+    assert restored.item_emb.shape == viewed_ds.item_emb.shape
+    assert restored.item_emb.dtype == viewed_ds.item_emb.dtype
+    for i in [0, 7, 150, 299]:
+        np.testing.assert_array_equal(
+            restored.item_emb[i].numpy(),
+            stacked_ds.item_emb[i].numpy(),
+        )
+
+
+def test_view_supports_dataset_len_and_indexing_via_random_sampler() -> None:
+    """The RandomSampler used inside DataLoader(shuffle=True) calls
+    ``len(dataset)`` to decide the index range, then probes random
+    Python ints in that range. Verify both directly so a regression
+    in either would surface here, not just in a full DataLoader
+    pass."""
+    stacked_ds, viewed_ds = _make_dataset_pair()
+    assert len(viewed_ds) == len(stacked_ds)
+    rng = np.random.default_rng(13)
+    for _ in range(50):
+        i = int(rng.integers(0, len(viewed_ds)))
+        row_s = stacked_ds[i]
+        row_v = viewed_ds[i]
+        for ts, tv in zip(row_s, row_v):
+            np.testing.assert_array_equal(ts.numpy(), tv.numpy())

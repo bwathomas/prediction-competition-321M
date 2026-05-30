@@ -4198,10 +4198,14 @@ for fold in folds:
         )
         _fold_ckpt = _fold_m1_bundle["ckpt"]
         # Build _oof_ds_fold _after_ the cache call so:
-        #   - cache HIT path: train/val ds were never built (~52 GB saved)
+        #   - cache HIT path: train/val ds were never built
         #   - cache MISS path: train/val ds were built inside compute_fn
-        #     and freed before this point (~52 GB saved at this peak)
-        # Only _oof_ds_fold (~27 GB at largest fold) is live during scoring.
+        #     and freed before this point
+        # With IndexedEmbeddingView the item-embedding portion of each
+        # dataset is ~5 GB (unique items, dedup'd) rather than ~80 GB
+        # (per-row stacked). _oof_ds_fold is the only live dataset
+        # during scoring; the savings dominate the steady-state RSS
+        # of the OOF inner loop.
         _oof_ds_fold = _build(fold_oof_df, nn_oof_mat_fold)
         # Load fold M1 weights into a fresh model + score on OOF rows.
         _fold_model = _build_model_for_inf(MODEL_A_NAME, model_a_cfg)
