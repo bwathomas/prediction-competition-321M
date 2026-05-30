@@ -2866,29 +2866,56 @@ def _content_digest(*arrays, k_rows: int = 4096) -> str:
             h.update(ac[::stride].tobytes())
             h.update(ac[:64].tobytes())
             h.update(ac[-64:].tobytes())
+        # Chunked aggregates: peak-memory-safe for huge arrays.
+        #
+        # The previous implementation did
+        # ``ac.astype(np.float64) ** 2`` (and a second
+        # ``ac.astype(np.float64)`` for ``abs``), which
+        # materialized TWO full-array float64 copies. On
+        # ``X_train_dense_m4`` (~24 GB float32) that is ~48 GB
+        # *each* in transient -- big enough to host-OOM Colab
+        # before ``fit_fwfm_member`` ever started.
+        #
+        # The chunked path here holds at most
+        # ``CHUNK_ROWS * F * 8 * 2`` bytes transient (~1.3 GB
+        # at chunk=65536, F=1216) while producing the same five
+        # aggregates: sum, sum-of-squares, abs-sum, min, max.
+        _CD_CHUNK = 65_536
+        n_rows = int(ac.shape[0])
         if ac.dtype.kind == "f":
-            agg = np.asarray(
-                [
-                    float(ac.sum(dtype=np.float64)),
-                    float((ac.astype(np.float64) ** 2).sum()),
-                    float(np.abs(ac.astype(np.float64)).sum()),
-                    float(ac.min()),
-                    float(ac.max()),
-                ],
-                dtype=np.float64,
-            )
+            s_sum = 0.0
+            s_sq = 0.0
+            s_abs = 0.0
+            mn = float("inf")
+            mx = float("-inf")
+            for _s in range(0, n_rows, _CD_CHUNK):
+                _e = min(_s + _CD_CHUNK, n_rows)
+                _chunk = ac[_s:_e].astype(np.float64, copy=False)
+                s_sum += float(_chunk.sum())
+                s_sq += float((_chunk * _chunk).sum())
+                s_abs += float(np.abs(_chunk).sum())
+                mn = min(mn, float(_chunk.min()))
+                mx = max(mx, float(_chunk.max()))
+                _chunk = None  # noqa: F841
+            agg = np.asarray([s_sum, s_sq, s_abs, mn, mx], dtype=np.float64)
         else:
-            ac64 = ac.astype(np.int64, copy=False)
-            agg = np.asarray(
-                [
-                    int(ac64.sum()),
-                    int((ac64 * ac64).sum()),
-                    int(np.abs(ac64).sum()),
-                    int(ac.min()),
-                    int(ac.max()),
-                ],
-                dtype=np.int64,
-            )
+            i_sum = 0
+            i_sq = 0
+            i_abs = 0
+            i_mn = int(ac.ravel()[0])
+            i_mx = int(ac.ravel()[0])
+            for _s in range(0, n_rows, _CD_CHUNK):
+                _e = min(_s + _CD_CHUNK, n_rows)
+                _chunk = ac[_s:_e]
+                _c64 = _chunk.astype(np.int64, copy=False)
+                i_sum += int(_c64.sum())
+                i_sq += int((_c64 * _c64).sum())
+                i_abs += int(np.abs(_c64).sum())
+                i_mn = min(i_mn, int(_chunk.min()))
+                i_mx = max(i_mx, int(_chunk.max()))
+                _chunk = None  # noqa: F841
+                _c64 = None  # noqa: F841
+            agg = np.asarray([i_sum, i_sq, i_abs, i_mn, i_mx], dtype=np.int64)
         h.update(agg.tobytes())
     return h.hexdigest()
 

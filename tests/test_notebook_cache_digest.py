@@ -38,7 +38,12 @@ def _content_digest_under_test(*arrays, k_rows: int = 4096) -> str:
 
     Kept here so that the test file is self-contained: importing
     the notebook would trigger heavy initialization side effects
-    that are unrelated to the digest contract."""
+    that are unrelated to the digest contract.
+
+    Chunked aggregates so peak memory stays bounded for huge
+    arrays (the previous monolithic ``ac.astype(np.float64)``
+    materialized two full-array float64 copies and was the host
+    OOM trigger on ``X_train_dense_m4`` (~24 GB float32))."""
     h = hashlib.blake2b(digest_size=16)
     for a in arrays:
         if a is None:
@@ -58,29 +63,42 @@ def _content_digest_under_test(*arrays, k_rows: int = 4096) -> str:
             h.update(ac[::stride].tobytes())
             h.update(ac[:64].tobytes())
             h.update(ac[-64:].tobytes())
+        _CD_CHUNK = 65_536
+        n_rows = int(ac.shape[0])
         if ac.dtype.kind == "f":
-            agg = np.asarray(
-                [
-                    float(ac.sum(dtype=np.float64)),
-                    float((ac.astype(np.float64) ** 2).sum()),
-                    float(np.abs(ac.astype(np.float64)).sum()),
-                    float(ac.min()),
-                    float(ac.max()),
-                ],
-                dtype=np.float64,
-            )
+            s_sum = 0.0
+            s_sq = 0.0
+            s_abs = 0.0
+            mn = float("inf")
+            mx = float("-inf")
+            for s in range(0, n_rows, _CD_CHUNK):
+                e = min(s + _CD_CHUNK, n_rows)
+                chunk = ac[s:e].astype(np.float64, copy=False)
+                s_sum += float(chunk.sum())
+                s_sq += float((chunk * chunk).sum())
+                s_abs += float(np.abs(chunk).sum())
+                mn = min(mn, float(chunk.min()))
+                mx = max(mx, float(chunk.max()))
+                chunk = None
+            agg = np.asarray([s_sum, s_sq, s_abs, mn, mx], dtype=np.float64)
         else:
-            ac64 = ac.astype(np.int64, copy=False)
-            agg = np.asarray(
-                [
-                    int(ac64.sum()),
-                    int((ac64 * ac64).sum()),
-                    int(np.abs(ac64).sum()),
-                    int(ac.min()),
-                    int(ac.max()),
-                ],
-                dtype=np.int64,
-            )
+            i_sum = 0
+            i_sq = 0
+            i_abs = 0
+            i_mn = int(ac.ravel()[0])
+            i_mx = int(ac.ravel()[0])
+            for s in range(0, n_rows, _CD_CHUNK):
+                e = min(s + _CD_CHUNK, n_rows)
+                chunk = ac[s:e]
+                c64 = chunk.astype(np.int64, copy=False)
+                i_sum += int(c64.sum())
+                i_sq += int((c64 * c64).sum())
+                i_abs += int(np.abs(c64).sum())
+                i_mn = min(i_mn, int(chunk.min()))
+                i_mx = max(i_mx, int(chunk.max()))
+                chunk = None
+                c64 = None
+            agg = np.asarray([i_sum, i_sq, i_abs, i_mn, i_mx], dtype=np.int64)
         h.update(agg.tobytes())
     return h.hexdigest()
 
@@ -162,3 +180,42 @@ def test_digest_runs_quickly_on_working_size() -> None:
     _content_digest_under_test(a, k_rows=8192)
     elapsed = time.time() - t0
     assert elapsed < 10.0, f"digest too slow: {elapsed:.2f}s on working size"
+
+
+def test_digest_peak_memory_bounded_for_huge_array() -> None:
+    """Regression test for the host-OOM bug:
+    ``ac.astype(np.float64)`` on the M4 hybrid matrix
+    (~24 GB float32) allocated two ~48 GB float64 copies plus
+    the squared array, killing the kernel before any model
+    training started.
+
+    The chunked implementation must hold peak transient memory
+    well below ``M.nbytes``. We exercise a 1M x 100 float32
+    array (~400 MB resident) and require peak < 0.5 * M.nbytes
+    -- comfortable for the chunked path (~105 MB observed)
+    and catches any reintroduction of a full f64 materialization
+    (which would peak around 3.2 GB on this fixture)."""
+    import tracemalloc
+
+    rng = np.random.default_rng(7)
+    M = np.ascontiguousarray(
+        rng.standard_normal((1_000_000, 100)).astype(np.float32)
+    )
+    assert M.nbytes >= 100 * 1024 * 1024
+
+    tracemalloc.start()
+    try:
+        tracemalloc.clear_traces()
+        _content_digest_under_test(M, k_rows=4096)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    threshold = int(0.5 * M.nbytes)
+    assert peak < threshold, (
+        f"Peak Python-allocated memory during _content_digest "
+        f"({peak / 1e6:.1f} MB) >= threshold "
+        f"({threshold / 1e6:.1f} MB). This suggests the function "
+        f"is materializing a full float64 copy again. "
+        f"M.nbytes={M.nbytes / 1e6:.1f} MB."
+    )
