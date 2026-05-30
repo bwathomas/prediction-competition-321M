@@ -1070,9 +1070,27 @@ def fit_member2_metadata_mlp(
     class _M2MLP(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.subject_emb = nn.Embedding(int(n_subjects) + 1, int(d_subj))
-            self.bc_emb = nn.Embedding(int(n_bcs) + 1, int(d_bc))
-            self.cluster_emb = nn.Embedding(int(n_clusters) + 1, int(d_cluster))
+            # Metadata-only mode sets d_subj / d_bc / d_cluster to 0.
+            # nn.Embedding(n, 0) still registers a [n, 0] weight tensor;
+            # AdamW's CUDA foreach path then hits illegal memory access on
+            # those zero-numel parameters.  Skip the module entirely and
+            # emit an explicit [N, 0] slice in forward (matches the numpy
+            # path in _safe_cat_lookup when table.shape[1] == 0).
+            self._d_subj = int(d_subj)
+            self._d_bc = int(d_bc)
+            self._d_cluster = int(d_cluster)
+            self.subject_emb = (
+                nn.Embedding(int(n_subjects) + 1, int(d_subj))
+                if int(d_subj) > 0 else None
+            )
+            self.bc_emb = (
+                nn.Embedding(int(n_bcs) + 1, int(d_bc))
+                if int(d_bc) > 0 else None
+            )
+            self.cluster_emb = (
+                nn.Embedding(int(n_clusters) + 1, int(d_cluster))
+                if int(d_cluster) > 0 else None
+            )
             self.family_emb = nn.Embedding(int(n_families) + 1, int(d_family))
             self.macro_emb = nn.Embedding(int(n_macro_families) + 1, int(d_macro))
             self.org_emb = nn.Embedding(int(n_organizations) + 1, int(d_org))
@@ -1087,11 +1105,28 @@ def fit_member2_metadata_mlp(
             self.head = nn.Linear(d_in + int(hid2), 1)
             self._init_weights()
 
+        @staticmethod
+        def _cat_emb(
+            emb: "nn.Embedding | None",  # type: ignore[name-defined]
+            ids: "torch.Tensor",  # type: ignore[name-defined]
+            d: int,
+        ) -> "torch.Tensor":  # type: ignore[name-defined]
+            if int(d) == 0:
+                return torch.empty(
+                    (int(ids.shape[0]), 0),
+                    device=ids.device,
+                    dtype=torch.float32,
+                )
+            assert emb is not None
+            return emb(ids)
+
         def _init_weights(self) -> None:
             for emb in (
                 self.subject_emb, self.bc_emb, self.cluster_emb,
                 self.family_emb, self.macro_emb, self.org_emb, self.topic_emb,
             ):
+                if emb is None:
+                    continue
                 nn.init.normal_(emb.weight, std=0.01)
                 # UNK row -> zero so cold-start equals "ignore this field".
                 with torch.no_grad():
@@ -1122,7 +1157,9 @@ def fit_member2_metadata_mlp(
             m: "torch.Tensor",                       # type: ignore[name-defined]
         ) -> "torch.Tensor":                        # type: ignore[name-defined]
             x0 = torch.cat([
-                self.subject_emb(s), self.bc_emb(b), self.cluster_emb(c),
+                self._cat_emb(self.subject_emb, s, self._d_subj),
+                self._cat_emb(self.bc_emb, b, self._d_bc),
+                self._cat_emb(self.cluster_emb, c, self._d_cluster),
                 self.family_emb(f), self.macro_emb(mf), self.org_emb(o),
                 self.topic_emb(t), m,
             ], dim=1)
@@ -1450,6 +1487,12 @@ def fit_member2_metadata_mlp(
     def _w(key: str) -> np.ndarray:
         return sd[key].astype(np.float32, copy=False)
 
+    def _emb_weight(key: str, n_cat: int, d: int) -> np.ndarray:
+        """Embedding table for state export; synthesise [n+1, 0] when d=0."""
+        if int(d) == 0:
+            return np.zeros((int(n_cat) + 1, 0), dtype=np.float32)
+        return _w(key)
+
     cross_V_list: list[np.ndarray] = []
     cross_U_list: list[np.ndarray] = []
     cross_b_list: list[np.ndarray] = []
@@ -1465,9 +1508,9 @@ def fit_member2_metadata_mlp(
         cross_b_list.append(_w(f"cross_blocks.{li}.U.bias"))
 
     state = Member2MLPState(
-        subject_emb=_w("subject_emb.weight"),
-        bc_emb=_w("bc_emb.weight"),
-        cluster_emb=_w("cluster_emb.weight"),
+        subject_emb=_emb_weight("subject_emb.weight", n_subjects, d_subj),
+        bc_emb=_emb_weight("bc_emb.weight", n_bcs, d_bc),
+        cluster_emb=_emb_weight("cluster_emb.weight", n_clusters, d_cluster),
         family_emb=_w("family_emb.weight"),
         macro_emb=_w("macro_emb.weight"),
         org_emb=_w("org_emb.weight"),
