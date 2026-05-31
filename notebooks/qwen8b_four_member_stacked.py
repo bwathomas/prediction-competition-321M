@@ -5013,13 +5013,18 @@ for fold in folds:
     gc.collect()
 
     # ----- Fold Member 5 (variant-dependent) -----
-    # Two variants share this block. Both produce a [N_oof_fold] float32
-    # ``p5_oof_fold`` written into the global accumulator, and both must
-    # release any per-fold state before Member 4's training tensors land.
-    #   - "residual_cluster" (new default): refit the subject x cluster
-    #     residual passrate state on fold-train rows. Pure lookup, no
-    #     embedding stack needed; cheap to fit, cheap to score.
+    # One mutually-exclusive if/elif/elif/else chain. Every branch
+    # produces a [N_oof_fold] float32 ``p5_oof_fold`` written into the
+    # global accumulator, AND frees the M3-built fold arrays
+    # (_fold_item_emb_stacked / _fold_passrate_dense /
+    # _fold_passrate_mask_dense) exactly once before Member 4's training
+    # tensors land. The chain MUST stay an if/elif/else so the arrays are
+    # never double-freed (the crash that motivated this structure):
+    #   - "tail_knn" (current default): kNN in the PCA tail subspace,
+    #     subject-aware via the M3 passrate matrix.
+    #   - "residual_cluster": subject x cluster residual passrate lookup.
     #   - "difficulty_knn" (legacy): the original 1-D difficulty kNN.
+    #   - else (disabled / unknown variant): p5=None, free the arrays.
     if _M5_ENABLED and _M5_VARIANT == "tail_knn":
         print(f"[OOF f{fold.fold_id}] Fitting fold Member 5 (tail_knn)...")
         # kNN in the PCA tail subspace. Reuses the M3-built fold passrate
@@ -5068,7 +5073,7 @@ for fold in folds:
         del _fold_m5_state, _m5_oof_tail
         gc.collect()
 
-    if _M5_ENABLED and _M5_VARIANT == "residual_cluster":
+    elif _M5_ENABLED and _M5_VARIANT == "residual_cluster":
         print(f"[OOF f{fold.fold_id}] Fitting fold Member 5 (residual_cluster)...")
         # Free the M3-built fold passrate/embeddings; the residual M5
         # only needs row-level (subject_id, cluster_id, label) arrays.
