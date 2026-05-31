@@ -402,7 +402,10 @@ CFG.setdefault("member2_mlp", {})
 #   architecture; it left M2 with err-corr 0.87 against M1 and only
 #   +0.012 stacker weight on the last full run, so we restrict
 #   composition rather than throw more capacity at it.
-CFG["member2_mlp"].setdefault("feature_mode", "metadata_only")
+# Diversification pass (2026-05-30): M2 now also gets the item-cluster
+# embedding on top of the metadata block ("metadata_cluster"). Subject/
+# bc id embeddings and the marginals stay OFF (those live in M4/M6/M7).
+CFG["member2_mlp"].setdefault("feature_mode", "metadata_cluster")
 # Categorical-embedding widths. In metadata_only mode the subject /
 # bc / cluster widths are forced to 0 below (those embedding tables
 # vanish from the model entirely; the saved state still serialises
@@ -535,6 +538,67 @@ CFG["member6"].setdefault("val_fraction", 0.1)
 # "embedding_vs_marginal" (2 fields: 0=embedding-derived M2 columns,
 # 1=mean-encoded marginal columns from MEMBER4_MARGINAL_FEATURE_NAMES).
 CFG["member6"].setdefault("field_split_mode", "embedding_vs_marginal")
+
+# --- PCA tail subspace (shared by Members 4 & 5) -------------------------
+# Diversification pass (2026-05-30). We fit ONE unsupervised randomized
+# PCA on the unique train item embeddings, drop the top `head_drop`
+# components (the coarse semantic axis M1/M3 already key on) and keep
+# the next `tail_take` components as a "tail" subspace. Members 4 & 5
+# operate ONLY on this residual geometry, which carries a different
+# error structure than the variance-dominant head. The fit is label-
+# free, so reusing one global basis across OOF folds leaks nothing.
+CFG.setdefault("pca_tail", {})
+CFG["pca_tail"].setdefault("n_components", 256)
+CFG["pca_tail"].setdefault("head_drop", 32)
+CFG["pca_tail"].setdefault("tail_take", 128)
+CFG["pca_tail"].setdefault("seed_offset", 7)
+
+# --- Member 5 variant override: tail-subspace kNN ------------------------
+# The diversification pass repurposes Member 5 from the residual-cluster
+# lookup to a kNN in the PCA tail subspace (subject-aware via the same
+# subject x item passrate matrix Member 3 uses). Set variant back to
+# "residual_cluster"/"difficulty_knn" for the legacy behaviour.
+CFG["member5"]["variant"] = "tail_knn"
+# kNN hyperparameters for the tail-subspace variant (reuses
+# fit_knn_member, so the knobs mirror Member 3's).
+CFG["member5"].setdefault("tail_k", 128)
+CFG["member5"].setdefault("tail_tau_subject", 5.0)
+CFG["member5"].setdefault("tail_tau_global", 200.0)
+CFG["member5"].setdefault("tail_item_fallback_weight", 0.5)
+CFG["member5"].setdefault("tail_quantization", "int8")
+
+# --- Member 7: pure-marginal GLU-MLP -------------------------------------
+# A small GLU-MLP on the 14 mean-encoded marginals ONLY (no embeddings,
+# no raw metadata). Captures non-linear interactions among the marginals
+# that the additive-linear M4 and field-bilinear M6 cannot express.
+CFG.setdefault("member7", {})
+CFG["member7"].setdefault("enabled", True)
+CFG["member7"].setdefault("hid1", 64)
+CFG["member7"].setdefault("hid2", 32)
+CFG["member7"].setdefault("learning_rate", 1.0e-3)
+CFG["member7"].setdefault("weight_decay", 1.0e-5)
+CFG["member7"].setdefault("epochs", 40)
+CFG["member7"].setdefault("batch_size", 16384)
+CFG["member7"].setdefault("early_stopping_patience", 6)
+CFG["member7"].setdefault("feat_dropout", 0.10)
+
+# --- Member 8: embeddings GLU-MLP ----------------------------------------
+# A learned subject-id embedding concatenated with the full item
+# embedding, fed to a GLU-MLP. Collaborative + content; structurally
+# distinct from M1's IRT-MLP head. Memory-safe: item embeddings are
+# gathered from unique-item storage, never materialised as [N, D].
+CFG.setdefault("member8", {})
+CFG["member8"].setdefault("enabled", True)
+CFG["member8"].setdefault("subj_emb_dim", 32)
+CFG["member8"].setdefault("hid1", 256)
+CFG["member8"].setdefault("hid2", 128)
+CFG["member8"].setdefault("learning_rate", 1.0e-3)
+CFG["member8"].setdefault("weight_decay", 1.0e-5)
+CFG["member8"].setdefault("epochs", 30)
+CFG["member8"].setdefault("batch_size", 16384)
+CFG["member8"].setdefault("early_stopping_patience", 5)
+CFG["member8"].setdefault("feat_dropout", 0.10)
+
 CFG.setdefault("judge", {})
 CFG["judge"]["enabled"] = False
 CFG.setdefault("lora", {})
@@ -2725,17 +2789,30 @@ def _m2_gather_metadata(subj_ids: np.ndarray, bc_ids: np.ndarray) -> dict:
 # bc_redacted_flag). The same toggle has to apply to both the global
 # fit and every OOF fold; we resolve it once here so the two callers
 # can't drift apart.
-_M2_FEATURE_MODE = str(CFG.get("member2_mlp", {}).get("feature_mode", "metadata_only"))
-if _M2_FEATURE_MODE not in {"metadata_only", "full"}:
+_M2_FEATURE_MODE = str(CFG.get("member2_mlp", {}).get("feature_mode", "metadata_cluster"))
+if _M2_FEATURE_MODE not in {"metadata_only", "metadata_cluster", "full"}:
     raise ValueError(
-        f"CFG['member2_mlp']['feature_mode'] must be 'metadata_only' or "
-        f"'full', got {_M2_FEATURE_MODE!r}"
+        f"CFG['member2_mlp']['feature_mode'] must be 'metadata_only', "
+        f"'metadata_cluster' or 'full', got {_M2_FEATURE_MODE!r}"
     )
-_M2_METADATA_ONLY = (_M2_FEATURE_MODE == "metadata_only")
-# In metadata_only mode the numerical block excludes the marginals so
+# Three composition modes, expressed as three orthogonal channel gates
+# so the global / OOF / shuffle-null fits can't drift:
+#   metadata_only    -> pure subject/bench metadata block (no ids, no
+#                       cluster, no marginals).
+#   metadata_cluster -> metadata block + item-cluster embedding (still
+#                       no subject/bc id embeddings, no marginals).
+#   full             -> everything (subject/bc/cluster ids + marginals).
+_M2_USE_SUBJ_BC = (_M2_FEATURE_MODE == "full")
+_M2_USE_CLUSTER = (_M2_FEATURE_MODE in {"metadata_cluster", "full"})
+_M2_USE_MARGINALS = (_M2_FEATURE_MODE == "full")
+# Back-compat alias still consulted by the marginal/redact-zeroing
+# branches below (now keyed on "are marginals active?", which is the
+# only thing those branches actually care about).
+_M2_METADATA_ONLY = not _M2_USE_MARGINALS
+# When marginals are inactive the numerical block excludes them so
 # _M2_NUM_FEATURE_NAMES has to match (its length is part of the state
 # contract via num_feature_names).
-if _M2_METADATA_ONLY:
+if not _M2_USE_MARGINALS:
     _M2_NUM_FEATURE_NAMES = m2_numerical_feature_names(
         subj_num_names=_M2_SUBJ_NUM_FEATURE_NAMES,
         bench_num_names=_M2_BENCH_NUM_FEATURE_NAMES,
@@ -2860,9 +2937,9 @@ def _fit_member2_mlp_global():
         n_subj_num=int(_M2_N_SUBJ_NUM),
         n_bench_num=int(_M2_N_BENCH_NUM),
         n_marginals=int(_M2_N_MARGINALS_ACTIVE),
-        d_subj=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_subj", 32))),
-        d_bc=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_bc", 32))),
-        d_cluster=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_cluster", 16))),
+        d_subj=(int(_m2_cfg.get("d_subj", 32)) if _M2_USE_SUBJ_BC else 0),
+        d_bc=(int(_m2_cfg.get("d_bc", 32)) if _M2_USE_SUBJ_BC else 0),
+        d_cluster=(int(_m2_cfg.get("d_cluster", 16)) if _M2_USE_CLUSTER else 0),
         d_family=int(_m2_cfg.get("d_family", 16)),
         d_macro=int(_m2_cfg.get("d_macro", 8)),
         d_org=int(_m2_cfg.get("d_org", 16)),
@@ -3226,6 +3303,84 @@ del val_item_emb
 gc.collect()
 
 # %% [markdown]
+# ## 9d-tail. PCA tail subspace (shared by Members 4 & 5)
+#
+# Diversification pass (2026-05-30). Fit ONE unsupervised randomized PCA
+# on the unique train item embeddings, drop the top `head_drop` PCs (the
+# coarse semantic axis M1/M3/M8 key on), keep the next `tail_take` PCs as
+# the residual "tail" subspace. Members 4 (logreg) and 5 (kNN) operate
+# ONLY on this geometry so their errors decorrelate from the head-driven
+# members. The fit is label-free, so one global basis reused across OOF
+# folds leaks nothing.
+
+# %%
+from src.pca_tail import PcaTailBasis, fit_pca_tail
+
+_PT_CFG = CFG["pca_tail"]
+_PT_NCOMP = int(_PT_CFG.get("n_components", 256))
+_PT_HEAD = int(_PT_CFG.get("head_drop", 32))
+_PT_TAIL = int(_PT_CFG.get("tail_take", 128))
+_PT_SEED = int(SEED) + int(_PT_CFG.get("seed_offset", 7))
+_PT_D_EMB = int(item_emb_lookup[train_item_keys[0]].shape[0])
+
+
+def _fit_pca_tail_global():
+    print(
+        f"[PCA-tail] stacking {len(train_item_keys):,} unique train item "
+        "embeddings (inside cache compute_fn so a HIT skips this)..."
+    )
+    _emb = np.empty((len(train_item_keys), _PT_D_EMB), dtype=np.float32)
+    for _i, _k in enumerate(train_item_keys):
+        _emb[_i] = item_emb_lookup[_k]
+    _basis = fit_pca_tail(
+        _emb, n_components=_PT_NCOMP, head_drop=_PT_HEAD,
+        tail_take=_PT_TAIL, seed=_PT_SEED,
+    )
+    _tail_unique = _basis.project(_emb).astype(np.float32)
+    del _emb
+    gc.collect()
+    return {"basis": _basis, "tail_unique": _tail_unique}
+
+
+_pca_tail_bundle = cache_or_compute(
+    "pca_tail_subspace",
+    key_inputs=(
+        "pca_tail_v1", int(len(train_item_keys)), int(_PT_D_EMB),
+        _PT_NCOMP, _PT_HEAD, _PT_TAIL, _PT_SEED,
+    ),
+    compute_fn=_fit_pca_tail_global,
+)
+pca_tail: PcaTailBasis = _pca_tail_bundle["basis"]
+tail_proj_unique_train = _pca_tail_bundle["tail_unique"]   # [n_train_items, tail_dim]
+_TAIL_DIM = int(pca_tail.tail_dim)
+print(
+    f"[PCA-tail] basis: D={pca_tail.d_emb} -> tail_dim={_TAIL_DIM} "
+    f"(dropped top {pca_tail.head_drop}); "
+    f"mean tail explained-var={float(pca_tail.explained_variance.mean()):.4g}"
+)
+
+# Per-row tail projection for TRAIN rows via the unique-item gather.
+# ``m2_holdout_item_id`` is the train-item index per row (all train rows
+# resolve to a valid train item, so the gather is total).
+assert int(m2_holdout_item_id.min()) >= 0, (
+    "every train row must map to a train item for the tail gather"
+)
+tail_proj_train_rows = tail_proj_unique_train[m2_holdout_item_id]   # [N_train, tail_dim]
+
+# Per-row tail projection for VAL rows. Val items are cold (not in
+# train_item_keys), so project their embeddings directly.
+_val_emb_for_tail = np.empty((len(primary.val), int(pca_tail.d_emb)), dtype=np.float32)
+for _i, _k in enumerate(primary.val["item_key"]):
+    _val_emb_for_tail[_i] = item_emb_lookup[str(_k)]
+tail_proj_val_rows = pca_tail.project(_val_emb_for_tail)            # [N_val, tail_dim]
+del _val_emb_for_tail
+gc.collect()
+print(
+    f"[PCA-tail] per-row projections: train {tail_proj_train_rows.shape}  "
+    f"val {tail_proj_val_rows.shape}"
+)
+
+# %% [markdown]
 # ## 9d-bis. Train Member 5 (kNN on a 1-D supervised difficulty projection)
 #
 # Task 4 of the diversification plan. Member 3 finds neighbors by COSINE
@@ -3247,10 +3402,10 @@ if CFG.get("member5", {}).get("enabled", False):
 
     _m5_cfg = CFG["member5"]
     _M5_VARIANT = str(_m5_cfg.get("variant", "residual_cluster")).lower()
-    if _M5_VARIANT not in {"difficulty_knn", "residual_cluster"}:
+    if _M5_VARIANT not in {"difficulty_knn", "residual_cluster", "tail_knn"}:
         raise ValueError(
             f"CFG['member5']['variant']={_M5_VARIANT!r} unrecognized; "
-            "expected 'difficulty_knn' or 'residual_cluster'."
+            "expected 'difficulty_knn', 'residual_cluster' or 'tail_knn'."
         )
 
     _M5_ENABLED = True
@@ -3273,6 +3428,76 @@ if CFG.get("member5", {}).get("enabled", False):
         f"legacy(knn)[k={_M5_K} tau={_M5_TAU} ridge={_M5_RIDGE_ALPHA}]  "
         f"residual[smooth_cell={_M5_SMOOTH_CELL} smooth_marg={_M5_SMOOTH_MARG} "
         f"scale={_M5_RES_SCALE}]"
+    )
+
+# ---- Branch: tail_knn variant (diversification pass 2026-05-30) ----------
+# Member 5 = kNN in the PCA tail subspace. We reuse fit_knn_member (the
+# exact machinery Member 3 uses) but feed it TAIL-projected item
+# embeddings instead of raw embeddings, so neighbours are found by
+# fine-grained residual similarity -- a different neighbour set than M3's
+# head-dominated cosine kNN. Subject-awareness comes from the same
+# subject x item passrate matrix M3 uses (so this honours "subject-aware"
+# without folding subject features into the ill-defined kNN distance).
+if CFG.get("member5", {}).get("enabled", False) and str(
+    CFG["member5"].get("variant", "residual_cluster")
+).lower() == "tail_knn":
+    _M5_KIND = "tail_knn"
+    _M5_TAIL_K = int(_m5_cfg.get("tail_k", 128))
+    _M5_TAIL_TAU_S = float(_m5_cfg.get("tail_tau_subject", 5.0))
+    _M5_TAIL_TAU_G = float(_m5_cfg.get("tail_tau_global", 200.0))
+    _M5_TAIL_FB = float(_m5_cfg.get("tail_item_fallback_weight", 0.5))
+    _M5_TAIL_QUANT = str(_m5_cfg.get("tail_quantization", "int8"))
+
+    def _fit_member5_tail():
+        print(
+            f"[Member 5/tail] fitting kNN on tail subspace "
+            f"(tail_dim={_TAIL_DIM}, k={_M5_TAIL_K}) over "
+            f"{len(train_item_keys):,} train items..."
+        )
+        return fit_knn_member(
+            item_keys=list(train_item_keys),
+            item_embeddings=tail_proj_unique_train,
+            subject_keys=list(_subject_keys_ordered),
+            passrate_dense=m3_passrate_dense,
+            passrate_mask=m3_passrate_mask,
+            pca_dim=int(_TAIL_DIM),
+            quantization=_M5_TAIL_QUANT,
+            k=_M5_TAIL_K,
+            tau_subject=_M5_TAIL_TAU_S,
+            tau_global=_M5_TAIL_TAU_G,
+            item_fallback_weight=_M5_TAIL_FB,
+            seed=int(SEED) + 777,
+        )
+
+    member5_state = cache_or_compute(
+        "member5_tail_knn_state",
+        key_inputs=(
+            "m5_tail_knn_v1", int(len(train_item_keys)),
+            int(indexer.n_subjects), int(_TAIL_DIM),
+            _M5_TAIL_K, round(_M5_TAIL_TAU_S, 6), round(_M5_TAIL_TAU_G, 6),
+            round(_M5_TAIL_FB, 6), _M5_TAIL_QUANT,
+            int(_PT_HEAD), int(_PT_TAIL), int(_PT_NCOMP), int(SEED),
+        ),
+        compute_fn=_fit_member5_tail,
+    )
+    print(
+        f"[Member 5/tail] state: pca_dim={member5_state.pca_dim}  "
+        f"k={member5_state.k}  n_items={len(train_item_keys):,}"
+    )
+    p_member5_val = knn_apply_batch(
+        member5_state, tail_proj_val_rows,
+        [str(s) for s in primary.val["subject_key"]],
+        chunk_size=_M3_CHUNK, use_gpu=_M3_USE_GPU, progress=True,
+    )
+    nll_m5 = float(-(
+        ylab_val * np.log(np.clip(p_member5_val, 1e-6, 1 - 1e-6))
+        + (1 - ylab_val) * np.log(1 - np.clip(p_member5_val, 1e-6, 1 - 1e-6))
+    ).mean())
+    print(
+        f"[Member 5/tail] val log-loss: {nll_m5:.6f}  "
+        f"p stats: min={float(p_member5_val.min()):.4f} "
+        f"mean={float(p_member5_val.mean()):.4f} "
+        f"max={float(p_member5_val.max()):.4f}"
     )
 
 # ---- Branch: residual_cluster variant (new default) ----------------------
@@ -3589,45 +3814,51 @@ from src.logreg_member import (
 )
 
 
-X_train_dense_m4 = np.concatenate(
-    [X_train_dense, member4_marginal_train], axis=1
-).astype(np.float32, copy=False)
-X_val_dense_m4 = np.concatenate(
-    [X_val_dense, member4_marginal_val], axis=1
-).astype(np.float32, copy=False)
-member4_feature_names = tuple(member_feat_schema.feature_names) + tuple(
-    MEMBER4_MARGINAL_FEATURE_NAMES
+# Diversification pass (2026-05-30): Member 4 is now a logistic
+# regression on the PCA TAIL subspace + two subject features
+# (IRT theta, subject mean-passrate). It is decorrelated-by-construction
+# from M1/M3/M8 (which key on the embedding HEAD) and from M6 (full dense
+# matrix). The subject features make it a genuine (subject, item) model
+# rather than a per-item difficulty constant.
+def _build_m4_tail_matrix(tail_rows, subj_ids, marginal_block):
+    _theta = theta_s_per_subject[
+        np.clip(subj_ids, 0, len(theta_s_per_subject) - 1)
+    ].astype(np.float32)
+    # subject mean-passrate is marginal column 0 (mg__subj_mean).
+    _submean = np.asarray(marginal_block[:, 0], dtype=np.float32)
+    return np.concatenate(
+        [tail_rows, _theta[:, None], _submean[:, None]], axis=1
+    ).astype(np.float32, copy=False)
+
+
+X_train_tail_m4 = _build_m4_tail_matrix(
+    tail_proj_train_rows, _mef_train_subj, member4_marginal_train,
+)
+X_val_tail_m4 = _build_m4_tail_matrix(
+    tail_proj_val_rows, _mef_val_subj, member4_marginal_val,
+)
+member4_feature_names = tuple(f"tail_pc_{i}" for i in range(_TAIL_DIM)) + (
+    "subj_theta", "subj_mean_passrate",
 )
 print(
-    f"[Member 4] hybrid feature matrix: train {X_train_dense_m4.shape}  "
-    f"val {X_val_dense_m4.shape}  "
-    f"(embedding dense={X_train_dense.shape[1]} + marginals={MEMBER4_MARGINAL_FEATURE_DIM})"
+    f"[Member 4] tail feature matrix: train {X_train_tail_m4.shape}  "
+    f"val {X_val_tail_m4.shape}  (tail_dim={_TAIL_DIM} + theta + subj_mean)"
 )
 
 
 def _fit_member4():
-    # HYBRID: embedding-derived dense features + 14 mean-encoded
-    # marginals. The marginal-only version (val NLL 0.523, stacker
-    # weight -0.075) was too weak to compete; the embedding-only
-    # version (val NLL 0.483, stacker weight ~0.10) was too redundant
-    # with M1/M3 (both also lean on embeddings). The hybrid keeps the
-    # predictive power AND gives the LR an exclusive feature axis
-    # (subject/bench marginals) that none of the other members use
-    # for direct prediction. Stronger L1 (3e-3, up from 1e-3) lets it
-    # pick a sparser subset over the now-1216-dim input.
     print(
-        f"[Member 4] training torch logistic regression on HYBRID "
-        f"(X cols={X_train_dense_m4.shape[1]}, "
-        f"embedding+marginal mix, l1_strength=3e-3)..."
+        f"[Member 4] training torch logistic regression on TAIL subspace "
+        f"(X cols={X_train_tail_m4.shape[1]}, tail+subject features)..."
     )
     return fit_logreg_member(
-        X=X_train_dense_m4,
+        X=X_train_tail_m4,
         y=y_train,
         feature_names=member4_feature_names,
         epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
         learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
         weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
-        l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_hybrid", 3.0e-3)),
+        l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_tail", 1.0e-4)),
         min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
         early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
         seed=SEED,
@@ -3636,23 +3867,22 @@ def _fit_member4():
     )
 
 
-# Cache key bumped: ``hybrid_v1`` ties this entry to the hybrid feature
-# matrix (embedding dense + marginals). Old entries (marginal-only OR
-# legacy embedding-only) are incompatible -- the saved weights vector
-# has a different dimensionality.
+# Cache key tag ``tail_v1`` ties this entry to the tail-subspace feature
+# matrix; old (hybrid / marginal-only / embedding-only) entries have a
+# different feature dimensionality and must not be reused.
 logreg_state = cache_or_compute(
     "logreg_state",
     key_inputs=(
-        int(X_train_dense_m4.shape[1]), len(primary.train), SEED,
-        "std_v1", "l1minfreq_v1", "coldsplit_v1", "redact_v1", "hybrid_v1",
-        round(float(CFG.get("member4_logreg", {}).get("l1_strength_hybrid", 3.0e-3)), 6),
+        int(X_train_tail_m4.shape[1]), len(primary.train), SEED,
+        "std_v1", "l1minfreq_v1", "coldsplit_v1", "tail_v1",
+        int(_TAIL_DIM), int(_PT_HEAD), int(_PT_TAIL), int(_PT_NCOMP),
+        round(float(CFG.get("member4_logreg", {}).get("l1_strength_tail", 1.0e-4)), 6),
         round(float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)), 6),
         round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
-        round(BC_REDACT_FRAC, 3), _bc_redact_seed,
     ),
     compute_fn=_fit_member4,
 )
-p_member4_val = logreg_apply_state_batch(logreg_state, X_val_dense_m4)
+p_member4_val = logreg_apply_state_batch(logreg_state, X_val_tail_m4)
 nll_m4 = float(-(ylab_val * np.log(np.clip(p_member4_val, 1e-6, 1 - 1e-6))
                  + (1 - ylab_val) * np.log(1 - np.clip(p_member4_val, 1e-6, 1 - 1e-6))).mean())
 print(f"[Member 4] val log-loss: {nll_m4:.6f}  "
@@ -3707,6 +3937,19 @@ if _M6_ENABLED:
     _M6_VAL_FRAC = float(_m6_cfg.get("val_fraction", 0.1))
     _M6_FIELD_MODE = str(_m6_cfg.get("field_split_mode", "embedding_vs_marginal")).lower()
 
+    # Member 4 moved to the PCA tail subspace, so it no longer builds the
+    # dense hybrid matrix. Member 6 still needs it, so rebuild it here
+    # (embedding-derived dense features + 14 mean-encoded marginals).
+    X_train_dense_m4 = np.concatenate(
+        [X_train_dense, member4_marginal_train], axis=1,
+    ).astype(np.float32, copy=False)
+    X_val_dense_m4 = np.concatenate(
+        [X_val_dense, member4_marginal_val], axis=1,
+    ).astype(np.float32, copy=False)
+    _m6_dense_feature_names = tuple(member_feat_schema.feature_names) + tuple(
+        MEMBER4_MARGINAL_FEATURE_NAMES
+    )
+
     _F_M4_TOTAL = int(X_train_dense_m4.shape[1])
     _F_M4_BASE = int(member_feat_schema.feature_dim)
     if _M6_FIELD_MODE == "single":
@@ -3732,7 +3975,7 @@ if _M6_ENABLED:
         return fit_fwfm_member(
             X=X_train_dense_m4,
             y=y_train,
-            feature_names=member4_feature_names,
+            feature_names=_m6_dense_feature_names,
             field_ids=_m6_field_ids,
             k=_M6_K,
             learning_rate=_M6_LR,
@@ -3829,6 +4072,157 @@ else:
     print("[Member 6] DISABLED via CFG['member6']['enabled']=False")
 
 # %% [markdown]
+# ## 9e-quater. Train Member 7 (pure-marginal GLU-MLP) and Member 8
+# (embeddings GLU-MLP)
+#
+# Diversification pass (2026-05-30). Two new GLU-MLP members:
+#   * M7 -- non-linear interactions among the 14 mean-encoded marginals
+#     ONLY (no embeddings, no raw metadata). Complements the additive M4
+#     and bilinear M6 on the marginal channel.
+#   * M8 -- learned subject-id embedding + full item embedding -> MLP. A
+#     collaborative+content model; the item embeddings are gathered from
+#     unique-item storage (never materialised as [N, D]).
+# Both run BEFORE the pre-OOF cleanup because M7 consumes
+# ``member4_marginal_train`` (freed there).
+
+# %%
+from src.mlp_member import (
+    MlpMemberState as _MlpMemberState,
+    apply_state_batch as mlp_apply_state_batch,
+    fit_mlp_member,
+)
+
+
+def _nll_vec(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return float(-(ylab_val * np.log(p) + (1 - ylab_val) * np.log(1 - p)).mean())
+
+
+_M7_ENABLED = bool(CFG.get("member7", {}).get("enabled", False))
+if _M7_ENABLED:
+    _m7_cfg = CFG["member7"]
+
+    def _fit_member7():
+        print(
+            f"[Member 7] training GLU-MLP on {int(MEMBER4_MARGINAL_FEATURE_DIM)} "
+            "marginals (full train)..."
+        )
+        return fit_mlp_member(
+            labels=y_train,
+            dense_X=member4_marginal_train,
+            dense_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+            hid1=int(_m7_cfg.get("hid1", 64)),
+            hid2=int(_m7_cfg.get("hid2", 32)),
+            learning_rate=float(_m7_cfg.get("learning_rate", 1.0e-3)),
+            weight_decay=float(_m7_cfg.get("weight_decay", 1.0e-5)),
+            epochs=int(_m7_cfg.get("epochs", 40)),
+            batch_size=int(_m7_cfg.get("batch_size", 16384)),
+            early_stopping_patience=int(_m7_cfg.get("early_stopping_patience", 6)),
+            feat_dropout=float(_m7_cfg.get("feat_dropout", 0.10)),
+            seed=int(SEED) + 701,
+            holdout_group_id=holdout_item_id,
+            show_progress=True,
+        )
+
+    member7_state = cache_or_compute(
+        "member7_marginal_mlp_state",
+        key_inputs=(
+            "m7_marg_mlp_v1", int(MEMBER4_MARGINAL_FEATURE_DIM), len(primary.train),
+            int(_m7_cfg.get("hid1", 64)), int(_m7_cfg.get("hid2", 32)),
+            round(float(_m7_cfg.get("learning_rate", 1.0e-3)), 6),
+            round(float(_m7_cfg.get("weight_decay", 1.0e-5)), 7),
+            int(_m7_cfg.get("epochs", 40)),
+            int(_m7_cfg.get("early_stopping_patience", 6)),
+            round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+            int(SEED),
+        ),
+        compute_fn=_fit_member7,
+    )
+    p_member7_val = mlp_apply_state_batch(member7_state, dense_X=member4_marginal_val)
+    nll_m7 = _nll_vec(p_member7_val)
+    print(
+        f"[Member 7] val log-loss: {nll_m7:.6f}  "
+        f"p[min/mean/max]={float(p_member7_val.min()):.4f}/"
+        f"{float(p_member7_val.mean()):.4f}/{float(p_member7_val.max()):.4f}"
+    )
+else:
+    member7_state = None
+    p_member7_val = None
+    nll_m7 = float("nan")
+    print("[Member 7] DISABLED via CFG['member7']['enabled']=False")
+
+
+_M8_ENABLED = bool(CFG.get("member8", {}).get("enabled", False))
+if _M8_ENABLED:
+    _m8_cfg = CFG["member8"]
+
+    def _fit_member8():
+        print(
+            f"[Member 8] stacking {len(train_item_keys):,} unique item "
+            "embeddings (inside cache compute_fn so a HIT skips this)..."
+        )
+        _emb = np.empty((len(train_item_keys), _PT_D_EMB), dtype=np.float32)
+        for _i, _k in enumerate(train_item_keys):
+            _emb[_i] = item_emb_lookup[_k]
+        _st = fit_mlp_member(
+            labels=y_train,
+            subject_ids=_mef_train_subj,
+            n_subjects=int(indexer.n_subjects),
+            subj_emb_dim=int(_m8_cfg.get("subj_emb_dim", 32)),
+            item_emb_unique=_emb,
+            row_to_uniq=m2_holdout_item_id,
+            hid1=int(_m8_cfg.get("hid1", 256)),
+            hid2=int(_m8_cfg.get("hid2", 128)),
+            learning_rate=float(_m8_cfg.get("learning_rate", 1.0e-3)),
+            weight_decay=float(_m8_cfg.get("weight_decay", 1.0e-5)),
+            epochs=int(_m8_cfg.get("epochs", 30)),
+            batch_size=int(_m8_cfg.get("batch_size", 16384)),
+            early_stopping_patience=int(_m8_cfg.get("early_stopping_patience", 5)),
+            feat_dropout=float(_m8_cfg.get("feat_dropout", 0.10)),
+            seed=int(SEED) + 801,
+            holdout_group_id=m2_holdout_item_id,
+            show_progress=True,
+        )
+        del _emb
+        gc.collect()
+        return _st
+
+    member8_state = cache_or_compute(
+        "member8_embedding_mlp_state",
+        key_inputs=(
+            "m8_emb_mlp_v1", len(train_item_keys), int(_PT_D_EMB),
+            int(indexer.n_subjects), int(_m8_cfg.get("subj_emb_dim", 32)),
+            int(_m8_cfg.get("hid1", 256)), int(_m8_cfg.get("hid2", 128)),
+            round(float(_m8_cfg.get("learning_rate", 1.0e-3)), 6),
+            round(float(_m8_cfg.get("weight_decay", 1.0e-5)), 7),
+            int(_m8_cfg.get("epochs", 30)),
+            int(_m8_cfg.get("early_stopping_patience", 5)),
+            int(SEED),
+        ),
+        compute_fn=_fit_member8,
+    )
+    # Val scoring: gather val-row item embeddings (transient), apply, free.
+    _m8_val_emb = np.empty((len(primary.val), _PT_D_EMB), dtype=np.float32)
+    for _i, _k in enumerate(primary.val["item_key"]):
+        _m8_val_emb[_i] = item_emb_lookup[str(_k)]
+    p_member8_val = mlp_apply_state_batch(
+        member8_state, subject_ids=_mef_val_subj, item_emb=_m8_val_emb,
+    )
+    del _m8_val_emb
+    gc.collect()
+    nll_m8 = _nll_vec(p_member8_val)
+    print(
+        f"[Member 8] val log-loss: {nll_m8:.6f}  "
+        f"p[min/mean/max]={float(p_member8_val.min()):.4f}/"
+        f"{float(p_member8_val.mean()):.4f}/{float(p_member8_val.max()):.4f}"
+    )
+else:
+    member8_state = None
+    p_member8_val = None
+    nll_m8 = float("nan")
+    print("[Member 8] DISABLED via CFG['member8']['enabled']=False")
+
+# %% [markdown]
 # ## 9e-bis. Pre-OOF memory reclamation
 #
 # AGGRESSIVE MEMORY DISCIPLINE: every dense matrix in this notebook is
@@ -3862,6 +4256,10 @@ _pre_oof_to_free = [
     ("X_val_dense_m4", X_val_dense_m4),
     ("member4_marginal_train", member4_marginal_train),
     ("member4_marginal_val", member4_marginal_val),
+    ("tail_proj_train_rows", tail_proj_train_rows),
+    ("tail_proj_unique_train", tail_proj_unique_train),
+    ("X_train_tail_m4", X_train_tail_m4),
+    ("X_val_tail_m4", X_val_tail_m4),
 ]
 if X_train_dense_m2 is not None:
     _pre_oof_to_free.append(("X_train_dense_m2", X_train_dense_m2))
@@ -3887,6 +4285,12 @@ X_train_dense_m4 = None
 X_val_dense_m4 = None
 member4_marginal_train = None
 member4_marginal_val = None
+# Tail projections / matrices used only by the GLOBAL M4/M5 fits.
+# Per-fold OOF builds its own tail projections, so these can go.
+tail_proj_train_rows = None
+tail_proj_unique_train = None
+X_train_tail_m4 = None
+X_val_tail_m4 = None
 gc.collect()
 # Flush PyTorch's CUDA caching allocator: at this point Members 1, 2,
 # and 6 have all just been trained on GPU. The trainer functions
@@ -3978,6 +4382,16 @@ if _M6_ENABLED:
     p6_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p6_train_oof")
 else:
     p6_train_oof_acc = None
+
+# Members 7 (marginal MLP) & 8 (embedding MLP) OOF accumulators.
+if _M7_ENABLED:
+    p7_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p7_train_oof")
+else:
+    p7_train_oof_acc = None
+if _M8_ENABLED:
+    p8_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p8_train_oof")
+else:
+    p8_train_oof_acc = None
 
 
 # Gate 1b tracker: for each fold we'll save a sample of OOF-row top-k
@@ -4433,9 +4847,9 @@ for fold in folds:
             n_subj_num=int(_M2_N_SUBJ_NUM),
             n_bench_num=int(_M2_N_BENCH_NUM),
             n_marginals=int(_M2_N_MARGINALS_ACTIVE),
-            d_subj=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_subj", 32))),
-            d_bc=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_bc", 32))),
-            d_cluster=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_cluster", 16))),
+            d_subj=(int(_m2_cfg.get("d_subj", 32)) if _M2_USE_SUBJ_BC else 0),
+            d_bc=(int(_m2_cfg.get("d_bc", 32)) if _M2_USE_SUBJ_BC else 0),
+            d_cluster=(int(_m2_cfg.get("d_cluster", 16)) if _M2_USE_CLUSTER else 0),
             d_family=int(_m2_cfg.get("d_family", 16)),
             d_macro=int(_m2_cfg.get("d_macro", 8)),
             d_org=int(_m2_cfg.get("d_org", 16)),
@@ -4606,6 +5020,54 @@ for fold in folds:
     #     residual passrate state on fold-train rows. Pure lookup, no
     #     embedding stack needed; cheap to fit, cheap to score.
     #   - "difficulty_knn" (legacy): the original 1-D difficulty kNN.
+    if _M5_ENABLED and _M5_VARIANT == "tail_knn":
+        print(f"[OOF f{fold.fold_id}] Fitting fold Member 5 (tail_knn)...")
+        # kNN in the PCA tail subspace. Reuses the M3-built fold passrate
+        # (subject-awareness) but projects items into the tail basis so
+        # neighbours differ from M3's head-dominated cosine kNN.
+        _fold_tail_items = pca_tail.project(_fold_item_emb_stacked)  # [n_fit, tail_dim]
+        _fold_m5_state = cache_or_compute(
+            "member5_tail_knn_state_oof_fold",
+            key_inputs=(
+                "m5_tail_knn_oof_v1", fold.fold_id, fold_suffix,
+                int(len(fold.train_item_keys)), int(indexer.n_subjects),
+                int(_TAIL_DIM), int(_M5_TAIL_K),
+                round(_M5_TAIL_TAU_S, 6), round(_M5_TAIL_TAU_G, 6),
+                round(_M5_TAIL_FB, 6), _M5_TAIL_QUANT,
+                int(_PT_HEAD), int(_PT_TAIL), int(SEED),
+            ),
+            compute_fn=lambda _ff=fold: fit_knn_member(
+                item_keys=list(_ff.train_item_keys),
+                item_embeddings=_fold_tail_items,
+                subject_keys=list(_subject_keys_ordered),
+                passrate_dense=_fold_passrate_dense,
+                passrate_mask=_fold_passrate_mask_dense,
+                pca_dim=int(_TAIL_DIM),
+                quantization=_M5_TAIL_QUANT,
+                k=_M5_TAIL_K,
+                tau_subject=_M5_TAIL_TAU_S,
+                tau_global=_M5_TAIL_TAU_G,
+                item_fallback_weight=_M5_TAIL_FB,
+                seed=int(SEED) + 777 * (int(_ff.fold_id) + 1),
+            ),
+        )
+        del _fold_item_emb_stacked, _fold_passrate_dense
+        del _fold_passrate_mask_dense, _fold_tail_items
+        gc.collect()
+        # Score OOF rows: project their (cold) item embeddings to tail.
+        _m5_oof_emb = np.empty((len(fold_oof_df), _PT_D_EMB), dtype=np.float32)
+        for _i, _k in enumerate(fold_oof_df["item_key"].astype(str)):
+            _m5_oof_emb[_i] = item_emb_lookup[_k]
+        _m5_oof_tail = pca_tail.project(_m5_oof_emb)
+        del _m5_oof_emb
+        p5_oof_fold = knn_apply_batch(
+            _fold_m5_state, _m5_oof_tail,
+            fold_oof_df["subject_key"].astype(str).tolist(),
+        )
+        p5_train_oof_acc.write_fold(fold.oof_row_idx, p5_oof_fold)
+        del _fold_m5_state, _m5_oof_tail
+        gc.collect()
+
     if _M5_ENABLED and _M5_VARIANT == "residual_cluster":
         print(f"[OOF f{fold.fold_id}] Fitting fold Member 5 (residual_cluster)...")
         # Free the M3-built fold passrate/embeddings; the residual M5
@@ -4813,6 +5275,170 @@ for fold in folds:
         del _fold_item_emb_stacked, _fold_passrate_dense, _fold_passrate_mask_dense
         gc.collect()
 
+    # ===== Diversification members: M4 (tail logreg), M7 (marginal MLP),
+    #       M8 (embedding MLP). Fit here -- BEFORE the dense-matrix build
+    #       below frees the fold marginals that M7/M4 consume. M5 (tail
+    #       kNN) was already fit + written in its branch above. =====
+    print(f"[OOF f{fold.fold_id}] Fitting diversification members (M4-tail / M7 / M8)...")
+    # Fold-train + fold-oof UNIQUE item embeddings (gather once; reused by
+    # M4's tail features and M8's item channel). Unique-item counts are
+    # small (tens of thousands), so these stacks are a few GB at most and
+    # are freed at the end of this block, before the dense build lands.
+    _div_tr_item_keys = [str(k) for k in fold.train_item_keys]
+    _div_tr_item_idx = {k: i for i, k in enumerate(_div_tr_item_keys)}
+    _div_of_item_keys = [str(k) for k in fold.oof_item_keys]
+    _div_of_item_idx = {k: i for i, k in enumerate(_div_of_item_keys)}
+    _div_tr_uniq_emb = np.empty((len(_div_tr_item_keys), _PT_D_EMB), dtype=np.float32)
+    for _i, _k in enumerate(_div_tr_item_keys):
+        _div_tr_uniq_emb[_i] = item_emb_lookup[_k]
+    _div_of_uniq_emb = np.empty((len(_div_of_item_keys), _PT_D_EMB), dtype=np.float32)
+    for _i, _k in enumerate(_div_of_item_keys):
+        _div_of_uniq_emb[_i] = item_emb_lookup[_k]
+    _div_tr_r2u = np.fromiter(
+        (_div_tr_item_idx[str(k)] for k in fold_train_df["item_key"]),
+        dtype=np.int64, count=len(fold_train_df),
+    )
+    _div_of_r2u = np.fromiter(
+        (_div_of_item_idx[str(k)] for k in fold_oof_df["item_key"]),
+        dtype=np.int64, count=len(fold_oof_df),
+    )
+
+    # ---- M4 (tail logreg): [tail-PCA + theta + subject mean-passrate] ----
+    _div_tr_uniq_tail = pca_tail.project(_div_tr_uniq_emb)
+    _div_of_uniq_tail = pca_tail.project(_div_of_uniq_emb)
+    _m4_theta_tr = theta_s_per_subject[
+        np.clip(_mef_subj_fold_train, 0, len(theta_s_per_subject) - 1)
+    ].astype(np.float32)
+    _m4_theta_of = theta_s_per_subject[
+        np.clip(_mef_subj_fold_oof, 0, len(theta_s_per_subject) - 1)
+    ].astype(np.float32)
+    _m4_submean_tr = fold_member4_marginal_train[:, 0].astype(np.float32)
+    _m4_submean_of = fold_member4_marginal_oof[:, 0].astype(np.float32)
+    _X_m4_tr = np.concatenate(
+        [_div_tr_uniq_tail[_div_tr_r2u], _m4_theta_tr[:, None], _m4_submean_tr[:, None]],
+        axis=1,
+    ).astype(np.float32)
+    _X_m4_of = np.concatenate(
+        [_div_of_uniq_tail[_div_of_r2u], _m4_theta_of[:, None], _m4_submean_of[:, None]],
+        axis=1,
+    ).astype(np.float32)
+    _m4_tail_names = tuple(f"tail_pc_{i}" for i in range(_TAIL_DIM)) + (
+        "subj_theta", "subj_mean_passrate",
+    )
+    _fold_logreg_state = cache_or_compute(
+        "logreg_state_oof_fold",
+        key_inputs=(
+            "logreg_tail_oof_v1", fold.fold_id, fold_suffix,
+            int(_X_m4_tr.shape[1]), int(_X_m4_tr.shape[0]),
+            int(_TAIL_DIM), int(_PT_HEAD), int(_PT_TAIL), int(SEED),
+        ),
+        compute_fn=lambda _ff=fold: fit_logreg_member(
+            X=_X_m4_tr,
+            y=_y_fold_train,
+            feature_names=_m4_tail_names,
+            epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
+            learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
+            weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
+            l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_tail", 1.0e-4)),
+            min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
+            early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
+            seed=int(SEED) + 300 * (int(_ff.fold_id) + 1),
+            val_fraction=0.1,
+            holdout_group_id=_m2_holdout_fold,
+        ),
+    )
+    p4_oof_fold = logreg_apply_state_batch(_fold_logreg_state, _X_m4_of)
+    p4_train_oof_acc.write_fold(fold.oof_row_idx, p4_oof_fold)
+    del _X_m4_tr, _X_m4_of, _fold_logreg_state
+    del _div_tr_uniq_tail, _div_of_uniq_tail
+    gc.collect()
+
+    # ---- M7 (marginal MLP) ----
+    if _M7_ENABLED:
+        _fold_m7_state = cache_or_compute(
+            "member7_marginal_mlp_state_oof_fold",
+            key_inputs=(
+                "m7_marg_mlp_oof_v1", fold.fold_id, fold_suffix,
+                int(MEMBER4_MARGINAL_FEATURE_DIM), int(len(fold_train_df)),
+                int(_m7_cfg.get("hid1", 64)), int(_m7_cfg.get("hid2", 32)),
+                int(_m7_cfg.get("epochs", 40)), int(SEED),
+            ),
+            compute_fn=lambda _ff=fold: fit_mlp_member(
+                labels=_y_fold_train,
+                dense_X=fold_member4_marginal_train,
+                dense_feature_names=MEMBER4_MARGINAL_FEATURE_NAMES,
+                hid1=int(_m7_cfg.get("hid1", 64)), hid2=int(_m7_cfg.get("hid2", 32)),
+                learning_rate=float(_m7_cfg.get("learning_rate", 1.0e-3)),
+                weight_decay=float(_m7_cfg.get("weight_decay", 1.0e-5)),
+                epochs=int(_m7_cfg.get("epochs", 40)),
+                batch_size=int(_m7_cfg.get("batch_size", 16384)),
+                early_stopping_patience=int(_m7_cfg.get("early_stopping_patience", 6)),
+                feat_dropout=float(_m7_cfg.get("feat_dropout", 0.10)),
+                seed=int(SEED) + 701 * (int(_ff.fold_id) + 1),
+                holdout_group_id=_m2_holdout_fold,
+                show_progress=False,
+            ),
+        )
+        p7_oof_fold = mlp_apply_state_batch(_fold_m7_state, dense_X=fold_member4_marginal_oof)
+        p7_train_oof_acc.write_fold(fold.oof_row_idx, p7_oof_fold)
+        del _fold_m7_state
+        gc.collect()
+    else:
+        p7_oof_fold = None
+
+    # ---- M8 (embedding MLP): subject-id emb + item emb ----
+    if _M8_ENABLED:
+        _fold_m8_state = cache_or_compute(
+            "member8_embedding_mlp_state_oof_fold",
+            key_inputs=(
+                "m8_emb_mlp_oof_v1", fold.fold_id, fold_suffix,
+                int(len(_div_tr_item_keys)), int(_PT_D_EMB),
+                int(indexer.n_subjects), int(_m8_cfg.get("subj_emb_dim", 32)),
+                int(_m8_cfg.get("hid1", 256)), int(_m8_cfg.get("hid2", 128)),
+                int(_m8_cfg.get("epochs", 30)), int(SEED),
+            ),
+            compute_fn=lambda _ff=fold: fit_mlp_member(
+                labels=_y_fold_train,
+                subject_ids=_mef_subj_fold_train,
+                n_subjects=int(indexer.n_subjects),
+                subj_emb_dim=int(_m8_cfg.get("subj_emb_dim", 32)),
+                item_emb_unique=_div_tr_uniq_emb,
+                row_to_uniq=_div_tr_r2u,
+                hid1=int(_m8_cfg.get("hid1", 256)), hid2=int(_m8_cfg.get("hid2", 128)),
+                learning_rate=float(_m8_cfg.get("learning_rate", 1.0e-3)),
+                weight_decay=float(_m8_cfg.get("weight_decay", 1.0e-5)),
+                epochs=int(_m8_cfg.get("epochs", 30)),
+                batch_size=int(_m8_cfg.get("batch_size", 16384)),
+                early_stopping_patience=int(_m8_cfg.get("early_stopping_patience", 5)),
+                feat_dropout=float(_m8_cfg.get("feat_dropout", 0.10)),
+                seed=int(SEED) + 801 * (int(_ff.fold_id) + 1),
+                holdout_group_id=_m2_holdout_fold,
+                show_progress=False,
+            ),
+        )
+        # Score OOF rows in chunks (avoid materialising [N_oof, D]).
+        _N_OOF8 = int(len(fold_oof_df))
+        p8_oof_fold = np.empty(_N_OOF8, dtype=np.float32)
+        _CH8 = 200_000
+        for _cs in range(0, _N_OOF8, _CH8):
+            _ce = min(_cs + _CH8, _N_OOF8)
+            _emb_ch = _div_of_uniq_emb[_div_of_r2u[_cs:_ce]]
+            p8_oof_fold[_cs:_ce] = mlp_apply_state_batch(
+                _fold_m8_state,
+                subject_ids=_mef_subj_fold_oof[_cs:_ce],
+                item_emb=_emb_ch,
+            )
+            del _emb_ch
+        p8_train_oof_acc.write_fold(fold.oof_row_idx, p8_oof_fold)
+        del _fold_m8_state
+        gc.collect()
+    else:
+        p8_oof_fold = None
+
+    del _div_tr_uniq_emb, _div_of_uniq_emb, _div_tr_r2u, _div_of_r2u
+    del _div_tr_item_keys, _div_tr_item_idx, _div_of_item_keys, _div_of_item_idx
+    gc.collect()
+
     # ----- Fold Member 4 (LogReg hybrid) -----
     # MEMORY: build M4's training matrix JIT, train, free, then build
     # M4's OOF matrix, score, free. At full scale each is ~16 GB
@@ -4865,37 +5491,16 @@ for fold in folds:
     del fold_member4_marginal_train, _bc_redacted_fold_train
     gc.collect()
 
-    print(f"[OOF f{fold.fold_id}] Training fold Member 4 (LogReg hybrid)...")
+    # NOTE: Member 4 is now a TAIL-subspace logreg, fit + written in the
+    # diversification block above. The dense matrix here is built solely
+    # for Member 6 (FwFM). ``_fold_m4_feature_names`` is the FwFM feature
+    # name vector (kept under its historical name to minimise churn).
     _fold_m4_feature_names = (
         tuple(member_feat_schema.feature_names)
         + tuple(MEMBER4_MARGINAL_FEATURE_NAMES)
     )
-    _fold_logreg_state = cache_or_compute(
-        "logreg_state_oof_fold",
-        key_inputs=(
-            "logreg_oof_v1", fold.fold_id, fold_suffix,
-            int(X_fold_train_dense_m4.shape[1]), int(X_fold_train_dense_m4.shape[0]),
-            int(SEED),
-        ),
-        compute_fn=lambda _ff=fold: fit_logreg_member(
-            X=X_fold_train_dense_m4,
-            y=_y_fold_train,
-            feature_names=_fold_m4_feature_names,
-            epochs=int(CFG.get("member4_logreg", {}).get("epochs", 200)),
-            learning_rate=float(CFG.get("member4_logreg", {}).get("learning_rate", 0.05)),
-            weight_decay=float(CFG.get("member4_logreg", {}).get("weight_decay", 1.0e-3)),
-            l1_strength=float(CFG.get("member4_logreg", {}).get("l1_strength_hybrid", 3.0e-3)),
-            min_feature_std=float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)),
-            early_stopping_patience=int(CFG.get("member4_logreg", {}).get("early_stopping_patience", 20)),
-            seed=int(SEED) + 300 * (int(_ff.fold_id) + 1),
-            val_fraction=0.1,
-            holdout_group_id=_m2_holdout_fold,
-        ),
-    )
-    # ----- Fold Member 6 (FwFM) -- reuses the M4 train matrix -----
-    # We fit FwFM on the SAME [N_train, F+14] matrix that M4 just used.
-    # Holding it for the duration of one more torch fit is cheaper than
-    # rematerializing the matrix later for an isolated M6 path.
+    # ----- Fold Member 6 (FwFM) -- on the dense hybrid matrix -----
+    # FwFM fits on the [N_train, F+14] dense matrix built just above.
     if _M6_ENABLED:
         print(f"[OOF f{fold.fold_id}] Training fold Member 6 (FwFM)...")
         _m6_x_digest_fold = _content_digest(X_fold_train_dense_m4, k_rows=8192)
@@ -4989,10 +5594,11 @@ for fold in folds:
         del X_fold_oof_dense
     del fold_member4_marginal_oof, _bc_redacted_fold_oof
     gc.collect()
-    p4_oof_fold = logreg_apply_state_batch(_fold_logreg_state, X_fold_oof_dense_m4)
-    p4_train_oof_acc.write_fold(fold.oof_row_idx, p4_oof_fold)
+    # Member 4 (p4) was already scored + written in the diversification
+    # block above (tail-subspace logreg). The dense OOF matrix here is
+    # consumed only by Member 6.
 
-    # M6 (FwFM) OOF score on the same OOF matrix M4 just consumed.
+    # M6 (FwFM) OOF score on the dense OOF matrix.
     if _M6_ENABLED:
         p6_oof_fold = fwfm_apply_state_batch(_fold_fwfm_state, X_fold_oof_dense_m4)
         p6_train_oof_acc.write_fold(fold.oof_row_idx, p6_oof_fold)
@@ -5025,6 +5631,8 @@ for fold in folds:
         f"M3={_nll(p3_oof_fold):.5f}  M4={_nll(p4_oof_fold):.5f}"
         + (f"  M5={_nll(p5_oof_fold):.5f}" if _M5_ENABLED else "")
         + (f"  M6={_nll(p6_oof_fold):.5f}" if _M6_ENABLED else "")
+        + (f"  M7={_nll(p7_oof_fold):.5f}" if (_M7_ENABLED and p7_oof_fold is not None) else "")
+        + (f"  M8={_nll(p8_oof_fold):.5f}" if (_M8_ENABLED and p8_oof_fold is not None) else "")
     )
 
     # Free fold-scoped artifacts before next iteration (keep RAM bounded).
@@ -5061,6 +5669,14 @@ if _M6_ENABLED:
     p6_train_oof = p6_train_oof_acc.finalize()
 else:
     p6_train_oof = None
+if _M7_ENABLED:
+    p7_train_oof = p7_train_oof_acc.finalize()
+else:
+    p7_train_oof = None
+if _M8_ENABLED:
+    p8_train_oof = p8_train_oof_acc.finalize()
+else:
+    p8_train_oof = None
 nn_mean_sim_oof = nn_mean_sim_oof_acc.finalize().astype(np.float32)
 nn_support_oof = nn_support_oof_acc.finalize().astype(np.float32)
 centroid_dist_oof = centroid_dist_oof_acc.finalize().astype(np.float32)
@@ -5079,6 +5695,10 @@ if _M5_ENABLED:
     print(f"  M5 OOF: {_nll_full(p5_train_oof):.5f}")
 if _M6_ENABLED:
     print(f"  M6 OOF: {_nll_full(p6_train_oof):.5f}")
+if _M7_ENABLED:
+    print(f"  M7 OOF: {_nll_full(p7_train_oof):.5f}")
+if _M8_ENABLED:
+    print(f"  M8 OOF: {_nll_full(p8_train_oof):.5f}")
 print(f"[OOF] All accumulators finalized OK ({_N_TRAIN:,} rows each, all finite, single-write).")
 
 # Task 4: Aggregate Gate 4c (per-fold projection-leakage probe) results.
@@ -5172,6 +5792,12 @@ if _M5_ENABLED:
 if _M6_ENABLED:
     _stacker_member_list_val.append(p_member6_val)
     _stacker_member_names_val.append("M6 (p_member6_val)")
+if _M7_ENABLED:
+    _stacker_member_list_val.append(p_member7_val)
+    _stacker_member_names_val.append("M7 (p_member7_val)")
+if _M8_ENABLED:
+    _stacker_member_list_val.append(p_member8_val)
+    _stacker_member_names_val.append("M8 (p_member8_val)")
 
 # Defensive shape audit + 1-D coercion. ``np.stack`` raises a generic
 # ``ValueError: all input arrays must have the same shape`` when any of
@@ -5243,7 +5869,7 @@ stacker_X_val = build_stacker_features(
     nn_mean_similarity=val_nn_mean_sim,
     centroid_distance=val_centroid_dist,
 )
-_n_members_dyn = 4 + int(_M5_ENABLED) + int(_M6_ENABLED)
+_n_members_dyn = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED)
 print(f"[Stacker] X_val (final-reporting view): {stacker_X_val.shape} "
       f"(n_members={_n_members_dyn})")
 
@@ -5272,6 +5898,12 @@ if _M5_ENABLED:
 if _M6_ENABLED:
     _stacker_member_list_train_oof.append(p6_train_oof.astype(np.float32))
     _stacker_oof_names.append("M6 (p6_train_oof)")
+if _M7_ENABLED:
+    _stacker_member_list_train_oof.append(p7_train_oof.astype(np.float32))
+    _stacker_oof_names.append("M7 (p7_train_oof)")
+if _M8_ENABLED:
+    _stacker_member_list_train_oof.append(p8_train_oof.astype(np.float32))
+    _stacker_oof_names.append("M8 (p8_train_oof)")
 
 # Mirror the val-side defensive audit: same generic ``np.stack`` error,
 # same need to surface WHICH OOF member is the offender. Length mismatch
@@ -5331,7 +5963,7 @@ ylab_train_np = primary.train["label"].astype(float).to_numpy().astype(np.float3
 print(f"[Stacker] X_train_oof: {stacker_X_train_oof.shape}  ylab_train: {ylab_train_np.shape}")
 
 
-_n_stacker_members = 4 + int(_M5_ENABLED) + int(_M6_ENABLED)
+_n_stacker_members = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED)
 _stacker_feature_names = stacker_feature_names(_n_stacker_members)
 assert int(stacker_X_train_oof.shape[1]) == len(_stacker_feature_names), (
     f"stacker_X_train_oof has {stacker_X_train_oof.shape[1]} cols but "
@@ -5472,6 +6104,10 @@ if _M5_ENABLED:
     print(f"  Member 5 ({_m5_label}, val):  {nll_m5:.6f}")
 if _M6_ENABLED:
     print(f"  Member 6 (FwFM, val):               {nll_m6:.6f}")
+if _M7_ENABLED:
+    print(f"  Member 7 (marginal MLP, val):       {nll_m7:.6f}")
+if _M8_ENABLED:
+    print(f"  Member 8 (embedding MLP, val):      {nll_m8:.6f}")
 print(f"  Uniform avg of {_n_stacker_members} members (val):     {nll_uniform_val:.6f}")
 print(f"  STACKER (val, OOF-fit):             {nll_stack_val:.6f}")
 print(f"  STACKER (OOF-train, in-sample):     {nll_stack_train_oof:.6f}")
@@ -5672,6 +6308,12 @@ if _HEATMAP_OK:
     if _M6_ENABLED and p_member6_val is not None:
         _hm_names.append("M6")
         _hm_preds.append(p_member6_val.astype(np.float64))
+    if _M7_ENABLED and p_member7_val is not None:
+        _hm_names.append("M7")
+        _hm_preds.append(p_member7_val.astype(np.float64))
+    if _M8_ENABLED and p_member8_val is not None:
+        _hm_names.append("M8")
+        _hm_preds.append(p_member8_val.astype(np.float64))
     # Validate alignment defensively.
     _hm_n = int(ylab_val.shape[0])
     _hm_clean_names, _hm_clean_preds = [], []
@@ -6041,9 +6683,9 @@ else:
             n_subj_num=int(_M2_N_SUBJ_NUM),
             n_bench_num=int(_M2_N_BENCH_NUM),
             n_marginals=int(_M2_N_MARGINALS_ACTIVE),
-            d_subj=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_subj", 32))),
-            d_bc=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_bc", 32))),
-            d_cluster=(0 if _M2_METADATA_ONLY else int(_m2_cfg.get("d_cluster", 16))),
+            d_subj=(int(_m2_cfg.get("d_subj", 32)) if _M2_USE_SUBJ_BC else 0),
+            d_bc=(int(_m2_cfg.get("d_bc", 32)) if _M2_USE_SUBJ_BC else 0),
+            d_cluster=(int(_m2_cfg.get("d_cluster", 16)) if _M2_USE_CLUSTER else 0),
             d_family=int(_m2_cfg.get("d_family", 16)),
             d_macro=int(_m2_cfg.get("d_macro", 8)),
             d_org=int(_m2_cfg.get("d_org", 16)),
@@ -6281,6 +6923,11 @@ else:
     if _M6_ENABLED:
         _shuf_member_list.append(p6_shuf)
     stacker_member_probs_train_shuf = np.stack(_shuf_member_list, axis=1).astype(np.float32)
+    # The shuffled-label null is a leakage probe only; it intentionally
+    # uses the subset of members that have a cheap shuffle-path fit (M1-M6,
+    # no M7/M8). Derive the feature-name width from the ACTUAL shuf stack
+    # so it stays consistent regardless of how many members were stacked.
+    _n_shuf_members = int(stacker_member_probs_train_shuf.shape[1])
     stacker_X_train_shuf = build_stacker_features(
         member_probs=stacker_member_probs_train_shuf,
         bench_present=_train_bench_present,
@@ -6291,7 +6938,7 @@ else:
     stacker_state_shuf = fit_stacker(
         X=stacker_X_train_shuf,
         y=y_train_shuf,
-        feature_names=stacker_feature_names(_n_stacker_members),
+        feature_names=stacker_feature_names(_n_shuf_members),
         n_iters=int(CFG.get("stacker", {}).get("n_iters", 1500)),
         learning_rate=float(CFG.get("stacker", {}).get("learning_rate", 0.05)),
         l2=float(CFG.get("stacker", {}).get("l2", 1.0)),
@@ -6299,7 +6946,19 @@ else:
         val_fraction=0.2,
         seed=int(SEED) + 7777,
     )
-    p_stacker_val_shuf = stacker_apply_batch(stacker_state_shuf, stacker_X_val)
+    # Build a matching val feature matrix from the SAME member subset the
+    # shuf stacker was fit on (the first _n_shuf_members columns of the
+    # locked val stack are M1..M6 in order). Avoids a dim mismatch now
+    # that the live stacker carries 8 members but the null carries <=6.
+    _shuf_val_member_probs = stacker_member_probs_val[:, :_n_shuf_members]
+    stacker_X_val_shuf = build_stacker_features(
+        member_probs=_shuf_val_member_probs,
+        bench_present=val_bench_present,
+        nn_neighbor_support=val_nn_support,
+        nn_mean_similarity=val_nn_mean_sim,
+        centroid_distance=val_centroid_dist,
+    )
+    p_stacker_val_shuf = stacker_apply_batch(stacker_state_shuf, stacker_X_val_shuf)
     nll_stacker_val_shuf = _bce(ylab_val, p_stacker_val_shuf)
     print(
         f"\n[OOF Gate 1c] shuffled-label stacker val log-loss = {nll_stacker_val_shuf:.5f}  "
@@ -6484,6 +7143,10 @@ if _M5_ENABLED:
     _oof_member_preds_for_digest.append(p5_train_oof)
 if _M6_ENABLED:
     _oof_member_preds_for_digest.append(p6_train_oof)
+if _M7_ENABLED:
+    _oof_member_preds_for_digest.append(p7_train_oof)
+if _M8_ENABLED:
+    _oof_member_preds_for_digest.append(p8_train_oof)
 _oof_member_preds_digest = _hashlib.sha256(
     np.ascontiguousarray(
         np.stack(_oof_member_preds_for_digest, axis=1),
@@ -6583,17 +7246,28 @@ print(f"[Calibrator] residual table saved to {RESIDUAL_DIR}")
 # CFG['member6']['enabled']=False, re-run, and rerun this section.
 
 # %%
-_EXPORT_BUNDLE_OK = not _M6_ENABLED and (
-    (not _M5_ENABLED) or _M5_VARIANT == "difficulty_knn"
+# Diversification pass (2026-05-30): the exporter only has runtime
+# templates for the legacy member set (M1-M4 hybrid logreg, M5
+# difficulty_knn). The new diversification members -- M4 as a TAIL-
+# subspace logreg, M5 as a tail_knn, M6 (FwFM), M7 (marginal MLP) and
+# M8 (embedding MLP) -- have no src/_pure/ template yet, so the bundle
+# is skipped while we evaluate offline. Training / stacker / heatmaps
+# still run end-to-end.
+_EXPORT_BUNDLE_OK = (
+    not _M6_ENABLED
+    and not _M7_ENABLED
+    and not _M8_ENABLED
+    and ((not _M5_ENABLED) or _M5_VARIANT == "difficulty_knn")
 )
 if not _EXPORT_BUNDLE_OK:
     import warnings as _exp_warn
     _exp_warn.warn(
         "[Export] SKIPPING bundle build: the active configuration includes "
-        f"Member 6 ({_M6_ENABLED=}) or the residual_cluster variant of "
-        f"Member 5 ({_M5_VARIANT=}), and src/_pure/ has no runtime template "
-        "for either yet. Stacker quality / heatmap diagnostics above remain "
-        "valid; only the Codabench bundle is skipped."
+        f"diversification members (M6={_M6_ENABLED}, M7={_M7_ENABLED}, "
+        f"M8={_M8_ENABLED}) or a non-difficulty_knn Member 5 "
+        f"({_M5_VARIANT=}), and src/_pure/ has no runtime template for these "
+        "yet. Stacker quality / heatmap diagnostics above remain valid; only "
+        "the Codabench bundle is skipped."
     )
     print(
         "[Export] SKIPPED. _M5_ENABLED="

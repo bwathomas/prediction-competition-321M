@@ -127,6 +127,41 @@ def test_stacker_feature_names_rejects_zero_members():
         stacker_feature_names(0)
 
 
+def test_stacker_feature_names_for_8_members_appends_logit_member8():
+    """Diversification pass: the ensemble grew to 8 members (M1-M8).
+    The first 8 columns are logit_member1..8, the trailing 4 aux columns
+    are unchanged."""
+    names_8 = stacker_feature_names(8)
+    assert len(names_8) == stacker_feature_dim(8) == 12
+    assert names_8[:8] == tuple(f"logit_member{i + 1}" for i in range(8))
+    assert names_8[8:] == STACKER_FEATURE_NAMES[4:]
+
+
+def test_build_stacker_features_supports_8_members():
+    """[N, 8] member_probs -> [N, 12] matrix; logits at cols 0..7,
+    the four aux features at cols 8..11."""
+    rng = np.random.default_rng(0)
+    member_probs = rng.uniform(0.05, 0.95, size=(3, 8)).astype(np.float32)
+    bench_present = np.array([1, 0, 1], dtype=np.float32)
+    nn_support = np.array([1.5, 0.0, 0.7], dtype=np.float32)
+    nn_sim = np.array([0.8, 0.1, 0.5], dtype=np.float32)
+    centroid_distance = np.array([0.4, 1.2, 0.9], dtype=np.float32)
+    feats = build_stacker_features(
+        member_probs=member_probs,
+        bench_present=bench_present,
+        nn_neighbor_support=nn_support,
+        nn_mean_similarity=nn_sim,
+        centroid_distance=centroid_distance,
+    )
+    assert feats.shape == (3, stacker_feature_dim(8))
+    expected_logits = np.log(member_probs / (1 - member_probs))
+    np.testing.assert_allclose(feats[:, 0:8], expected_logits, atol=1e-5)
+    np.testing.assert_array_equal(feats[:, 8], bench_present)
+    np.testing.assert_array_equal(feats[:, 9], nn_support)
+    np.testing.assert_array_equal(feats[:, 10], nn_sim)
+    np.testing.assert_array_equal(feats[:, 11], centroid_distance)
+
+
 def test_build_stacker_features_supports_5_members():
     """Task 4: stacker must accept [N, 5] member_probs and produce a
     [N, 9] matrix with logit_member5 at column index 4 and the four
