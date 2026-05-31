@@ -531,6 +531,8 @@ def fit_fwfm_member(
     log_every: int = 5,
     holdout_group_id: np.ndarray | None = None,
     init_w0_from_prior: bool = True,
+    ncl_anchor_preds: np.ndarray | None = None,
+    ncl_lambda: float = 0.0,
 ) -> FwFMState:
     """Fit Member 6 (FwFM) with Adam + early stopping.
 
@@ -709,6 +711,17 @@ def fit_fwfm_member(
     else:
         sw_np = None
 
+    # Negative-correlation learning target (optional, row-aligned with X).
+    use_ncl = (ncl_anchor_preds is not None) and (float(ncl_lambda) != 0.0)
+    if use_ncl:
+        ncl_anchor_np = np.asarray(ncl_anchor_preds, dtype=np.float32).reshape(-1)
+        if ncl_anchor_np.shape[0] != N:
+            raise ValueError(
+                f"ncl_anchor_preds length {ncl_anchor_np.shape[0]} != N={N}"
+            )
+    else:
+        ncl_anchor_np = None
+
     def _gather_batch_to_device(
         global_idx: np.ndarray,
     ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor | None"]:
@@ -828,6 +841,7 @@ def fit_fwfm_member(
     def _compute_loss_on_batch(
         model_: _FwFM, x_: torch.Tensor, y_: torch.Tensor,
         w_: torch.Tensor | None,
+        a_: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-batch loss used during training. Returns a scalar
         tensor on ``device`` so backward can flow."""
@@ -842,7 +856,11 @@ def fit_fwfm_member(
             + 0.5 * float(weight_decay_V) * (model_.V * model_.V).sum()
             + 0.5 * float(weight_decay_r) * (model_.r_raw * model_.r_raw).sum()
         )
-        return data_loss + reg
+        loss = data_loss + reg
+        if a_ is not None:
+            p = torch.sigmoid(logits)
+            loss = loss + float(ncl_lambda) * ((p - y_) * (a_ - y_)).mean()
+        return loss
 
     def _streamed_eval_loss(
         model_: _FwFM,
@@ -916,8 +934,12 @@ def fit_fwfm_member(
             e = min(s + int(batch_size), n_train)
             global_idx = train_idx_np[perm_in[s:e]]
             xb, yb, wb = _gather_batch_to_device(global_idx)
+            ab = (
+                None if ncl_anchor_np is None
+                else torch.from_numpy(ncl_anchor_np[global_idx]).to(device, non_blocking=False)
+            )
             opt.zero_grad(set_to_none=True)
-            loss = _compute_loss_on_batch(model, xb, yb, wb)
+            loss = _compute_loss_on_batch(model, xb, yb, wb, ab)
             loss.backward()
             opt.step()
             ep_loss += float(loss.item())
@@ -925,6 +947,7 @@ def fit_fwfm_member(
             xb = None
             yb = None
             wb = None
+            ab = None
 
         val_loss = _streamed_eval_loss(model, val_idx_np, chunk=_EVAL_CHUNK)
         train_loss_ep = ep_loss / max(n_batches, 1)

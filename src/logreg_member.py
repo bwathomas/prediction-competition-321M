@@ -364,6 +364,8 @@ def fit_logreg_member(
     log_every: int = 10,
     min_feature_std: float = 0.0,
     holdout_group_id: np.ndarray | None = None,
+    ncl_anchor_preds: np.ndarray | None = None,
+    ncl_lambda: float = 0.0,
 ) -> LogRegMemberState:
     """Fit a torch logistic regression with Adam + early stopping.
 
@@ -563,7 +565,25 @@ def fit_logreg_member(
 
     n_train = int(X_t_train.shape[0])
 
-    def _loss(linear_, x_, y_, w_):
+    # Negative-correlation learning target (optional). ``ncl_anchor_preds`` is
+    # row-aligned with the full ``X``; slice to the internal train rows so it
+    # lines up with ``X_t_train`` / batch indices. Penalty is applied to the
+    # TRAIN loss only (not val / early-stopping), as a regulariser on training
+    # rows -- it never touches held-out labels.
+    use_ncl = (ncl_anchor_preds is not None) and (float(ncl_lambda) != 0.0)
+    if use_ncl:
+        _anchor_np = np.asarray(ncl_anchor_preds, dtype=np.float32).reshape(-1)
+        if _anchor_np.shape[0] != N:
+            raise ValueError(
+                f"ncl_anchor_preds length {_anchor_np.shape[0]} != N={N}"
+            )
+        anchor_train_t = torch.as_tensor(
+            _anchor_np[train_idx], dtype=torch.float32, device=device
+        )
+    else:
+        anchor_train_t = None
+
+    def _loss(linear_, x_, y_, w_, a_=None):
         logits = linear_(x_).squeeze(-1)
         per_row = bce(logits, y_)
         if w_ is None:
@@ -580,6 +600,9 @@ def fit_logreg_member(
         # care about (1e-3 .. 1e-2 range).
         if float(l1_strength) > 0.0:
             l = l + float(l1_strength) * linear_.weight.abs().sum()
+        if a_ is not None:
+            p = torch.sigmoid(logits)
+            l = l + float(ncl_lambda) * ((p - y_) * (a_ - y_)).mean()
         return l
 
     best_val = float("inf")
@@ -601,8 +624,9 @@ def fit_logreg_member(
                 if w_t_train is None
                 else w_t_train.index_select(0, idx)
             )
+            ab = None if anchor_train_t is None else anchor_train_t.index_select(0, idx)
             opt.zero_grad(set_to_none=True)
-            loss = _loss(linear, xb, yb, wb)
+            loss = _loss(linear, xb, yb, wb, ab)
             loss.backward()
             opt.step()
             ep_loss += float(loss.item())

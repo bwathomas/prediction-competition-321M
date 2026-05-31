@@ -891,6 +891,8 @@ def fit_member2_metadata_mlp(
     init_head_b_from_prior: bool = True,
     log_every: int = 5,
     show_progress: bool = True,
+    ncl_anchor_preds: np.ndarray | None = None,
+    ncl_lambda: float = 0.0,
 ) -> Member2MLPState:
     """Fit the dense metadata Member 2 MLP (v2).
 
@@ -1187,6 +1189,21 @@ def fit_member2_metadata_mlp(
     )
     bce = nn.BCEWithLogitsLoss(reduction="mean")
 
+    # --- Negative-correlation learning target (optional) ---
+    # ``ncl_anchor_preds`` is row-aligned with the full input; the per-batch
+    # penalty pushes M2's signed errors to be negatively correlated with the
+    # anchors' (frozen) signed errors on the training rows only.
+    use_ncl = (ncl_anchor_preds is not None) and (float(ncl_lambda) != 0.0)
+    if use_ncl:
+        ncl_anchor_full = np.asarray(ncl_anchor_preds, dtype=np.float32).reshape(-1)
+        if ncl_anchor_full.shape[0] != int(y_arr.shape[0]):
+            raise ValueError(
+                f"ncl_anchor_preds length {ncl_anchor_full.shape[0]} "
+                f"!= N={int(y_arr.shape[0])}"
+            )
+    else:
+        ncl_anchor_full = None
+
     # --- LR schedule: linear warmup + cosine decay ---
     base_lr = float(learning_rate)
     warmup_e = int(warmup_epochs)
@@ -1376,6 +1393,13 @@ def fit_member2_metadata_mlp(
             optimizer.zero_grad(set_to_none=True)
             z = model(s_t, b_t, c_t, f_t, mf_t, o_t, t_t, M_t)
             loss = bce(z, y_t)
+            if use_ncl:
+                p_ncl = torch.sigmoid(z)
+                y_ncl = torch.from_numpy(y_b.astype(np.float32)).to(dev, non_blocking=True)
+                a_ncl = torch.from_numpy(
+                    ncl_anchor_full[rows].astype(np.float32)
+                ).to(dev, non_blocking=True)
+                loss = loss + float(ncl_lambda) * ((p_ncl - y_ncl) * (a_ncl - y_ncl)).mean()
             loss.backward()
             optimizer.step()
             _ema_step()

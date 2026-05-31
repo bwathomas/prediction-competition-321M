@@ -350,12 +350,23 @@ def fit_mlp_member(
     device: str | None = None,
     holdout_group_id: np.ndarray | None = None,
     show_progress: bool = True,
+    ncl_anchor_preds: np.ndarray | None = None,
+    ncl_lambda: float = 0.0,
 ) -> MlpMemberState:
     """Train a two-layer GLU-MLP via Adam + early stopping.
 
     Exactly one of the embedding/dense channels must be active.
     Standardisation stats for ``dense_X`` are computed on the internal
     train slice only and baked into the saved state.
+
+    Negative-correlation learning (optional): when ``ncl_anchor_preds`` (a
+    ``[N]`` array of frozen anchor probabilities, row-aligned with ``labels``)
+    and ``ncl_lambda > 0`` are supplied, the per-batch loss gains a term
+    ``ncl_lambda * mean((p - y)(p_anchor - y))``. Minimising it drives this
+    member's signed errors to be negatively correlated with the anchors',
+    i.e. it learns to be right where the anchors are wrong. The penalty is a
+    regulariser on the *training* rows only (it never sees held-out labels),
+    so OOF predictions remain honest.
     """
     import torch
     import torch.nn as nn
@@ -475,6 +486,17 @@ def fit_mlp_member(
     )
     y_t = torch.from_numpy(y).to(device)
 
+    use_ncl = (ncl_anchor_preds is not None) and (float(ncl_lambda) != 0.0)
+    if use_ncl:
+        _anchor_np = np.asarray(ncl_anchor_preds, dtype=np.float32).reshape(-1)
+        if _anchor_np.shape[0] != N:
+            raise ValueError(
+                f"ncl_anchor_preds length {_anchor_np.shape[0]} != N={N}"
+            )
+        anchor_t = torch.from_numpy(_anchor_np).to(device)
+    else:
+        anchor_t = None
+
     def _run_batch(idx_t: "torch.Tensor"):
         sid_b = sid_all[idx_t] if use_subj else None
         iemb_b = item_t[r2u_all[idx_t]] if use_item else None
@@ -510,6 +532,11 @@ def fit_mlp_member(
             b = tr_shuf[bstart:bstart + batch_size]
             logits = _run_batch(b)
             loss = bce(logits, y_t[b])
+            if use_ncl:
+                p_b = torch.sigmoid(logits)
+                err_m = p_b - y_t[b]
+                err_a = anchor_t[b] - y_t[b]
+                loss = loss + float(ncl_lambda) * (err_m * err_a).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()

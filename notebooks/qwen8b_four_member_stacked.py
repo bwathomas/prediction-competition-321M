@@ -599,6 +599,45 @@ CFG["member8"].setdefault("batch_size", 16384)
 CFG["member8"].setdefault("early_stopping_patience", 5)
 CFG["member8"].setdefault("feat_dropout", 0.10)
 
+# --- Item-form features + CoT/item-type interactions for dense members ---
+# The hand-engineered item-form features (token_len, has_code, has_latex,
+# is_multiple_choice, ...) already feed Member 1. The diversification pass
+# (2026-05-31) also broadcasts a z-scored item-form block + condition x item
+# interactions (cot_x_*) + item_type one-hots to the SECONDARY dense members
+# M2/M6/M8. M4 (tail specialist) and M7 (pure marginals) stay narrow on
+# purpose -- feeding them the same block would just raise their correlation
+# with M2/M6/M8, working against NCL.
+CFG.setdefault("dense_item_features", {})
+CFG["dense_item_features"].setdefault("enabled", True)
+CFG["dense_item_features"].setdefault("members", ("member2", "member6", "member8"))
+CFG["dense_item_features"].setdefault("add_item_type", True)
+CFG["dense_item_features"].setdefault("add_cot_interactions", True)
+
+# --- Negative-correlation learning (NCL) ---------------------------------
+# Adds a per-batch decorrelation penalty
+#     lambda * mean((p - y) * (p_anchor - y))
+# to the penalized members so they learn to be right where the strong
+# anchors are wrong. The anchor target is the mean of the GLOBAL anchors'
+# train-row predictions -- a regulariser on TRAIN rows only, so the OOF
+# predictions the stacker consumes stay honest. Master switch: set
+# enabled=False to revert to the plain (non-NCL) members instantly.
+CFG.setdefault("ncl", {})
+CFG["ncl"].setdefault("enabled", True)
+CFG["ncl"].setdefault("lambda_", 0.30)
+CFG["ncl"].setdefault("anchors", ("member1", "member6", "member8"))
+CFG["ncl"].setdefault("penalized", ("member2", "member4", "member7"))
+# Member 9 (FwFM clone) decorrelates from this (smaller) anchor set so it
+# diverges from M1/M8 while its twin M6 stays a pure anchor.
+CFG["ncl"].setdefault("m9_anchors", ("member1", "member8"))
+
+# --- Member 9: FwFM clone trained with NCL -------------------------------
+# Same architecture / dense block as Member 6 (FwFM on the embedding-vs-
+# marginal block) but trained with the NCL penalty against {M1, M8}. Gives
+# the ensemble a "diversified" factorization machine alongside the pure M6.
+CFG.setdefault("member9", {})
+CFG["member9"].setdefault("enabled", True)
+CFG["member9"].setdefault("ncl_lambda", 0.50)
+
 CFG.setdefault("judge", {})
 CFG["judge"]["enabled"] = False
 CFG.setdefault("lora", {})
@@ -944,6 +983,117 @@ pool_features_z = apply_zscore(combined_df, pool_stats)
 POOL_FEATURE_NAMES_EXT = tuple(combined_cols)
 print(f"Pool feature width: {len(POOL_FEATURE_NAMES_EXT)}  "
       f"(9 text + {top_m} centroid_dist)")
+
+# %% [markdown]
+# ## 6-pre. Shared item-form / interaction block + NCL config
+#
+# The diversification+NCL pass (2026-05-31) broadcasts a small dense block
+# of item-form features (z-scored text-pool features) + item-type one-hots +
+# condition x item interactions (cot_x_*) to the secondary dense members
+# M2/M6/M8. M6 already has the raw pool features via ``member_feat_schema``,
+# so it only takes the NEW columns (item_type + cot_x_*); M2/M8 take the
+# full block. Everything here is item-or-row level and leakage-free.
+
+# %%
+from src.item_features import (
+    COT_INTERACTION_BASE as _COT_BASE,
+    ITEM_TYPE_NAMES as _ITEM_TYPE_NAMES,
+    build_cot_interactions as _build_cot_interactions,
+    cot_interaction_names as _cot_interaction_names,
+    is_cot_from_condition as _is_cot_from_condition,
+    item_type_onehot as _item_type_onehot,
+)
+
+# Text-form (non-centroid) pool columns, z-scored, keyed by item_key.
+_FORM_COLS = [c for c in combined_cols if not c.startswith("centroid_dist_")]
+_pool_z_by_item = pool_features_z.set_index("item_key")
+_pool_raw_by_item = pool_df.set_index("item_key")
+
+# Per-item item-type one-hot (depends only on the raw form features).
+_item_type_by_item: dict[str, dict[str, float]] = {
+    str(ik): _item_type_onehot(row.to_dict())
+    for ik, row in _pool_raw_by_item.iterrows()
+}
+
+DENSE_FORM_FULL_NAMES = (
+    tuple(_FORM_COLS) + tuple(_ITEM_TYPE_NAMES) + tuple(_cot_interaction_names())
+)
+DENSE_FORM_EXTRA_NAMES = tuple(_ITEM_TYPE_NAMES) + tuple(_cot_interaction_names())
+
+
+def build_item_form_block(item_keys, conditions, *, full: bool):
+    """Return ``(matrix [N, F], names)`` for the item-form interaction block.
+
+    ``full=True``  -> [pool_z form | item_type one-hot | cot_x_* interactions]
+    ``full=False`` -> [item_type one-hot | cot_x_* interactions]  (M6: pool
+                      features already present via member_feat_schema).
+    """
+    ik = [str(k) for k in item_keys]
+    n = len(ik)
+    pz = _pool_z_by_item.reindex(ik)[_FORM_COLS].to_numpy(dtype=np.float32)
+    pz = np.nan_to_num(pz, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    tnames = list(_ITEM_TYPE_NAMES)
+    tmat = np.zeros((n, len(tnames)), dtype=np.float32)
+    for i, k in enumerate(ik):
+        t = _item_type_by_item.get(k)
+        if t is not None:
+            for j, tn in enumerate(tnames):
+                tmat[i, j] = t[tn]
+    base = np.concatenate([pz, tmat], axis=1).astype(np.float32)
+    base_names = list(_FORM_COLS) + tnames
+    is_cot = np.fromiter(
+        (_is_cot_from_condition(c) for c in conditions),
+        count=n, dtype=np.float32,
+    )
+    inter, inter_names = _build_cot_interactions(base, base_names, is_cot)
+    if full:
+        mat = np.concatenate([pz, tmat, inter], axis=1).astype(np.float32)
+        names = tuple(_FORM_COLS) + tuple(tnames) + tuple(inter_names)
+    else:
+        mat = np.concatenate([tmat, inter], axis=1).astype(np.float32)
+        names = tuple(tnames) + tuple(inter_names)
+    return mat, names
+
+
+# Per-row item_key / condition arrays for the global train & val splits.
+_train_row_item_keys_g = primary.train["item_key"].astype(str).to_numpy()
+_val_row_item_keys_g = primary.val["item_key"].astype(str).to_numpy()
+_train_row_conditions_g = primary.train["condition"].astype(str).to_numpy()
+_val_row_conditions_g = primary.val["condition"].astype(str).to_numpy()
+
+_DENSE_ITEM_CFG = CFG.get("dense_item_features", {})
+_DENSE_ITEM_ENABLED = bool(_DENSE_ITEM_CFG.get("enabled", False))
+_DENSE_ITEM_MEMBERS = tuple(_DENSE_ITEM_CFG.get("members", ()))
+
+
+def _dense_form_on(member_key: str) -> bool:
+    return _DENSE_ITEM_ENABLED and (member_key in _DENSE_ITEM_MEMBERS)
+
+
+# --- NCL config (master switch + per-member lambda resolver) ---
+_NCL_CFG = CFG.get("ncl", {})
+_NCL_ENABLED = bool(_NCL_CFG.get("enabled", False))
+_NCL_LAMBDA = float(_NCL_CFG.get("lambda_", 0.0))
+_NCL_ANCHORS = tuple(_NCL_CFG.get("anchors", ()))
+_NCL_PENALIZED = tuple(_NCL_CFG.get("penalized", ()))
+_NCL_M9_ANCHORS = tuple(_NCL_CFG.get("m9_anchors", ()))
+
+
+def _ncl_lambda_for(member_key: str) -> float:
+    """Penalty strength for a member (0.0 disables the NCL term)."""
+    if _NCL_ENABLED and member_key in _NCL_PENALIZED:
+        return _NCL_LAMBDA
+    return 0.0
+
+
+print(
+    f"[dense item features] enabled={_DENSE_ITEM_ENABLED} members={_DENSE_ITEM_MEMBERS} "
+    f"full_block={len(DENSE_FORM_FULL_NAMES)} extra_block={len(DENSE_FORM_EXTRA_NAMES)}"
+)
+print(
+    f"[NCL] enabled={_NCL_ENABLED} lambda={_NCL_LAMBDA} "
+    f"anchors={_NCL_ANCHORS} penalized={_NCL_PENALIZED} m9_anchors={_NCL_M9_ANCHORS}"
+)
 
 # %% [markdown]
 # ## 6. Indexer + nearest-neighbor features (FAISS GPU; on by default)
@@ -2850,6 +3000,39 @@ else:
     _m2_bc_redact_val_active = bc_redacted_val
     _M2_N_MARGINALS_ACTIVE = int(MEMBER4_MARGINAL_FEATURE_DIM)
 
+# Broadcast the item-form + CoT/item-type interaction block into M2's
+# numerical channel. It rides in the "marginals" extension slot (the
+# trainer's block_sum contract treats anything past subj/bench/redact as
+# marginals), so no schema special-casing is required.
+_M2_FORM_NAMES: tuple[str, ...] = ()
+if _dense_form_on("member2"):
+    _m2_form_train, _M2_FORM_NAMES = build_item_form_block(
+        _train_row_item_keys_g, _train_row_conditions_g, full=True,
+    )
+    _m2_form_val, _ = build_item_form_block(
+        _val_row_item_keys_g, _val_row_conditions_g, full=True,
+    )
+    _m2_marginal_train_active = np.concatenate(
+        [_m2_marginal_train_active, _m2_form_train], axis=1,
+    ).astype(np.float32, copy=False)
+    _m2_marginal_val_active = np.concatenate(
+        [_m2_marginal_val_active, _m2_form_val], axis=1,
+    ).astype(np.float32, copy=False)
+    _m2_active_marginal_names = (
+        (tuple(MEMBER4_MARGINAL_FEATURE_NAMES) if _M2_USE_MARGINALS else ())
+        + tuple(_M2_FORM_NAMES)
+    )
+    _M2_N_MARGINALS_ACTIVE = int(_m2_marginal_train_active.shape[1])
+    _M2_NUM_FEATURE_NAMES = m2_numerical_feature_names(
+        subj_num_names=_M2_SUBJ_NUM_FEATURE_NAMES,
+        bench_num_names=_M2_BENCH_NUM_FEATURE_NAMES,
+        marginal_names=_m2_active_marginal_names,
+    )
+    print(
+        f"[Member 2 MLP] + item-form block: {len(_M2_FORM_NAMES)} cols "
+        f"-> n_marginals_active={_M2_N_MARGINALS_ACTIVE}"
+    )
+
 m2_numerical_train = m2_assemble_numerical(
     subject_numerical=_m2_meta_train["subject_numerical"],
     bench_numerical=_m2_meta_train["bench_numerical"],
@@ -2976,6 +3159,11 @@ def _fit_member2_mlp_global():
         seed=int(SEED),
         holdout_group_id=m2_holdout_item_id,
         show_progress=True,
+        # Global M2 decorrelates from M1 (p_a_train), the dominant anchor and
+        # exactly what the Gate-3e val diagnostic measures. The OOF path uses
+        # the full {M1,M6,M8} anchor set for the stacker.
+        ncl_anchor_preds=(p_a_train if _ncl_lambda_for("member2") > 0 else None),
+        ncl_lambda=_ncl_lambda_for("member2"),
     )
 
 
@@ -3118,6 +3306,10 @@ member2_mlp_state = cache_or_compute(
         _m2_num_digest,
         _m2_cat_digest,
         tuple(sorted(_m2_cfg.items())),
+        # NCL invalidation: lambda + anchor digest so a toggle/relam can't
+        # silently reuse a non-NCL (or differently-anchored) checkpoint.
+        ("ncl", round(_ncl_lambda_for("member2"), 5)),
+        (_content_digest(p_a_train, k_rows=4096) if _ncl_lambda_for("member2") > 0 else "noncl"),
     ),
     compute_fn=_fit_member2_mlp_global,
 )
@@ -3864,6 +4056,9 @@ def _fit_member4():
         seed=SEED,
         val_fraction=0.1,
         holdout_group_id=holdout_item_id,
+        # Global M4 decorrelates from M1 (dominant anchor / Gate diagnostic).
+        ncl_anchor_preds=(p_a_train if _ncl_lambda_for("member4") > 0 else None),
+        ncl_lambda=_ncl_lambda_for("member4"),
     )
 
 
@@ -3879,6 +4074,7 @@ logreg_state = cache_or_compute(
         round(float(CFG.get("member4_logreg", {}).get("l1_strength_tail", 1.0e-4)), 6),
         round(float(CFG.get("member4_logreg", {}).get("min_feature_std", 1.0e-2)), 6),
         round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
+        ("ncl", round(_ncl_lambda_for("member4"), 5)),
     ),
     compute_fn=_fit_member4,
 )
@@ -3949,6 +4145,30 @@ if _M6_ENABLED:
     _m6_dense_feature_names = tuple(member_feat_schema.feature_names) + tuple(
         MEMBER4_MARGINAL_FEATURE_NAMES
     )
+
+    # Diversification: append the item_type one-hots + CoT interaction
+    # columns (M6 already carries the raw pool features via
+    # member_feat_schema, so only the NEW "extra" block is added). These
+    # land past _F_M4_BASE so the embedding_vs_marginal field split assigns
+    # them to the marginal/non-embedding field automatically.
+    _M6_FORM_NAMES: tuple[str, ...] = ()
+    if _dense_form_on("member6"):
+        _m6_form_train, _M6_FORM_NAMES = build_item_form_block(
+            _train_row_item_keys_g, _train_row_conditions_g, full=False,
+        )
+        _m6_form_val, _ = build_item_form_block(
+            _val_row_item_keys_g, _val_row_conditions_g, full=False,
+        )
+        X_train_dense_m4 = np.concatenate(
+            [X_train_dense_m4, _m6_form_train], axis=1,
+        ).astype(np.float32, copy=False)
+        X_val_dense_m4 = np.concatenate(
+            [X_val_dense_m4, _m6_form_val], axis=1,
+        ).astype(np.float32, copy=False)
+        _m6_dense_feature_names = _m6_dense_feature_names + tuple(_M6_FORM_NAMES)
+        _m6_form_train = None
+        _m6_form_val = None
+        print(f"[Member 6] + item-form interaction block: {len(_M6_FORM_NAMES)} cols")
 
     _F_M4_TOTAL = int(X_train_dense_m4.shape[1])
     _F_M4_BASE = int(member_feat_schema.feature_dim)
@@ -4043,6 +4263,18 @@ if _M6_ENABLED:
         torch.cuda.synchronize()
 
     p_member6_val = fwfm_apply_state_batch(fwfm_state, X_val_dense_m4)
+
+    # Global train-row preds: M6 is an NCL anchor, so its train predictions
+    # feed the {M1,M6,M8} decorrelation target used by the OOF penalized
+    # members. Chunked to avoid a transient [N,F] standardized copy (~24 GB).
+    def _fwfm_apply_chunked(_state, _X, _chunk=262_144):
+        _out = np.empty(int(_X.shape[0]), dtype=np.float32)
+        for _s in range(0, int(_X.shape[0]), int(_chunk)):
+            _e = min(_s + int(_chunk), int(_X.shape[0]))
+            _out[_s:_e] = fwfm_apply_state_batch(_state, _X[_s:_e])
+        return _out
+
+    p6_train_global = _fwfm_apply_chunked(fwfm_state, X_train_dense_m4)
     nll_m6 = float(-(
         ylab_val * np.log(np.clip(p_member6_val, 1e-6, 1 - 1e-6))
         + (1 - ylab_val) * np.log(1 - np.clip(p_member6_val, 1e-6, 1 - 1e-6))
@@ -4068,6 +4300,7 @@ if _M6_ENABLED:
 else:
     fwfm_state = None
     p_member6_val = None
+    p6_train_global = None
     nll_m6 = float("nan")
     print("[Member 6] DISABLED via CFG['member6']['enabled']=False")
 
@@ -4122,6 +4355,8 @@ if _M7_ENABLED:
             seed=int(SEED) + 701,
             holdout_group_id=holdout_item_id,
             show_progress=True,
+            ncl_anchor_preds=(p_a_train if _ncl_lambda_for("member7") > 0 else None),
+            ncl_lambda=_ncl_lambda_for("member7"),
         )
 
     member7_state = cache_or_compute(
@@ -4135,6 +4370,7 @@ if _M7_ENABLED:
             int(_m7_cfg.get("early_stopping_patience", 6)),
             round(float(CFG.get("mean_encoded", {}).get("smoothing", 30.0)), 4),
             int(SEED),
+            ("ncl", round(_ncl_lambda_for("member7"), 5)),
         ),
         compute_fn=_fit_member7,
     )
@@ -4156,6 +4392,19 @@ _M8_ENABLED = bool(CFG.get("member8", {}).get("enabled", False))
 if _M8_ENABLED:
     _m8_cfg = CFG["member8"]
 
+    # Item-form dense block for M8 (full block: pool_z + item_type + cot_x_*).
+    _M8_FORM_NAMES: tuple[str, ...] = ()
+    _m8_form_train = None
+    _m8_form_val = None
+    if _dense_form_on("member8"):
+        _m8_form_train, _M8_FORM_NAMES = build_item_form_block(
+            _train_row_item_keys_g, _train_row_conditions_g, full=True,
+        )
+        _m8_form_val, _ = build_item_form_block(
+            _val_row_item_keys_g, _val_row_conditions_g, full=True,
+        )
+        print(f"[Member 8] + item-form block: {len(_M8_FORM_NAMES)} dense cols")
+
     def _fit_member8():
         print(
             f"[Member 8] stacking {len(train_item_keys):,} unique item "
@@ -4171,6 +4420,8 @@ if _M8_ENABLED:
             subj_emb_dim=int(_m8_cfg.get("subj_emb_dim", 32)),
             item_emb_unique=_emb,
             row_to_uniq=m2_holdout_item_id,
+            dense_X=_m8_form_train,
+            dense_feature_names=_M8_FORM_NAMES,
             hid1=int(_m8_cfg.get("hid1", 256)),
             hid2=int(_m8_cfg.get("hid2", 128)),
             learning_rate=float(_m8_cfg.get("learning_rate", 1.0e-3)),
@@ -4198,17 +4449,36 @@ if _M8_ENABLED:
             int(_m8_cfg.get("epochs", 30)),
             int(_m8_cfg.get("early_stopping_patience", 5)),
             int(SEED),
+            ("form", len(_M8_FORM_NAMES)),
         ),
         compute_fn=_fit_member8,
     )
-    # Val scoring: gather val-row item embeddings (transient), apply, free.
-    _m8_val_emb = np.empty((len(primary.val), _PT_D_EMB), dtype=np.float32)
-    for _i, _k in enumerate(primary.val["item_key"]):
-        _m8_val_emb[_i] = item_emb_lookup[str(_k)]
-    p_member8_val = mlp_apply_state_batch(
-        member8_state, subject_ids=_mef_val_subj, item_emb=_m8_val_emb,
+
+    # Chunked per-row apply (item embeddings gathered per chunk so we never
+    # materialise [N, D]). Shared by val scoring and the global train-row
+    # anchor preds (M8 is an NCL anchor).
+    def _m8_apply_chunked(_state, _item_keys, _subj_ids, _form, _chunk=131_072):
+        _keys = np.asarray(_item_keys).astype(str)
+        _out = np.empty(int(_keys.shape[0]), dtype=np.float32)
+        for _s in range(0, int(_keys.shape[0]), int(_chunk)):
+            _e = min(_s + int(_chunk), int(_keys.shape[0]))
+            _emb = np.empty((_e - _s, _PT_D_EMB), dtype=np.float32)
+            for _j, _k in enumerate(_keys[_s:_e]):
+                _emb[_j] = item_emb_lookup[_k]
+            _dz = None if _form is None else _form[_s:_e]
+            _out[_s:_e] = mlp_apply_state_batch(
+                _state, subject_ids=_subj_ids[_s:_e], item_emb=_emb, dense_X=_dz,
+            )
+            _emb = None
+        return _out
+
+    p_member8_val = _m8_apply_chunked(
+        member8_state, _val_row_item_keys_g, _mef_val_subj, _m8_form_val,
     )
-    del _m8_val_emb
+    # Global train-row preds (NCL anchor for the OOF penalized members + M9).
+    p8_train_global = _m8_apply_chunked(
+        member8_state, _train_row_item_keys_g, _mef_train_subj, _m8_form_train,
+    )
     gc.collect()
     nll_m8 = _nll_vec(p_member8_val)
     print(
@@ -4219,8 +4489,116 @@ if _M8_ENABLED:
 else:
     member8_state = None
     p_member8_val = None
+    p8_train_global = None
     nll_m8 = float("nan")
     print("[Member 8] DISABLED via CFG['member8']['enabled']=False")
+
+
+# %% [markdown]
+# ## 9e-quinquies. Build the global NCL anchor targets + Member 9 (FwFM+NCL)
+#
+# The OOF penalized members (M2/M4/M7) decorrelate from the mean of the
+# GLOBAL anchors' train-row predictions {M1, M6, M8}; Member 9 (the FwFM
+# clone) decorrelates from {M1, M8}. We build those targets here (all
+# anchors are now fit) and immediately train the global Member 9 while
+# Member 6's dense matrix (which M9 reuses) is still resident -- before the
+# pre-OOF cleanup frees it.
+
+# %%
+def _mean_of_anchor_preds(anchor_keys):
+    """Row-wise mean of the available global anchor train-preds."""
+    _parts = []
+    for _k in anchor_keys:
+        if _k == "member1":
+            _parts.append(p_a_train)
+        elif _k == "member6" and ("p6_train_global" in globals()) and (p6_train_global is not None):
+            _parts.append(p6_train_global)
+        elif _k == "member8" and ("p8_train_global" in globals()) and (p8_train_global is not None):
+            _parts.append(p8_train_global)
+    if not _parts:
+        return None
+    return np.mean(np.stack(_parts, axis=0), axis=0).astype(np.float32)
+
+
+_ncl_anchor_oof = (
+    _mean_of_anchor_preds(_NCL_ANCHORS) if _NCL_ENABLED else None
+)
+_ncl_anchor_oof_m9 = (
+    _mean_of_anchor_preds(_NCL_M9_ANCHORS) if _NCL_ENABLED else None
+)
+if _ncl_anchor_oof is not None:
+    print(
+        f"[NCL] OOF anchor target built from {_NCL_ANCHORS} "
+        f"(mean={float(np.mean(_ncl_anchor_oof)):.4f})"
+    )
+
+_M9_ENABLED = bool(CFG.get("member9", {}).get("enabled", False)) and _M6_ENABLED
+if _M9_ENABLED:
+    _m9_cfg = CFG["member9"]
+    _M9_NCL_LAMBDA = float(_m9_cfg.get("ncl_lambda", 0.0)) if _NCL_ENABLED else 0.0
+    # M9 = clone of M6 (same dense matrix / fields / hyperparams) trained
+    # with the NCL penalty against {M1, M8} so it diverges from its twin.
+    _m9_anchor_global = (
+        _mean_of_anchor_preds(_NCL_M9_ANCHORS) if _M9_NCL_LAMBDA > 0 else None
+    )
+
+    def _fit_member9():
+        print(
+            f"[Member 9] training FwFM clone with NCL (lambda={_M9_NCL_LAMBDA}, "
+            f"anchors={_NCL_M9_ANCHORS}) on X cols={int(X_train_dense_m4.shape[1])}..."
+        )
+        return fit_fwfm_member(
+            X=X_train_dense_m4,
+            y=y_train,
+            feature_names=_m6_dense_feature_names,
+            field_ids=_m6_field_ids,
+            k=_M6_K,
+            learning_rate=_M6_LR,
+            weight_decay_w=_M6_WD_W,
+            weight_decay_V=_M6_WD_V,
+            weight_decay_r=_M6_WD_R,
+            epochs=_M6_EPOCHS,
+            batch_size=_M6_BS,
+            val_fraction=_M6_VAL_FRAC,
+            early_stopping_patience=_M6_PATIENCE,
+            seed=int(SEED) + 901,
+            standardize=True,
+            holdout_group_id=holdout_item_id,
+            ncl_anchor_preds=_m9_anchor_global,
+            ncl_lambda=_M9_NCL_LAMBDA,
+        )
+
+    member9_state = cache_or_compute(
+        "member9_fwfm_ncl_state",
+        key_inputs=(
+            "m9_fwfm_ncl_v1",
+            int(X_train_dense_m4.shape[1]), len(primary.train), int(SEED),
+            int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
+            round(_M6_LR, 6), round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
+            int(_M6_EPOCHS), int(_M6_BS), int(_M6_PATIENCE), round(_M6_VAL_FRAC, 4),
+            _m6_x_digest_train, _m6_y_digest_train, _m6_holdout_digest_train,
+            ("ncl", round(_M9_NCL_LAMBDA, 5), tuple(_NCL_M9_ANCHORS)),
+        ),
+        compute_fn=_fit_member9,
+    )
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    p_member9_val = fwfm_apply_state_batch(member9_state, X_val_dense_m4)
+    nll_m9 = float(-(
+        ylab_val * np.log(np.clip(p_member9_val, 1e-6, 1 - 1e-6))
+        + (1 - ylab_val) * np.log(1 - np.clip(p_member9_val, 1e-6, 1 - 1e-6))
+    ).mean())
+    print(
+        f"[Member 9] val log-loss: {nll_m9:.6f}  "
+        f"(M6 twin val={nll_m6:.6f})  fit_method={member9_state.fit_method}"
+    )
+else:
+    member9_state = None
+    p_member9_val = None
+    nll_m9 = float("nan")
+    print("[Member 9] DISABLED (needs member9.enabled and member6.enabled)")
 
 # %% [markdown]
 # ## 9e-bis. Pre-OOF memory reclamation
@@ -4392,6 +4770,12 @@ if _M8_ENABLED:
     p8_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p8_train_oof")
 else:
     p8_train_oof_acc = None
+
+# Member 9 (FwFM + NCL clone) OOF accumulator.
+if _M9_ENABLED:
+    p9_train_oof_acc = OofPredictionAccumulator(_N_TRAIN, name="p9_train_oof")
+else:
+    p9_train_oof_acc = None
 
 
 # Gate 1b tracker: for each fold we'll save a sample of OOF-row top-k
@@ -4810,6 +5194,25 @@ for fold in folds:
         _m2_fold_redact_train = bc_redacted_train[fold.train_row_idx]
         _m2_fold_redact_oof = bc_redacted_train[fold.oof_row_idx]
 
+    # Item-form block for this fold (must match the global M2 composition).
+    if _dense_form_on("member2"):
+        _m2_form_fold_train, _ = build_item_form_block(
+            _train_row_item_keys_g[fold.train_row_idx],
+            _train_row_conditions_g[fold.train_row_idx],
+            full=True,
+        )
+        _m2_form_fold_oof, _ = build_item_form_block(
+            _train_row_item_keys_g[fold.oof_row_idx],
+            _train_row_conditions_g[fold.oof_row_idx],
+            full=True,
+        )
+        _m2_fold_marg_train = np.concatenate(
+            [_m2_fold_marg_train, _m2_form_fold_train], axis=1,
+        ).astype(np.float32, copy=False)
+        _m2_fold_marg_oof = np.concatenate(
+            [_m2_fold_marg_oof, _m2_form_fold_oof], axis=1,
+        ).astype(np.float32, copy=False)
+
     _m2_num_fold_train = m2_assemble_numerical(
         subject_numerical=_m2_meta_fold_train["subject_numerical"],
         bench_numerical=_m2_meta_fold_train["bench_numerical"],
@@ -4881,6 +5284,14 @@ for fold in folds:
             seed=int(SEED) + 100 * (int(_ff.fold_id) + 1),
             holdout_group_id=_m2_holdout_fold,
             show_progress=False,
+            # OOF NCL: decorrelate from the {M1,M6,M8} global anchor target
+            # restricted to this fold's train rows (regulariser only).
+            ncl_anchor_preds=(
+                _ncl_anchor_oof[_ff.train_row_idx]
+                if (_ncl_lambda_for("member2") > 0 and _ncl_anchor_oof is not None)
+                else None
+            ),
+            ncl_lambda=_ncl_lambda_for("member2"),
         )
 
     # Per-fold content digests over the actual fit inputs. The
@@ -4922,6 +5333,7 @@ for fold in folds:
             _m2_cat_digest_fold,
             tuple(sorted(_m2_cfg.items())),
             int(SEED),
+            ("ncl", round(_ncl_lambda_for("member2"), 5)),
         ),
         compute_fn=_fit_fold_m2_mlp,
     )
@@ -5336,6 +5748,7 @@ for fold in folds:
             "logreg_tail_oof_v1", fold.fold_id, fold_suffix,
             int(_X_m4_tr.shape[1]), int(_X_m4_tr.shape[0]),
             int(_TAIL_DIM), int(_PT_HEAD), int(_PT_TAIL), int(SEED),
+            ("ncl", round(_ncl_lambda_for("member4"), 5)),
         ),
         compute_fn=lambda _ff=fold: fit_logreg_member(
             X=_X_m4_tr,
@@ -5350,6 +5763,12 @@ for fold in folds:
             seed=int(SEED) + 300 * (int(_ff.fold_id) + 1),
             val_fraction=0.1,
             holdout_group_id=_m2_holdout_fold,
+            ncl_anchor_preds=(
+                _ncl_anchor_oof[_ff.train_row_idx]
+                if (_ncl_lambda_for("member4") > 0 and _ncl_anchor_oof is not None)
+                else None
+            ),
+            ncl_lambda=_ncl_lambda_for("member4"),
         ),
     )
     p4_oof_fold = logreg_apply_state_batch(_fold_logreg_state, _X_m4_of)
@@ -5367,6 +5786,7 @@ for fold in folds:
                 int(MEMBER4_MARGINAL_FEATURE_DIM), int(len(fold_train_df)),
                 int(_m7_cfg.get("hid1", 64)), int(_m7_cfg.get("hid2", 32)),
                 int(_m7_cfg.get("epochs", 40)), int(SEED),
+                ("ncl", round(_ncl_lambda_for("member7"), 5)),
             ),
             compute_fn=lambda _ff=fold: fit_mlp_member(
                 labels=_y_fold_train,
@@ -5382,6 +5802,12 @@ for fold in folds:
                 seed=int(SEED) + 701 * (int(_ff.fold_id) + 1),
                 holdout_group_id=_m2_holdout_fold,
                 show_progress=False,
+                ncl_anchor_preds=(
+                    _ncl_anchor_oof[_ff.train_row_idx]
+                    if (_ncl_lambda_for("member7") > 0 and _ncl_anchor_oof is not None)
+                    else None
+                ),
+                ncl_lambda=_ncl_lambda_for("member7"),
             ),
         )
         p7_oof_fold = mlp_apply_state_batch(_fold_m7_state, dense_X=fold_member4_marginal_oof)
@@ -5391,8 +5817,22 @@ for fold in folds:
     else:
         p7_oof_fold = None
 
-    # ---- M8 (embedding MLP): subject-id emb + item emb ----
+    # ---- M8 (embedding MLP): subject-id emb + item emb (+ item-form block) ----
     if _M8_ENABLED:
+        if _dense_form_on("member8"):
+            _m8_form_fold_train, _ = build_item_form_block(
+                _train_row_item_keys_g[fold.train_row_idx],
+                _train_row_conditions_g[fold.train_row_idx],
+                full=True,
+            )
+            _m8_form_fold_oof, _ = build_item_form_block(
+                _train_row_item_keys_g[fold.oof_row_idx],
+                _train_row_conditions_g[fold.oof_row_idx],
+                full=True,
+            )
+        else:
+            _m8_form_fold_train = None
+            _m8_form_fold_oof = None
         _fold_m8_state = cache_or_compute(
             "member8_embedding_mlp_state_oof_fold",
             key_inputs=(
@@ -5401,6 +5841,7 @@ for fold in folds:
                 int(indexer.n_subjects), int(_m8_cfg.get("subj_emb_dim", 32)),
                 int(_m8_cfg.get("hid1", 256)), int(_m8_cfg.get("hid2", 128)),
                 int(_m8_cfg.get("epochs", 30)), int(SEED),
+                ("form", int(len(DENSE_FORM_FULL_NAMES)) if _dense_form_on("member8") else 0),
             ),
             compute_fn=lambda _ff=fold: fit_mlp_member(
                 labels=_y_fold_train,
@@ -5409,6 +5850,8 @@ for fold in folds:
                 subj_emb_dim=int(_m8_cfg.get("subj_emb_dim", 32)),
                 item_emb_unique=_div_tr_uniq_emb,
                 row_to_uniq=_div_tr_r2u,
+                dense_X=_m8_form_fold_train,
+                dense_feature_names=(DENSE_FORM_FULL_NAMES if _dense_form_on("member8") else ()),
                 hid1=int(_m8_cfg.get("hid1", 256)), hid2=int(_m8_cfg.get("hid2", 128)),
                 learning_rate=float(_m8_cfg.get("learning_rate", 1.0e-3)),
                 weight_decay=float(_m8_cfg.get("weight_decay", 1.0e-5)),
@@ -5432,10 +5875,13 @@ for fold in folds:
                 _fold_m8_state,
                 subject_ids=_mef_subj_fold_oof[_cs:_ce],
                 item_emb=_emb_ch,
+                dense_X=(None if _m8_form_fold_oof is None else _m8_form_fold_oof[_cs:_ce]),
             )
             del _emb_ch
         p8_train_oof_acc.write_fold(fold.oof_row_idx, p8_oof_fold)
         del _fold_m8_state
+        _m8_form_fold_train = None
+        _m8_form_fold_oof = None
         gc.collect()
     else:
         p8_oof_fold = None
@@ -5504,8 +5950,21 @@ for fold in folds:
         tuple(member_feat_schema.feature_names)
         + tuple(MEMBER4_MARGINAL_FEATURE_NAMES)
     )
+    # Append the M6 item-form interaction block (item_type + cot_x_*) so the
+    # fold matrix matches the GLOBAL M6 width / field_ids / feature names.
+    if _dense_form_on("member6"):
+        _m6_form_fold_train, _ = build_item_form_block(
+            _train_row_item_keys_g[fold.train_row_idx],
+            _train_row_conditions_g[fold.train_row_idx],
+            full=False,
+        )
+        X_fold_train_dense_m4 = np.concatenate(
+            [X_fold_train_dense_m4, _m6_form_fold_train], axis=1,
+        ).astype(np.float32, copy=False)
+        _fold_m4_feature_names = _fold_m4_feature_names + tuple(DENSE_FORM_EXTRA_NAMES)
+        _m6_form_fold_train = None
     # ----- Fold Member 6 (FwFM) -- on the dense hybrid matrix -----
-    # FwFM fits on the [N_train, F+14] dense matrix built just above.
+    # FwFM fits on the [N_train, F+14(+form)] dense matrix built just above.
     if _M6_ENABLED:
         print(f"[OOF f{fold.fold_id}] Training fold Member 6 (FwFM)...")
         _m6_x_digest_fold = _content_digest(X_fold_train_dense_m4, k_rows=8192)
@@ -5567,6 +6026,56 @@ for fold in folds:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
+    # ----- Fold Member 9 (FwFM clone + NCL) -- reuses M6's train matrix -----
+    if _M9_ENABLED:
+        print(f"[OOF f{fold.fold_id}] Training fold Member 9 (FwFM + NCL)...")
+        _m9_anchor_fold = (
+            _ncl_anchor_oof_m9[fold.train_row_idx]
+            if (_M9_NCL_LAMBDA > 0 and _ncl_anchor_oof_m9 is not None)
+            else None
+        )
+        _fold_m9_state = cache_or_compute(
+            "member9_fwfm_ncl_state_oof_fold",
+            key_inputs=(
+                "m9_fwfm_ncl_oof_v1", fold.fold_id, fold_suffix,
+                int(X_fold_train_dense_m4.shape[1]),
+                int(X_fold_train_dense_m4.shape[0]),
+                int(_M6_K), str(_M6_FIELD_MODE), int(_m6_n_fields),
+                round(_M6_LR, 6),
+                round(_M6_WD_W, 7), round(_M6_WD_V, 7), round(_M6_WD_R, 7),
+                int(_M6_EPOCHS), int(_M6_BS), int(_M6_PATIENCE),
+                _m6_x_digest_fold, _m6_y_digest_fold, _m6_holdout_digest_fold,
+                int(SEED),
+                ("ncl", round(_M9_NCL_LAMBDA, 5), tuple(_NCL_M9_ANCHORS)),
+            ),
+            compute_fn=lambda _ff=fold, _anc=_m9_anchor_fold: fit_fwfm_member(
+                X=X_fold_train_dense_m4,
+                y=_y_fold_train,
+                feature_names=_fold_m4_feature_names,
+                field_ids=_m6_field_ids,
+                k=_M6_K,
+                learning_rate=_M6_LR,
+                weight_decay_w=_M6_WD_W,
+                weight_decay_V=_M6_WD_V,
+                weight_decay_r=_M6_WD_R,
+                epochs=_M6_EPOCHS,
+                batch_size=_M6_BS,
+                val_fraction=_M6_VAL_FRAC,
+                early_stopping_patience=_M6_PATIENCE,
+                seed=int(SEED) + 900 * (int(_ff.fold_id) + 1),
+                standardize=True,
+                holdout_group_id=_m2_holdout_fold,
+                ncl_anchor_preds=_anc,
+                ncl_lambda=_M9_NCL_LAMBDA,
+            ),
+        )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    else:
+        _fold_m9_state = None
+
     # Training done. Free the [N_train, F+14] matrix BEFORE building the
     # OOF matrix so they don't both live during scoring.
     del X_fold_train_dense_m4
@@ -5599,9 +6108,20 @@ for fold in folds:
         del X_fold_oof_dense
     del fold_member4_marginal_oof, _bc_redacted_fold_oof
     gc.collect()
+    # Append the M6 item-form interaction block to the OOF matrix too.
+    if _dense_form_on("member6"):
+        _m6_form_fold_oof, _ = build_item_form_block(
+            _train_row_item_keys_g[fold.oof_row_idx],
+            _train_row_conditions_g[fold.oof_row_idx],
+            full=False,
+        )
+        X_fold_oof_dense_m4 = np.concatenate(
+            [X_fold_oof_dense_m4, _m6_form_fold_oof], axis=1,
+        ).astype(np.float32, copy=False)
+        _m6_form_fold_oof = None
     # Member 4 (p4) was already scored + written in the diversification
     # block above (tail-subspace logreg). The dense OOF matrix here is
-    # consumed only by Member 6.
+    # consumed by Members 6 and 9.
 
     # M6 (FwFM) OOF score on the dense OOF matrix.
     if _M6_ENABLED:
@@ -5610,6 +6130,14 @@ for fold in folds:
         del _fold_fwfm_state
     else:
         p6_oof_fold = None
+
+    # M9 (FwFM + NCL) OOF score on the same dense OOF matrix.
+    if _M9_ENABLED and (_fold_m9_state is not None):
+        p9_oof_fold = fwfm_apply_state_batch(_fold_m9_state, X_fold_oof_dense_m4)
+        p9_train_oof_acc.write_fold(fold.oof_row_idx, p9_oof_fold)
+        del _fold_m9_state
+    else:
+        p9_oof_fold = None
 
     del X_fold_oof_dense_m4
     gc.collect()
@@ -5638,6 +6166,7 @@ for fold in folds:
         + (f"  M6={_nll(p6_oof_fold):.5f}" if _M6_ENABLED else "")
         + (f"  M7={_nll(p7_oof_fold):.5f}" if (_M7_ENABLED and p7_oof_fold is not None) else "")
         + (f"  M8={_nll(p8_oof_fold):.5f}" if (_M8_ENABLED and p8_oof_fold is not None) else "")
+        + (f"  M9={_nll(p9_oof_fold):.5f}" if (_M9_ENABLED and p9_oof_fold is not None) else "")
     )
 
     # Free fold-scoped artifacts before next iteration (keep RAM bounded).
@@ -5682,6 +6211,10 @@ if _M8_ENABLED:
     p8_train_oof = p8_train_oof_acc.finalize()
 else:
     p8_train_oof = None
+if _M9_ENABLED:
+    p9_train_oof = p9_train_oof_acc.finalize()
+else:
+    p9_train_oof = None
 nn_mean_sim_oof = nn_mean_sim_oof_acc.finalize().astype(np.float32)
 nn_support_oof = nn_support_oof_acc.finalize().astype(np.float32)
 centroid_dist_oof = centroid_dist_oof_acc.finalize().astype(np.float32)
@@ -5704,6 +6237,8 @@ if _M7_ENABLED:
     print(f"  M7 OOF: {_nll_full(p7_train_oof):.5f}")
 if _M8_ENABLED:
     print(f"  M8 OOF: {_nll_full(p8_train_oof):.5f}")
+if _M9_ENABLED:
+    print(f"  M9 OOF: {_nll_full(p9_train_oof):.5f}")
 print(f"[OOF] All accumulators finalized OK ({_N_TRAIN:,} rows each, all finite, single-write).")
 
 # Task 4: Aggregate Gate 4c (per-fold projection-leakage probe) results.
@@ -5803,6 +6338,9 @@ if _M7_ENABLED:
 if _M8_ENABLED:
     _stacker_member_list_val.append(p_member8_val)
     _stacker_member_names_val.append("M8 (p_member8_val)")
+if _M9_ENABLED and (p_member9_val is not None):
+    _stacker_member_list_val.append(p_member9_val)
+    _stacker_member_names_val.append("M9 (p_member9_val)")
 
 # Defensive shape audit + 1-D coercion. ``np.stack`` raises a generic
 # ``ValueError: all input arrays must have the same shape`` when any of
@@ -5874,7 +6412,7 @@ stacker_X_val = build_stacker_features(
     nn_mean_similarity=val_nn_mean_sim,
     centroid_distance=val_centroid_dist,
 )
-_n_members_dyn = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED)
+_n_members_dyn = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED) + int(_M9_ENABLED)
 print(f"[Stacker] X_val (final-reporting view): {stacker_X_val.shape} "
       f"(n_members={_n_members_dyn})")
 
@@ -5909,6 +6447,9 @@ if _M7_ENABLED:
 if _M8_ENABLED:
     _stacker_member_list_train_oof.append(p8_train_oof.astype(np.float32))
     _stacker_oof_names.append("M8 (p8_train_oof)")
+if _M9_ENABLED and (p9_train_oof is not None):
+    _stacker_member_list_train_oof.append(p9_train_oof.astype(np.float32))
+    _stacker_oof_names.append("M9 (p9_train_oof)")
 
 # Mirror the val-side defensive audit: same generic ``np.stack`` error,
 # same need to surface WHICH OOF member is the offender. Length mismatch
@@ -5968,7 +6509,7 @@ ylab_train_np = primary.train["label"].astype(float).to_numpy().astype(np.float3
 print(f"[Stacker] X_train_oof: {stacker_X_train_oof.shape}  ylab_train: {ylab_train_np.shape}")
 
 
-_n_stacker_members = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED)
+_n_stacker_members = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED) + int(_M9_ENABLED)
 _stacker_feature_names = stacker_feature_names(_n_stacker_members)
 assert int(stacker_X_train_oof.shape[1]) == len(_stacker_feature_names), (
     f"stacker_X_train_oof has {stacker_X_train_oof.shape[1]} cols but "
@@ -6113,6 +6654,8 @@ if _M7_ENABLED:
     print(f"  Member 7 (marginal MLP, val):       {nll_m7:.6f}")
 if _M8_ENABLED:
     print(f"  Member 8 (embedding MLP, val):      {nll_m8:.6f}")
+if _M9_ENABLED:
+    print(f"  Member 9 (FwFM+NCL clone, val):     {nll_m9:.6f}")
 print(f"  Uniform avg of {_n_stacker_members} members (val):     {nll_uniform_val:.6f}")
 print(f"  STACKER (val, OOF-fit):             {nll_stack_val:.6f}")
 print(f"  STACKER (OOF-train, in-sample):     {nll_stack_train_oof:.6f}")
@@ -6270,6 +6813,36 @@ if _M6_ENABLED and p_member6_val is not None:
            else "(non-trivial in at least one bucket -- FwFM is contributing)")
     )
 
+# Gate 9 (NCL): does the FwFM+NCL clone (M9) actually decorrelate from its
+# anchors {M1, M8} and from its twin M6? Lower |corr| vs M6's own anchor
+# correlations means the NCL penalty bought genuine diversity.
+if _M9_ENABLED and p_member9_val is not None:
+    _y64_g9 = ylab_val.astype(np.float64)
+    _err_m9 = p_member9_val.astype(np.float64) - _y64_g9
+    _err_m1_g9 = p_a_val.astype(np.float64) - _y64_g9
+    _corr_m9_m1 = float(np.corrcoef(_err_m9, _err_m1_g9)[0, 1])
+    _corr_m9_m6 = (
+        float(np.corrcoef(_err_m9, p_member6_val.astype(np.float64) - _y64_g9)[0, 1])
+        if (_M6_ENABLED and p_member6_val is not None) else float("nan")
+    )
+    _corr_m9_m8 = (
+        float(np.corrcoef(_err_m9, p_member8_val.astype(np.float64) - _y64_g9)[0, 1])
+        if (_M8_ENABLED and p_member8_val is not None) else float("nan")
+    )
+    print(
+        f"\n[Gate 9] Member 9 (FwFM+NCL) error correlations on val:\n"
+        f"  corr(err_m9, err_m1) = {_corr_m9_m1:+.4f}  "
+        f"corr(err_m9, err_m8) = {_corr_m9_m8:+.4f}  "
+        f"corr(err_m9, err_m6) = {_corr_m9_m6:+.4f}"
+    )
+    _w9_col = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED)
+    _w9_known = float(stacker_state.known.weights[_w9_col])
+    _w9_unknown = float(stacker_state.unknown.weights[_w9_col])
+    print(
+        f"[Member 9] stacker weight (col {_w9_col}): "
+        f"known={_w9_known:+.4f}  unknown={_w9_unknown:+.4f}"
+    )
+
 # %% [markdown]
 # ## 9f-quad. Member-correlation heatmaps (val)
 #
@@ -6319,6 +6892,9 @@ if _HEATMAP_OK:
     if _M8_ENABLED and p_member8_val is not None:
         _hm_names.append("M8")
         _hm_preds.append(p_member8_val.astype(np.float64))
+    if _M9_ENABLED and p_member9_val is not None:
+        _hm_names.append("M9")
+        _hm_preds.append(p_member9_val.astype(np.float64))
     # Validate alignment defensively.
     _hm_n = int(ylab_val.shape[0])
     _hm_clean_names, _hm_clean_preds = [], []
@@ -7152,6 +7728,8 @@ if _M7_ENABLED:
     _oof_member_preds_for_digest.append(p7_train_oof)
 if _M8_ENABLED:
     _oof_member_preds_for_digest.append(p8_train_oof)
+if _M9_ENABLED:
+    _oof_member_preds_for_digest.append(p9_train_oof)
 _oof_member_preds_digest = _hashlib.sha256(
     np.ascontiguousarray(
         np.stack(_oof_member_preds_for_digest, axis=1),
@@ -7262,6 +7840,7 @@ _EXPORT_BUNDLE_OK = (
     not _M6_ENABLED
     and not _M7_ENABLED
     and not _M8_ENABLED
+    and not _M9_ENABLED
     and ((not _M5_ENABLED) or _M5_VARIANT == "difficulty_knn")
 )
 if not _EXPORT_BUNDLE_OK:

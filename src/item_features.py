@@ -412,16 +412,130 @@ def merge_pool_and_centroid_features(
     return merged, base_cols + extra_cols
 
 
+# CoT / item-type interaction helpers ---------------------------------------
+#
+# These power the "secondary" dense members (M2/M6/M8) where we want
+# explicit condition x item-form interactions, e.g. "does chain-of-thought
+# help THIS kind of item". They are deliberately kept OUT of the canonical
+# POOL_FEATURE_NAMES so the primary model (M1) -- whose cached input width is
+# baked into its checkpoint -- is unaffected. Item-type is per-item; the CoT
+# crosses are per-ROW (condition lives on the row, not the item).
+
+ITEM_TYPE_NAMES: tuple[str, ...] = (
+    "type_mcq",
+    "type_code",
+    "type_math",
+    "type_prose",
+)
+
+# Tokens that mark a chain-of-thought / step-by-step style condition.
+_COT_TOKENS: tuple[str, ...] = (
+    "cot",
+    "chain-of-thought",
+    "chain of thought",
+    "chainofthought",
+    "step by step",
+    "step-by-step",
+    "scratchpad",
+    "reasoning",
+)
+
+# Base features the CoT flag is crossed with (chosen to avoid collinear /
+# low-signal crosses: char_len ~ token_len, n_questions/lang_en weak).
+COT_INTERACTION_BASE: tuple[str, ...] = (
+    "has_code",
+    "has_latex",
+    "is_multiple_choice",
+    "n_numbers",
+    "token_len",
+    "type_mcq",
+    "type_code",
+    "type_math",
+)
+
+
+def is_cot_from_condition(condition: str) -> float:
+    """1.0 if the (normalized) condition looks like a CoT/step-by-step mode."""
+    s = str(condition or "").strip().lower()
+    if not s or s == "none":
+        return 0.0
+    return 1.0 if any(tok in s for tok in _COT_TOKENS) else 0.0
+
+
+def item_type_onehot(pool: dict) -> dict[str, float]:
+    """Coarse, mutually-exclusive item type from the form features.
+
+    Priority order code > mcq > math > prose, so every item lands in exactly
+    one bucket. ``pool`` is a dict as returned by :func:`compute_pool_features`.
+    """
+    has_code = float(pool.get("has_code", 0.0)) >= 0.5
+    is_mc = float(pool.get("is_multiple_choice", 0.0)) >= 0.5
+    has_latex = float(pool.get("has_latex", 0.0)) >= 0.5
+    n_numbers = float(pool.get("n_numbers", 0.0))
+    is_math = has_latex or n_numbers >= 5.0
+    t = {n: 0.0 for n in ITEM_TYPE_NAMES}
+    if has_code:
+        t["type_code"] = 1.0
+    elif is_mc:
+        t["type_mcq"] = 1.0
+    elif is_math:
+        t["type_math"] = 1.0
+    else:
+        t["type_prose"] = 1.0
+    return t
+
+
+def cot_interaction_names(bases: Sequence[str] = COT_INTERACTION_BASE) -> list[str]:
+    """Canonical ``cot_x_<base>`` column order."""
+    return [f"cot_x_{b}" for b in bases]
+
+
+def build_cot_interactions(
+    base: np.ndarray,
+    base_names: Sequence[str],
+    is_cot: np.ndarray,
+    *,
+    bases: Sequence[str] = COT_INTERACTION_BASE,
+) -> tuple[np.ndarray, list[str]]:
+    """Build the ``[N, len(bases)]`` CoT-interaction matrix.
+
+    ``base`` is a ``[N, F]`` per-row matrix (z-scored pool features + item-type
+    one-hots), ``base_names`` its column names, ``is_cot`` a ``[N]`` 0/1 vector.
+    Each output column is ``is_cot * base[:, base_col]`` -- i.e. it is zero on
+    non-CoT rows and equal to the (z-scored) base value on CoT rows, which lets
+    a linear/MLP head learn a CoT-specific slope per base feature.
+    """
+    name_to_col = {str(n): i for i, n in enumerate(base_names)}
+    isc = np.asarray(is_cot, dtype=np.float32).reshape(-1, 1)
+    cols: list[np.ndarray] = []
+    out_names: list[str] = []
+    for b in bases:
+        j = name_to_col.get(str(b))
+        if j is None:
+            continue
+        cols.append(base[:, j : j + 1].astype(np.float32) * isc)
+        out_names.append(f"cot_x_{b}")
+    if not cols:
+        return np.zeros((int(base.shape[0]), 0), dtype=np.float32), []
+    return np.concatenate(cols, axis=1).astype(np.float32), out_names
+
+
 __all__ = [
+    "COT_INTERACTION_BASE",
+    "ITEM_TYPE_NAMES",
     "POOL_FEATURE_NAMES",
     "apply_zscore",
     "build_centroid_distance_features",
+    "build_cot_interactions",
     "build_feature_matrix",
     "centroid_distance_feature_names",
     "compute_features_for_items",
     "compute_pool_features",
+    "cot_interaction_names",
     "feature_names",
     "fit_zscore_stats",
+    "is_cot_from_condition",
+    "item_type_onehot",
     "load_pool_features",
     "load_zscore_stats",
     "merge_pool_and_centroid_features",
