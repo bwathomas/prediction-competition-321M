@@ -701,7 +701,11 @@ from src.nn_features import (
 )
 
 if EXP["use_nn_block"]:
-    nn_cfg = NNFeaturesConfig(**CFG["nn_features"])
+    # Use the dataclass's `from_dict` helper because `CFG["nn_features"]`
+    # also carries `query_chunk_size` (a kwarg of compute_nn_features_streaming,
+    # NOT a field on the config dataclass) -- spreading the dict directly
+    # into the dataclass constructor would TypeError on that key.
+    nn_cfg = NNFeaturesConfig.from_dict(CFG["nn_features"])
     NN_DIR = ROOT / nn_cfg.cache_dir / "training_richprobe"
     NN_DIR.mkdir(parents=True, exist_ok=True)
 
