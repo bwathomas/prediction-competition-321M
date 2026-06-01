@@ -236,6 +236,7 @@ N_VAL = int(len(val_df))
 # %%
 from dataclasses import fields as _dc_fields
 
+from src import drive_cache as drive_cache_mod
 from src.embeddings import (
     EncoderConfig,
     TransformerEmbedder,
@@ -287,6 +288,21 @@ CONTENT_HASH = content_hash_for_items(
     list(zip(item_keys_list, item_texts_list))
     + list(zip(subject_keys_list, subject_texts_list))
 )
+print(f"Content hash: {CONTENT_HASH[:16]}...")
+
+# Hydrate the local encoder cache from Drive BEFORE warming the in-memory
+# index. On a fresh Colab kernel the local artifacts dir is empty, so
+# without this step `warm_caches_from_disk` finds nothing and `embed_unique`
+# re-encodes every item. Mirrors the production notebook exactly so the
+# probe hits the same Drive cache the main pipeline populates.
+cache_root = ROOT / CFG["encoder"]["cache_dir"]
+drive_status = drive_cache_mod.resolve_cache(
+    cfg=CFG, encoder_slug=slug,
+    local_cache_root=cache_root, expected_hash=CONTENT_HASH,
+)
+print("Cache decision:", drive_status.reason,
+      "(hit:", bool(drive_status.cache_hit), ")")
+
 embedder.warm_caches_from_disk()
 print("Encoding items (cache-aware)...")
 item_emb_lookup, item_log = embedder.embed_unique(
@@ -294,6 +310,28 @@ item_emb_lookup, item_log = embedder.embed_unique(
     benchmarks=item_benches_list,
 )
 print(f"  cached={item_log['n_cache_hits']}  encoded={item_log['n_encoded']}")
+
+# If the probe encoded anything new (shouldn't happen if the production
+# cache is up to date, but is the safety net), upload back to Drive so
+# future runs hit cache too.
+embedder.finalize(
+    content_hash=CONTENT_HASH,
+    n_items=len(item_keys_list),
+    n_subjects=0,
+    extra_log={"items": item_log, "drive_cache": drive_status.as_dict()},
+)
+_drive_cfg = CFG.get("drive_cache") or {}
+if (
+    _drive_cfg.get("enabled")
+    and _drive_cfg.get("upload_on_completion", True)
+    and getattr(drive_status, "mounted", False)
+    and item_log["n_encoded"]
+):
+    _drive_folder = Path(_drive_cfg["folder"]) / slug
+    print(drive_cache_mod.upload_from_local(
+        local_folder=embedder.base, drive_folder=_drive_folder,
+    ))
+
 ITEM_EMB_DIM = int(embedder.embedding_dim)
 print(f"Item embedding dim D = {ITEM_EMB_DIM}")
 
