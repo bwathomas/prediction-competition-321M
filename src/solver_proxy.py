@@ -244,6 +244,12 @@ class SolverProxyConfig:
     # Items per cache flush: generation + parse + append happen per chunk so
     # progress is visible and the run is resumable mid-way.
     chunk_items: int = 32
+    # Optional system message prepended via the chat template. Used for
+    # models whose reasoning mode is controlled by a system prompt rather
+    # than an ``enable_thinking`` kwarg -- e.g. NVIDIA Llama-Nemotron, which
+    # needs ``"detailed thinking off"`` to emit short, parseable answers
+    # within a small token budget instead of a truncated reasoning trace.
+    system_prompt: str = ""
     solve_template: str = (
         "Solve the following evaluation item. Reason briefly step by step, then "
         "state your final answer on the last line as 'Answer: <answer>'.\n\n"
@@ -268,6 +274,7 @@ def config_hash(cfg: SolverProxyConfig) -> str:
         str(cfg.n_samples), str(round(cfg.temperature, 4)), str(round(cfg.top_p, 4)),
         str(cfg.max_new_tokens), str(cfg.max_prompt_tokens), str(cfg.seed),
         str(cfg.compute_p_true), str(cfg.use_chat_template), str(cfg.enable_thinking),
+        cfg.system_prompt,
         "|".join(cfg.yes_tokens), "|".join(cfg.no_tokens),
     ):
         h.update(part.encode("utf-8", errors="replace"))
@@ -415,7 +422,10 @@ class SolverProxy:
             item_content=str(row.get("item_content", "") or ""),
         )
         if self.cfg.use_chat_template and getattr(self._tok, "chat_template", None):
-            msgs = [{"role": "user", "content": user}]
+            msgs = []
+            if self.cfg.system_prompt:
+                msgs.append({"role": "system", "content": self.cfg.system_prompt})
+            msgs.append({"role": "user", "content": user})
             try:
                 return self._tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True,
@@ -426,7 +436,8 @@ class SolverProxy:
                 return self._tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True,
                 )
-        return user
+        # Raw fallback: prepend the system prompt inline.
+        return f"{self.cfg.system_prompt}\n\n{user}" if self.cfg.system_prompt else user
 
     def _generate_samples(self, prompts: Sequence[str]) -> list[list[str]]:
         """Return ``n_samples`` decoded completions for each prompt (one batch)."""

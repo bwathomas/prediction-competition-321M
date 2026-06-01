@@ -30,16 +30,21 @@
 # into the normal notebook below.
 #
 # Solver models (see `CFG["proxy_probe"]["models"]`): a diverse trio chosen
-# for leaderboard standing **and** family diversity (cross-model disagreement
-# only estimates item *discrimination* if the models fail differently):
-#   * `Qwen/Qwen3-8B`           (Alibaba) -- top general+math 8B; thinking mode.
-#   * `google/gemma-2-9b-it`    (Google)  -- different lineage; strong ARC/Math.
-#   * `microsoft/Phi-4-mini-reasoning` (Microsoft) -- synthetic-heavy training,
-#     genuinely different error modes; the best disagreement source.
-# They also bracket the subject ability range (Phi-mini < Gemma-9B < Qwen3-8B)
-# so the difficulty proxy stays discriminative instead of saturating. All
-# three run by default (`multi_model = True`, `n_samples = 3`); set
-# `multi_model = False` to fall back to the single-model (Qwen3-8B) probe.
+# for family diversity (cross-model disagreement only estimates item
+# *discrimination* if the models fail differently) and -- critically --
+# **ungated** HF repos, so we don't repeat the gated-repo 403 that killed
+# `google/gemma-2-9b-it`. Each entry may be a plain id or a dict carrying
+# per-model overrides (`trust_remote_code`, `system_prompt`, `enable_thinking`):
+#   * `nvidia/Llama-3.1-Nemotron-Nano-8B-v1` (NVIDIA) -- Llama-3.1-8B reasoning
+#     derivative; ungated. Reasoning is toggled by the SYSTEM prompt, so we
+#     pass `"detailed thinking off"` to keep answers short/parseable in the
+#     512-token budget (otherwise it emits a truncated reasoning trace).
+#   * `LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct` (LG AI) -- different lineage
+#     (bilingual KO/EN); ungated but ships custom modeling code, so it needs
+#     `trust_remote_code=True`.
+#   * a Mistral model (the third slot) -- distinct error modes again.
+# All three run by default (`multi_model = True`, `n_samples = 3`); set
+# `multi_model = False` to fall back to the single-model (first) probe.
 #
 # ---
 # Original header follows.
@@ -1435,10 +1440,22 @@ _PP.setdefault("n_boot", 500)
 _PP.setdefault("support_col", 7)            # nn_train_mat col 7 = n_labeled_neighbors_log1p
 # Extra single-model columns (from the primary model) to also evaluate.
 _PP.setdefault("proxy_cols", ["answer_entropy", "p_true", "mean_trace_len"])
+# Each entry is either a plain HF id (str) or a dict with the id plus
+# per-model overrides: trust_remote_code / system_prompt / enable_thinking.
 _PP.setdefault("models", [
-    "Qwen/Qwen3-8B",                 # Alibaba  -- strong, weights likely cached
-    "google/gemma-2-9b-it",          # Google   -- different lineage
-    "microsoft/Phi-4-mini-reasoning",# Microsoft-- synthetic-heavy, distinct errors
+    # NVIDIA Llama-Nemotron: ungated; reasoning toggled via system prompt.
+    {
+        "model_id": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        "system_prompt": "detailed thinking off",
+    },
+    # LG AI EXAONE 3.5: ungated but needs trust_remote_code for custom code.
+    {
+        "model_id": "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct",
+        "trust_remote_code": True,
+    },
+    # Mistral (third slot): ungated Apache-2.0 7B instruct (Ministral-8B and
+    # Mistral-Small/Magistral are gated and/or too large for the probe GPU).
+    "mistralai/Mistral-7B-Instruct-v0.3",
 ])
 
 if not _PP["enabled"]:
@@ -1491,9 +1508,21 @@ else:
     #    cross-model disagreement -- "do DIFFERENT models agree on the answer".
     #    (a) is a within-model difficulty signal; (b) estimates discrimination.
     _models = list(_PP["models"]) if bool(_PP["multi_model"]) else list(_PP["models"])[:1]
+
+    def _normalize_model_entry(_e):
+        """Accept a plain id or a dict with per-model overrides."""
+        if isinstance(_e, str):
+            return {"model_id": _e}
+        _d = dict(_e)
+        if "model_id" not in _d:
+            raise ValueError(f"model entry missing 'model_id': {_e!r}")
+        return _d
+
     _model_dfs: dict[str, "pd.DataFrame"] = {}
     _modal_by_model: dict[str, dict[str, str]] = {}
-    for _mi, _mid in enumerate(_models):
+    for _mi, _entry in enumerate(_models):
+        _spec = _normalize_model_entry(_entry)
+        _mid = _spec["model_id"]
         _cfg_m = SolverProxyConfig(
             model_id=_mid,
             n_samples=int(_PP["n_samples"]),
@@ -1503,7 +1532,10 @@ else:
             # P(True) only on the primary model (cheap extra; others skip it).
             compute_p_true=bool(_PP["compute_p_true"]) and (_mi == 0),
             use_chat_template=bool(_PP["use_chat_template"]),
-            enable_thinking=bool(_PP["enable_thinking"]),
+            # Per-model overrides (fall back to the global probe defaults).
+            enable_thinking=bool(_spec.get("enable_thinking", _PP["enable_thinking"])),
+            trust_remote_code=bool(_spec.get("trust_remote_code", False)),
+            system_prompt=str(_spec.get("system_prompt", "")),
             chunk_items=int(_PP["chunk_items"]),
             cache_dir=str(ROOT / "artifacts" / "solver_proxy"),
         )
@@ -1518,7 +1550,7 @@ else:
             zip(_df_m["item_key"].astype(str), _df_m["modal_answer"].astype(str))
         )
 
-    _primary_id = _models[0]
+    _primary_id = _normalize_model_entry(_models[0])["model_id"]
     _proxy_df = _model_dfs[_primary_id]
 
     # ---- Assemble the candidate proxies -----------------------------------
