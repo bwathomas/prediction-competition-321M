@@ -5,6 +5,7 @@ alwaysApply: true
 
 # Git workflow
 
-- After creating any commit, ALWAYS push to `main` automatically (`git push origin HEAD:main`). Do not ask the user for permission to push.
-- Still only *create* commits when the user asks for one (the auto-push rule applies to commits the user requested).
+- ALWAYS commit every code/notebook change you make in this session, in a coherent message, without being asked. Do not ask for permission to commit.
+- ALWAYS push immediately after committing, also without asking. Push to the **current branch** (`git push -u origin HEAD`) -- only push to `main` when the working branch IS `main`. Never auto-push a feature/experiment branch to `main`.
+- When committing, stage ONLY the files you actually changed this turn. Do not blanket-add unrelated untracked files lying around in the working tree.
 - This shell is PowerShell: do NOT use `&&`, `||`, or heredocs (`<<'EOF'`). Chain commands with `;`, and pass multi-line commit messages via `git commit -F <file>`.

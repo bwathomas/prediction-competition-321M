@@ -203,17 +203,39 @@ primary = make_item_cold_start_split(
 )
 print(f"train rows: {len(primary.train):,}  val rows: {len(primary.val):,}")
 
-# ---- optional sub-sample of TRAIN rows (val kept full) ------------------
+# ---- optional sub-sample of TRAIN, ITEM-BASED (val kept full) ----------
+# Sampling is done on UNIQUE ITEMS, not rows. We pick whole items at random
+# until the cumulative row count first exceeds `max_train_rows`, then keep
+# every row belonging to those items. This preserves:
+#   * Item-cold guarantee at every downstream level (sub-sample boundary is
+#     also an item boundary, so the OOF folds + internal val + cold-start
+#     weights cannot see partial-item leakage).
+#   * The natural rows-per-item distribution (rare items stay rare, hot
+#     items stay hot), which the cold-start weighting in section 6 needs to
+#     be meaningful.
 _rng = np.random.default_rng(SEED)
-_N_full = len(primary.train)
+_full_train = primary.train.reset_index(drop=True)
+_N_full = len(_full_train)
 _max_rows = EXP["max_train_rows"]
 if _max_rows is not None and _N_full > int(_max_rows):
-    _sub_idx = np.sort(_rng.choice(_N_full, int(_max_rows), replace=False))
-    train_df = primary.train.iloc[_sub_idx].reset_index(drop=True)
-    print(f"[subsample] using {len(train_df):,} of {_N_full:,} train rows")
+    _full_keys = _full_train["item_key"].astype(str).to_numpy()
+    _uniq_keys, _rows_per_item = np.unique(_full_keys, return_counts=True)
+    _perm = _rng.permutation(len(_uniq_keys))
+    _shuffled_counts = _rows_per_item[_perm]
+    _cumrows = np.cumsum(_shuffled_counts)
+    _cutoff = int(np.searchsorted(_cumrows, int(_max_rows), side="left")) + 1
+    _cutoff = min(_cutoff, len(_uniq_keys))
+    _kept_items = set(_uniq_keys[_perm[:_cutoff]].tolist())
+    _keep_mask = np.fromiter((k in _kept_items for k in _full_keys),
+                             count=_N_full, dtype=bool)
+    train_df = _full_train.iloc[_keep_mask].reset_index(drop=True)
+    print(f"[subsample] item-based: kept {len(_kept_items):,} of "
+          f"{len(_uniq_keys):,} unique items -> {len(train_df):,} of "
+          f"{_N_full:,} rows (target ~{_max_rows:,})")
 else:
-    train_df = primary.train.reset_index(drop=True)
-    print(f"[subsample] using ALL {len(train_df):,} train rows")
+    train_df = _full_train
+    print(f"[subsample] using ALL {len(train_df):,} train rows "
+          f"({train_df['item_key'].nunique():,} unique items)")
 val_df = primary.val.reset_index(drop=True)
 
 y_train = train_df["label"].astype(float).to_numpy().astype(np.float32)
@@ -359,6 +381,31 @@ print(f"Built {len(folds)} item-cold folds:")
 for f in folds:
     print(f"  fold {f.fold_id}: train_rows={len(f.train_row_idx):,}  "
           f"oof_rows={len(f.oof_row_idx):,}  oof_items={len(f.oof_item_keys):,}")
+
+# Invariant: every fold's train-side item set must be DISJOINT from its
+# OOF-side item set (item-cold guarantee). Hard-fail if violated -- this
+# would silently leak through if `make_item_grouped_folds` were ever
+# changed or fed row-grouped keys by mistake.
+for f in folds:
+    _train_items = set(_train_keys[f.train_row_idx].tolist())
+    _oof_items = set(_train_keys[f.oof_row_idx].tolist())
+    _overlap = _train_items & _oof_items
+    if _overlap:
+        raise RuntimeError(
+            f"[oof check] fold {f.fold_id} has {len(_overlap)} items on "
+            f"BOTH train and OOF sides -- item-cold guarantee violated."
+        )
+# Same invariant between every fold's OOF items and the final val set.
+_val_item_set = set(val_df["item_key"].astype(str).tolist())
+for f in folds:
+    _oof_items = set(_train_keys[f.oof_row_idx].tolist())
+    if _oof_items & _val_item_set:
+        raise RuntimeError(
+            f"[oof check] fold {f.fold_id} OOF items overlap the final val "
+            "set -- this would leak val items into the per-fold training."
+        )
+print("[oof check] item-cold invariants OK: train/oof disjoint per fold + "
+      "OOF disjoint from val.")
 
 # %% [markdown]
 # ## 6. Cold-start weights (item rarity in train)
