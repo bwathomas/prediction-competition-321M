@@ -12,40 +12,49 @@
 # %% [markdown]
 # # MoE proof-of-concept on the M8 architecture
 #
-# **Question.** Does training one Member-8 instance per item-type bucket
-# (upweighted on its own type, full data otherwise) and hard-routing val
-# rows to the matching expert beat a single M8 trained on all data?
+# **Question.** Does training one Member-8 instance per bucket (upweighted
+# on its own bucket, full data otherwise) and hard-routing val rows to
+# the matching expert beat a single M8 trained on all data -- and is the
+# win actually attributable to **routing-specific specialization** rather
+# than a free sample-weight training trick?
 #
-# **Hypothesis.** Different item types (math / code / MCQ / prose) live
-# on qualitatively different feature manifolds, so a single global MLP is
-# forced to compromise across them. Per-type experts free up capacity for
-# within-type structure and should produce errors that disagree on a
-# different axis than a fixed-architecture global model.
+# **Hypothesis.** Different input regions live on qualitatively different
+# feature manifolds, so a single global MLP is forced to compromise
+# across them. Per-region experts free up capacity for within-region
+# structure and produce errors that disagree on an axis the global model
+# cannot exploit.
 #
-# **Why this is a CLEAN test of the MoE hypothesis** (vs. loss-diversity):
-# 1. The training-signal change is along a different axis -- **input-space
-#    specialization**, not loss-shape variation. The loss-diversity probe
-#    falsified loss-shape diversity; we are testing whether the OTHER
-#    axis (input partitioning) carries diversity the global model misses.
-# 2. **Soft training (upweighting) instead of hard partitioning.** Every
-#    expert sees the full data; it just gets a 5x gradient bump on its
-#    own type's rows. Failure here means "MoE doesn't help on this axis"
-#    rather than "the expert undertrained on 1/K of the data" -- removes
-#    the most common false-negative for stratified ensembles.
-# 3. **Hard routing at inference.** Routing is the deterministic item-type
-#    indicator from `src/item_features.py` -- no learned router to debug.
-#    Decouples "do experts specialize?" from "is the router any good?".
+# **Partition axes (EXP['partition_axis']):**
+# * ``item_type``  -- K=4 form buckets (math/code/mcq/prose). The v1 POC.
+#   Coarse + heavily imbalanced (~75% prose). Showed -0.011 nat total lift
+#   but controls revealed ~70% of it was the global focal-style trick.
+# * ``nn_support`` -- **default**. K=N octiles on item-embedding NN
+#   density (mean cosine sim to top-5 nearest TRAIN items, leave-one-out
+#   for train items). Balanced by construction; directly aligned to the
+#   cold-start axis the test set is heavy on; expected to give wider
+#   per-bucket NLL spread => more routing-specific lift potential.
 #
-# **Decision rule from this run:**
-# * Routed ensemble beats baseline by >= 0.003 nats AND the per-type
-#   diagnostic shows each expert beats baseline on its own region:
-#   -> MoE direction is real, escalate to (a) tune weight multiplier,
-#      (b) try soft routing, (c) try joint type x cold-warm partition,
-#      (d) eventually proper end-to-end MoE with a learned router.
-# * Routed beats by < 0.003 but per-type diagnostic shows specialization:
-#   -> routing is wrong; try soft routing or per-row blending.
-# * Per-type diagnostic shows experts barely beating baseline in their
-#   region: -> MoE doesn't work on this axis at this scale. Don't escalate.
+# **What this notebook reports** (mandatory controls baked in):
+# 1. Baseline (uniform M8) -- the apples-to-apples reference.
+# 2. K experts (M8 per bucket, 5x upweight on own bucket, full data).
+# 3. **Hard-routed MoE** -- the "real" MoE prediction.
+# 4. **Scrambled routing** -- route to a RANDOM expert. Isolates the
+#    global lift (focal trick) from routing-specific lift.
+# 5. **Uniform avg of experts** -- diversity sanity check (does naive
+#    averaging beat the best single expert?).
+# 6. **Best single expert** -- floor for any routing scheme.
+# 7. **Per-bucket diagonal** -- does each expert actually win on its own
+#    bucket?
+# 8. **Residual-vs-baseline correlation heatmap** -- the diversity number
+#    a stacker / FWLS merge actually sees (NOT signed-error corr, which
+#    is misleading for strong models).
+#
+# **Decision rule:**
+# * routing_lift (routed - scrambled) <= -0.002 AND >= K/2 diagonal wins
+#   -> escalate this partition (soft routing, weight sweep, more buckets).
+# * routing_lift ~0 BUT global_lift (scrambled - baseline) <= -0.003
+#   -> upweighting is a free training trick; apply to vanilla M8.
+# * neither -> partition doesn't pay. Try a different axis.
 #
 # **All shared infrastructure (data, embeddings, OOF folds, dense block,
 # M8 trainer) is reused from the production stack and the loss-diversity
@@ -121,8 +130,8 @@ SEED = int(CFG["seed"])
 
 # ---- Experiment configuration -------------------------------------------
 # Same compute budget as the loss-diversity probe so the comparison is
-# apples-to-apples. K=4 experts (item type) + 1 baseline = 5 OOF passes
-# over the M8 architecture, identical to the 5 quickest objectives there.
+# apples-to-apples. K experts + 1 baseline = K+1 OOF passes over the M8
+# architecture.
 EXP = {
     # Data / compute budget
     "max_train_rows": 600_000,
@@ -146,22 +155,32 @@ EXP = {
     "feat_dropout": 0.10,
 
     # ---- MoE-specific ---------------------------------------------------
-    # Sample-weight multiplier on rows whose item type matches the expert.
+    # Sample-weight multiplier on rows whose bucket matches the expert.
     # 5x is the recommended starting point: enough to bias the gradient
     # toward the region without near-zero gradient on out-of-region rows
-    # (the failure mode of hard partitioning). Sweep this if the POC
-    # passes -- (3x, 5x, 10x, inf [= hard partition]) is the natural arc.
+    # (the failure mode of hard partitioning).
     "expert_weight_multiplier": 5.0,
-    # Item-type buckets (mutually exclusive, defined in src/item_features.py
-    # via item_type_onehot: priority code > mcq > math > prose, so every
-    # item lands in exactly one bucket).
-    "type_buckets": ("type_code", "type_mcq", "type_math", "type_prose"),
-    # Hard-route val rows to the expert matching the item's type. Soft
-    # routing (blend by type one-hot probabilities) is the obvious next
-    # extension if hard routing under-performs; left as a follow-up so
-    # this POC has exactly one moving part vs. the baseline.
-    "routing": "hard",
 
+    # Partition axis for the K experts. Two implementations:
+    #   "item_type"  -> K=4 mutually-exclusive form buckets from
+    #                   src.item_features.item_type_onehot (priority
+    #                   code > mcq > math > prose). Coarse + heavily
+    #                   imbalanced (~75% prose) -- the v1 POC.
+    #   "nn_support" -> K=n_buckets octiles on item-embedding neighborhood
+    #                   density (mean cosine sim to top-k nearest TRAIN
+    #                   items, leave-one-out for train items so an item
+    #                   is not its own neighbor). Bucket boundaries are
+    #                   fit on the TRAIN distribution; val items
+    #                   distribute by how isolated they are (bucket 0 =
+    #                   coldest support). Balanced by construction +
+    #                   directly aligned to the cold-start axis the
+    #                   test set is heavy on.
+    "partition_axis": "nn_support",
+    "n_buckets": 8,
+    "type_buckets": ("type_code", "type_mcq", "type_math", "type_prose"),
+    "support_k_neighbors": 5,
+
+    "routing": "hard",
     "seed": SEED,
 }
 
@@ -497,56 +516,172 @@ DENSE_DIM = 0 if dense_train is None else int(dense_train.shape[1])
 print(f"[form] dense_train width = {DENSE_DIM}  (use_metadata={EXP['use_metadata']})")
 
 # %% [markdown]
-# ## 7. Per-row item type (the partition axis + the router)
+# ## 7. Per-row expert bucket (the partition axis + the router)
 #
-# This is the MoE-specific bit. For every train/val row we look up the
-# unique item's coarse type via `item_type_onehot` (priority code > mcq >
-# math > prose, so every item is in exactly one bucket). The resulting
-# per-row int vector is BOTH:
-#   * the source of the sample-weight upweight per expert (training), and
-#   * the deterministic router at inference (hard-route to expert k).
-# No learned router; no extra moving parts beyond the experts themselves.
+# This is the MoE-specific bit. We partition train + val rows into K
+# buckets along a single axis, then train one expert per bucket
+# (upweighted on its bucket, full data otherwise). The bucket id is BOTH
+# the source of the sample-weight upweight per expert (training) AND the
+# deterministic router at inference. No learned router; the partition is
+# the entire moving part.
+#
+# Two partition axes are supported (see EXP['partition_axis']):
+#
+# * ``item_type``  -- K=4 form buckets from src.item_features.item_type_onehot
+#   (priority code > mcq > math > prose). Mutually exclusive but heavily
+#   imbalanced on this dataset (~75% prose, so expert_type_prose ends up
+#   training on almost all rows with a small tilt -- the v1 POC showed
+#   exactly this).
+#
+# * ``nn_support`` -- K=n_buckets octiles by item-embedding neighborhood
+#   density. For each item we measure the mean cosine similarity to its
+#   top-k nearest TRAIN items (leave-one-out for train items so an item
+#   is not its own neighbor). Bucket boundaries are fit on the TRAIN item
+#   distribution. Val items distribute naturally by how isolated they
+#   are: bucket 0 = coldest support (smallest mean similarity), bucket
+#   K-1 = warmest. Balanced by construction AND aligned to the cold-start
+#   axis the test set is heavy on -- the right next-step axis after the
+#   v1 (item_type) controls revealed that ~70% of the v1 win was actually
+#   focal-style global lift, not routing-specific specialization.
 
 # %%
-_BUCKETS = list(EXP["type_buckets"])
-_BUCKET_TO_IDX = {b: i for i, b in enumerate(_BUCKETS)}
-K_EXPERTS = len(_BUCKETS)
+_PARTITION_AXIS = str(EXP.get("partition_axis", "nn_support"))
+print(f"[partition] axis = {_PARTITION_AXIS}")
 
+if _PARTITION_AXIS == "item_type":
+    _BUCKET_NAMES = list(EXP["type_buckets"])
+    K_EXPERTS = len(_BUCKET_NAMES)
+    _bucket_to_idx = {b: i for i, b in enumerate(_BUCKET_NAMES)}
 
-def _row_type_ids(item_keys) -> np.ndarray:
-    """Per-row int in [0, K-1] giving the item-type bucket index.
+    def _row_bucket_ids(item_keys) -> np.ndarray:
+        out = np.zeros(int(len(item_keys)), dtype=np.int64)
+        fallback = _bucket_to_idx.get("type_prose", 0)
+        for i, k in enumerate(item_keys):
+            t = _item_type_by_item.get(str(k))
+            if t is None:
+                out[i] = fallback
+                continue
+            for j, name in enumerate(_BUCKET_NAMES):
+                if float(t.get(name, 0.0)) >= 0.5:
+                    out[i] = j
+                    break
+        return out
 
-    Items not present in `_item_type_by_item` (shouldn't happen for any
-    train/val row) fall back to `type_prose` -- the largest residual
-    bucket -- so the router never produces an out-of-range index.
-    """
-    out = np.zeros(int(len(item_keys)), dtype=np.int64)
-    fallback = _BUCKET_TO_IDX.get("type_prose", 0)
-    for i, k in enumerate(item_keys):
-        t = _item_type_by_item.get(str(k))
-        if t is None:
-            out[i] = fallback
-            continue
-        # Each item is in exactly one bucket by construction; argmax over
-        # the one-hot gives the bucket index.
-        for j, name in enumerate(_BUCKETS):
-            if float(t.get(name, 0.0)) >= 0.5:
-                out[i] = j
-                break
-    return out
+elif _PARTITION_AXIS == "nn_support":
+    import faiss
 
+    K_EXPERTS = int(EXP["n_buckets"])
+    K_NN = int(EXP["support_k_neighbors"])
 
-type_train = _row_type_ids(_train_keys)
-type_val = _row_type_ids(_val_keys)
+    # Unique TRAIN item embeddings, L2-normalized so FAISS inner-product
+    # == cosine similarity. ~50k items @ 4096 D -> ~800 MB resident; well
+    # within budget. Keep a separate L2-normalized matrix because the
+    # global ALL_UNIQ table is RAW (the GLU-MLP expects raw embeddings).
+    _train_uniq_keys = sorted(
+        k for k in set(_train_keys.tolist()) if k in item_emb_lookup
+    )
+    _train_emb_uniq = np.stack(
+        [item_emb_lookup[k] for k in _train_uniq_keys]
+    ).astype(np.float32)
+    _train_norms = np.linalg.norm(_train_emb_uniq, axis=1, keepdims=True)
+    _train_emb_uniq = (
+        _train_emb_uniq / np.clip(_train_norms, 1e-12, None)
+    ).astype(np.float32)
 
-print("Type-bucket distribution (TRAIN rows):")
-for j, name in enumerate(_BUCKETS):
-    n = int((type_train == j).sum())
-    print(f"  {name:12s} train_rows={n:>9,} ({n / N_TRAIN:>5.1%})")
-print("Type-bucket distribution (VAL rows):")
-for j, name in enumerate(_BUCKETS):
-    n = int((type_val == j).sum())
-    print(f"  {name:12s} val_rows={n:>9,} ({n / N_VAL:>5.1%})")
+    print(
+        f"[support] building FAISS IP index on {len(_train_uniq_keys):,} "
+        f"unique train items (D={ITEM_EMB_DIM})..."
+    )
+    _faiss_idx = faiss.IndexFlatIP(ITEM_EMB_DIM)
+    _faiss_idx.add(_train_emb_uniq)
+
+    # K+1 neighbors so we can drop rank-0 (self) for train items. Mean
+    # of the next K is the density score -- higher means denser local
+    # neighborhood (warmer support).
+    _sims_train, _ = _faiss_idx.search(_train_emb_uniq, K_NN + 1)
+    _score_train_uniq = _sims_train[:, 1:].mean(axis=1).astype(np.float32)
+    print(
+        f"[support] train item density: min={_score_train_uniq.min():.4f} "
+        f"mean={_score_train_uniq.mean():.4f} "
+        f"max={_score_train_uniq.max():.4f}"
+    )
+
+    # Val items are NOT in the index (item-cold guarantee), so all K
+    # neighbors are different items -- no self-exclusion needed.
+    _val_uniq_keys = sorted(
+        k for k in set(_val_keys.tolist()) if k in item_emb_lookup
+    )
+    _val_emb_uniq = np.stack(
+        [item_emb_lookup[k] for k in _val_uniq_keys]
+    ).astype(np.float32)
+    _val_norms = np.linalg.norm(_val_emb_uniq, axis=1, keepdims=True)
+    _val_emb_uniq = (
+        _val_emb_uniq / np.clip(_val_norms, 1e-12, None)
+    ).astype(np.float32)
+    _sims_val, _ = _faiss_idx.search(_val_emb_uniq, K_NN)
+    _score_val_uniq = _sims_val.mean(axis=1).astype(np.float32)
+    print(
+        f"[support] val item density:   min={_score_val_uniq.min():.4f} "
+        f"mean={_score_val_uniq.mean():.4f} "
+        f"max={_score_val_uniq.max():.4f}"
+    )
+
+    # Bucket boundaries from TRAIN distribution. K-1 cut points produce
+    # K buckets (octiles for K=8). Items below the first cut go in
+    # bucket 0; items above the last cut go in bucket K-1.
+    _boundaries = np.quantile(
+        _score_train_uniq, np.linspace(0.0, 1.0, K_EXPERTS + 1)
+    )[1:-1].astype(np.float32)
+    print(
+        f"[support] {K_EXPERTS}-bucket cut points: "
+        + ", ".join(f"{b:.4f}" for b in _boundaries)
+    )
+
+    _support_by_item: dict[str, float] = dict(
+        zip(_train_uniq_keys, _score_train_uniq.tolist())
+    )
+    for k, s in zip(_val_uniq_keys, _score_val_uniq.tolist()):
+        _support_by_item[k] = float(s)
+    _median_score = float(np.median(_score_train_uniq))
+
+    def _row_bucket_ids(item_keys) -> np.ndarray:
+        scores = np.fromiter(
+            (
+                float(_support_by_item.get(str(k), _median_score))
+                for k in item_keys
+            ),
+            count=int(len(item_keys)),
+            dtype=np.float32,
+        )
+        return np.searchsorted(
+            _boundaries, scores, side="right"
+        ).astype(np.int64)
+
+    # q1 = coldest (lowest mean-sim quantile); qK = warmest.
+    _BUCKET_NAMES = [f"support_q{j + 1}" for j in range(K_EXPERTS)]
+
+    # Free the L2-normalized matrices + the index now that we have the
+    # bucket assignments. The GLU-MLP downstream uses ALL_UNIQ (raw
+    # embeddings), not these.
+    del _train_emb_uniq, _val_emb_uniq, _faiss_idx, _sims_train, _sims_val
+else:
+    raise ValueError(
+        f"Unknown EXP['partition_axis']={_PARTITION_AXIS!r}; "
+        "expected one of {'item_type', 'nn_support'}"
+    )
+
+bucket_train = _row_bucket_ids(_train_keys)
+bucket_val = _row_bucket_ids(_val_keys)
+
+print(f"\nK_EXPERTS = {K_EXPERTS}")
+print("Bucket distribution (TRAIN rows):")
+for j, name in enumerate(_BUCKET_NAMES):
+    n = int((bucket_train == j).sum())
+    print(f"  {name:14s} train_rows={n:>9,} ({n / N_TRAIN:>5.1%})")
+print("Bucket distribution (VAL rows):")
+for j, name in enumerate(_BUCKET_NAMES):
+    n = int((bucket_val == j).sum())
+    print(f"  {name:14s} val_rows={n:>9,} ({n / N_VAL:>5.1%})")
 
 # %% [markdown]
 # ## 8. Train baseline + K experts (item-cold OOF, shared trainer)
@@ -555,9 +690,11 @@ for j, name in enumerate(_BUCKETS):
 # weights (= 1 everywhere). The fair control.
 #
 # **Expert k**: same M8, trained on full data with
-# `sample_weight = expert_weight_multiplier` on rows whose item type is
-# bucket k, and `1.0` elsewhere. Every expert still sees the full data
-# every epoch -- failure here cannot be blamed on undertraining.
+# `sample_weight = expert_weight_multiplier` on rows whose bucket equals
+# k, and `1.0` elsewhere (then mean-normalized to 1.0 so total gradient
+# magnitude per batch matches the baseline). Every expert still sees the
+# full data every epoch -- failure here cannot be blamed on
+# undertraining.
 #
 # Same OOF folds, same epochs, same patience, same seed offsetting as
 # the loss-diversity probe -- so we can read the comparison as a clean
@@ -626,9 +763,9 @@ oof_preds["baseline"], val_preds["baseline"] = _run_one_oof(
     "baseline (uniform weights)", sample_weights=None,
 )
 
-# K experts, one per item-type bucket.
-for j, name in enumerate(_BUCKETS):
-    in_bucket = (type_train == j)
+# K experts, one per bucket.
+for j, name in enumerate(_BUCKET_NAMES):
+    in_bucket = (bucket_train == j)
     w = _make_weights(in_bucket, EXP["expert_weight_multiplier"])
     n_in = int(in_bucket.sum())
     print(
@@ -684,7 +821,7 @@ def _platt(p_oof, p_val):
     return stacker_apply_batch(st, Xv).astype(np.float32)
 
 
-_names = ["baseline"] + [f"expert_{b}" for b in _BUCKETS]
+_names = ["baseline"] + [f"expert_{b}" for b in _BUCKET_NAMES]
 cal_val = {n: _platt(oof_preds[n], val_preds[n]) for n in _names}
 print("\nCalibrated solo val log-loss (lower is better):")
 _solo = {n: _nll(cal_val[n], y_val) for n in _names}
@@ -694,18 +831,27 @@ for n in _names:
     print(f"  {n:24s}: {_solo[n]:.6f}   (vs baseline: {d:+.6f})")
 
 # %% [markdown]
-# ## 10. Per-type specialization diagnostic
+# ## 10. Per-bucket specialization diagnostic
 #
 # **The single most important table in this notebook.** For each
-# (expert k, type bucket j) we report calibrated val NLL on the SLICE of
-# val rows whose item type is j. The diagonal entries (expert k on its
-# own type) are where MoE has to pay off. Compare to the baseline row.
+# (expert k, bucket j) we report calibrated val NLL on the SLICE of val
+# rows in bucket j. The diagonal entries (expert k on its own bucket)
+# are where routing-specific MoE has to pay off. Compare to the baseline
+# row to see whether the upweighting bought anything that scrambled
+# routing wouldn't also capture.
 
 # %%
-print("\n" + "=" * 88)
-print("PER-TYPE SPECIALIZATION DIAGNOSTIC (calibrated val NLL on each type slice)")
-print("=" * 88)
-header = f"{'model':<24s}" + "".join(f"{b:>16s}" for b in _BUCKETS) + f"{'overall':>10s}"
+print("\n" + "=" * 96)
+print(
+    f"PER-BUCKET SPECIALIZATION DIAGNOSTIC "
+    f"(calibrated val NLL on each bucket slice; axis={_PARTITION_AXIS})"
+)
+print("=" * 96)
+header = (
+    f"{'model':<28s}"
+    + "".join(f"{b:>14s}" for b in _BUCKET_NAMES)
+    + f"{'overall':>10s}"
+)
 print(header)
 print("-" * len(header))
 
@@ -718,20 +864,20 @@ def _slice_nll(p, mask):
 
 _slice_table = {}
 for n in _names:
-    row = [f"{n:<24s}"]
+    row = [f"{n:<28s}"]
     slice_vals = []
-    for j, b in enumerate(_BUCKETS):
-        mask = (type_val == j)
+    for j, _ in enumerate(_BUCKET_NAMES):
+        mask = (bucket_val == j)
         v = _slice_nll(cal_val[n], mask)
         slice_vals.append(v)
-        row.append(f"{v:>16.6f}")
+        row.append(f"{v:>14.6f}")
     row.append(f"{_solo[n]:>10.6f}")
     _slice_table[n] = slice_vals
     print("".join(row))
 
-print("\nDIAGONAL CHECK -- each expert vs the baseline ON ITS OWN TYPE:")
-print(f"  {'type':<14s}{'baseline':>12s}{'expert':>12s}{'delta':>12s}")
-for j, b in enumerate(_BUCKETS):
+print("\nDIAGONAL CHECK -- each expert vs the baseline ON ITS OWN BUCKET:")
+print(f"  {'bucket':<14s}{'baseline':>12s}{'expert':>12s}{'delta':>12s}")
+for j, b in enumerate(_BUCKET_NAMES):
     base_v = _slice_table["baseline"][j]
     exp_v = _slice_table[f"expert_{b}"][j]
     d = exp_v - base_v
@@ -739,150 +885,284 @@ for j, b in enumerate(_BUCKETS):
     print(f"  {b:<14s}{base_v:>12.6f}{exp_v:>12.6f}{d:>+12.6f}{flag}")
 
 # %% [markdown]
-# ## 11. Hard-routed ensemble: route val row to expert matching its type
+# ## 11. Hard-routed ensemble + decomposition controls
 #
-# This is the actual MoE prediction. No learned router -- each row goes
-# to the expert assigned to its item-type bucket.
+# Three reported numbers:
+#
+# * **routed** -- hard-route each val row to the expert for its bucket.
+#   The actual MoE prediction.
+# * **scrambled** -- route each val row to a RANDOM expert. Isolates the
+#   "experts are systematically better than baseline" lift (focal-style
+#   sample-weight effect) from the routing-specific lift.
+# * **uniform avg** -- mean of all expert predictions per row. Tells us
+#   whether the experts are diverse enough that naive averaging beats
+#   the best single one.
+# * **best single expert** -- the expert with lowest overall NLL on its
+#   own. Floor for any routing/merging scheme; if "routed" doesn't beat
+#   this, routing is adding no value beyond pick-the-best-expert.
+#
+# The decomposition is:
+#     routed_lift  =  (scrambled - baseline)  +  (routed - scrambled)
+#                  =       global lift         +     routing lift
+# If most of `routed_lift` is global, the win is a free training trick
+# you can apply to vanilla M8 without any MoE architecture.
 
 # %%
-def _route_hard(per_expert_val, type_per_row):
-    """Hard-route: per_expert_val is dict[expert_name] -> [N_val] probs.
-
-    Returns [N_val] where row i takes the prediction from
-    `expert_<bucket_for_row_i>`.
-    """
-    out = np.empty(int(len(type_per_row)), dtype=np.float32)
-    for j, b in enumerate(_BUCKETS):
-        mask = (type_per_row == j)
+def _route_hard(per_expert_val, bucket_per_row):
+    """Hard-route: row i takes prediction from expert_<bucket_per_row[i]>."""
+    out = np.empty(int(len(bucket_per_row)), dtype=np.float32)
+    for j, b in enumerate(_BUCKET_NAMES):
+        mask = (bucket_per_row == j)
         out[mask] = per_expert_val[f"expert_{b}"][mask]
     return out
 
 
-# Use the calibrated per-expert val preds for the routed ensemble, so
-# the comparison to the calibrated baseline is apples-to-apples (each
-# expert contributes a Platt-calibrated probability to its routed slice).
-p_routed = _route_hard(cal_val, type_val)
+# Calibrated per-expert val preds so every comparison is apples-to-apples.
+p_routed = _route_hard(cal_val, bucket_val)
 nll_routed = _nll(p_routed, y_val)
 
-print("\n" + "=" * 64)
-print("ROUTED ENSEMBLE vs BASELINE (val log-loss; lower is better)")
-print("=" * 64)
-print(f"  Baseline (uniform M8, calibrated)   : {_base_nll:.6f}")
-print(f"  Hard-routed MoE (K={K_EXPERTS} experts, "
-      f"upweight={EXP['expert_weight_multiplier']}x)  : "
-      f"{nll_routed:.6f}  ({nll_routed - _base_nll:+.6f})")
+# Scrambled routing: route to a random expert (not the row's bucket).
+_rng_route = np.random.default_rng(SEED + 12345)
+_scrambled_bucket = _rng_route.integers(0, K_EXPERTS, size=N_VAL).astype(np.int64)
+p_scrambled = _route_hard(cal_val, _scrambled_bucket)
+nll_scrambled = _nll(p_scrambled, y_val)
 
-# Routed-ensemble per-type slice diagnostic.
-print("\nPer-type slice for the routed ensemble:")
-print(f"  {'type':<14s}{'baseline':>12s}{'routed':>12s}{'delta':>12s}")
-for j, b in enumerate(_BUCKETS):
-    mask = (type_val == j)
+# Uniform average of all expert predictions.
+p_uniform = np.mean(
+    [cal_val[f"expert_{b}"] for b in _BUCKET_NAMES], axis=0
+).astype(np.float32)
+nll_uniform = _nll(p_uniform, y_val)
+
+# Best single expert (smallest overall calibrated NLL among experts).
+_expert_solo = {
+    n: _solo[n] for n in _names if n != "baseline"
+}
+_best_single_name = min(_expert_solo, key=_expert_solo.get)
+nll_best_single = _expert_solo[_best_single_name]
+
+# Decomposition: split routed_lift into global vs routing components.
+_global_lift = nll_scrambled - _base_nll
+_routing_lift = nll_routed - nll_scrambled
+_total_lift = nll_routed - _base_nll
+
+print("\n" + "=" * 72)
+print("ROUTED ENSEMBLE vs BASELINE (val log-loss; lower is better)")
+print("=" * 72)
+print(f"  Baseline (uniform M8, calibrated)        : {_base_nll:.6f}")
+print(f"  Scrambled routing (random expert per row): {nll_scrambled:.6f}  "
+      f"({nll_scrambled - _base_nll:+.6f})")
+print(f"  Uniform avg of {K_EXPERTS} experts                : "
+      f"{nll_uniform:.6f}  ({nll_uniform - _base_nll:+.6f})")
+print(f"  Best single expert ({_best_single_name:<22s}): "
+      f"{nll_best_single:.6f}  ({nll_best_single - _base_nll:+.6f})")
+print(f"  Hard-routed MoE (K={K_EXPERTS}, upweight"
+      f"={EXP['expert_weight_multiplier']}x)     : "
+      f"{nll_routed:.6f}  ({_total_lift:+.6f})")
+
+print("\nLIFT DECOMPOSITION:")
+print(f"  Global (scrambled - baseline)  : {_global_lift:+.6f}  "
+      f"(any-expert vs baseline; pure focal effect, no routing needed)")
+print(f"  Routing (routed   - scrambled) : {_routing_lift:+.6f}  "
+      f"(routed - scrambled; pure routing-specific gain)")
+print(f"  Total  (routed    - baseline)  : {_total_lift:+.6f}")
+if abs(_total_lift) > 1e-9:
+    _routing_share = max(0.0, -_routing_lift) / max(1e-9, -_total_lift) * 100.0
+    print(f"  Routing share of total lift    : {_routing_share:.1f}%")
+
+# Routed-ensemble per-bucket slice.
+print("\nPer-bucket slice for the routed ensemble:")
+print(f"  {'bucket':<14s}{'baseline':>12s}{'routed':>12s}{'delta':>12s}")
+for j, b in enumerate(_BUCKET_NAMES):
+    mask = (bucket_val == j)
     base_v = _slice_nll(cal_val["baseline"], mask)
     routed_v = _slice_nll(p_routed, mask)
     d = routed_v - base_v
     print(f"  {b:<14s}{base_v:>12.6f}{routed_v:>12.6f}{d:>+12.6f}")
 
 # %% [markdown]
-# ## 12. Error-correlation heatmap
+# ## 12. Diversity heatmaps
 #
-# Signed-error correlation `(p_cal - y)` on val across:
-# baseline + K experts + the hard-routed ensemble. We want EXPERTS to
-# de-correlate FROM EACH OTHER (off-diagonal much below 1.0); routed
-# vs baseline tells us how much the routing axis adds beyond a single
-# global model.
+# Two complementary correlation matrices, both on val:
+#
+# * **Signed-error correlation** `corr(p_i - y, p_j - y)`. The classic
+#   ensemble-diversity number. Misleading when models are all reasonably
+#   strong: most of the variance in `p_i - y` is explained by the binary
+#   label, so any two competent models score ~0.95+ even when they
+#   disagree meaningfully on row-level probabilities.
+# * **Residual-vs-baseline correlation** `corr(p_i - p_base, p_j - p_base)`.
+#   The right diversity metric for ensembling around an existing strong
+#   model: subtract the baseline level, then ask whether the experts
+#   move in the same direction or different directions. This is what
+#   stacker weights actually see and what governs whether a per-region
+#   FWLS merge can recover signal.
 
 # %%
 _corr_names = _names + ["routed"]
-_err_stack = np.stack(
-    [cal_val[n] - y_val for n in _names] + [p_routed - y_val], axis=1
+_p_stack = {n: cal_val[n] for n in _names}
+_p_stack["routed"] = p_routed
+
+# Signed-error correlation (classic, often misleading).
+_err_stack = np.stack([_p_stack[n] - y_val for n in _corr_names], axis=1)
+_corr_err = np.corrcoef(_err_stack.T)
+
+# Residual-vs-baseline (drop baseline column since it would be 0).
+_resid_names = [n for n in _corr_names if n != "baseline"]
+_resid_stack = np.stack(
+    [_p_stack[n] - cal_val["baseline"] for n in _resid_names], axis=1
 )
-_corr = np.corrcoef(_err_stack.T)
+_corr_resid = np.corrcoef(_resid_stack.T)
 
-# Per-pair max-off-diagonal summary (the headline diversity number).
-_K = _corr.shape[0]
+_K = _corr_err.shape[0]
 _mask = ~np.eye(_K, dtype=bool)
-print(f"\nMean off-diagonal |error correlation| (all-pairs) = "
-      f"{np.abs(_corr[_mask]).mean():.4f}")
+print(
+    f"\nMean off-diagonal |error correlation|       (all)     = "
+    f"{np.abs(_corr_err[_mask]).mean():.4f}"
+)
 
-# Just the experts vs experts (drop baseline/routed) -- this is the
-# "do the experts disagree with each other?" diagnostic.
 _exp_idx = [i for i, n in enumerate(_corr_names) if n.startswith("expert_")]
-_exp_corr = _corr[np.ix_(_exp_idx, _exp_idx)]
+_exp_err = _corr_err[np.ix_(_exp_idx, _exp_idx)]
 _exp_mask = ~np.eye(len(_exp_idx), dtype=bool)
-print(f"Mean off-diagonal |error correlation| (experts only) = "
-      f"{np.abs(_exp_corr[_exp_mask]).mean():.4f}")
+print(
+    f"Mean off-diagonal |error correlation|       (experts) = "
+    f"{np.abs(_exp_err[_exp_mask]).mean():.4f}"
+)
 
-try:
-    import matplotlib.pyplot as plt
+_Kr = _corr_resid.shape[0]
+_mask_r = ~np.eye(_Kr, dtype=bool)
+print(
+    f"Mean off-diagonal |residual-vs-base corr|   (experts) = "
+    f"{np.abs(_corr_resid[_mask_r]).mean():.4f}  "
+    f"<-- DIVERSITY signal (lower = more orthogonal)"
+)
 
-    fig, ax = plt.subplots(figsize=(9, 7.5))
-    im = ax.imshow(_corr, vmin=0.0, vmax=1.0, cmap="viridis")
-    ax.set_xticks(range(_K))
-    ax.set_yticks(range(_K))
-    ax.set_xticklabels(_corr_names, rotation=45, ha="right")
-    ax.set_yticklabels(_corr_names)
-    for i in range(_K):
-        for j in range(_K):
-            ax.text(j, i, f"{_corr[i, j]:.2f}", ha="center", va="center",
-                    color="white" if _corr[i, j] < 0.7 else "black", fontsize=8)
-    ax.set_title(
-        f"MoE error correlation (val)\n"
-        f"K={K_EXPERTS} item-type experts, upweight"
-        f"={EXP['expert_weight_multiplier']}x, hard routing"
-    )
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    _outdir = ROOT / "artifacts" / "diagnostics"
-    _outdir.mkdir(parents=True, exist_ok=True)
-    _outpath = _outdir / "moe_poc_corr.png"
-    fig.savefig(_outpath, dpi=120, bbox_inches="tight")
-    print(f"[heatmap] saved -> {_outpath}")
-    plt.show()
-except Exception as exc:  # pragma: no cover - plotting optional
-    print(f"[heatmap] skipped ({exc!r})")
-    print(np.round(_corr, 3))
+
+def _render(corr, names, title, fname, cmap_high=0.7, fig_w=9.0, fig_h=7.5):
+    try:
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        im = ax.imshow(corr, vmin=-1.0, vmax=1.0, cmap="RdBu_r")
+        ax.set_xticks(range(len(names)))
+        ax.set_yticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=45, ha="right")
+        ax.set_yticklabels(names)
+        for i in range(len(names)):
+            for j in range(len(names)):
+                ax.text(
+                    j, i, f"{corr[i, j]:+.2f}", ha="center", va="center",
+                    color="white" if abs(corr[i, j]) > cmap_high else "black",
+                    fontsize=7,
+                )
+        ax.set_title(title)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        _outdir = ROOT / "artifacts" / "diagnostics"
+        _outdir.mkdir(parents=True, exist_ok=True)
+        _outpath = _outdir / fname
+        fig.savefig(_outpath, dpi=120, bbox_inches="tight")
+        print(f"[heatmap] saved -> {_outpath}")
+        plt.show()
+    except Exception as exc:  # pragma: no cover - plotting optional
+        print(f"[heatmap {fname}] skipped ({exc!r})")
+        print(np.round(corr, 3))
+
+
+_render(
+    _corr_err,
+    _corr_names,
+    title=(
+        f"MoE signed-error correlation (val)\n"
+        f"axis={_PARTITION_AXIS}, K={K_EXPERTS}, "
+        f"upweight={EXP['expert_weight_multiplier']}x, hard routing"
+    ),
+    fname=f"moe_poc_{_PARTITION_AXIS}_K{K_EXPERTS}_err_corr.png",
+)
+_render(
+    _corr_resid,
+    _resid_names,
+    title=(
+        f"MoE residual-vs-baseline correlation (val)\n"
+        f"axis={_PARTITION_AXIS}, K={K_EXPERTS}, "
+        f"upweight={EXP['expert_weight_multiplier']}x  "
+        f"(lower off-diag = more useful to a stacker)"
+    ),
+    fname=f"moe_poc_{_PARTITION_AXIS}_K{K_EXPERTS}_resid_corr.png",
+)
 
 # %% [markdown]
 # ## 13. Verdict
 #
-# Apply the decision rule from the header:
-# * Routed beats baseline by >= 0.003 nats AND per-type diagonal shows
-#   each expert beating baseline on its own type
-#   -> MoE direction is real; escalate (weight sweep, soft routing, MoE
-#      proper with learned router).
-# * Routed beats by < 0.003 but per-type shows specialization
-#   -> routing is wrong; try soft routing or per-row blending.
-# * Per-type diagonal shows experts barely beating baseline in own
-#   region -> MoE doesn't work on this axis at this scale; don't escalate.
+# We score the partition on **three** signals, not just `routed - baseline`:
+#
+# 1. **routing-specific lift**  = `routed - scrambled` -- the only
+#    component that's actually attributable to MoE-style specialization.
+#    If this is ~0, the win (if any) is just the focal-style sample-weight
+#    trick and you should pursue that directly on vanilla M8, not MoE.
+# 2. **per-bucket diagonal wins** = number of buckets where the matching
+#    expert beats baseline on its own slice. Tells us whether each expert
+#    is actually specializing.
+# 3. **residual-vs-baseline orthogonality** = mean off-diagonal of
+#    `corr(p_expert - p_base, p_other_expert - p_base)`. The number a
+#    stacker (or FWLS merge) actually sees. Lower = more useful.
+#
+# Decision tree:
+# * routing_lift <= -0.002 AND >= K/2 diagonal wins
+#     -> escalate this partition (soft routing, weight sweep, more buckets).
+# * routing_lift >= -0.001 BUT global_lift <= -0.003
+#     -> the upweighting is a free training trick. Apply it to vanilla M8
+#        (no architecture change) and move on.
+# * neither holds
+#     -> partition does nothing. Try a different axis.
 
 # %%
 _diag_wins = 0
 _diag_total = 0
-for j, b in enumerate(_BUCKETS):
+for j, b in enumerate(_BUCKET_NAMES):
     base_v = _slice_table["baseline"][j]
     exp_v = _slice_table[f"expert_{b}"][j]
     _diag_total += 1
     if exp_v < base_v - 0.0005:
         _diag_wins += 1
-_routed_delta = nll_routed - _base_nll
-print("=" * 64)
-print("VERDICT")
-print("=" * 64)
-print(f"  Baseline (uniform M8)        : {_base_nll:.6f}")
-print(f"  Hard-routed MoE              : {nll_routed:.6f}  ({_routed_delta:+.6f})")
-print(f"  Experts winning on own type  : {_diag_wins}/{_diag_total}")
-print(f"  Mean experts-only |err corr| : "
-      f"{np.abs(_exp_corr[_exp_mask]).mean():.4f}")
-if _routed_delta < -0.003 and _diag_wins == _diag_total:
-    print("  -> MoE WORKS on item-type axis. Escalate: sweep weight "
-          "multiplier, try soft routing, try joint partition.")
-elif _routed_delta < -0.0005 and _diag_wins >= max(1, _diag_total // 2):
-    print("  -> Marginal MoE win. Likely the routing is leaving lift on "
-          "the table; try soft routing next.")
-elif _diag_wins == 0:
-    print("  -> No specialization on the per-type diagonal. MoE on "
-          "item-type does not pay here. Try a different partition axis "
-          "(subject family, embedding cluster) or accept the conclusion.")
+_mean_resid_corr = float(np.abs(_corr_resid[_mask_r]).mean())
+
+print("=" * 72)
+print(f"VERDICT (partition_axis={_PARTITION_AXIS}, K={K_EXPERTS}, "
+      f"upweight={EXP['expert_weight_multiplier']}x)")
+print("=" * 72)
+print(f"  Baseline (uniform M8)                : {_base_nll:.6f}")
+print(f"  Scrambled routing                    : {nll_scrambled:.6f}  "
+      f"({_global_lift:+.6f}  global lift)")
+print(f"  Hard-routed MoE                      : {nll_routed:.6f}  "
+      f"({_total_lift:+.6f}  total)")
+print(f"  Routing-specific lift (routed-scram) : {_routing_lift:+.6f}")
+print(f"  Best single expert ({_best_single_name:<22s}) : {nll_best_single:.6f}")
+print(f"  Uniform avg of {K_EXPERTS} experts            : {nll_uniform:.6f}")
+print(f"  Experts winning on own bucket        : {_diag_wins}/{_diag_total}")
+print(f"  Mean residual-vs-base |corr| (exp)   : {_mean_resid_corr:.4f}  "
+      f"(lower = more useful to stacker)")
+
+if _routing_lift <= -0.002 and _diag_wins >= max(1, _diag_total // 2):
+    print(
+        f"  -> ROUTING-SPECIFIC WIN on axis={_PARTITION_AXIS}. Escalate: "
+        "sweep weight multiplier, try soft routing (item-conditional "
+        "blend), add this as a 5th member to the ensemble."
+    )
+elif _routing_lift >= -0.0010 and _global_lift <= -0.003:
+    print(
+        "  -> NO routing-specific lift, but the upweighting is a "
+        "free training trick. Apply non-uniform sample weights to "
+        "vanilla M8 (no MoE architecture) and move on."
+    )
+elif _mean_resid_corr < 0.5 and _total_lift <= -0.001:
+    print(
+        "  -> Mixed: routing doesn't beat scrambled by much, BUT the "
+        "experts are diverse enough that a stacker / FWLS merge "
+        "might recover the lift. Worth feeding into the L1 stacker "
+        "as separate members."
+    )
 else:
-    print("  -> Mixed: some experts specialize but routing doesn't recover "
-          "it. Soft routing is the next experiment.")
+    print(
+        f"  -> Axis '{_PARTITION_AXIS}' does not pay here. Try a "
+        "different partition (NN support if you ran item_type, or "
+        "vice versa; subject cluster; embedding k-means)."
+    )
