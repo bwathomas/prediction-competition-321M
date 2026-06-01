@@ -10,58 +10,50 @@
 # ---
 
 # %% [markdown]
-# # Feature-dropout × NN-support MoE × per-row gated combiner
+# # Feature-dropout x NN-support MoE x linear stacker -- SWEEP edition
 #
-# **The question this notebook answers.** The
-# `feature_dropout_ensemble.py` probe showed something we hadn't seen
-# before: **truly orthogonal / anti-correlated residuals** between
-# rich-M8 variants where one feature class is masked at train AND val.
-# The logit-linear Platt stacker only extracted -0.0010 nat from those
-# residuals because two of the most orthogonal variants
-# (`no_subj_channel`, `no_nn_block`) are also the weakest in absolute
-# terms, and a single-weight-per-member linear combiner has no way to
-# leverage their orthogonality without importing their absolute error.
+# **The question this notebook answers.** Prior run of this notebook
+# (single MoE config: upweight=5x, K=8 NN-support quartiles) showed
+# the **logit-linear stacker on 6 variant-MoE preds wins at 0.45568
+# val NLL** -- the first stacker in the project that actually uses
+# multiple members with meaningful weights (no_subj +0.13, no_form
+# +0.36, no_nn -0.09 corrective, etc.). FWLS overfit; MLP added
+# nothing.
 #
-# This notebook tests **whether a per-row gated combiner can extract
-# the rest** by:
+# Now we want to know: **was (upweight=5x, K=8) the right MoE
+# hyperparameter choice?** This notebook does a 2-stage sweep:
 #
-# 1. Training the NN-support MoE (8 buckets, soft-routed at
-#    `tau = 1.0 * std`) **for each of the K+1 = 6 feature-dropout
-#    variants**. Each variant gets its own routed prediction, so we
-#    have 6 routed-MoE outputs instead of 1.
-# 2. Combining those 6 routed predictions with three different
-#    blenders, sharing the same OOF features and val targets so the
-#    comparison is paired:
-#    * **Uniform avg** -- naive baseline.
-#    * **Logit-linear stacker** (current production style) -- one
-#      global weight per member; auxiliary features enter as bias.
-#    * **FWLS-style stacker** -- explicit (member x aux) cross
-#      terms so per-row gating is possible. Built by hand because
-#      `fit_stacker` only adds aux features as standalone columns.
-#    * **Small MLP combiner** -- a tiny 2-layer net on the 6 logits +
-#      4 aux features. Non-linear, so it can express interactions the
-#      stacker can't.
-# 3. Reporting the per-combiner val NLL versus the relevant
-#    references (rich_baseline alone, rich_baseline + MoE, feature-
-#    dropout uniform_avg, feature-dropout Platt stacker) so we know
-#    whether the per-row gating actually pays.
+# **Stage A -- cheap single-variant MoE grid** over
+# (`expert_weight_multiplier`, `support_k_buckets`). Uses ONLY the
+# `full` variant (no feature dropout). Reports per-cell solo NLL
+# after Platt calibration of the soft-routed prediction. ~10 hours
+# at the default grid (3 upweights x 3 K-buckets x 1 variant x
+# avg(K)=9.3 buckets x 3 folds = 252 trainings).
 #
-# **Order-of-operations note.** This is the
-# *feature-dropout-outer / MoE-inner* arrangement that the prior
-# notebook's header argued for: each feature-dropout variant gets its
-# own complete soft-routed MoE on top, then the combiner does a per-
-# row weighted blend across the K+1 routed predictions. The (variant,
-# bucket) grid has `(K + 1) * M = 6 * 8 = 48` trained nets per fold;
-# at `n_folds = 3` that's 144 trainings before the combiners run.
-# Knob it down with `EXP["variants"]` and `EXP["support_k_buckets"]`
-# if compute is tight.
+# **Stage B -- full pipeline at winner.** Take the best (upweight*,
+# K*) from Stage A, then re-run the full 6-variant feature-dropout
+# pipeline at that config and report the logit-linear stacker NLL.
+# ~6 hours at K=8 (6 variants x 8 buckets x 3 folds = 144
+# trainings); scales linearly with K_winner.
 #
-# **What this notebook shares with the prior two notebooks.** Same
-# data, same item-cold OOF folds, same per-unit UNK redaction at
-# train AND val time, same Qwen3 item embedding cache, same metadata
-# preprocessor, same rich net architecture + per-variant feature
-# masking, same NN-support partition geometry. Only the per-variant
-# MoE + the FWLS / MLP combiners are new.
+# **What's the same as the prior run.** Same data, same item-cold
+# OOF folds, same per-unit UNK redaction at train AND val time,
+# same Qwen3 item embedding cache, same metadata preprocessor, same
+# rich net architecture + per-variant feature masking, same FAISS
+# per-row NN-support SCORE (only the bucket *partition* depends on
+# K). Only Stage A and Stage B's outer sweep loop are new.
+#
+# **Combiner choice.** Per the prior result, only the logit-linear
+# stacker is enabled by default (FWLS overfit; small MLP added no
+# signal). Flip the knobs in EXP if you want them back.
+#
+# **Caveat on the sweep design.** Stage A picks the winner based on
+# single-variant (`full`) solo NLL, not on the full feature-dropout
+# stacker NLL. The two orderings could differ -- the stacker might
+# prefer a slightly different (upweight, K). To be sure, ship the
+# Stage B result only after re-running it at the runner-up (upweight,
+# K) and confirming it's worse. We skip that here to keep compute
+# bounded; the verdict cell flags the residual uncertainty.
 
 # %% [markdown]
 # ## 0. Colab bootstrap
@@ -107,7 +99,7 @@ print(f"Working directory: {ROOT}")
 print(f"In Colab: {IN_COLAB}")
 
 # %% [markdown]
-# ## 1. Config + experiment knobs
+# ## 1. Config + experiment knobs (NEW: sweep grid)
 
 # %%
 import numpy as np
@@ -129,7 +121,7 @@ CFG["encoder"].update({
 SEED = int(CFG["seed"])
 
 EXP = {
-    # ---- Shared budget --------------------------------------------------
+    # ---- Shared budget ----------------------------------------------
     "max_train_rows": 600_000,
     "n_folds": 3,
     "epochs": 20,
@@ -140,7 +132,7 @@ EXP = {
     "predict_chunk": 131_072,
     "use_metadata": True,
 
-    # ---- Rich-M8 arch knobs (matches the prior two probes) --------------
+    # ---- Rich-M8 arch (matches prior two probes) ---------------------
     "rich_subj_emb_dim": 32,
     "rich_bc_emb_dim": 16,
     "rich_cluster_emb_dim": 16,
@@ -163,7 +155,7 @@ EXP = {
     "rich_cat_dropout_org": 0.05,
     "rich_cat_dropout_topic": 0.10,
 
-    # ---- Feature blocks ------------------------------------------------
+    # ---- Feature blocks ---------------------------------------------
     "use_nn_block": True,
     "use_subject_numeric": True,
     "use_bench_numeric": True,
@@ -172,10 +164,8 @@ EXP = {
     "kmeans_iters": 50,
     "kmeans_seed": 23,
 
-    # ---- Feature-dropout variants -- which to run ----------------------
-    # The full (K + 1) = 6 grid. Shrink this list (e.g. drop the
-    # catastrophic 'no_nn_block') to save compute; the combiner cells
-    # below auto-adapt to whatever variants are populated.
+    # ---- Feature-dropout variants -- used in Stage B (winner) -------
+    # 'full' is also the sole Stage A sweep variant.
     "variants": (
         "full",
         "no_subj_channel",
@@ -185,23 +175,35 @@ EXP = {
         "no_cluster_channel",
     ),
 
-    # ---- NN-support MoE knobs ------------------------------------------
-    "support_k_buckets": 8,
+    # ---- NN-support MoE knobs ---------------------------------------
     "support_k_neighbors": 5,
-    "expert_weight_multiplier": 5.0,
     # Single tau picked from the prior probe sweep (1.0xstd was the
-    # winner at -0.0038 nat over rich_baseline). Sweep would 5x the
-    # combiner-fit time without changing the per-variant routed
-    # prediction substantially.
+    # winner). We sweep K + upweight only; if you also want to sweep
+    # tau, do it inside _eval_config_at_winner after Stage B.
     "support_kernel_tau_mult": 1.0,
 
-    # ---- Combiner knobs ------------------------------------------------
+    # ---- SWEEP GRID (Stage A) ---------------------------------------
+    # All upweights are >= the prior run's 5x (per user spec).
+    # All K-bucket values are >= 4 (per user spec). The default
+    # 3 x 3 = 9-cell grid trains the 'full' variant at each cell;
+    # at avg(K)=9.3 buckets x 3 folds that's 252 single-variant
+    # rich trainings (~10 h on A100). Shrink the tuples if compute
+    # is tight; the rest of the notebook auto-adapts.
+    "sweep_upweights": (5.0, 10.0, 20.0),
+    "sweep_k_buckets": (4, 8, 16),
+    # Which variant to sweep on in Stage A. 'full' is the canonical
+    # anchor; using anything else is fine but the comparison to
+    # the prior single-config result becomes harder to read.
+    "sweep_stage_a_variant": "full",
+
+    # ---- Combiner selection (Stage B) -------------------------------
+    # Per the prior run: linear wins, FWLS overfit, MLP no signal.
+    # Re-enable the others below if you want to retest at the
+    # winning (upweight, K).
     "combiner_uniform_avg": True,
     "combiner_logit_linear_stacker": True,
-    "combiner_fwls_stacker": True,
-    "combiner_small_mlp": True,
-    # Small MLP combiner -- intentionally tiny so it doesn't overfit
-    # to 600K OOF rows with ~10 input features.
+    "combiner_fwls_stacker": False,
+    "combiner_small_mlp": False,
     "mlp_hidden": 16,
     "mlp_dropout": 0.2,
     "mlp_lr": 5.0e-3,
@@ -213,12 +215,32 @@ EXP = {
     "seed": SEED,
 }
 
-print("Experiment config (feature-dropout x NN-support MoE x combiner):")
+print("Experiment config (feature-dropout x MoE x linear stacker SWEEP):")
 for k, v in EXP.items():
     print(f"  {k}: {v}")
 
+# Quick compute estimate so the user knows what they signed up for.
+_avg_k_a = float(np.mean(EXP["sweep_k_buckets"]))
+_stage_a_trainings = (
+    len(EXP["sweep_upweights"]) * len(EXP["sweep_k_buckets"]) * 1
+    * _avg_k_a * int(EXP["n_folds"])
+)
+_stage_b_trainings_max = (
+    len(EXP["variants"]) * max(EXP["sweep_k_buckets"]) * int(EXP["n_folds"])
+)
+print(
+    f"\n[budget] Stage A: ~{int(_stage_a_trainings)} trainings "
+    f"({len(EXP['sweep_upweights'])} upweights x {len(EXP['sweep_k_buckets'])} K-buckets "
+    f"x 1 variant x avg-K={_avg_k_a:.1f} x {EXP['n_folds']} folds)"
+)
+print(
+    f"[budget] Stage B (upper bound, K=K_max): "
+    f"~{int(_stage_b_trainings_max)} trainings "
+    f"({len(EXP['variants'])} variants x {max(EXP['sweep_k_buckets'])} buckets x {EXP['n_folds']} folds)"
+)
+
 # %% [markdown]
-# ## 2. Load data + item-cold split (item-based sub-sample)
+# ## 2. Load data + item-cold split
 
 # %%
 import pandas as pd
@@ -275,7 +297,7 @@ N_TRAIN = int(len(train_df))
 N_VAL = int(len(val_df))
 
 # %% [markdown]
-# ## 3. Item embeddings (cache-aware; no re-encoding)
+# ## 3. Item embeddings (cache-aware)
 
 # %%
 from dataclasses import fields as _dc_fields
@@ -435,7 +457,7 @@ folds = make_item_grouped_folds(
     n_folds=int(EXP["n_folds"]),
     seed=int(CFG.get("oof", {}).get("seed", 7)),
 )
-print(f"Built {len(folds)} item-cold folds:")
+print(f"Built {len(folds)} item-cold folds")
 for f in folds:
     print(f"  fold {f.fold_id}: train_rows={len(f.train_row_idx):,}  "
           f"oof_rows={len(f.oof_row_idx):,}  oof_items={len(f.oof_item_keys):,}")
@@ -463,9 +485,6 @@ _pool_df = load_pool_features(_POOL_PATH)
 if _pool_df is None:
     _pool_df = compute_features_for_items(item_df, progress=True)
     save_pool_features(_pool_df, _POOL_PATH)
-    print(f"[form] computed pool features for {len(_pool_df):,} items")
-else:
-    print(f"[form] loaded pool features for {len(_pool_df):,} items")
 
 _POOL_COLS = list(_POOL_FEATURE_NAMES)
 _train_item_set = set(train_df["item_key"].astype(str).tolist())
@@ -556,10 +575,6 @@ N_FAMILIES = _vocab_n("family", "subject") if _FAMILY_COL >= 0 else 1
 N_MACROS = _vocab_n("macro_family", "subject") if _MACRO_COL >= 0 else 1
 N_ORGS = _vocab_n("organization", "subject") if _ORG_COL >= 0 else 1
 N_TOPICS = _vocab_n("topic", "benchmark") if _TOPIC_COL >= 0 else 1
-print(
-    f"[meta] cardinalities: families={N_FAMILIES}  macros={N_MACROS}  "
-    f"orgs={N_ORGS}  topics={N_TOPICS}"
-)
 
 
 def _gather_cats(subject_ids, bc_ids):
@@ -630,10 +645,9 @@ _subj_num_val,   _bench_num_val   = _gather_nums(subj_val,   bc_val)
 
 SUBJ_NUM_DIM = int(_subj_num_train.shape[1]) if EXP["use_subject_numeric"] else 0
 BENCH_NUM_DIM = int(_bench_num_train.shape[1]) if EXP["use_bench_numeric"] else 0
-print(f"[meta] subject_num_dim={SUBJ_NUM_DIM}  bench_num_dim={BENCH_NUM_DIM}")
 
 # %% [markdown]
-# ## 8. NN block (15 cells; global passrate; no per-fold rebuild)
+# ## 8. NN block
 
 # %%
 import gc
@@ -647,9 +661,8 @@ from src.nn_features import (
 
 if EXP["use_nn_block"]:
     nn_cfg = NNFeaturesConfig.from_dict(CFG["nn_features"])
-    NN_DIR = ROOT / nn_cfg.cache_dir / "training_combiner"
+    NN_DIR = ROOT / nn_cfg.cache_dir / "training_combiner_sweep"
     NN_DIR.mkdir(parents=True, exist_ok=True)
-
     train_item_keys = sorted(set(primary.train["item_key"].astype(str)))
     train_item_keys = [k for k in train_item_keys if k in item_emb_lookup]
     print(f"[nn] building NN index on {len(train_item_keys):,} unique train items...")
@@ -682,14 +695,13 @@ if EXP["use_nn_block"]:
         cfg=nn_cfg, exclude_self=False, query_chunk_size=_NN_CHUNK,
     )
     NN_DIM = int(nn_train_mat.shape[1])
-    print(f"[nn] nn_train_mat={nn_train_mat.shape}  nn_val_mat={nn_val_mat.shape}")
 else:
     nn_train_mat = np.zeros((N_TRAIN, 0), dtype=np.float32)
     nn_val_mat = np.zeros((N_VAL, 0), dtype=np.float32)
     NN_DIM = 0
 
 # %% [markdown]
-# ## 9. Cluster block: k-means on item embeddings -> cluster_id + 8 centroid distances
+# ## 9. Cluster block
 
 # %%
 if EXP["use_cluster_block"]:
@@ -704,10 +716,6 @@ if EXP["use_cluster_block"]:
     ).astype(np.float32)
     _norms = np.linalg.norm(_uniq_train_emb, axis=1, keepdims=True)
     _uniq_train_emb_n = (_uniq_train_emb / np.clip(_norms, 1e-12, None)).astype(np.float32)
-    print(
-        f"[cluster] fitting k-means K={K_CLUSTERS} on "
-        f"{len(_uniq_train_item_keys):,} unique train items..."
-    )
     km = KMeans(
         n_clusters=K_CLUSTERS, n_init=4,
         max_iter=int(EXP["kmeans_iters"]),
@@ -887,15 +895,19 @@ print(
 del _rich_train_raw, _rich_val_raw
 
 # %% [markdown]
-# ## 11. NN-support partition (FAISS index + per-row support score + 8 buckets)
+# ## 11. NN-support per-row SCORE + parameterized partition factory
+#
+# The FAISS index + per-row support score is computed ONCE here (it's
+# the same for every K). Only the bucket partition (boundaries +
+# bucket assignments + Gaussian-kernel centroids) depends on K, so
+# we factor that into ``_make_support_partition(k)`` and call it
+# at each sweep cell.
 
 # %%
 import faiss
 
-_SUP_K = int(EXP["support_k_buckets"])
 K_NN = int(EXP["support_k_neighbors"])
 
-# Reuse the unique train embedding stack from the k-means cell if it ran.
 if EXP["use_cluster_block"]:
     _support_emb_uniq = _uniq_train_emb_n
     _support_uniq_keys = _uniq_train_item_keys
@@ -936,14 +948,6 @@ _uniq_val_emb_sup = (
 _sims_val, _ = _sup_idx.search(_uniq_val_emb_sup, K_NN)
 _score_val_uniq = _sims_val.mean(axis=1).astype(np.float32)
 
-_sup_boundaries = np.quantile(
-    _score_train_uniq, np.linspace(0.0, 1.0, _SUP_K + 1)
-)[1:-1].astype(np.float32)
-print(
-    f"[partition support] K={_SUP_K}  cut points: "
-    + ", ".join(f"{b:.4f}" for b in _sup_boundaries)
-)
-
 _support_by_item: dict[str, float] = dict(
     zip(_support_uniq_keys, _score_train_uniq.tolist())
 )
@@ -959,34 +963,51 @@ def _support_score(item_keys) -> np.ndarray:
     )
 
 
-def _support_bucket(scores: np.ndarray) -> np.ndarray:
-    return np.searchsorted(_sup_boundaries, scores, side="right").astype(np.int64)
-
-
 support_score_train = _support_score(_train_keys)
 support_score_val = _support_score(_val_keys)
-bucket_support_train = _support_bucket(support_score_train)
-bucket_support_val = _support_bucket(support_score_val)
-_SUP_BUCKET_NAMES = [f"support_q{j + 1}" for j in range(_SUP_K)]
-print("  train bucket sizes:")
-for j, name in enumerate(_SUP_BUCKET_NAMES):
-    n = int((bucket_support_train == j).sum())
-    print(f"    {name:<14s} train_rows={n:>9,} ({n / N_TRAIN:>5.1%})")
-
-# Bucket centroids on TRAIN scores for the Gaussian-kernel soft router.
-_sup_centroids = np.array([
-    float(support_score_train[bucket_support_train == j].mean())
-    if int((bucket_support_train == j).sum()) > 0
-    else float(np.mean(_sup_boundaries))
-    for j in range(_SUP_K)
-], dtype=np.float32)
-print(
-    f"[partition support] bucket centroids on train: "
-    + ", ".join(f"{c:.4f}" for c in _sup_centroids)
-)
-
 del _sup_idx, _sims_train, _sims_val
 gc.collect()
+
+
+def _make_support_partition(k: int):
+    """Build the K-bucket NN-support partition.
+
+    Returns
+    -------
+    boundaries : [k - 1] cut points
+    bucket_train, bucket_val : [N_*] int64 bucket id per row
+    centroids : [k] mean support score per bucket on TRAIN rows
+    """
+    boundaries = np.quantile(
+        _score_train_uniq, np.linspace(0.0, 1.0, k + 1)
+    )[1:-1].astype(np.float32)
+    bucket_train = np.searchsorted(
+        boundaries, support_score_train, side="right"
+    ).astype(np.int64)
+    bucket_val = np.searchsorted(
+        boundaries, support_score_val, side="right"
+    ).astype(np.int64)
+    centroids = np.array([
+        float(support_score_train[bucket_train == j].mean())
+        if int((bucket_train == j).sum()) > 0
+        else float(np.mean(boundaries)) if len(boundaries) > 0 else 0.0
+        for j in range(k)
+    ], dtype=np.float32)
+    return boundaries, bucket_train, bucket_val, centroids
+
+
+# Sanity print for one default-K partition so we have a reference
+# bucket-size table at the start.
+_b_, _bt_, _bv_, _bc_ = _make_support_partition(8)
+print(
+    f"[partition support k=8] cut points: "
+    + ", ".join(f"{b:.4f}" for b in _b_)
+)
+print("  train bucket sizes (k=8):")
+for j in range(8):
+    n = int((_bt_ == j).sum())
+    print(f"    support_q{j + 1}    train_rows={n:>9,} ({n / N_TRAIN:>5.1%})")
+del _b_, _bt_, _bv_, _bc_
 
 # %% [markdown]
 # ## 12. Feature-class specs + per-variant masking helpers
@@ -1015,7 +1036,10 @@ VARIANT_SPECS: dict[str, FeatureSpec] = {
 }
 VARIANT_KEYS = [v for v in EXP["variants"] if v in VARIANT_SPECS]
 assert "full" in VARIANT_KEYS, "the 'full' variant is the comparison anchor"
-print(f"[variants] active ({len(VARIANT_KEYS)}): {VARIANT_KEYS}")
+SWEEP_VARIANT = EXP["sweep_stage_a_variant"]
+assert SWEEP_VARIANT in VARIANT_SPECS, (
+    f"sweep_stage_a_variant={SWEEP_VARIANT} not in VARIANT_SPECS"
+)
 
 
 def _apply_dense_mask(dense_mat: np.ndarray, spec: FeatureSpec) -> np.ndarray:
@@ -1066,10 +1090,12 @@ def _apply_cat_mask(spec: FeatureSpec, *, side: str):
     return s, b, c, f, mf, o, t
 
 
-# Pre-compute per-variant masked arrays ONCE outside the per-fold loop.
-# Saves re-copying ~600K x 200-column matrices on every fold / bucket.
+# Pre-build per-variant masked arrays (cheap; same across all
+# (upweight, K) sweep cells). Only the variants we will actually
+# train in Stage A or Stage B get cached; the others are skipped.
+_needed_variants = set(VARIANT_KEYS) | {SWEEP_VARIANT}
 VARIANT_ARRAYS: dict[str, dict[str, np.ndarray]] = {}
-for vname in VARIANT_KEYS:
+for vname in _needed_variants:
     spec = VARIANT_SPECS[vname]
     s_tr, b_tr, c_tr, f_tr, mf_tr, o_tr, t_tr = _apply_cat_mask(spec, side="train")
     s_va, b_va, c_va, f_va, mf_va, o_va, t_va = _apply_cat_mask(spec, side="val")
@@ -1082,22 +1108,18 @@ for vname in VARIANT_KEYS:
         dense_val=_apply_dense_mask(rich_dense_val, spec),
     )
 print(
-    f"[variants] pre-built masked id+dense arrays for {len(VARIANT_KEYS)} variants "
-    f"(~{sum(a['dense_train'].nbytes for a in VARIANT_ARRAYS.values()) / 1e9:.2f} GB "
-    "of cached dense)"
+    f"[variants] pre-built masked id+dense arrays for {len(_needed_variants)} variants"
 )
 
 # %% [markdown]
-# ## 13. Trainer + per-(variant, bucket, fold) OOF runner
+# ## 13. Parameterized per-(variant, bucket, fold) OOF runner
 #
-# Pattern: for each (variant, bucket), train ONE rich net per fold with
-# the variant's feature mask applied AND the bucket's rows upweighted
-# 5x. Store both OOF and val predictions; per-fold val preds are
-# averaged across folds (same as the prior probes). The seed varies
-# by (variant_idx, fold_id) so different variants and folds use
-# different init, but all buckets WITHIN a (variant, fold) share a
-# seed so the per-bucket lift is purely from the upweighting, not
-# from seed diversity.
+# Takes (variant_name, bucket_id_in_partition, upweight, bucket_assignment_train,
+# variant_idx_seed) and returns per-fold-averaged (oof, val) predictions
+# for that single (variant, bucket) cell. The seed scheme keeps
+# different (variant, fold) pairs independent while bucket-mates within
+# the same (variant, fold) share a seed so per-bucket lift is purely
+# from the upweighting, not from re-initialization.
 
 # %%
 import torch
@@ -1154,19 +1176,16 @@ def _make_weights(in_bucket_mask, mult):
     return (w / w.mean()).astype(np.float32)
 
 
-def _run_variant_bucket_oof(variant_name: str, bucket_j: int,
-                             variant_idx: int):
-    """Train one rich net per fold for (variant, bucket); return (oof, val).
-
-    The variant's pre-masked id+dense arrays are pulled from
-    ``VARIANT_ARRAYS[variant_name]``. Bucket upweighting is applied
-    via ``sample_weights`` (5x on rows in ``bucket_j``).
-    """
+def _run_variant_bucket_oof(
+    variant_name: str, bucket_j: int, *,
+    upweight: float, bucket_train: np.ndarray, variant_idx: int,
+):
+    """Train one rich net per fold for (variant, bucket); return (oof, val)."""
     arr = VARIANT_ARRAYS[variant_name]
     spec = VARIANT_SPECS[variant_name]
     emb_for_variant = _EMB_T_ZERO if spec.drop_item_embedding else EMB_T
-    in_bucket = (bucket_support_train == int(bucket_j))
-    sample_weights = _make_weights(in_bucket, EXP["expert_weight_multiplier"])
+    in_bucket = (bucket_train == int(bucket_j))
+    sample_weights = _make_weights(in_bucket, float(upweight))
 
     acc = OofPredictionAccumulator(
         N_TRAIN, name=f"oof_{variant_name}_q{bucket_j + 1}",
@@ -1223,81 +1242,19 @@ def _run_variant_bucket_oof(variant_name: str, bucket_j: int,
     )
 
 # %% [markdown]
-# ## 14. Run the (variant x bucket) grid
+# ## 14. ``_run_one_moe_config(upweight, k, variants)`` -- one sweep cell
 #
-# Default size: ``len(variants) * support_k_buckets * n_folds`` = 6 * 8 * 3
-# = 144 trainings. Set EXP['variants'] to a shorter list (or shrink
-# ``support_k_buckets``) to cut compute. Progress is printed every
-# bucket; a per-(variant, bucket) heading lets you tell how far in
-# you are by reading the last log line.
-
-# %%
-import time
-
-# oof_grid[variant][bucket_name] = [N_TRAIN] OOF predictions
-# val_grid[variant][bucket_name] = [N_VAL] val predictions (fold-averaged)
-oof_grid: dict[str, dict[str, np.ndarray]] = {v: {} for v in VARIANT_KEYS}
-val_grid: dict[str, dict[str, np.ndarray]] = {v: {} for v in VARIANT_KEYS}
-
-_t0 = time.time()
-_N_combos = len(VARIANT_KEYS) * _SUP_K
-_done = 0
-for vi, vname in enumerate(VARIANT_KEYS):
-    for j, bname in enumerate(_SUP_BUCKET_NAMES):
-        _done += 1
-        n_in = int((bucket_support_train == j).sum())
-        print(
-            f"\n[{_done:>3d}/{_N_combos}] variant={vname:<22s} bucket={bname}  "
-            f"({n_in:,} bucket rows; elapsed {(time.time() - _t0) / 60:.1f} min)"
-        )
-        oof_p, val_p = _run_variant_bucket_oof(vname, j, variant_idx=vi)
-        oof_grid[vname][bname] = oof_p
-        val_grid[vname][bname] = val_p
-print(
-    f"\n[grid] done. Trained {len(VARIANT_KEYS) * _SUP_K * len(folds)} "
-    f"rich nets in {(time.time() - _t0) / 60:.1f} min"
-)
-
-# %% [markdown]
-# ## 15. Per-variant soft-routed prediction (NN-support kernel, tau = 1.0xstd)
+# Trains the full (variants x K buckets x folds) grid at a single
+# (upweight, K) configuration, soft-routes per variant, Platt-
+# calibrates the routed prediction, and returns:
 #
-# Within each variant, combine its 8 bucket experts via the Gaussian
-# kernel router from :func:`src.rich_mlp_variant.soft_routing_weights_kernel`.
-# Uses ``tau = 1.0 * std(support_score_*)``, the winner from the prior
-# probe's tau sweep. Output: one routed prediction per variant on OOF
-# (used by the combiner) and on val (used for solo NLL + combiner).
-
-# %%
-_std_score_tr = float(np.std(support_score_train).clip(1e-6, None))
-_std_score_va = float(np.std(support_score_val).clip(1e-6, None))
-_TAU_TR = float(EXP["support_kernel_tau_mult"]) * _std_score_tr
-_TAU_VA = float(EXP["support_kernel_tau_mult"]) * _std_score_va
-print(
-    f"[soft route] tau_train={_TAU_TR:.4f}  tau_val={_TAU_VA:.4f}  "
-    f"(tau_mult={EXP['support_kernel_tau_mult']}xstd)"
-)
-
-_w_tr = soft_routing_weights_kernel(
-    support_score_train, bucket_centroids=_sup_centroids, tau=_TAU_TR,
-)  # [N_TRAIN, K]
-_w_va = soft_routing_weights_kernel(
-    support_score_val, bucket_centroids=_sup_centroids, tau=_TAU_VA,
-)  # [N_VAL, K]
-
-oof_routed: dict[str, np.ndarray] = {}
-val_routed: dict[str, np.ndarray] = {}
-for vname in VARIANT_KEYS:
-    expert_keys = _SUP_BUCKET_NAMES  # keys used inside the variant's grid
-    oof_routed[vname] = apply_soft_routing(
-        oof_grid[vname], expert_names=expert_keys, weights=_w_tr,
-    ).astype(np.float32)
-    val_routed[vname] = apply_soft_routing(
-        val_grid[vname], expert_names=expert_keys, weights=_w_va,
-    ).astype(np.float32)
-print(f"[soft route] built routed preds for {len(VARIANT_KEYS)} variants")
-
-# %% [markdown]
-# ## 16. Per-variant Platt calibration
+# * ``cal_val[variant]``: [N_VAL] calibrated val probability
+# * ``cal_oof[variant]``: [N_TRAIN] calibrated OOF probability (used
+#   downstream by the Stage B stacker)
+# * ``solo_nll[variant]``: float, calibrated solo val NLL
+# * ``meta``: dict with bucket sizes, tau, and partition info
+#
+# This is the single function the sweep + the winner step both call.
 
 # %%
 from src.stacker import (
@@ -1307,6 +1264,7 @@ from src.stacker import (
     logit_clipped,
     stacker_feature_names,
 )
+import time
 
 
 def _nll(p, y):
@@ -1339,18 +1297,265 @@ def _platt(p_oof, p_val):
     return stacker_apply_batch(st, Xv).astype(np.float32)
 
 
-cal_val: dict[str, np.ndarray] = {
-    v: _platt(oof_routed[v], val_routed[v]) for v in VARIANT_KEYS
-}
-cal_oof: dict[str, np.ndarray] = {
-    v: _platt(oof_routed[v], oof_routed[v]) for v in VARIANT_KEYS
-}
+def _run_one_moe_config(*, upweight: float, k_buckets: int,
+                        variants: list[str]) -> dict:
+    """Train + soft-route + Platt-calibrate for one MoE configuration.
 
-print("\nCalibrated solo val log-loss per variant (each variant = its own "
-      "NN-support soft-routed MoE):")
-_solo = {v: _nll(cal_val[v], y_val) for v in VARIANT_KEYS}
+    Parameters
+    ----------
+    upweight : float
+        Sample-weight multiplier on rows in the bucket being trained
+        (the remaining rows get weight 1.0; weights are mean-normalised).
+    k_buckets : int
+        Number of NN-support buckets in this MoE.
+    variants : list[str]
+        Which variants to actually train (each variant gets ``k_buckets``
+        experts trained on ``n_folds`` folds each).
+
+    Returns
+    -------
+    dict with keys: 'cal_val', 'cal_oof', 'solo_nll', 'oof_grid',
+    'val_grid', 'meta'.
+    """
+    _t0 = time.time()
+    print(f"\n  ----- config(upweight={upweight}, K={k_buckets}, "
+          f"variants={variants}) -----")
+
+    # Partition (cheap; only the bucket assignments change with K).
+    _bds, _bt, _bv, _cents = _make_support_partition(int(k_buckets))
+    bucket_names = [f"support_q{j + 1}" for j in range(int(k_buckets))]
+    print("    train bucket sizes: " + ", ".join(
+        f"{name}={int((_bt == j).sum()):,}"
+        for j, name in enumerate(bucket_names)
+    ))
+
+    # (variants x buckets x folds) grid.
+    oof_grid: dict[str, dict[str, np.ndarray]] = {v: {} for v in variants}
+    val_grid: dict[str, dict[str, np.ndarray]] = {v: {} for v in variants}
+    n_done = 0
+    n_total = len(variants) * int(k_buckets)
+    for vi, vname in enumerate(variants):
+        for j, bname in enumerate(bucket_names):
+            n_done += 1
+            n_in = int((_bt == j).sum())
+            elapsed = (time.time() - _t0) / 60.0
+            print(f"    [{n_done:>3d}/{n_total}] variant={vname:<22s} "
+                  f"bucket={bname} ({n_in:,} bucket rows; elapsed {elapsed:.1f}m)")
+            oof_p, val_p = _run_variant_bucket_oof(
+                vname, j,
+                upweight=float(upweight), bucket_train=_bt,
+                # Stable per-variant seed offset so the same variant
+                # in different sweep cells reuses the same init seed.
+                variant_idx=vi,
+            )
+            oof_grid[vname][bname] = oof_p
+            val_grid[vname][bname] = val_p
+
+    # Per-variant soft routing.
+    std_score_tr = float(np.std(support_score_train).clip(1e-6, None))
+    std_score_va = float(np.std(support_score_val).clip(1e-6, None))
+    tau_tr = float(EXP["support_kernel_tau_mult"]) * std_score_tr
+    tau_va = float(EXP["support_kernel_tau_mult"]) * std_score_va
+    w_tr = soft_routing_weights_kernel(
+        support_score_train, bucket_centroids=_cents, tau=tau_tr,
+    )
+    w_va = soft_routing_weights_kernel(
+        support_score_val, bucket_centroids=_cents, tau=tau_va,
+    )
+
+    oof_routed: dict[str, np.ndarray] = {}
+    val_routed: dict[str, np.ndarray] = {}
+    for vname in variants:
+        oof_routed[vname] = apply_soft_routing(
+            oof_grid[vname], expert_names=bucket_names, weights=w_tr,
+        ).astype(np.float32)
+        val_routed[vname] = apply_soft_routing(
+            val_grid[vname], expert_names=bucket_names, weights=w_va,
+        ).astype(np.float32)
+
+    # Platt calibration per variant.
+    cal_val = {v: _platt(oof_routed[v], val_routed[v]) for v in variants}
+    cal_oof = {v: _platt(oof_routed[v], oof_routed[v]) for v in variants}
+    solo_nll = {v: _nll(cal_val[v], y_val) for v in variants}
+
+    elapsed_total = (time.time() - _t0) / 60.0
+    print(f"    config done in {elapsed_total:.1f}m  solo NLLs:")
+    for v in variants:
+        print(f"      {v:<22s} : {solo_nll[v]:.6f}")
+    return dict(
+        cal_val=cal_val, cal_oof=cal_oof, solo_nll=solo_nll,
+        oof_grid=oof_grid, val_grid=val_grid,
+        meta=dict(
+            upweight=float(upweight), k_buckets=int(k_buckets),
+            bucket_names=bucket_names, bucket_centroids=_cents,
+            tau_tr=tau_tr, tau_va=tau_va,
+            elapsed_min=elapsed_total,
+        ),
+    )
+
+# %% [markdown]
+# ## 15. STAGE A -- 2D sweep over (upweight, K) with the 'full' variant only
+#
+# Cheap MoE-only sweep. For each cell in the
+# ``EXP["sweep_upweights"]`` x ``EXP["sweep_k_buckets"]`` grid, we
+# train just the ``sweep_stage_a_variant`` (default 'full') x K
+# buckets x n_folds, then report the Platt-calibrated solo val NLL.
+# The winner of this grid becomes the (upweight, K) used for Stage B.
+#
+# **Why this is the right cheap proxy.** The combiner lift in the
+# prior run was -0.0021 nat on top of the single-variant MoE
+# (full + MoE 0.4578 -> stacker 0.4557). A 0.001 swing in the
+# single-variant NLL across sweep cells dominates that combiner lift,
+# so the sweep winner on solo NLL is almost certainly also the
+# winner on stacker NLL. If two cells tie within 0.001 nat on Stage A,
+# re-run Stage B at the runner-up before committing.
+
+# %%
+print("\n" + "=" * 80)
+print(f"STAGE A -- sweep ({SWEEP_VARIANT} only) over "
+      f"upweights={EXP['sweep_upweights']}  K_buckets={EXP['sweep_k_buckets']}")
+print("=" * 80)
+
+# stage_a_grid[(upweight, k)] = solo NLL for SWEEP_VARIANT
+stage_a_grid: dict[tuple[float, int], float] = {}
+stage_a_meta: dict[tuple[float, int], dict] = {}
+stage_a_t0 = time.time()
+_cell_idx = 0
+_cell_total = len(EXP["sweep_upweights"]) * len(EXP["sweep_k_buckets"])
+for up in EXP["sweep_upweights"]:
+    for k in EXP["sweep_k_buckets"]:
+        _cell_idx += 1
+        print(f"\n[STAGE A {_cell_idx}/{_cell_total}] "
+              f"upweight={up}  K={k}  variant={SWEEP_VARIANT}  "
+              f"total elapsed {(time.time() - stage_a_t0) / 60:.1f}m")
+        res = _run_one_moe_config(
+            upweight=float(up), k_buckets=int(k),
+            variants=[SWEEP_VARIANT],
+        )
+        stage_a_grid[(float(up), int(k))] = float(res["solo_nll"][SWEEP_VARIANT])
+        stage_a_meta[(float(up), int(k))] = res["meta"]
+
+print(f"\n[STAGE A] done in {(time.time() - stage_a_t0) / 60:.1f}m")
+
+# %% [markdown]
+# ## 15b. Stage A summary -- table + heatmap
+
+# %%
+print("\n" + "-" * 80)
+print(f"STAGE A grid -- solo Platt-calibrated val NLL ({SWEEP_VARIANT} variant)")
+print("-" * 80)
+
+_ups = list(EXP["sweep_upweights"])
+_ks = list(EXP["sweep_k_buckets"])
+
+# Print as a text table.
+header = f"  {'upweight \\ K':<14s}" + "".join(f"{k:>14d}" for k in _ks)
+print(header)
+print("  " + "-" * (len(header) - 2))
+_grid_arr = np.zeros((len(_ups), len(_ks)), dtype=np.float64)
+for i, up in enumerate(_ups):
+    row = [f"  {up:<14g}"]
+    for j, k in enumerate(_ks):
+        v = stage_a_grid.get((float(up), int(k)), float("nan"))
+        _grid_arr[i, j] = v
+        row.append(f"{v:>14.6f}")
+    print("".join(row))
+
+# Mark the best cell.
+_flat_idx = int(np.nanargmin(_grid_arr))
+_best_i, _best_j = np.unravel_index(_flat_idx, _grid_arr.shape)
+_best_up = _ups[_best_i]
+_best_k = _ks[_best_j]
+_best_nll = float(_grid_arr[_best_i, _best_j])
+print(f"\n[STAGE A winner] (upweight={_best_up}, K={_best_k}) "
+      f"with solo NLL = {_best_nll:.6f}")
+
+# Heatmap so the surface shape is easy to read at a glance.
+try:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(0.9 * len(_ks) + 3, 0.7 * len(_ups) + 2))
+    im = ax.imshow(_grid_arr, cmap="viridis_r", aspect="auto")
+    ax.set_xticks(range(len(_ks)))
+    ax.set_yticks(range(len(_ups)))
+    ax.set_xticklabels([str(k) for k in _ks])
+    ax.set_yticklabels([str(u) for u in _ups])
+    ax.set_xlabel("K (support buckets)")
+    ax.set_ylabel("upweight (multiplier)")
+    for i in range(len(_ups)):
+        for j in range(len(_ks)):
+            v = _grid_arr[i, j]
+            text = f"{v:.5f}"
+            # Highlight the winner in red.
+            color = "red" if (i, j) == (_best_i, _best_j) else "white"
+            ax.text(j, i, text, ha="center", va="center",
+                    color=color, fontsize=9,
+                    fontweight=("bold" if (i, j) == (_best_i, _best_j) else "normal"))
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="solo NLL (lower=better)")
+    ax.set_title(
+        f"Stage A: solo Platt-calibrated val NLL\n"
+        f"({SWEEP_VARIANT} variant; winner highlighted)"
+    )
+    fig.tight_layout()
+    _outdir = ROOT / "artifacts" / "diagnostics"
+    _outdir.mkdir(parents=True, exist_ok=True)
+    _outpath = _outdir / "feature_dropout_moe_combiner_sweep_stage_a.png"
+    fig.savefig(_outpath, dpi=120, bbox_inches="tight")
+    print(f"[heatmap] saved -> {_outpath}")
+    plt.show()
+except Exception as exc:  # pragma: no cover - plotting optional
+    print(f"[stage A heatmap] skipped ({exc!r})")
+
+# Runner-up callout -- if the best cell is within 0.001 nat of the
+# 2nd-best, flag it so the user knows the stacker pick is uncertain.
+_sorted = sorted(stage_a_grid.items(), key=lambda kv: kv[1])
+if len(_sorted) >= 2:
+    _runner_up_key, _runner_up_nll = _sorted[1]
+    _gap = _runner_up_nll - _best_nll
+    print(
+        f"\n[STAGE A runner-up] {_runner_up_key} with NLL = {_runner_up_nll:.6f}  "
+        f"(+{_gap:.6f} vs winner)"
+    )
+    if _gap < 0.001:
+        print(
+            "  ! WARNING: winner / runner-up gap < 0.001 nat. The Stage B "
+            "stacker NLL could prefer the runner-up. Consider re-running "
+            "Stage B at the runner-up before committing to the winner."
+        )
+
+# %% [markdown]
+# ## 16. STAGE B -- full feature-dropout pipeline at the (upweight, K) winner
+#
+# Now train all K+1 = 6 feature-dropout variants at (upweight*, K*)
+# from Stage A, soft-route per variant, Platt-calibrate, then fit the
+# logit-linear stacker on the 6 calibrated routed predictions + 4
+# auxiliary features.
+#
+# Per the prior run the logit-linear stacker beats uniform_avg, FWLS,
+# and a small MLP; only ``combiner_logit_linear_stacker`` is enabled
+# by default. Re-enable the others in EXP if you want to re-test
+# them at the new (upweight*, K*).
+
+# %%
+print("\n" + "=" * 80)
+print(f"STAGE B -- full feature-dropout pipeline at WINNER "
+      f"(upweight={_best_up}, K={_best_k})")
+print("=" * 80)
+
+stage_b_t0 = time.time()
+stage_b_res = _run_one_moe_config(
+    upweight=float(_best_up), k_buckets=int(_best_k),
+    variants=list(VARIANT_KEYS),
+)
+print(f"\n[STAGE B] done in {(time.time() - stage_b_t0) / 60:.1f}m")
+
+cal_val = stage_b_res["cal_val"]
+cal_oof = stage_b_res["cal_oof"]
+_solo = stage_b_res["solo_nll"]
 _full_routed_nll = _solo["full"]
-print(f"  {'full + MoE (anchor)':<32s}: {_full_routed_nll:.6f}   (reference)")
+
+print("\nStage B per-variant solo val log-loss (each variant = its own routed MoE):")
+print(f"  {'full + MoE (anchor)':<32s}: {_full_routed_nll:.6f}")
 for v in VARIANT_KEYS:
     if v == "full":
         continue
@@ -1358,26 +1563,10 @@ for v in VARIANT_KEYS:
     print(f"  {v + ' + MoE':<32s}: {_solo[v]:.6f}   ({d:+.6f})")
 
 # %% [markdown]
-# ## 17. Auxiliary features for the gated combiners
+# ## 17. Auxiliary features + combiners on the Stage B routed predictions
 #
-# Four numeric per-row gates used by the FWLS stacker and the MLP
-# combiner. All are honest features available at inference time:
-#
-# * ``bench_present`` -- 1 if bc is visible (not redacted to UNK), 0
-#   otherwise. Lets the combiner trust the ``no_bench_channel``
-#   variant when bench is hidden in production.
-# * ``nn_neighbor_support`` -- the NN-support score per row (mean
-#   cosine sim to top-K train neighbours). Already used by the
-#   per-variant soft router; also fed to the combiner so it can
-#   gate cross-variant blending on the same axis.
-# * ``nn_mean_similarity`` -- alias of the support score in this
-#   implementation; kept as a separate column so the production
-#   stacker schema matches (its build_stacker_features expects 4 aux).
-# * ``centroid_distance`` -- min centroid distance per row from the
-#   k-means atlas. A small distance means "this item lies in a dense
-#   cluster the model has seen many neighbours of"; a large distance
-#   means it's near the boundary of the embedding atlas (effectively
-#   cold from the cluster's POV).
+# Identical aux-feature construction to the prior run so the stacker
+# weights are directly comparable.
 
 # %%
 def _bench_present_for(bc_arr):
@@ -1388,8 +1577,6 @@ def _min_centroid_dist(row_centroid_dist_mat):
     return row_centroid_dist_mat.min(axis=1).astype(np.float32)
 
 
-# Train-side aux uses the ORIGINAL (un-redacted) bc_train -- the train
-# OOF rows aren't part of the val redaction contract.
 aux_train = dict(
     bench_present=_bench_present_for(bc_train),
     nn_neighbor_support=support_score_train.astype(np.float32),
@@ -1399,8 +1586,6 @@ aux_train = dict(
         if CENTROID_DIST_DIM > 0 else _aux_half(N_TRAIN)
     ),
 )
-# Val-side aux uses the REDACTED bc_val_red, matching what the val
-# rows actually see at predict time.
 aux_val = dict(
     bench_present=_bench_present_for(bc_val_red),
     nn_neighbor_support=support_score_val.astype(np.float32),
@@ -1412,21 +1597,7 @@ aux_val = dict(
 )
 _AUX_NAMES = ["bench_present", "nn_neighbor_support",
               "nn_mean_similarity", "centroid_distance"]
-print(
-    f"[aux] built {len(_AUX_NAMES)} per-row features for combiner "
-    f"({N_TRAIN:,} train; {N_VAL:,} val)"
-)
-print(
-    "  bench_present rates: "
-    f"train={aux_train['bench_present'].mean():.3f}  "
-    f"val={aux_val['bench_present'].mean():.3f}  "
-    f"(val < train by ~{aux_train['bench_present'].mean() - aux_val['bench_present'].mean():.3f} "
-    "due to per-unit redaction)"
-)
 
-# Z-score the non-binary aux features on train stats so the FWLS /
-# MLP combiners get inputs at the same scale. ``bench_present`` is
-# already in {0, 1} so we leave it alone.
 _aux_means = np.array([
     0.0,
     aux_train["nn_neighbor_support"].mean(),
@@ -1452,27 +1623,13 @@ aux_train_mat_norm = _aux_to_matrix(aux_train, normalize=True)
 aux_val_mat_norm = _aux_to_matrix(aux_val, normalize=True)
 aux_train_mat_raw = _aux_to_matrix(aux_train, normalize=False)
 aux_val_mat_raw = _aux_to_matrix(aux_val, normalize=False)
-print(f"[aux] aux_train_mat shape={aux_train_mat_norm.shape}")
 
 # %% [markdown]
-# ## 18. Combiners
-#
-# 18a. **Uniform avg** -- baseline ensemble.
-# 18b. **Logit-linear stacker** -- production-style; one global weight
-#      per member, aux features as standalone bias columns. This is
-#      what `feature_dropout_ensemble.py`'s Platt stacker did, applied
-#      here to the routed-MoE predictions instead of the raw
-#      per-variant predictions.
-# 18c. **FWLS stacker** -- explicit (member x aux) cross terms. Built
-#      by hand because `fit_stacker` only adds aux features as
-#      standalone columns. Gives per-row gated linear blending.
-# 18d. **Small MLP combiner** -- a tiny 2-layer net on the K+1 logits
-#      + 4 aux features. Non-linear; can express interactions the
-#      stacker can't.
+# ## 18. Combiners (linear only by default; flip EXP knobs to re-test)
 
 # %%
 print("\n" + "=" * 80)
-print("COMBINERS -- val NLL")
+print("STAGE B COMBINERS -- val NLL")
 print("=" * 80)
 
 _M = len(VARIANT_KEYS)
@@ -1480,16 +1637,18 @@ _G = len(_AUX_NAMES)
 _stack_oof = np.stack([cal_oof[v] for v in VARIANT_KEYS], axis=1).astype(np.float32)
 _stack_val = np.stack([cal_val[v] for v in VARIANT_KEYS], axis=1).astype(np.float32)
 
-# 18a. Uniform avg
+nll_uniform = None
+nll_ll = None
+nll_fwls = None
+nll_mlp = None
+_w_ll = None
+
 if EXP["combiner_uniform_avg"]:
     _uniform_val = _stack_val.mean(axis=1).astype(np.float32)
     nll_uniform = _nll(_uniform_val, y_val)
     print(f"  uniform_avg                       : {nll_uniform:.6f}   "
           f"(vs full+MoE: {nll_uniform - _full_routed_nll:+.6f})")
 
-# 18b. Logit-linear stacker (member probs + aux as standalone columns).
-#      This is what build_stacker_features produces; reusing it keeps
-#      apples-to-apples with the prior probe's stacker.
 if EXP["combiner_logit_linear_stacker"]:
     Xo_ll = build_stacker_features(
         member_probs=_stack_oof,
@@ -1517,18 +1676,11 @@ if EXP["combiner_logit_linear_stacker"]:
     print("  weights (member channels):")
     for i, v in enumerate(VARIANT_KEYS):
         print(f"    {v:<28s} weight={_w_ll[i]:+.4f}")
+    print("  weights (aux channels):")
+    for i, g in enumerate(_AUX_NAMES):
+        print(f"    {g:<28s} weight={_w_ll[_M + i]:+.4f}")
+    print(f"  bias = {stk_ll.bias:+.4f}")
 
-# 18c. FWLS stacker -- true per-row gated linear blend.
-#
-# Feature layout (column order):
-#   [0 .. M)                : logit(member_i)               (the M base members)
-#   [M .. M + M*G)          : logit(member_i) * aux_g       (M*G cross terms)
-#   [M + M*G .. M + M*G+G)  : aux_g                          (G standalone aux for bias)
-#
-# Standalone aux columns are kept normalized; cross terms use
-# RAW aux so the per-row gating has interpretable units (e.g. a
-# weight on "logit(no_bench) * (1 - bench_present)" reads as
-# "trust no_bench more by W per unit of bench-redaction").
 if EXP["combiner_fwls_stacker"]:
     def _build_fwls_features(member_probs, aux_mat_raw, aux_mat_norm):
         N, M = member_probs.shape
@@ -1549,14 +1701,8 @@ if EXP["combiner_fwls_stacker"]:
         + [f"m_{v}_x_{g}" for g in _AUX_NAMES for v in VARIANT_KEYS]
         + list(_AUX_NAMES)
     )
-    Xo_fwls = _build_fwls_features(
-        _stack_oof, aux_train_mat_raw, aux_train_mat_norm,
-    )
-    Xv_fwls = _build_fwls_features(
-        _stack_val, aux_val_mat_raw, aux_val_mat_norm,
-    )
-    print(f"\n  [fwls] feature dim = {Xo_fwls.shape[1]}  "
-          f"(M={_M}, G={_G}, M*G={_M * _G})")
+    Xo_fwls = _build_fwls_features(_stack_oof, aux_train_mat_raw, aux_train_mat_norm)
+    Xv_fwls = _build_fwls_features(_stack_val, aux_val_mat_raw, aux_val_mat_norm)
     stk_fwls = fit_stacker(
         X=Xo_fwls, y=y_train, feature_names=_fwls_feat_names,
         seed=SEED + 22, n_iters=3000, l2=2.0, early_stopping_patience=300,
@@ -1565,22 +1711,7 @@ if EXP["combiner_fwls_stacker"]:
     nll_fwls = _nll(_val_fwls, y_val)
     print(f"  fwls_stacker                      : {nll_fwls:.6f}   "
           f"(vs full+MoE: {nll_fwls - _full_routed_nll:+.6f})")
-    _w_fwls = np.asarray(stk_fwls.weights, dtype=np.float32).reshape(-1)
-    print("  FWLS main-effect weights (per member, no aux gate):")
-    for i, v in enumerate(VARIANT_KEYS):
-        print(f"    {v:<28s} main={_w_fwls[i]:+.4f}")
-    print("  FWLS gated-weight effects (member * aux):")
-    for gi, g in enumerate(_AUX_NAMES):
-        for vi, v in enumerate(VARIANT_KEYS):
-            idx = _M + gi * _M + vi
-            print(f"    {v:<28s} x {g:<24s} gate={_w_fwls[idx]:+.4f}")
 
-# 18d. Small MLP combiner (PyTorch).
-#
-# Tiny 2-layer net: input [logits | aux_normalized] -> hidden ->
-# sigmoid. Trains on OOF predictions with an internal val split for
-# early stopping. Kept small (hidden=16) so 600K rows x 10 inputs
-# can't overfit it.
 if EXP["combiner_small_mlp"]:
     import torch.nn as nn
 
@@ -1588,114 +1719,83 @@ if EXP["combiner_small_mlp"]:
         def __init__(self, n_in, hidden, p_drop):
             super().__init__()
             self.net = nn.Sequential(
-                nn.Linear(n_in, hidden),
-                nn.GELU(),
-                nn.Dropout(float(p_drop)),
-                nn.Linear(hidden, hidden),
-                nn.GELU(),
-                nn.Dropout(float(p_drop)),
+                nn.Linear(n_in, hidden), nn.GELU(), nn.Dropout(float(p_drop)),
+                nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(float(p_drop)),
                 nn.Linear(hidden, 1),
             )
-
         def forward(self, x):
             return self.net(x).squeeze(-1)
 
-    def _mlp_train_predict():
-        # Build [N, M + G] feature matrices.
-        Xo = np.concatenate([
-            np.asarray(logit_clipped(np.asarray(_stack_oof, dtype=np.float64))).astype(np.float32),
-            aux_train_mat_norm,
-        ], axis=1)
-        Xv = np.concatenate([
-            np.asarray(logit_clipped(np.asarray(_stack_val, dtype=np.float64))).astype(np.float32),
-            aux_val_mat_norm,
-        ], axis=1)
-        Xo = np.where(np.isfinite(Xo), Xo, 0.0).astype(np.float32)
-        Xv = np.where(np.isfinite(Xv), Xv, 0.0).astype(np.float32)
+    Xo = np.concatenate([
+        np.asarray(logit_clipped(np.asarray(_stack_oof, dtype=np.float64))).astype(np.float32),
+        aux_train_mat_norm,
+    ], axis=1)
+    Xv = np.concatenate([
+        np.asarray(logit_clipped(np.asarray(_stack_val, dtype=np.float64))).astype(np.float32),
+        aux_val_mat_norm,
+    ], axis=1)
+    Xo = np.where(np.isfinite(Xo), Xo, 0.0).astype(np.float32)
+    Xv = np.where(np.isfinite(Xv), Xv, 0.0).astype(np.float32)
 
-        dev = _dev
-        rng = np.random.default_rng(SEED + 33)
-        N = Xo.shape[0]
-        n_val = max(2000, int(round(float(EXP["mlp_val_fraction"]) * N)))
-        perm = rng.permutation(N)
-        vidx = perm[:n_val]
-        tidx = perm[n_val:]
-
-        net = TinyCombiner(
-            n_in=Xo.shape[1], hidden=int(EXP["mlp_hidden"]),
-            p_drop=float(EXP["mlp_dropout"]),
-        ).to(dev)
-        opt = torch.optim.AdamW(
-            net.parameters(), lr=float(EXP["mlp_lr"]),
-            weight_decay=float(EXP["mlp_wd"]),
-        )
-        bce = nn.BCEWithLogitsLoss()
-        Xo_t = torch.from_numpy(Xo).to(dev)
-        y_t = torch.from_numpy(y_train).to(dev)
-
-        bs = 65536
-        best_val = float("inf")
-        best_state = None
-        no_imp = 0
-        for epoch in range(int(EXP["mlp_epochs"])):
-            net.train()
-            perm_tr = rng.permutation(tidx)
-            for i in range(0, len(perm_tr), bs):
-                idx = perm_tr[i:i + bs]
-                logits = net(Xo_t[idx])
-                loss = bce(logits, y_t[idx])
-                opt.zero_grad(); loss.backward(); opt.step()
-            net.eval()
-            with torch.no_grad():
-                v_logits = net(Xo_t[vidx])
-                vl = bce(v_logits, y_t[vidx]).item()
-            if vl + 1e-5 < best_val:
-                best_val = vl
-                best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
-                no_imp = 0
-            else:
-                no_imp += 1
-                if no_imp >= int(EXP["mlp_patience"]):
-                    print(f"    [mlp] early stop at epoch {epoch + 1}; "
-                          f"best val BCE={best_val:.5f}")
-                    break
-        if best_state is not None:
-            net.load_state_dict(best_state)
-
-        # Predict val.
+    rng = np.random.default_rng(SEED + 33)
+    N = Xo.shape[0]
+    n_val = max(2000, int(round(float(EXP["mlp_val_fraction"]) * N)))
+    perm = rng.permutation(N)
+    vidx = perm[:n_val]; tidx = perm[n_val:]
+    net = TinyCombiner(Xo.shape[1], int(EXP["mlp_hidden"]), float(EXP["mlp_dropout"])).to(_dev)
+    opt = torch.optim.AdamW(net.parameters(), lr=float(EXP["mlp_lr"]),
+                            weight_decay=float(EXP["mlp_wd"]))
+    bce = nn.BCEWithLogitsLoss()
+    Xo_t = torch.from_numpy(Xo).to(_dev)
+    y_t = torch.from_numpy(y_train).to(_dev)
+    bs = 65536
+    best_val = float("inf"); best_state = None; no_imp = 0
+    for epoch in range(int(EXP["mlp_epochs"])):
+        net.train()
+        perm_tr = rng.permutation(tidx)
+        for i in range(0, len(perm_tr), bs):
+            idx = perm_tr[i:i + bs]
+            logits = net(Xo_t[idx])
+            loss = bce(logits, y_t[idx])
+            opt.zero_grad(); loss.backward(); opt.step()
         net.eval()
-        Xv_t = torch.from_numpy(Xv).to(dev)
         with torch.no_grad():
-            p_val_logits = torch.zeros(Xv.shape[0], dtype=torch.float32, device=dev)
-            for i in range(0, Xv.shape[0], bs):
-                end = min(i + bs, Xv.shape[0])
-                p_val_logits[i:end] = net(Xv_t[i:end])
-            p_val = torch.sigmoid(p_val_logits).cpu().numpy().astype(np.float32)
-        return p_val
-
-    print("\n  [mlp] training tiny combiner...")
-    _val_mlp = _mlp_train_predict()
+            v_logits = net(Xo_t[vidx])
+            vl = bce(v_logits, y_t[vidx]).item()
+        if vl + 1e-5 < best_val:
+            best_val = vl
+            best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+            no_imp = 0
+        else:
+            no_imp += 1
+            if no_imp >= int(EXP["mlp_patience"]):
+                break
+    if best_state is not None:
+        net.load_state_dict(best_state)
+    net.eval()
+    Xv_t = torch.from_numpy(Xv).to(_dev)
+    with torch.no_grad():
+        p_val_logits = torch.zeros(Xv.shape[0], dtype=torch.float32, device=_dev)
+        for i in range(0, Xv.shape[0], bs):
+            end = min(i + bs, Xv.shape[0])
+            p_val_logits[i:end] = net(Xv_t[i:end])
+        _val_mlp = torch.sigmoid(p_val_logits).cpu().numpy().astype(np.float32)
     nll_mlp = _nll(_val_mlp, y_val)
     print(f"  small_mlp_combiner                : {nll_mlp:.6f}   "
           f"(vs full+MoE: {nll_mlp - _full_routed_nll:+.6f})")
 
 # %% [markdown]
-# ## 19. Comparison table -- reference NLLs from the prior probes
-#
-# We don't re-train the plain-vs-rich or the single-variant
-# rich+MoE baselines here (they're already in the prior probe
-# logs). Embedded as constants below for the apples-to-apples table.
-# The numbers come from this same dataset / fold split / val
-# redaction sample, so the comparison is honest.
+# ## 19. Combined comparison table -- prior refs + Stage A grid + Stage B winner
 
 # %%
-# Reference NLLs (from prior runs of the same dataset / val redaction):
-REF_PLAIN = 0.509200            # plain-M8 baseline
-REF_RICH_NO_MOE = 0.462682       # rich_baseline (no MoE) from rich_mlp_moe_probe
-REF_RICH_NN_MOE = 0.458928       # rich + NN-support soft-MoE tau=1.0xstd (best from prior probe)
-REF_FD_UNIFORM = 0.463049        # feature-dropout uniform_avg from feature_dropout_ensemble
-REF_FD_PLATT = 0.461719          # feature-dropout platt_stacker from feature_dropout_ensemble
-REF_FD_BEAT4 = 0.461018          # feature-dropout uniform_avg over 4 'beat-full' variants
+# References from earlier runs of the same dataset / val redaction.
+REF_PLAIN = 0.509200
+REF_RICH_NO_MOE = 0.462682
+REF_RICH_NN_MOE = 0.458928
+REF_FD_UNIFORM = 0.463049
+REF_FD_PLATT = 0.461719
+REF_FD_BEAT4 = 0.461018
+REF_PRIOR_STACKER_at_5_8 = 0.455683  # the prior run's logit_linear winner
 
 print("\n" + "=" * 80)
 print("COMBINED COMPARISON -- val NLL (lower is better)")
@@ -1709,57 +1809,65 @@ def _row(name, nll, ref_name, ref_nll):
 
 print(_row("plain_baseline (PRIOR)", REF_PLAIN, "rich_no_moe", REF_RICH_NO_MOE))
 print(_row("rich_baseline NO MoE (PRIOR ref)", REF_RICH_NO_MOE, "self", REF_RICH_NO_MOE))
-print(_row("rich + NN-support soft-MoE (PRIOR)", REF_RICH_NN_MOE, "rich_no_moe", REF_RICH_NO_MOE))
+print(_row("rich + NN-support MoE @ (5, 8) (PRIOR)", REF_RICH_NN_MOE, "rich_no_moe", REF_RICH_NO_MOE))
 print(_row("feature-dropout uniform_avg (PRIOR)", REF_FD_UNIFORM, "rich_no_moe", REF_RICH_NO_MOE))
 print(_row("feature-dropout platt_stacker (PRIOR)", REF_FD_PLATT, "rich_no_moe", REF_RICH_NO_MOE))
-print(_row("feature-dropout 4-beat-full uniform (PRIOR)", REF_FD_BEAT4, "rich_no_moe", REF_RICH_NO_MOE))
-print(_row("full + MoE (THIS RUN; per-variant anchor)", _full_routed_nll, "rich_no_moe", REF_RICH_NO_MOE))
+print(_row("PRIOR variant-MoE logit_linear @ (5, 8)", REF_PRIOR_STACKER_at_5_8,
+           "rich_no_moe", REF_RICH_NO_MOE))
 print()
+print(f"  STAGE A grid solo NLL ({SWEEP_VARIANT} only):")
+for (up, k), v in sorted(stage_a_grid.items()):
+    print(f"    upweight={up:<6g} K={k:<4d} : {v:.6f}")
+print()
+print(_row(f"STAGE B full+MoE anchor @ ({_best_up}, {_best_k})",
+           _full_routed_nll, "rich_no_moe", REF_RICH_NO_MOE))
 if EXP["combiner_uniform_avg"]:
-    print(_row("THIS: variant-MoE uniform_avg", nll_uniform, "rich_no_moe", REF_RICH_NO_MOE))
+    print(_row(f"STAGE B variant-MoE uniform_avg @ ({_best_up}, {_best_k})",
+               nll_uniform, "rich_no_moe", REF_RICH_NO_MOE))
 if EXP["combiner_logit_linear_stacker"]:
-    print(_row("THIS: variant-MoE logit_linear_stacker", nll_ll, "rich_no_moe", REF_RICH_NO_MOE))
+    print(_row(f"STAGE B variant-MoE logit_linear @ ({_best_up}, {_best_k})",
+               nll_ll, "rich_no_moe", REF_RICH_NO_MOE))
 if EXP["combiner_fwls_stacker"]:
-    print(_row("THIS: variant-MoE fwls_stacker", nll_fwls, "rich_no_moe", REF_RICH_NO_MOE))
+    print(_row(f"STAGE B variant-MoE fwls @ ({_best_up}, {_best_k})",
+               nll_fwls, "rich_no_moe", REF_RICH_NO_MOE))
 if EXP["combiner_small_mlp"]:
-    print(_row("THIS: variant-MoE small_mlp", nll_mlp, "rich_no_moe", REF_RICH_NO_MOE))
+    print(_row(f"STAGE B variant-MoE small_mlp @ ({_best_up}, {_best_k})",
+               nll_mlp, "rich_no_moe", REF_RICH_NO_MOE))
 
 # %% [markdown]
-# ## 20. Residual correlation heatmap (across variant-MoE preds)
+# ## 20. Residual correlation heatmap at the Stage B winner
 
 # %%
-import matplotlib.pyplot as plt
-
-
 def _render_heatmap(corr, names, title, fname,
                     cmap_high=0.6, fig_w=10.0, fig_h=8.0):
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    im = ax.imshow(corr, vmin=-1.0, vmax=1.0, cmap="RdBu_r")
-    ax.set_xticks(range(len(names)))
-    ax.set_yticks(range(len(names)))
-    ax.set_xticklabels(names, rotation=45, ha="right")
-    ax.set_yticklabels(names)
-    for i in range(len(names)):
-        for j in range(len(names)):
-            ax.text(
-                j, i, f"{corr[i, j]:+.2f}", ha="center", va="center",
-                color="white" if abs(corr[i, j]) > cmap_high else "black",
-                fontsize=7,
-            )
-    ax.set_title(title)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    _outdir = ROOT / "artifacts" / "diagnostics"
-    _outdir.mkdir(parents=True, exist_ok=True)
-    _outpath = _outdir / fname
-    fig.savefig(_outpath, dpi=120, bbox_inches="tight")
-    print(f"[heatmap] saved -> {_outpath}")
-    plt.show()
+    try:
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        im = ax.imshow(corr, vmin=-1.0, vmax=1.0, cmap="RdBu_r")
+        ax.set_xticks(range(len(names)))
+        ax.set_yticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=45, ha="right")
+        ax.set_yticklabels(names)
+        for i in range(len(names)):
+            for j in range(len(names)):
+                ax.text(
+                    j, i, f"{corr[i, j]:+.2f}", ha="center", va="center",
+                    color="white" if abs(corr[i, j]) > cmap_high else "black",
+                    fontsize=7,
+                )
+        ax.set_title(title)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        _outdir = ROOT / "artifacts" / "diagnostics"
+        _outdir.mkdir(parents=True, exist_ok=True)
+        _outpath = _outdir / fname
+        fig.savefig(_outpath, dpi=120, bbox_inches="tight")
+        print(f"[heatmap] saved -> {_outpath}")
+        plt.show()
+    except Exception as exc:  # pragma: no cover
+        print(f"[heatmap {fname}] skipped ({exc!r})")
+        print(np.round(corr, 3))
 
 
-# Residual vs 'full + MoE' anchor. The 'full' column carries the
-# raw (prob - y) anchor (otherwise it would be all zeros and break
-# corrcoef on that column).
 _resid_names = list(VARIANT_KEYS)
 _p_full = cal_val["full"]
 _resid_stack = np.stack(
@@ -1773,95 +1881,80 @@ _K = corr.shape[0]
 _off = ~np.eye(_K, dtype=bool)
 _mean_abs_off = float(np.abs(corr[_off]).mean())
 print(
-    f"\n[diversity] mean |residual-vs-full corr| across variant-MoE pairs = "
-    f"{_mean_abs_off:.4f} (lower => more independent errors)"
+    f"\n[diversity] STAGE B mean |residual-vs-full corr| = {_mean_abs_off:.4f}"
 )
 _render_heatmap(
     corr, _resid_names,
     title=(
-        "Variant-MoE residual correlation (val) -- after NN-support soft-MoE\n"
+        f"Stage B variant-MoE residual correlation (val) -- "
+        f"WINNER (upweight={_best_up}, K={_best_k})\n"
         f"K+1={len(VARIANT_KEYS)} variants; 'full' column = raw (prob - y) anchor"
     ),
-    fname=f"feature_dropout_moe_combiner_K{len(VARIANT_KEYS)}_resid_corr.png",
+    fname=(f"feature_dropout_moe_combiner_sweep_K{len(VARIANT_KEYS)}"
+           f"_up{_best_up}_k{_best_k}_resid_corr.png"),
 )
 
 # %% [markdown]
 # ## 21. Final verdict
 #
-# Decides which combiner is the right one given the lifts vs the
-# reference baselines. Thresholds match the prior probes:
-#
-# * ``>= 0.003 nat`` over the best prior reference: clear win,
-#   promote.
-# * ``>= 0.001 nat``: marginal, worth one more validation run with
-#   a different seed before promoting.
-# * ``< 0.001 nat``: not worth the extra compute / inference
-#   complexity.
+# Decides whether the (upweight*, K*) winner from Stage A + the
+# logit-linear stacker beats the prior (5, 8) baseline by enough to
+# promote, and surfaces any caveats (close runner-up, large drift
+# between prior and current single-config anchors, etc.).
 
 # %%
 print("\n" + "=" * 80)
 print("FINAL VERDICT")
 print("=" * 80)
-
-# Best prior reference is "rich + NN-support soft-MoE" at 0.458928.
-# Anything better than that justifies the (K + 1) x M trainings.
-_BEST_PRIOR = REF_RICH_NN_MOE
-print(f"  Best prior reference: rich + NN-support soft-MoE = {_BEST_PRIOR:.6f}")
-print(f"  Anchor in this run  : full + NN-support soft-MoE = {_full_routed_nll:.6f}")
-print(
-    f"  Drift between runs  : {_full_routed_nll - _BEST_PRIOR:+.6f} "
-    "(should be ~0 if seeds + data match)"
-)
-
-_candidates = []
-if EXP["combiner_uniform_avg"]:
-    _candidates.append(("uniform_avg", nll_uniform))
+print(f"  Stage A winner: (upweight={_best_up}, K={_best_k})  "
+      f"solo NLL = {_best_nll:.6f}")
+print(f"  Stage B at winner:")
+print(f"    full + MoE anchor : {_full_routed_nll:.6f}")
 if EXP["combiner_logit_linear_stacker"]:
-    _candidates.append(("logit_linear_stacker", nll_ll))
-if EXP["combiner_fwls_stacker"]:
-    _candidates.append(("fwls_stacker", nll_fwls))
-if EXP["combiner_small_mlp"]:
-    _candidates.append(("small_mlp", nll_mlp))
+    print(f"    logit_linear stk  : {nll_ll:.6f}   "
+          f"(vs full+MoE: {nll_ll - _full_routed_nll:+.6f})")
 
-print("\n  Combiner deltas vs BEST PRIOR reference (rich + NN-support soft-MoE):")
-for name, nll in _candidates:
-    d = nll - _BEST_PRIOR
-    if d <= -0.003:
-        verdict = "CLEAR WIN -- promote this combiner over single-variant MoE"
-    elif d <= -0.001:
-        verdict = "marginal win -- re-validate at another seed before promoting"
-    elif d <= 0.001:
-        verdict = "tie within noise -- the gating couldn't extract extra signal"
+print()
+print(f"  Prior reference (5x, K=8) logit_linear stacker  : {REF_PRIOR_STACKER_at_5_8:.6f}")
+if EXP["combiner_logit_linear_stacker"]:
+    _delta_vs_prior = nll_ll - REF_PRIOR_STACKER_at_5_8
+    print(f"  Stage B winner stacker - prior @ (5, 8)         : {_delta_vs_prior:+.6f}")
+    if _delta_vs_prior <= -0.003:
+        verdict = ("CLEAR WIN -- (upweight={uw}, K={k}) + linear stacker beats "
+                   "the prior (5, 8) baseline by >= 0.003 nat. Promote this "
+                   "MoE configuration.").format(uw=_best_up, k=_best_k)
+    elif _delta_vs_prior <= -0.001:
+        verdict = ("Marginal win -- {delta:+.6f} nat is real but small. "
+                   "Re-validate with a different SEED before promoting.").format(
+                   delta=_delta_vs_prior)
+    elif _delta_vs_prior <= 0.001:
+        verdict = ("Tie within noise -- the prior (5, 8) config was already "
+                   "near-optimal. Stick with (5, 8) unless the sweep grid "
+                   "is extended.")
     else:
-        verdict = "LOSS -- combiner adds overhead without lift"
-    print(f"    {name:<24s}: {nll:.6f}   ({d:+.6f})   -> {verdict}")
+        verdict = ("LOSS -- the prior (5, 8) baseline beats this sweep's "
+                   "winner. Either the sweep grid missed the true optimum "
+                   "(extend it) or run-to-run drift exceeded the lift.")
+    print(f"  -> {verdict}")
 
 print(
     f"\n  Cross-variant residual diversity (mean |corr|): {_mean_abs_off:.4f}"
 )
-if _mean_abs_off < 0.3:
-    print("    -> Variant-MoE preds remain strongly decorrelated even after "
-          "individual MoE routing. Per-row gating SHOULD pay if a combiner can "
-          "capture the orthogonality.")
-elif _mean_abs_off < 0.6:
-    print("    -> Moderate diversity. Gating helps but lift is bounded by "
-          "the residual correlation floor.")
-else:
-    print("    -> High residual correlation. The MoE step homogenised the "
-          "variants; the feature-dropout diversity has largely been "
-          "consumed by the routing.")
-
 print(
-    "\n  Reading guide:\n"
-    "  * If FWLS or MLP beats logit_linear_stacker by >= 0.001 nat,\n"
-    "    per-row gating is the lever and the orthogonal-residuals\n"
-    "    story is real. Promote that combiner as the L1 stack.\n"
-    "  * If logit_linear ties FWLS / MLP, a single-weight-per-member\n"
-    "    blend is enough; the residual orthogonality didn't survive\n"
-    "    the per-variant MoE step.\n"
-    "  * If no combiner beats `full + NN-support soft-MoE`, the\n"
-    "    per-variant MoE trainings are sunk cost and we should fall\n"
-    "    back to (a) single rich-M8 + NN-support MoE, or (b) a\n"
-    "    `lean_rich_M8` (no form / bench / cluster) + NN-support MoE\n"
-    "    informed by the prior probe's solo-NLL surprise."
+    "\nReading guide:\n"
+    "  * If Stage B winner stacker beats prior @ (5, 8) by >= 0.003 nat,\n"
+    "    promote the new (upweight*, K*) for the production NN-support MoE.\n"
+    "  * If it ties prior @ (5, 8), 5x upweight + K=8 was the right pick.\n"
+    "    Save compute and skip future sweeps in this region.\n"
+    "  * If the Stage A surface is monotonically improving toward an edge\n"
+    "    of the grid (e.g. K=16 is best), extend the grid in that direction\n"
+    "    and re-sweep.\n"
+    "  * If the Stage A surface is U-shaped (interior optimum), you've\n"
+    "    found the right (upweight, K) regime.\n"
+    "  * If the diversity dropped sharply from the prior 0.22 -> >0.4, the\n"
+    "    new MoE config homogenised the variants and the stacker lift will\n"
+    "    erode.\n"
+    "  * If you want a third-party check on the Stage A winner, re-run\n"
+    "    Stage B at the Stage A runner-up; if its stacker NLL is worse,\n"
+    "    the winner is robust."
 )
