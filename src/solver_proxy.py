@@ -49,7 +49,13 @@ LOG = logging.getLogger("solver_proxy")
 # Schema version of the extracted feature set. Bumped whenever the schema
 # changes (new columns or renamed columns) so config_hash flips and the
 # parquet cache invalidates cleanly. Independent of model-id / template.
-PROXY_FEATURE_SCHEMA_VERSION: str = "v2_extended_2026_05"
+#
+# v3 additionally persists the raw decoded samples (`raw_samples`) so any
+# future scalar feature can be re-derived from on-disk data WITHOUT paying
+# another Qwen pass. The `raw_samples` column is NOT folded into the
+# config-hash because it is data, not config -- bumping it would needlessly
+# invalidate caches whenever we toggle persistence on/off.
+PROXY_FEATURE_SCHEMA_VERSION: str = "v3_raw_samples_2026_05"
 
 # Core self-consistency / verification block (Tier 1+2 in the literature).
 _CORE_FEATURE_NAMES: tuple[str, ...] = (
@@ -397,6 +403,23 @@ class SolverProxyConfig:
     # Items per cache flush: generation + parse + append happen per chunk so
     # progress is visible and the run is resumable mid-way.
     chunk_items: int = 32
+    # Persist the raw decoded samples per item, so any future scalar feature
+    # (e.g. a new length / format / step diagnostic) can be re-derived from
+    # disk without re-running the model. Adds ~1-3 KB per item per sample to
+    # the parquet; disable only when storage is genuinely scarce.
+    store_raw_samples: bool = True
+    # On cache load, automatically re-derive every scalar in
+    # PROXY_FEATURE_NAMES from cached `raw_samples` (free, pure-CPU). This is
+    # what makes "add a new feature column" cost zero GPU on already-cached
+    # items. Legacy entries without raw_samples are left as-is (their new
+    # columns will be NaN until `force_resample_missing_raw` is set).
+    auto_backfill: bool = True
+    # When True, items present in cache but lacking raw_samples (i.e. scored
+    # before the v3 schema) are added back to `to_score` so we re-sample them
+    # ONCE and populate raw_samples + every feature. Pay once, never again.
+    # False (default) preserves the cache-hit behavior -- new features stay
+    # NaN for legacy items.
+    force_resample_missing_raw: bool = False
     # Optional system message prepended via the chat template. Used for
     # models whose reasoning mode is controlled by a system prompt rather
     # than an ``enable_thinking`` kwarg -- e.g. NVIDIA Llama-Nemotron, which
@@ -456,8 +479,48 @@ def _cache_path(cfg: SolverProxyConfig) -> Path:
 
 
 PROXY_CACHE_COLUMNS: tuple[str, ...] = (
-    ("item_key",) + PROXY_FEATURE_NAMES + ("modal_answer", "model_id", "config_hash")
+    ("item_key",)
+    + PROXY_FEATURE_NAMES
+    + ("modal_answer", "raw_samples", "model_id", "config_hash")
 )
+
+
+def extract_features_from_samples(
+    samples: Sequence[str],
+    *,
+    tokenizer=None,
+    p_true_value: float = 0.5,
+) -> dict[str, float]:
+    """Derive every scalar in :data:`PROXY_FEATURE_NAMES` from raw samples.
+
+    Pure CPU function -- no GPU, no model. ``tokenizer`` is optional; without
+    it the token-count features fall back to whitespace splits (close enough
+    for ordering but not identical to the model-tokenizer count). ``p_true``
+    is taken as-is from the caller (re-running the verification forward pass
+    is the only feature that requires GPU and is therefore not re-derivable).
+
+    Used both as the inner per-item pass in :meth:`SolverProxy.score_items`
+    and as the engine of :func:`backfill_derived_features` (which re-derives
+    on cached rows for free).
+    """
+    samples = list(samples or [])
+    parsed = [normalize_answer(t) for t in samples]
+    vs = vote_statistics(parsed)
+    if tokenizer is not None:
+        try:
+            lens = [
+                int(len(tokenizer.encode(t, add_special_tokens=False))) for t in samples
+            ]
+        except Exception:  # pragma: no cover - defensive
+            lens = [int(len((t or "").split())) for t in samples]
+    else:
+        lens = [int(len((t or "").split())) for t in samples]
+    vs["mean_trace_len"] = float(np.mean(lens)) if lens else 0.0
+    vs.update(extended_sample_features(samples, parsed, tokenizer=tokenizer))
+    vs["p_true"] = float(p_true_value)
+    # Restrict to PROXY_FEATURE_NAMES order so callers can rely on a stable
+    # superset of keys.
+    return {k: float(vs.get(k, 0.0)) for k in PROXY_FEATURE_NAMES}
 
 
 def load_cache(cfg: SolverProxyConfig) -> pd.DataFrame:
@@ -486,6 +549,123 @@ def append_cache(cfg: SolverProxyConfig, new_rows: pd.DataFrame) -> Path:
     merged.to_parquet(tmp, index=False)
     os.replace(tmp, path)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Raw-samples persistence + backfill (re-derive features without re-running)
+# ---------------------------------------------------------------------------
+
+
+def _serialize_raw_samples(samples: Sequence[str] | None) -> str | None:
+    """JSON-string-encode a list of decoded completions for parquet storage.
+
+    Plain Python list[str] occasionally trips pyarrow type inference when a
+    column has mixed null + list rows; JSON strings sidestep that entirely
+    and stay portable across pandas / pyarrow versions.
+    """
+    if samples is None:
+        return None
+    import json
+    return json.dumps(list(samples), ensure_ascii=False)
+
+
+def _deserialize_raw_samples(value) -> list[str] | None:
+    """Inverse of :func:`_serialize_raw_samples`; tolerant of null / list."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, str):
+        if not value:
+            return None
+        import json
+        try:
+            out = json.loads(value)
+            return list(out) if isinstance(out, list) else None
+        except Exception:
+            return None
+    try:
+        return list(value)
+    except Exception:
+        return None
+
+
+def _is_nonempty_seq(value) -> bool:
+    """True iff ``value`` is a non-empty raw-samples payload (after deser)."""
+    out = _deserialize_raw_samples(value)
+    return bool(out) and len(out) > 0
+
+
+def _backfill_dataframe(
+    df: pd.DataFrame, *, tokenizer=None
+) -> tuple[pd.DataFrame, int]:
+    """Re-derive every PROXY_FEATURE_NAMES column for rows with raw_samples.
+
+    Operates on a copy of ``df``; returns ``(new_df, n_rows_backfilled)``.
+    Rows without a non-empty raw_samples payload are left untouched. Missing
+    feature columns are added (filled NaN by default; backfilled for the
+    rows we can derive). ``p_true`` is preserved from the cached row when
+    present (the verification forward pass cannot be re-derived from text).
+    """
+    if df.empty or "raw_samples" not in df.columns:
+        return df, 0
+    out = df.copy()
+    # Ensure every feature column exists (NaN for rows we can't backfill).
+    for col in PROXY_FEATURE_NAMES:
+        if col not in out.columns:
+            out[col] = float("nan")
+    # Identify rows we can actually backfill.
+    raw_payloads = out["raw_samples"].map(_deserialize_raw_samples)
+    eligible = raw_payloads.map(lambda s: bool(s) and len(s) > 0)
+    n = int(eligible.sum())
+    if n == 0:
+        return out, 0
+    # Per-row backfill; keep `p_true` from the cached row when available.
+    for idx in out.index[eligible]:
+        samples = raw_payloads.loc[idx]
+        p_true_val = out.at[idx, "p_true"] if "p_true" in out.columns else 0.5
+        try:
+            p_true_val = float(p_true_val) if pd.notna(p_true_val) else 0.5
+        except Exception:
+            p_true_val = 0.5
+        feats = extract_features_from_samples(
+            samples, tokenizer=tokenizer, p_true_value=p_true_val,
+        )
+        for col, val in feats.items():
+            out.at[idx, col] = val
+    return out, n
+
+
+def backfill_derived_features(
+    cfg: SolverProxyConfig, *, tokenizer=None
+) -> tuple[Path, int]:
+    """Re-derive every scalar feature from cached raw_samples; write back.
+
+    Use this once after adding new feature columns to bring already-cached
+    items up to the latest schema without paying another GPU pass. Returns
+    ``(parquet_path, n_rows_backfilled)``. Rows without raw_samples are
+    skipped; their new-feature columns stay NaN until the items are
+    re-sampled (set ``cfg.force_resample_missing_raw = True`` and call
+    :meth:`SolverProxy.score_items` to opt into the one-time re-sample).
+    """
+    path = _cache_path(cfg)
+    if not path.exists():
+        return path, 0
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("backfill: failed to read %s (%s); aborting", path, exc)
+        return path, 0
+    new_df, n = _backfill_dataframe(df, tokenizer=tokenizer)
+    if n == 0:
+        return path, 0
+    tmp = path.with_suffix(".tmp.parquet")
+    new_df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+    LOG.info("backfill: rederived %d / %d rows in %s", n, len(df), path)
+    return path, n
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +864,62 @@ class SolverProxy:
             raise ValueError(f"score_items: missing columns {sorted(missing)}")
         uniq = item_rows.drop_duplicates(subset=["item_key"]).reset_index(drop=True)
         cached = load_cache(self.cfg)
+        # Optional in-memory backfill: re-derive every scalar feature column
+        # from any cached row that has `raw_samples`. Free, pure-CPU; lets a
+        # new feature column light up on already-cached items without paying
+        # another forward pass. Needs the tokenizer to match the on-line
+        # `mean_trace_len`; lazily load it if available (model not required).
+        if (
+            self.cfg.auto_backfill
+            and not cached.empty
+            and "raw_samples" in cached.columns
+            and cached["raw_samples"].notna().any()
+        ):
+            tok = self._tok
+            if tok is None:
+                try:
+                    from transformers import AutoTokenizer
+                    tok = AutoTokenizer.from_pretrained(
+                        self.cfg.model_id,
+                        trust_remote_code=self.cfg.trust_remote_code,
+                        use_fast=True,
+                    )
+                except Exception as _exc:  # pragma: no cover - defensive
+                    LOG.warning(
+                        "auto_backfill: failed to load tokenizer (%s); "
+                        "falling back to whitespace token counts.", _exc,
+                    )
+                    tok = None
+            cached, _n_back = _backfill_dataframe(cached, tokenizer=tok)
+            if _n_back > 0:
+                LOG.info(
+                    "solver_proxy[%s]: backfilled %d cached rows from raw_samples "
+                    "(no GPU work needed)", self.cfg.model_id, _n_back,
+                )
+                # Persist the freshly-derived columns so the next caller sees
+                # them without re-running this code path.
+                tmp = _cache_path(self.cfg).with_suffix(".tmp.parquet")
+                cached.to_parquet(tmp, index=False)
+                os.replace(tmp, _cache_path(self.cfg))
+        # Distinguish "in cache with raw_samples (truly cached)" from "in
+        # cache without raw_samples (legacy; needs re-sampling to populate
+        # the v3 feature columns)" when the user has opted in.
+        if not cached.empty and "raw_samples" in cached.columns:
+            _has_raw = cached["raw_samples"].apply(_is_nonempty_seq)
+        else:
+            _has_raw = pd.Series([False] * len(cached))
         cached_keys = set(cached["item_key"].astype(str)) if not cached.empty else set()
+        if self.cfg.force_resample_missing_raw and not cached.empty:
+            legacy_keys = set(
+                cached.loc[~_has_raw, "item_key"].astype(str).tolist()
+            )
+            cached_keys -= legacy_keys
+            if legacy_keys:
+                LOG.info(
+                    "solver_proxy[%s]: force_resample_missing_raw=True -> "
+                    "%d legacy items (no raw_samples) will be re-sampled once",
+                    self.cfg.model_id, len(legacy_keys),
+                )
         todo = uniq[~uniq["item_key"].astype(str).isin(cached_keys)].reset_index(drop=True)
         LOG.info(
             "solver_proxy[%s]: %d unique items (cached=%d, to_score=%d)",
@@ -713,36 +948,38 @@ class SolverProxy:
                 prompts = [self._format_prompt(r) for r in chunk_rows]
                 # Generation + parse + (optional) P(True) for this chunk only.
                 samples_all = self._generate_samples(prompts)
-                feats: list[dict] = []
-                modal_list: list[str] = []
-                for samples in samples_all:
-                    parsed = [normalize_answer(t) for t in samples]
-                    vs = vote_statistics(parsed)
-                    lens = [len(tok.encode(t, add_special_tokens=False)) for t in samples]
-                    vs["mean_trace_len"] = float(np.mean(lens)) if lens else 0.0
-                    # Extended length/step/format diagnostics (cheap; no
-                    # extra forward passes).
-                    ext = extended_sample_features(samples, parsed, tokenizer=tok)
-                    vs.update(ext)
-                    feats.append(vs)
-                    modal_list.append(modal_answer(parsed))
+                modal_list = [
+                    modal_answer([normalize_answer(t) for t in samples])
+                    for samples in samples_all
+                ]
                 if self.cfg.compute_p_true:
                     p_true = self._p_true(chunk_rows, modal_list)
                 else:
                     p_true = np.full(len(chunk_rows), 0.5, dtype=np.float64)
+                # Derive every scalar feature from the raw samples via the
+                # shared extractor -- exactly the same path used by the
+                # backfill helper, so on-disk derivations match in-line.
+                feats = [
+                    extract_features_from_samples(
+                        samples_all[i], tokenizer=tok, p_true_value=float(p_true[i])
+                    )
+                    for i in range(len(samples_all))
+                ]
                 _row_dict = {
                     "item_key": todo.iloc[cs:ce]["item_key"].astype(str).values,
                 }
-                # Core columns (existing schema).
-                for _core_col in _CORE_FEATURE_NAMES:
-                    if _core_col == "p_true":
-                        _row_dict[_core_col] = p_true
-                    else:
-                        _row_dict[_core_col] = [f[_core_col] for f in feats]
-                # Extended columns (new in v2 schema).
-                for _ext_col in _EXTENDED_FEATURE_NAMES:
-                    _row_dict[_ext_col] = [f[_ext_col] for f in feats]
+                for _col in PROXY_FEATURE_NAMES:
+                    _row_dict[_col] = [f[_col] for f in feats]
                 _row_dict["modal_answer"] = modal_list
+                # Persist raw samples (list[str] -> serialized as JSON for
+                # parquet portability) so future feature additions can
+                # backfill without re-running the model.
+                if self.cfg.store_raw_samples:
+                    _row_dict["raw_samples"] = [
+                        _serialize_raw_samples(s) for s in samples_all
+                    ]
+                else:
+                    _row_dict["raw_samples"] = [None] * len(samples_all)
                 _row_dict["model_id"] = self.cfg.model_id
                 _row_dict["config_hash"] = ch_hash
                 new_df = pd.DataFrame(_row_dict)
@@ -820,10 +1057,12 @@ __all__ = [
     "SolverProxy",
     "SolverProxyConfig",
     "append_cache",
+    "backfill_derived_features",
     "build_proxy_row_vector",
     "config_hash",
     "cross_model_disagreement",
     "extended_sample_features",
+    "extract_features_from_samples",
     "load_cache",
     "modal_answer",
     "normalize_answer",

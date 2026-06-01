@@ -4,21 +4,32 @@ from __future__ import annotations
 
 import math
 
+from pathlib import Path
+
+import pandas as pd
+
 from src.solver_proxy import (
+    PROXY_CACHE_COLUMNS,
     PROXY_FEATURE_NAMES,
     SolverProxyConfig,
+    backfill_derived_features,
     build_proxy_row_vector,
     config_hash,
     cross_model_disagreement,
     extended_sample_features,
+    extract_features_from_samples,
     modal_answer,
     normalize_answer,
     vote_statistics,
 )
 from src.solver_proxy import (  # private but stable; tested directly
     _answer_type,
+    _backfill_dataframe,
+    _cache_path,
     _count_steps,
+    _deserialize_raw_samples,
     _EXTENDED_FEATURE_NAMES,
+    _serialize_raw_samples,
 )
 
 
@@ -192,3 +203,156 @@ def test_proxy_feature_names_includes_all_core_and_extended():
         assert k in PROXY_FEATURE_NAMES
     for k in _EXTENDED_FEATURE_NAMES:
         assert k in PROXY_FEATURE_NAMES
+
+
+# ---------------------------------------------------------------------------
+# raw_samples persistence + backfill round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_proxy_cache_columns_include_raw_samples():
+    assert "raw_samples" in PROXY_CACHE_COLUMNS
+
+
+def test_serialize_roundtrip_list_str():
+    payload = ["sample one", "sample two", ""]
+    s = _serialize_raw_samples(payload)
+    assert isinstance(s, str)
+    back = _deserialize_raw_samples(s)
+    assert back == payload
+
+
+def test_serialize_handles_none():
+    assert _serialize_raw_samples(None) is None
+    assert _deserialize_raw_samples(None) is None
+    assert _deserialize_raw_samples("") is None
+
+
+def test_deserialize_passthrough_list():
+    # On the in-memory path (pre-parquet) we may already have a list.
+    assert _deserialize_raw_samples(["a", "b"]) == ["a", "b"]
+
+
+def test_extract_features_from_samples_includes_every_proxy_name():
+    samples = [
+        "1. think\n2. answer\n\\boxed{42}",
+        "Step 1: try x\nStep 2: try y\nAnswer: 42",
+        "Answer: 42",
+    ]
+    feats = extract_features_from_samples(samples, p_true_value=0.7)
+    # Must include EVERY scalar in PROXY_FEATURE_NAMES (stable superset).
+    for k in PROXY_FEATURE_NAMES:
+        assert k in feats, f"missing feature: {k}"
+    assert feats["p_true"] == 0.7              # caller-supplied p_true preserved
+    assert feats["self_consistency"] == 1.0    # all answers parse to "42"
+    assert feats["boxed_rate"] > 0.0
+    assert feats["mean_trace_len"] > 0.0       # whitespace fallback nonzero
+
+
+def test_extract_features_zero_samples_returns_full_schema():
+    feats = extract_features_from_samples([])
+    for k in PROXY_FEATURE_NAMES:
+        assert k in feats
+    # P(True) defaults to 0.5 when not supplied; sample-derived stats are 0.
+    assert feats["p_true"] == 0.5
+    assert feats["self_consistency"] == 0.0
+    assert feats["mean_trace_len"] == 0.0
+
+
+def test_backfill_dataframe_rederives_missing_columns():
+    # Simulate a legacy cache row (no raw_samples) + a new row (with).
+    legacy = {
+        "item_key": "leg1",
+        "self_consistency": 0.6,
+        "answer_entropy": 0.4,
+        "fsd": 0.2,
+        "n_distinct": 0.5,
+        "mean_trace_len": 100.0,
+        "refusal_rate": 0.0,
+        "p_true": 0.55,
+        "modal_answer": "42",
+        "raw_samples": None,
+        "model_id": "Qwen/Qwen3-8B",
+        "config_hash": "fakehash",
+    }
+    new = dict(legacy)
+    new["item_key"] = "new1"
+    new["raw_samples"] = _serialize_raw_samples([
+        "Answer: 42", "Answer: 42", "\\boxed{42}"
+    ])
+    df = pd.DataFrame([legacy, new])
+    new_df, n = _backfill_dataframe(df)
+    assert n == 1   # only the row with raw_samples was backfilled
+    # Extended columns added to BOTH rows (NaN on legacy, derived on new).
+    for col in _EXTENDED_FEATURE_NAMES:
+        assert col in new_df.columns
+    legacy_row = new_df[new_df["item_key"] == "leg1"].iloc[0]
+    new_row = new_df[new_df["item_key"] == "new1"].iloc[0]
+    # Legacy row: extended columns are NaN.
+    import math
+    assert math.isnan(float(legacy_row["boxed_rate"]))
+    # New row: extended columns populated; boxed_rate > 0 (one of three).
+    assert float(new_row["boxed_rate"]) > 0.0
+    # P(True) preserved from cached row (not overwritten to default 0.5).
+    assert abs(float(new_row["p_true"]) - 0.55) < 1e-9
+    # Legacy aggregate columns untouched.
+    assert abs(float(legacy_row["self_consistency"]) - 0.6) < 1e-9
+
+
+def test_backfill_skips_empty_or_missing_raw_samples():
+    df = pd.DataFrame([
+        {"item_key": "a", "raw_samples": None, "self_consistency": 0.1,
+         "modal_answer": "x", "model_id": "m", "config_hash": "h"},
+        {"item_key": "b", "raw_samples": _serialize_raw_samples([]),
+         "self_consistency": 0.2, "modal_answer": "y",
+         "model_id": "m", "config_hash": "h"},
+    ])
+    _, n = _backfill_dataframe(df)
+    assert n == 0
+
+
+def test_backfill_on_dataframe_without_raw_samples_column_is_noop():
+    df = pd.DataFrame([
+        {"item_key": "a", "self_consistency": 0.1, "modal_answer": "x"},
+    ])
+    out, n = _backfill_dataframe(df)
+    assert n == 0
+    # Original row unchanged.
+    assert out.iloc[0]["self_consistency"] == 0.1
+
+
+def test_backfill_derived_features_round_trip_on_disk(tmp_path: Path):
+    cfg = SolverProxyConfig(
+        model_id="test/model-id",
+        cache_dir=str(tmp_path),
+        n_samples=3,
+        compute_p_true=False,
+    )
+    # Hand-craft a parquet at the cfg's slug path.
+    path = _cache_path(cfg)
+    legacy_row = {
+        "item_key": "leg1",
+        "self_consistency": 0.5, "answer_entropy": 0.5, "fsd": 0.0,
+        "n_distinct": 1.0, "mean_trace_len": 0.0, "refusal_rate": 0.0,
+        "p_true": 0.5, "modal_answer": "<none>", "raw_samples": None,
+        "model_id": cfg.model_id, "config_hash": config_hash(cfg),
+    }
+    new_row = dict(legacy_row)
+    new_row["item_key"] = "new1"
+    new_row["raw_samples"] = _serialize_raw_samples([
+        "1. think\n2. solve\nAnswer: 42",
+        "Answer: 42",
+        "Step 1: yes\nStep 2: no\n\\boxed{42}",
+    ])
+    pd.DataFrame([legacy_row, new_row]).to_parquet(path, index=False)
+    out_path, n = backfill_derived_features(cfg)
+    assert out_path == path
+    assert n == 1
+    reread = pd.read_parquet(path)
+    new_back = reread[reread["item_key"] == "new1"].iloc[0]
+    # Extended columns populated for the row that had raw_samples.
+    assert float(new_back["boxed_rate"]) > 0.0
+    assert float(new_back["trace_steps_mean"]) > 0.0
+    # Round-trip preserved the raw_samples payload.
+    samples_back = _deserialize_raw_samples(new_back["raw_samples"])
+    assert isinstance(samples_back, list) and len(samples_back) == 3

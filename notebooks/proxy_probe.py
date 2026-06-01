@@ -1429,8 +1429,10 @@ from src.solver_proxy import (
     PROXY_FEATURE_NAMES,
     SolverProxy,
     SolverProxyConfig,
+    backfill_derived_features,
     build_proxy_row_vector,
     cross_model_disagreement,
+    load_cache,
 )
 
 # --- Probe config (self-contained; override in CFG if you like) -------------
@@ -1446,6 +1448,20 @@ _PP.setdefault("compute_p_true", True)
 _PP.setdefault("use_chat_template", True)   # instruct models -> emit EOS, finish early (fast)
 _PP.setdefault("enable_thinking", False)    # Qwen3 etc.: skip long <think> traces
 _PP.setdefault("chunk_items", 32)           # items per cache flush (visible/resumable progress)
+# Raw-sample persistence (v3 schema). When True (default), every sampled
+# CoT trace is stored in the parquet so future feature additions can be
+# re-derived from disk WITHOUT another Qwen pass -- pay the GPU cost
+# exactly once per item, ever.
+_PP.setdefault("store_raw_samples", True)
+# When the cache contains LEGACY rows (scored before v3, so no
+# raw_samples), this flag controls what happens. False (default) keeps
+# the cache hit -- the legacy items stay scored, but any feature column
+# that didn't exist in the legacy schema will be NaN for them. True
+# adds the legacy items back to `to_score` so they get re-sampled ONCE,
+# which populates raw_samples + every current feature column. Flip this
+# to True for a single run when you want to bring legacy items up to
+# the latest schema, then flip back to False so the next re-run is free.
+_PP.setdefault("force_resample_missing_raw", False)
 # Multi-model is OFF: we run a single solver (Qwen). Cross-model disagreement
 # requires >=2 solvers; when disabled we only get per-model self-consistency
 # (still the dominant within-model difficulty signal in the literature).
@@ -1567,7 +1583,42 @@ else:
             system_prompt=str(_spec.get("system_prompt", "")),
             chunk_items=int(_PP["chunk_items"]),
             cache_dir=str(_PP["cache_dir"]),
+            store_raw_samples=bool(_PP["store_raw_samples"]),
+            force_resample_missing_raw=bool(_PP["force_resample_missing_raw"]),
         )
+        # 1) Backfill: any cached row that has `raw_samples` gets its scalar
+        #    feature columns re-derived from disk for free (no GPU, no
+        #    re-sample). This is how a new feature column "lights up" on
+        #    already-cached items. No-op when the cache is empty or when
+        #    every row is pre-v3 (legacy: no raw_samples persisted).
+        try:
+            _bf_path, _bf_n = backfill_derived_features(_cfg_m)
+            if _bf_n > 0:
+                print(
+                    f"[proxy probe] backfilled {_bf_n} cached rows for {_mid} "
+                    f"from raw_samples (no GPU work needed)."
+                )
+        except Exception as _bf_exc:  # pragma: no cover - defensive
+            print(f"[proxy probe] backfill skipped for {_mid}: {_bf_exc!r}")
+        # 2) Diagnostic: how much of the cache is legacy (no raw_samples)?
+        #    If everything is legacy, the new feature columns will be NaN
+        #    until the user opts into `force_resample_missing_raw=True`.
+        _cache_pre = load_cache(_cfg_m)
+        if not _cache_pre.empty:
+            if "raw_samples" in _cache_pre.columns:
+                _has_raw = _cache_pre["raw_samples"].notna().sum()
+            else:
+                _has_raw = 0
+            _n_cache = len(_cache_pre)
+            _n_legacy = int(_n_cache - _has_raw)
+            if _n_legacy > 0 and not bool(_PP["force_resample_missing_raw"]):
+                print(
+                    f"[proxy probe] cache has {_n_legacy}/{_n_cache} legacy rows "
+                    f"(no raw_samples). New feature columns will be NaN for "
+                    f"these items. Set CFG['proxy_probe']"
+                    f"['force_resample_missing_raw']=True to re-sample them "
+                    f"ONCE and populate every column for good."
+                )
         print(
             f"[proxy probe] solving {len(_sample_rows)} items with "
             f"{_mid} (n_samples={_cfg_m.n_samples}) [{_mi + 1}/{len(_models)}] ..."
