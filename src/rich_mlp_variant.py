@@ -20,11 +20,18 @@ the channels the audit said M8 was blind to:
   cost. This is the lift any ``(family, NN_support)``-style cross has
   to come from -- a plain MLP can only learn additive interactions of
   the concatenated input.
-* **Per-field categorical dropout** at training time. Each batch we
-  randomly mask each categorical id to the UNK row with the
-  configured probability. This matches the production ~20% bc-redaction
-  rate and trains the model to degrade gracefully when subject /
-  benchmark metadata is absent at inference.
+* **Per-unit UNK dropout** at training time. Per-row dropout leaks
+  signal: if item X appears in rows A and B and we mask bc on A but
+  not on B, the model can memorize (this item's emb pattern) ->
+  (this bc) via row B and "recall" bc on row A even when it's
+  masked. We instead resample one mask **per unit** (per item for
+  ``bc``/``topic``/``cluster``; per subject for
+  ``subject``/``family``/``macro``/``organization``) at the start of
+  every epoch and apply that mask to *all* rows of that item /
+  subject inside the epoch. The default probabilities match the
+  production ~20% bc-redaction rate and a small ~5% on each subject
+  field. Internal val uses a FIXED mask (sampled at training start)
+  so the early-stop signal is deterministic across epochs.
 
 Design constraints
 ------------------
@@ -84,17 +91,22 @@ class RichMLPConfig:
     n_cross_layers: int = 2
     cross_rank: int = 64
 
-    # Training-time categorical dropout (UNK-masking probabilities).
-    # ~0.20 for benchmark matches the production redact rate so the
-    # generalization story isn't fitted to a different distribution
-    # than test sees.
-    cat_dropout_subject: float = 0.05
-    cat_dropout_bc: float = 0.20
+    # Training-time UNK-masking probabilities. Applied at the UNIT
+    # level (item or subject), NOT per-row, to prevent the model from
+    # using one row of an item / subject to "recall" a field that's
+    # been masked on another row of the same unit.
+    #
+    # Item-level (each item independently masked with prob p, across
+    # ALL its rows; resampled each epoch):
+    cat_dropout_bc: float = 0.20         # bc + topic are realistically linked
+    cat_dropout_topic: float = 0.10
     cat_dropout_cluster: float = 0.10
+    # Subject-level (each subject independently masked with prob p,
+    # across ALL its rows; resampled each epoch):
+    cat_dropout_subject: float = 0.05
     cat_dropout_family: float = 0.05
     cat_dropout_macro: float = 0.05
     cat_dropout_org: float = 0.05
-    cat_dropout_topic: float = 0.10
 
     # Optimizer.
     lr: float = 1.0e-3
@@ -288,25 +300,51 @@ def _build_arch(
 
 
 # ---------------------------------------------------------------------------
-# Per-field UNK dropout (vectorized; applied per batch on the device)
+# Per-unit UNK dropout (item-grouped or subject-grouped masks)
 # ---------------------------------------------------------------------------
 
 
-def _apply_unk_dropout(
-    ids, *, unk_id: int, p: float, generator,
-):
-    """Mask each entry of ``ids`` to ``unk_id`` with probability ``p``.
+def _sample_unit_mask(*, n_units: int, p: float, generator, device):
+    """Sample a per-unit Bernoulli mask: ``True`` = redact this unit.
 
-    ``generator`` is a ``torch.Generator`` on the same device as ``ids``
-    so the dropout is deterministic given the seed and reproducible
-    across runs.
+    Returns an empty tensor when ``p <= 0`` so the caller can fall back
+    to the no-redact path without paying for a random draw.
     """
-    if float(p) <= 0.0:
-        return ids
     import torch
 
-    rand = torch.rand(ids.shape, device=ids.device, generator=generator)
-    return torch.where(rand < float(p), torch.full_like(ids, int(unk_id)), ids)
+    if float(p) <= 0.0 or int(n_units) <= 0:
+        return torch.zeros(int(n_units), dtype=torch.bool, device=device)
+    rand = torch.rand(int(n_units), device=device, generator=generator)
+    return rand < float(p)
+
+
+def _apply_unit_dropout(
+    ids, *, unit_per_row, unit_mask, unk_id: int,
+):
+    """Mask ``ids`` to ``unk_id`` for rows whose unit is in ``unit_mask``.
+
+    ``unit_per_row`` is a ``[N]`` int64 tensor mapping each row to its
+    unit id (item index for item-level fields; subject id for
+    subject-level fields). ``unit_mask`` is a ``[n_units]`` bool tensor
+    where ``True`` means "redact every row of this unit". Values in
+    ``unit_per_row`` are clamped to the mask range (the production
+    indexer uses ``N`` to mean "cold / UNK" which is already out of
+    range for a ``[n_units]`` mask -- those rows simply skip the
+    dropout check since they're already UNK).
+
+    Empty ``unit_mask`` (when the field's dropout prob is 0) is a no-op.
+    """
+    import torch
+
+    if unit_mask.numel() == 0:
+        return ids
+    # Clamp to a valid mask index. Out-of-range ids (UNK / cold) get
+    # the mask[0] value but since their ``ids`` are already UNK the
+    # decision is a no-op for them either way.
+    n_units = int(unit_mask.numel())
+    safe_unit = unit_per_row.clamp(min=0, max=n_units - 1)
+    redact = unit_mask[safe_unit]
+    return torch.where(redact, torch.full_like(ids, int(unk_id)), ids)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +363,8 @@ def train_rich_mlp(
     org_ids,            # [N] int64
     topic_ids,          # [N] int64
     item_emb_tensor,    # [n_unique, item_dim] torch.Tensor on device
-    row_to_uniq,        # [N] int64
+    row_to_uniq,        # [N] int64 -- doubles as the per-row ITEM id
+                        #              for item-grouped UNK dropout
     dense_X,            # [N, dense_dim] float32 or None
     n_subjects: int,
     n_bcs: int,
@@ -346,7 +385,18 @@ def train_rich_mlp(
     value ``>= N`` is mapped to ``N`` (the UNK row) at the very start
     of training. This keeps the dataloader free of branching and lets
     cold subjects/benches share the same code path as the
-    cat-dropout-masked ones.
+    UNK-masked ones.
+
+    **Item-grouped UNK dropout.** ``row_to_uniq`` is also used as the
+    per-row item id for the bc / topic / cluster fields, so a single
+    Bernoulli decision per item masks every row of that item inside
+    an epoch. This prevents the model from using one row of an item
+    to "remember" its bc when bc is masked on another row of the
+    same item (the leak the per-row dropout has). Subject fields
+    (subject / family / macro / organization) are masked the same way
+    but at the SUBJECT level. Masks are resampled at the start of
+    every training epoch and held FIXED for the internal val split so
+    the early-stop signal is deterministic.
     """
     import torch
 
@@ -386,7 +436,9 @@ def train_rich_mlp(
     mf_all = torch.from_numpy(_clamp_to_unk(macro_ids, n_macros)).to(device)
     o_all = torch.from_numpy(_clamp_to_unk(org_ids, n_orgs)).to(device)
     t_all = torch.from_numpy(_clamp_to_unk(topic_ids, n_topics)).to(device)
-    r2u_all = torch.from_numpy(np.asarray(row_to_uniq, dtype=np.int64).reshape(-1)).to(device)
+    r2u_all = torch.from_numpy(
+        np.asarray(row_to_uniq, dtype=np.int64).reshape(-1)
+    ).to(device)
     y_all = torch.from_numpy(y).to(device)
     dz_all = (
         torch.from_numpy(np.asarray(dense_X, dtype=np.float32)).to(device)
@@ -396,6 +448,18 @@ def train_rich_mlp(
         torch.from_numpy(np.asarray(sample_weights, dtype=np.float32).reshape(-1)).to(device)
         if sample_weights is not None else None
     )
+
+    # Per-row "unit ids" for the unit-grouped UNK dropout. ITEM unit
+    # is the unique item embedding index (= row_to_uniq, defensively
+    # clamped); SUBJECT unit is the already-clamped subject id. Both
+    # are FRESH tensors so the user's r2u_all / s_all stay untouched
+    # for the item-embedding lookup further down.
+    n_items_total = int(item_emb_tensor.shape[0])
+    item_unit_all = (
+        r2u_all.clamp(0, n_items_total - 1) if n_items_total > 0
+        else r2u_all.clone()
+    )
+    subj_unit_all = s_all.clone()
 
     # Item-grouped internal val split (early stopping on held-out
     # items) -- same regime as src.mlp_variant.
@@ -414,15 +478,77 @@ def train_rich_mlp(
     tr_t = torch.from_numpy(tr_idx.astype(np.int64)).to(device)
     va_t = torch.from_numpy(va_idx.astype(np.int64)).to(device)
 
-    # One torch.Generator per cat field so dropout streams stay
-    # decorrelated across fields. All seeded off cfg.seed so the run
-    # is reproducible.
+    # Seven per-field torch.Generators so each field's per-unit mask
+    # stream stays decorrelated from the others. All derived from
+    # cfg.seed so the whole run is reproducible.
     gens = {
         name: torch.Generator(device=device).manual_seed(int(cfg.seed) + h)
         for h, name in enumerate(
-            ("s", "b", "c", "f", "mf", "o", "t")
+            # item-level fields followed by subject-level fields:
+            ("b", "t", "c", "s", "f", "mf", "o")
         )
     }
+    # Internal val uses a FIXED set of unit masks (sampled once at the
+    # start of training) so the early-stop signal doesn't whiplash
+    # epoch to epoch as the train-time masks resample.
+    val_gens = {
+        name: torch.Generator(device=device).manual_seed(int(cfg.seed) + 1_000 + h)
+        for h, name in enumerate(
+            ("b", "t", "c", "s", "f", "mf", "o")
+        )
+    }
+    val_unit_masks = {
+        "b": _sample_unit_mask(n_units=n_items_total, p=cfg.cat_dropout_bc, generator=val_gens["b"], device=device),
+        "t": _sample_unit_mask(n_units=n_items_total, p=cfg.cat_dropout_topic, generator=val_gens["t"], device=device),
+        "c": _sample_unit_mask(n_units=n_items_total, p=cfg.cat_dropout_cluster, generator=val_gens["c"], device=device),
+        "s": _sample_unit_mask(n_units=int(n_subjects), p=cfg.cat_dropout_subject, generator=val_gens["s"], device=device),
+        "f": _sample_unit_mask(n_units=int(n_subjects), p=cfg.cat_dropout_family, generator=val_gens["f"], device=device),
+        "mf": _sample_unit_mask(n_units=int(n_subjects), p=cfg.cat_dropout_macro, generator=val_gens["mf"], device=device),
+        "o": _sample_unit_mask(n_units=int(n_subjects), p=cfg.cat_dropout_org, generator=val_gens["o"], device=device),
+    }
+
+    # Per-epoch training masks (resampled at the top of each epoch
+    # below). Predeclared as empty so the first batch in epoch 0
+    # finds them populated.
+    train_unit_masks = {
+        "b": torch.zeros(0, dtype=torch.bool, device=device),
+        "t": torch.zeros(0, dtype=torch.bool, device=device),
+        "c": torch.zeros(0, dtype=torch.bool, device=device),
+        "s": torch.zeros(0, dtype=torch.bool, device=device),
+        "f": torch.zeros(0, dtype=torch.bool, device=device),
+        "mf": torch.zeros(0, dtype=torch.bool, device=device),
+        "o": torch.zeros(0, dtype=torch.bool, device=device),
+    }
+
+    def _resample_train_unit_masks():
+        train_unit_masks["b"] = _sample_unit_mask(
+            n_units=n_items_total, p=cfg.cat_dropout_bc,
+            generator=gens["b"], device=device,
+        )
+        train_unit_masks["t"] = _sample_unit_mask(
+            n_units=n_items_total, p=cfg.cat_dropout_topic,
+            generator=gens["t"], device=device,
+        )
+        train_unit_masks["c"] = _sample_unit_mask(
+            n_units=n_items_total, p=cfg.cat_dropout_cluster,
+            generator=gens["c"], device=device,
+        )
+        train_unit_masks["s"] = _sample_unit_mask(
+            n_units=int(n_subjects), p=cfg.cat_dropout_subject,
+            generator=gens["s"], device=device,
+        )
+        train_unit_masks["f"] = _sample_unit_mask(
+            n_units=int(n_subjects), p=cfg.cat_dropout_family,
+            generator=gens["f"], device=device,
+        )
+        train_unit_masks["mf"] = _sample_unit_mask(
+            n_units=int(n_subjects), p=cfg.cat_dropout_macro,
+            generator=gens["mf"], device=device,
+        )
+        train_unit_masks["o"] = _sample_unit_mask(
+            n_units=int(n_subjects), p=cfg.cat_dropout_org,
+            generator=gens["o"], device=device,
+        )
 
     def _ids_with_dropout(idx_t, training: bool):
         s = s_all[idx_t]
@@ -432,14 +558,18 @@ def train_rich_mlp(
         mf = mf_all[idx_t]
         o = o_all[idx_t]
         t = t_all[idx_t]
-        if training:
-            s = _apply_unk_dropout(s, unk_id=UNK_S, p=cfg.cat_dropout_subject, generator=gens["s"])
-            b = _apply_unk_dropout(b, unk_id=UNK_B, p=cfg.cat_dropout_bc, generator=gens["b"])
-            c = _apply_unk_dropout(c, unk_id=UNK_C, p=cfg.cat_dropout_cluster, generator=gens["c"])
-            f = _apply_unk_dropout(f, unk_id=UNK_F, p=cfg.cat_dropout_family, generator=gens["f"])
-            mf = _apply_unk_dropout(mf, unk_id=UNK_MF, p=cfg.cat_dropout_macro, generator=gens["mf"])
-            o = _apply_unk_dropout(o, unk_id=UNK_O, p=cfg.cat_dropout_org, generator=gens["o"])
-            t = _apply_unk_dropout(t, unk_id=UNK_T, p=cfg.cat_dropout_topic, generator=gens["t"])
+        item_unit = item_unit_all[idx_t]
+        subj_unit = subj_unit_all[idx_t]
+        masks = train_unit_masks if training else val_unit_masks
+        # Item-grouped (bc / topic / cluster).
+        b = _apply_unit_dropout(b, unit_per_row=item_unit, unit_mask=masks["b"], unk_id=UNK_B)
+        t = _apply_unit_dropout(t, unit_per_row=item_unit, unit_mask=masks["t"], unk_id=UNK_T)
+        c = _apply_unit_dropout(c, unit_per_row=item_unit, unit_mask=masks["c"], unk_id=UNK_C)
+        # Subject-grouped (subject / family / macro_family / organization).
+        s = _apply_unit_dropout(s, unit_per_row=subj_unit, unit_mask=masks["s"], unk_id=UNK_S)
+        f = _apply_unit_dropout(f, unit_per_row=subj_unit, unit_mask=masks["f"], unk_id=UNK_F)
+        mf = _apply_unit_dropout(mf, unit_per_row=subj_unit, unit_mask=masks["mf"], unk_id=UNK_MF)
+        o = _apply_unit_dropout(o, unit_per_row=subj_unit, unit_mask=masks["o"], unk_id=UNK_O)
         return s, b, c, f, mf, o, t
 
     def _logits(idx_t, training: bool):
@@ -480,6 +610,9 @@ def train_rich_mlp(
     bad = 0
     step = 0
     for ep in range(int(cfg.epochs)):
+        # Resample per-unit train-time UNK masks at the top of every
+        # epoch (so the model sees a fresh "redaction sample" per pass).
+        _resample_train_unit_masks()
         net.train()
         perm = torch.randperm(tr_idx.size, device=device)
         tr_shuf = tr_t[perm]

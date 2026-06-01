@@ -859,6 +859,143 @@ else:
     print("[cluster] skipped (EXP['use_cluster_block']=False)")
 
 # %% [markdown]
+# ## 9b. Val-side metadata redaction (item-grouped + subject-grouped)
+#
+# **Why redact val.** Test rows arrive with ~20% benchmark redaction
+# and a non-trivial fraction of cold subjects (no model_info match).
+# If we evaluate every fold on full metadata, the reported val NLL is
+# optimistic by exactly the amount the cat embeddings memorize. The
+# realistic NLL is the one where val mimics the test distribution.
+#
+# **Why item-grouped / subject-grouped.** Per-row redaction leaks: if
+# item X has bc visible in one val row and bc masked in another, the
+# model can infer bc from the item embedding pattern on the visible
+# row and apply it on the masked one. We redact per UNIT (per item
+# for ``bc`` / ``topic`` / ``cluster``; per subject for
+# ``subject`` / ``family`` / ``macro`` / ``organization``) so every
+# row of a masked item / subject is masked together. Matches the
+# train-time per-unit dropout in :func:`src.rich_mlp_variant.train_rich_mlp`.
+#
+# The redaction sample is FIXED (one draw at this cell's seed) so
+# every baseline / expert / soft-router scores the same val
+# distribution and the comparisons stay paired.
+
+# %%
+# Default: val redaction probabilities mirror the training-time
+# rich_cat_dropout_* knobs so the reported NLL reflects "model trained
+# with this redaction rate, evaluated on the same redaction rate".
+EXP.setdefault("redact_val", True)
+EXP.setdefault("val_dropout_bc", EXP["rich_cat_dropout_bc"])
+EXP.setdefault("val_dropout_topic", EXP["rich_cat_dropout_topic"])
+EXP.setdefault("val_dropout_cluster", EXP["rich_cat_dropout_cluster"])
+EXP.setdefault("val_dropout_subject", EXP["rich_cat_dropout_subject"])
+EXP.setdefault("val_dropout_family", EXP["rich_cat_dropout_family"])
+EXP.setdefault("val_dropout_macro", EXP["rich_cat_dropout_macro"])
+EXP.setdefault("val_dropout_org", EXP["rich_cat_dropout_org"])
+
+# UNK row ids (matching what the rich net's embedding tables expect
+# from src.rich_mlp_variant; predict_rich_mlp also internally clamps
+# any id >= cardinality to the UNK row, so passing these is safe).
+_UNK_BC = int(indexer.n_bc)
+_UNK_TOPIC = int(N_TOPICS)
+_UNK_CLUSTER = int(K_CLUSTERS) if EXP["use_cluster_block"] else 0
+_UNK_SUBJ = int(indexer.n_subjects)
+_UNK_FAM = int(N_FAMILIES)
+_UNK_MAC = int(N_MACROS)
+_UNK_ORG = int(N_ORGS)
+
+
+def _build_val_unit_masks(seed: int):
+    """Sample per-item and per-subject Bernoulli masks for val.
+
+    Returns ``(item_mask_*, subj_mask_*)`` boolean arrays indexed by
+    item-embedding-index and subject-id respectively. Same units appear
+    across many val rows; this lookup table guarantees consistency.
+    """
+    rng = np.random.default_rng(int(seed))
+    n_items_total = int(ALL_UNIQ.shape[0])
+    n_subj_total = int(indexer.n_subjects)
+    item_bc = rng.uniform(size=n_items_total) < float(EXP["val_dropout_bc"])
+    item_topic = rng.uniform(size=n_items_total) < float(EXP["val_dropout_topic"])
+    item_cluster = rng.uniform(size=n_items_total) < float(EXP["val_dropout_cluster"])
+    subj_subj = rng.uniform(size=n_subj_total) < float(EXP["val_dropout_subject"])
+    subj_fam = rng.uniform(size=n_subj_total) < float(EXP["val_dropout_family"])
+    subj_mac = rng.uniform(size=n_subj_total) < float(EXP["val_dropout_macro"])
+    subj_org = rng.uniform(size=n_subj_total) < float(EXP["val_dropout_org"])
+    return (item_bc, item_topic, item_cluster, subj_subj, subj_fam, subj_mac, subj_org)
+
+
+def _apply_val_redaction(
+    bc, topic, cluster, subj, family, macro, org,
+    *, item_per_row, subj_per_row, masks,
+):
+    item_bc, item_topic, item_cluster, subj_subj, subj_fam, subj_mac, subj_org = masks
+    # Item-grouped redaction.
+    redact_bc = item_bc[np.clip(item_per_row, 0, len(item_bc) - 1)]
+    redact_topic = item_topic[np.clip(item_per_row, 0, len(item_topic) - 1)]
+    redact_cluster = item_cluster[np.clip(item_per_row, 0, len(item_cluster) - 1)]
+    bc_v = np.where(redact_bc, _UNK_BC, bc).astype(np.int64)
+    topic_v = np.where(redact_topic, _UNK_TOPIC, topic).astype(np.int64)
+    cluster_v = np.where(redact_cluster, _UNK_CLUSTER, cluster).astype(np.int64)
+    # Subject-grouped redaction.
+    safe_subj = np.clip(subj_per_row, 0, len(subj_subj) - 1)
+    redact_subj = subj_subj[safe_subj]
+    redact_fam = subj_fam[safe_subj]
+    redact_mac = subj_mac[safe_subj]
+    redact_org = subj_org[safe_subj]
+    subj_v = np.where(redact_subj, _UNK_SUBJ, subj).astype(np.int64)
+    family_v = np.where(redact_fam, _UNK_FAM, family).astype(np.int64)
+    macro_v = np.where(redact_mac, _UNK_MAC, macro).astype(np.int64)
+    org_v = np.where(redact_org, _UNK_ORG, org).astype(np.int64)
+    return bc_v, topic_v, cluster_v, subj_v, family_v, macro_v, org_v
+
+
+if EXP["redact_val"]:
+    _val_masks = _build_val_unit_masks(seed=SEED + 2026)
+    (
+        bc_val_red, topic_val_red, cluster_val_red,
+        subj_val_red, family_val_red, macro_val_red, org_val_red,
+    ) = _apply_val_redaction(
+        bc_val, topic_val, cluster_val, subj_val,
+        family_val, macro_val, org_val,
+        item_per_row=r2u_val, subj_per_row=subj_val, masks=_val_masks,
+    )
+else:
+    bc_val_red = bc_val.copy()
+    topic_val_red = topic_val.copy()
+    cluster_val_red = cluster_val.copy()
+    subj_val_red = subj_val.copy()
+    family_val_red = family_val.copy()
+    macro_val_red = macro_val.copy()
+    org_val_red = org_val.copy()
+
+print(
+    f"[val redact] redact_val={EXP['redact_val']}  "
+    f"bc={EXP['val_dropout_bc']:.2f}  topic={EXP['val_dropout_topic']:.2f}  "
+    f"cluster={EXP['val_dropout_cluster']:.2f}  subj={EXP['val_dropout_subject']:.2f}  "
+    f"family={EXP['val_dropout_family']:.2f}  macro={EXP['val_dropout_macro']:.2f}  "
+    f"org={EXP['val_dropout_org']:.2f}"
+)
+print(
+    f"[val redact] redaction rates actually applied (item-grouped, subject-grouped):"
+)
+print(
+    f"  bc:      {(bc_val_red == _UNK_BC).mean() - (bc_val == _UNK_BC).mean():.3%} of val rows masked"
+)
+print(
+    f"  topic:   {(topic_val_red == _UNK_TOPIC).mean() - (topic_val == _UNK_TOPIC).mean():.3%} of val rows masked"
+)
+print(
+    f"  cluster: {(cluster_val_red == _UNK_CLUSTER).mean() - (cluster_val == _UNK_CLUSTER).mean():.3%} of val rows masked"
+)
+print(
+    f"  subj:    {(subj_val_red == _UNK_SUBJ).mean() - (subj_val == _UNK_SUBJ).mean():.3%} of val rows masked"
+)
+print(
+    f"  family:  {(family_val_red == _UNK_FAM).mean() - (family_val == _UNK_FAM).mean():.3%} of val rows masked"
+)
+
+# %% [markdown]
 # ## 10. Assemble dense block (PLAIN vs RICH) + z-score
 #
 # **Plain dense** (for the M8 baseline): form block only -- matches
@@ -948,10 +1085,21 @@ def _family_bucket(fam_ids: np.ndarray) -> np.ndarray:
 
 
 bucket_family_train = _family_bucket(family_train)
-bucket_family_val = _family_bucket(family_val)
+# Routing decisions for val use the REDACTED family ids: a row whose
+# subject is masked has family=UNK and must route to the "other/UNK"
+# bucket (= what the production scenario would see). The bucket
+# assignment is therefore consistent with what the rich net actually
+# receives on its input.
+bucket_family_val = _family_bucket(family_val_red)
+_bucket_family_val_oracle = _family_bucket(family_val)  # for ablation
 print(
     f"[partition family] K={_FAM_K}  "
     f"(top {_FAM_K - 1} families + 'other/UNK')"
+)
+print(
+    f"  routing uses REDACTED family_val ({(family_val_red == _UNK_FAM).sum():,} of "
+    f"{N_VAL:,} rows route to 'other/UNK' purely from redaction; "
+    f"{((family_val == 0)).sum():,} were already UNK pre-redaction)."
 )
 print("  train bucket sizes:")
 for j, name in enumerate(_FAM_BUCKET_NAMES):
@@ -1186,6 +1334,10 @@ def _run_one_oof(name, kind, sample_weights):
                 sample_weights=(sample_weights[tr] if sample_weights is not None else None),
                 show_progress=False,
             )
+            # OOF predictions use the ORIGINAL (un-redacted) train-side
+            # ids -- those rows are the model's own "test set" for the
+            # stacker downstream and aren't part of the val redaction
+            # contract.
             oof_p = predict_rich_mlp(
                 net,
                 subject_ids=subj_train[oof], bc_ids=bc_train[oof],
@@ -1198,11 +1350,18 @@ def _run_one_oof(name, kind, sample_weights):
                 n_families=_RICH_NF, n_macros=_RICH_NMF, n_orgs=_RICH_NO,
                 n_topics=_RICH_NT, device=_dev, chunk=int(EXP["predict_chunk"]),
             )
+            # Val predictions use the REDACTED val ids so the reported
+            # NLL reflects "trained with per-unit dropout, evaluated on
+            # the same per-unit dropout sample" -- the realistic
+            # generalization scenario the user asked for. Item embedding
+            # and dense_X are NEVER redacted (they're the always-on
+            # signal); only the cat-id channels go through UNK.
             val_p = predict_rich_mlp(
                 net,
-                subject_ids=subj_val, bc_ids=bc_val,
-                cluster_ids=cluster_val, family_ids=family_val,
-                macro_ids=macro_val, org_ids=org_val, topic_ids=topic_val,
+                subject_ids=subj_val_red, bc_ids=bc_val_red,
+                cluster_ids=cluster_val_red, family_ids=family_val_red,
+                macro_ids=macro_val_red, org_ids=org_val_red,
+                topic_ids=topic_val_red,
                 item_emb_tensor=EMB_T, row_to_uniq=r2u_val,
                 dense_X=(rich_dense_val if EXP["use_metadata"] else None),
                 n_subjects=_RICH_NS, n_bcs=_RICH_NB, n_clusters=_RICH_NC,
@@ -1578,32 +1737,27 @@ _gen_net = train_rich_mlp(
 )
 
 
-def _predict_with_redaction(redact: dict) -> np.ndarray:
-    """Predict on val with the listed fields forced to UNK."""
-    bc = bc_val.copy()
-    sj = subj_val.copy()
-    cl = cluster_val.copy()
-    fa = family_val.copy()
-    mf = macro_val.copy()
-    org = org_val.copy()
-    tp = topic_val.copy()
-    if redact.get("bc"):
-        bc[:] = _RICH_NB
-    if redact.get("subject"):
-        sj[:] = _RICH_NS
-    if redact.get("cluster"):
-        cl[:] = max(_RICH_NC, 1)
-    if redact.get("family"):
-        fa[:] = _RICH_NF
-    if redact.get("macro"):
-        mf[:] = _RICH_NMF
-    if redact.get("org"):
-        org[:] = _RICH_NO
-    if redact.get("topic"):
-        tp[:] = _RICH_NT
+def _predict_with_override(*, ids_override: dict | None = None) -> np.ndarray:
+    """Predict on val with the listed fields overridden.
+
+    ``ids_override`` is a dict whose keys are field names
+    (``bc``/``topic``/``cluster``/``subject``/``family``/``macro``/``org``)
+    and values are full-length per-row id arrays. Any field not in
+    ``ids_override`` uses the REDACTED val arrays (the realistic
+    baseline) so the bracket cases below isolate the marginal effect
+    of swapping ONE field's redaction state without rebuilding the
+    rest of the row.
+    """
+    o = ids_override or {}
     return predict_rich_mlp(
-        _gen_net, subject_ids=sj, bc_ids=bc, cluster_ids=cl,
-        family_ids=fa, macro_ids=mf, org_ids=org, topic_ids=tp,
+        _gen_net,
+        subject_ids=o.get("subject", subj_val_red),
+        bc_ids=o.get("bc", bc_val_red),
+        cluster_ids=o.get("cluster", cluster_val_red),
+        family_ids=o.get("family", family_val_red),
+        macro_ids=o.get("macro", macro_val_red),
+        org_ids=o.get("org", org_val_red),
+        topic_ids=o.get("topic", topic_val_red),
         item_emb_tensor=EMB_T, row_to_uniq=r2u_val,
         dense_X=(rich_dense_val if EXP["use_metadata"] else None),
         n_subjects=_RICH_NS, n_bcs=_RICH_NB, n_clusters=_RICH_NC,
@@ -1612,38 +1766,65 @@ def _predict_with_redaction(redact: dict) -> np.ndarray:
     )
 
 
-# Per-scenario NLLs (no calibration -- raw probabilities from the gen
-# net). These are not comparable to the calibrated solo NLLs above;
-# the comparison is across redaction scenarios at fixed weights.
-_gen_full = _nll(_predict_with_redaction({}), y_val)
-_gen_bc = _nll(_predict_with_redaction({"bc": True, "topic": True}), y_val)
-_gen_subj = _nll(
-    _predict_with_redaction({"subject": True, "family": True,
-                             "macro": True, "org": True}), y_val,
-)
-_gen_all = _nll(
-    _predict_with_redaction({
-        "bc": True, "topic": True, "subject": True,
-        "family": True, "macro": True, "org": True,
-    }),
-    y_val,
-)
-print(f"  full metadata          : {_gen_full:.6f}   (reference)")
-print(f"  redact bc + topic      : {_gen_bc:.6f}   ({_gen_bc - _gen_full:+.6f})")
+def _all_unk(unk_id):
+    return np.full(N_VAL, int(unk_id), dtype=np.int64)
+
+
+# Bracket scenarios. The "realistic" row (default redaction sample) is
+# the headline number that matches the rich_baseline NLL above.
+# "oracle" gives the floor (if metadata were never redacted), and
+# "all-UNK" the ceiling (if every cat field were missing).
+_gen_realistic = _nll(_predict_with_override(), y_val)
+_gen_oracle = _nll(_predict_with_override(ids_override={
+    "subject": subj_val, "bc": bc_val, "cluster": cluster_val,
+    "family": family_val, "macro": macro_val, "org": org_val,
+    "topic": topic_val,
+}), y_val)
+_gen_bc_unk = _nll(_predict_with_override(ids_override={
+    "bc": _all_unk(_RICH_NB), "topic": _all_unk(_RICH_NT),
+}), y_val)
+_gen_subj_unk = _nll(_predict_with_override(ids_override={
+    "subject": _all_unk(_RICH_NS), "family": _all_unk(_RICH_NF),
+    "macro": _all_unk(_RICH_NMF), "org": _all_unk(_RICH_NO),
+}), y_val)
+_gen_all_unk = _nll(_predict_with_override(ids_override={
+    "subject": _all_unk(_RICH_NS), "bc": _all_unk(_RICH_NB),
+    "cluster": _all_unk(max(_RICH_NC, 1)),
+    "family": _all_unk(_RICH_NF), "macro": _all_unk(_RICH_NMF),
+    "org": _all_unk(_RICH_NO), "topic": _all_unk(_RICH_NT),
+}), y_val)
 print(
-    f"  redact subject + family/macro/org: "
-    f"{_gen_subj:.6f}   ({_gen_subj - _gen_full:+.6f})"
+    f"  oracle (no redaction, all metadata visible) : {_gen_oracle:.6f}   "
+    f"(floor; this is the 'if metadata were perfect' lower bound)"
 )
 print(
-    f"  redact ALL cat metadata: "
-    f"{_gen_all:.6f}   ({_gen_all - _gen_full:+.6f})"
+    f"  realistic (item-grouped redaction sample)   : {_gen_realistic:.6f}   "
+    f"(headline; matches the rich_baseline NLL above)"
 )
 print(
-    "\nInterpretation: if the redacted runs collapse hard (>0.02 nat worse)"
-    " the rich model is memorizing the cat channel; bump the relevant "
-    "rich_cat_dropout_* knob. If they stay within ~0.005 nat the model "
-    "generalizes -- the rich lift is from the item-emb / dense / NN side,"
-    " not from cat-id memorization."
+    f"  stress: bc + topic fully UNK                : {_gen_bc_unk:.6f}   "
+    f"({_gen_bc_unk - _gen_realistic:+.6f} vs realistic)"
+)
+print(
+    f"  stress: subject + family/macro/org fully UNK: {_gen_subj_unk:.6f}   "
+    f"({_gen_subj_unk - _gen_realistic:+.6f} vs realistic)"
+)
+print(
+    f"  stress: ALL cat fields fully UNK            : {_gen_all_unk:.6f}   "
+    f"({_gen_all_unk - _gen_realistic:+.6f} vs realistic)"
+)
+print(
+    f"  oracle - all-UNK spread                     : "
+    f"{_gen_all_unk - _gen_oracle:+.6f}   "
+    f"(total cat-channel contribution; smaller = more of the lift is "
+    f"in item-emb / dense / NN, less is in cat-id memorization)"
+)
+print(
+    "\nInterpretation: realistic should be within ~0.005 nat of oracle "
+    "if the model generalizes well to the redaction distribution. "
+    "If oracle - realistic > 0.02 nat the cat channels memorized "
+    "specific items / subjects; raise the val (and train) "
+    "rich_cat_dropout_* rates and re-run."
 )
 del _gen_net
 if _dev == "cuda":
