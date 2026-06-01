@@ -622,12 +622,16 @@ CFG["dense_item_features"].setdefault("add_cot_interactions", True)
 # predictions the stacker consumes stay honest. Master switch: set
 # enabled=False to revert to the plain (non-NCL) members instantly.
 CFG.setdefault("ncl", {})
-CFG["ncl"].setdefault("enabled", True)
-# Raised from 0.30 -> 2.0: at 0.30 the NCL penalty (~0.02-0.04 in
-# magnitude) was a rounding error against the dense members' data-loss
-# gradient, so M2/M4/M7 barely decorrelated from their anchors. 2.0 is
-# in the range where the penalty actually bites; tune via the pre-OOF
-# diagnostic cell below before paying for the full OOF compute.
+# DISABLED after empirical falsification. We swept lambda 0.30 -> 2.0/3.0
+# and read the global val error-correlation heatmap: NCL moved the
+# *training objective* (inflated train loss) but produced ZERO measurable
+# decorrelation. corr(err_M2, err_M1) went 0.866 -> 0.89 (slightly WORSE),
+# and the FwFM+NCL clone M9 stayed at corr=0.99 with its plain twin M6.
+# Root cause is structural: the penalized members share the same feature
+# views as their anchors, so a correlation penalty cannot manufacture an
+# error geometry the inputs don't contain. Diversity must come from
+# different inputs, not NCL. Set enabled=True to re-enable for experiments.
+CFG["ncl"].setdefault("enabled", False)
 CFG["ncl"].setdefault("lambda_", 2.0)
 CFG["ncl"].setdefault("anchors", ("member1", "member6", "member8"))
 CFG["ncl"].setdefault("penalized", ("member2", "member4", "member7"))
@@ -636,16 +640,13 @@ CFG["ncl"].setdefault("penalized", ("member2", "member4", "member7"))
 CFG["ncl"].setdefault("m9_anchors", ("member1", "member8"))
 
 # --- Member 9: FwFM clone trained with NCL -------------------------------
-# Same architecture / dense block as Member 6 (FwFM on the embedding-vs-
-# marginal block) but trained with the NCL penalty against {M1, M8}. Gives
-# the ensemble a "diversified" factorization machine alongside the pure M6.
+# DISABLED. M9 is identical to M6 (same 1228-feature dense block, same
+# architecture) trained with an NCL penalty against {M1, M8}. Even at
+# lambda=3.0 it converged to corr(err_M9, err_M6)=0.99 -- a near-perfect
+# clone -- so it added a full extra ~40-min/fold FwFM (and the OOF OOM)
+# for no ensemble diversity. Set enabled=True to re-enable for experiments.
 CFG.setdefault("member9", {})
-CFG["member9"].setdefault("enabled", True)
-# Raised from 0.50 -> 3.0. M9 is identical to M6 except for this NCL
-# penalty against {M1, M8}; at 0.50 their weight norms tracked each
-# other almost exactly (M9 was a near-duplicate of M6 => wasted compute).
-# 3.0 forces a visible divergence. The pre-OOF diagnostic prints
-# corr(err_M9, err_M6) so you can confirm M9 is no longer a clone.
+CFG["member9"].setdefault("enabled", False)
 CFG["member9"].setdefault("ncl_lambda", 3.0)
 
 CFG.setdefault("judge", {})
