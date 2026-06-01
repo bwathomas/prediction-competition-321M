@@ -1,0 +1,10 @@
+---
+description: Git commit/push workflow preferences for this repo
+alwaysApply: true
+---
+
+# Git workflow
+
+- After creating any commit, ALWAYS push to `main` automatically (`git push origin HEAD:main`). Do not ask the user for permission to push.
+- Still only *create* commits when the user asks for one (the auto-push rule applies to commits the user requested).
+- This shell is PowerShell: do NOT use `&&`, `||`, or heredocs (`<<'EOF'`). Chain commands with `;`, and pass multi-line commit messages via `git commit -F <file>`.
