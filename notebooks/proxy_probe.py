@@ -29,22 +29,32 @@
 # for the full 9-member pipeline. Set `stop_after = False` to fall through
 # into the normal notebook below.
 #
-# Solver models (see `CFG["proxy_probe"]["models"]`): a diverse trio chosen
-# for family diversity (cross-model disagreement only estimates item
-# *discrimination* if the models fail differently) and -- critically --
-# **ungated** HF repos, so we don't repeat the gated-repo 403 that killed
-# `google/gemma-2-9b-it`. Each entry may be a plain id or a dict carrying
-# per-model overrides (`trust_remote_code`, `system_prompt`, `enable_thinking`):
-#   * `nvidia/Llama-3.1-Nemotron-Nano-8B-v1` (NVIDIA) -- Llama-3.1-8B reasoning
-#     derivative; ungated. Reasoning is toggled by the SYSTEM prompt, so we
-#     pass `"detailed thinking off"` to keep answers short/parseable in the
-#     512-token budget (otherwise it emits a truncated reasoning trace).
-#   * `LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct` (LG AI) -- different lineage
-#     (bilingual KO/EN); ungated but ships custom modeling code, so it needs
-#     `trust_remote_code=True`.
-#   * a Mistral model (the third slot) -- distinct error modes again.
-# All three run by default (`multi_model = True`, `n_samples = 3`); set
-# `multi_model = False` to fall back to the single-model (first) probe.
+# Solver model: by default we run ONLY `Qwen/Qwen3-8B` (single-family).
+# We previously ran a three-model trio (Nemotron / EXAONE / Mistral) for
+# cross-model disagreement, but EXAONE blew up against the current
+# `transformers` API (`AttentionInterface.get_interface` was removed in a
+# recent refactor) and the rest were not cheap enough to justify for a
+# diagnostic probe. The configurable `CFG["proxy_probe"]["models"]` list is
+# kept as a list so additional solvers can be re-enabled later without
+# touching code. Each entry may be a plain id or a dict carrying per-model
+# overrides (`trust_remote_code`, `system_prompt`, `enable_thinking`).
+#
+# Caching: results are persisted as a parquet keyed by (model_id,
+# config_hash, item_key). When Drive is mounted (Colab) the cache lives at
+# `CACHE_DRIVE / "solver_proxy"` so re-runs are free; otherwise it falls back
+# to the local repo path. The schema is versioned (see
+# `PROXY_FEATURE_SCHEMA_VERSION` in `src.solver_proxy`), so any time we add
+# new features the cache invalidates cleanly instead of silently merging
+# half-populated rows.
+#
+# Features extracted from Qwen's sampled traces (no extra forward passes):
+#   self_consistency, answer_entropy, fsd, n_distinct, mean_trace_len,
+#   refusal_rate, p_true, answer_chars_{mean,std}, answer_tokens_{mean,std},
+#   trace_steps_{mean,std}, trace_tokens_std, boxed_rate,
+#   first_line_chars_mean, answer_format_consistency
+# These cover the LLM-as-student diagnostic vocabulary: vote distribution
+# (self-consistency / FSD / entropy), refusal / format quality, trace
+# length variability (path variance), and answer-type consistency.
 #
 # ---
 # Original header follows.
@@ -1416,6 +1426,7 @@ from src.proxy_eval import (
     run_proxy_probe,
 )
 from src.solver_proxy import (
+    PROXY_FEATURE_NAMES,
     SolverProxy,
     SolverProxyConfig,
     build_proxy_row_vector,
@@ -1427,7 +1438,7 @@ _PP = CFG.setdefault("proxy_probe", {})
 _PP.setdefault("enabled", True)
 _PP.setdefault("stop_after", True)          # early-exit before heavy training
 _PP.setdefault("n_probe_items", 400)        # distinct TRAIN items to solve
-_PP.setdefault("n_samples", 3)              # CoT samples per item PER model
+_PP.setdefault("n_samples", 5)              # CoT samples per item PER model (5 gives stabler vote-stats than 3)
 _PP.setdefault("max_new_tokens", 512)
 _PP.setdefault("temperature", 0.8)
 _PP.setdefault("batch_size", 16)
@@ -1435,28 +1446,46 @@ _PP.setdefault("compute_p_true", True)
 _PP.setdefault("use_chat_template", True)   # instruct models -> emit EOS, finish early (fast)
 _PP.setdefault("enable_thinking", False)    # Qwen3 etc.: skip long <think> traces
 _PP.setdefault("chunk_items", 32)           # items per cache flush (visible/resumable progress)
-_PP.setdefault("multi_model", True)         # run ALL models for disagreement + per-model consistency
+# Multi-model is OFF: we run a single solver (Qwen). Cross-model disagreement
+# requires >=2 solvers; when disabled we only get per-model self-consistency
+# (still the dominant within-model difficulty signal in the literature).
+_PP.setdefault("multi_model", False)
 _PP.setdefault("n_boot", 500)
 _PP.setdefault("support_col", 7)            # nn_train_mat col 7 = n_labeled_neighbors_log1p
-# Extra single-model columns (from the primary model) to also evaluate.
-_PP.setdefault("proxy_cols", ["answer_entropy", "p_true", "mean_trace_len"])
+# By default the probe evaluates EVERY scalar feature in the cache schema
+# (`PROXY_FEATURE_NAMES`). Override here only if you want to subset.
+_PP.setdefault("proxy_cols", list(PROXY_FEATURE_NAMES))
 # Each entry is either a plain HF id (str) or a dict with the id plus
 # per-model overrides: trust_remote_code / system_prompt / enable_thinking.
+#
+# Qwen3-8B was chosen as the sole solver because (a) it has the same
+# embedding family as the production stack (Qwen3-Embedding-8B), so any
+# residual orthogonality we find here truly comes from the solver behaviour
+# rather than embedding-family drift; (b) it is ungated and reliably loads
+# against current transformers (EXAONE broke against the `AttentionInterface`
+# refactor; Nemotron / Mistral were not strictly needed for the diagnostic).
 _PP.setdefault("models", [
-    # NVIDIA Llama-Nemotron: ungated; reasoning toggled via system prompt.
     {
-        "model_id": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
-        "system_prompt": "detailed thinking off",
+        "model_id": "Qwen/Qwen3-8B",
+        # Qwen3 chat template supports `enable_thinking`; we leave it OFF so
+        # generations fit in `max_new_tokens` without truncating a <think>
+        # trace and never reaching the answer.
+        "enable_thinking": False,
     },
-    # LG AI EXAONE 3.5: ungated but needs trust_remote_code for custom code.
-    {
-        "model_id": "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct",
-        "trust_remote_code": True,
-    },
-    # Mistral (third slot): ungated Apache-2.0 7B instruct (Ministral-8B and
-    # Mistral-Small/Magistral are gated and/or too large for the probe GPU).
-    "mistralai/Mistral-7B-Instruct-v0.3",
 ])
+# Cache directory for solver_proxy parquet results. Drive when mounted so
+# multiple Colab sessions share the same persisted CoT samples; falls back
+# to the local artifacts/ path otherwise. Per-chunk flushes keep the cache
+# resumable mid-run.
+try:
+    _PP_DEFAULT_CACHE = (
+        str(CACHE_DRIVE / "solver_proxy") if CACHE_DRIVE is not None
+        else str(ROOT / "artifacts" / "solver_proxy")
+    )
+except NameError:
+    _PP_DEFAULT_CACHE = str(ROOT / "artifacts" / "solver_proxy")
+_PP.setdefault("cache_dir", _PP_DEFAULT_CACHE)
+print(f"[proxy probe] solver_proxy cache_dir = {_PP['cache_dir']}")
 
 if not _PP["enabled"]:
     print("[proxy probe] disabled via CFG['proxy_probe']['enabled']=False; skipping.")
@@ -1537,7 +1566,7 @@ else:
             trust_remote_code=bool(_spec.get("trust_remote_code", False)),
             system_prompt=str(_spec.get("system_prompt", "")),
             chunk_items=int(_PP["chunk_items"]),
-            cache_dir=str(ROOT / "artifacts" / "solver_proxy"),
+            cache_dir=str(_PP["cache_dir"]),
         )
         print(
             f"[proxy probe] solving {len(_sample_rows)} items with "
@@ -1568,23 +1597,31 @@ else:
             )
         )
     # Mean self-consistency across models (robust within-model difficulty).
-    _sc_merged = _selfcons_frames[0]
-    for _f in _selfcons_frames[1:]:
-        _sc_merged = _sc_merged.merge(_f, on="item_key", how="outer")
-    _sc_cols = [c for c in _sc_merged.columns if c != "item_key"]
-    _sc_mean = _sc_merged.set_index("item_key")[_sc_cols].mean(axis=1)
-    _proxy_per_item["selfcons::mean"] = _sc_mean.to_dict()
+    # With a single solver, the cross-model mean is identical to the per-
+    # model column; only add it when there's something to actually average.
+    if len(_selfcons_frames) > 1:
+        _sc_merged = _selfcons_frames[0]
+        for _f in _selfcons_frames[1:]:
+            _sc_merged = _sc_merged.merge(_f, on="item_key", how="outer")
+        _sc_cols = [c for c in _sc_merged.columns if c != "item_key"]
+        _sc_mean = _sc_merged.set_index("item_key")[_sc_cols].mean(axis=1)
+        _proxy_per_item["selfcons::mean"] = _sc_mean.to_dict()
 
     # (b) Cross-model DISAGREEMENT (estimates item discrimination a_i).
     if len(_models) > 1:
         _proxy_per_item["disagreement"] = cross_model_disagreement(_modal_by_model)
 
-    # (c) Extra single-model columns from the primary model, for reference.
+    # (c) Single-model scalar columns from the primary model. Includes the
+    #     extended length/step/format diagnostics (`answer_chars_mean`,
+    #     `trace_steps_mean`, `boxed_rate`, ...) when the v2 cache schema
+    #     populates them. Anything in `proxy_cols` that isn't present in the
+    #     parquet (e.g. an old cache) is silently skipped.
+    _primary_short = _primary_id.split("/")[-1]
     for _col in list(_PP["proxy_cols"]):
         if _col in _proxy_df.columns:
-            _proxy_per_item[f"{_col}::{_primary_id.split('/')[-1]}"] = dict(
-                zip(_proxy_df["item_key"].astype(str), _proxy_df[_col].astype(float))
-            )
+            _series = _proxy_df.set_index("item_key")[_col]
+            _series = pd.to_numeric(_series, errors="coerce").astype(float)
+            _proxy_per_item[f"{_col}::{_primary_short}"] = _series.dropna().to_dict()
 
     # ---- Cross-model descriptive summary (before the signal test) ---------
     print("\n[proxy probe] cross-model summary on sampled items:")
@@ -1650,7 +1687,160 @@ else:
     print("=" * 78)
     print("[proxy probe] DONE. Per-proxy ΔNLL (all-slice):")
     for _col, _d in _probe_summary.items():
-        print(f"  {_col:<16} ΔNLL_all={_d.get('all', float('nan')):+.5f}")
+        print(f"  {_col:<25} ΔNLL_all={_d.get('all', float('nan')):+.5f}")
+
+    # ---- Correlation analysis: are these proxies actually orthogonal? ------
+    # The incremental-NLL test already answers "does it help on top of the NN
+    # baseline" rigorously. This cell answers the complementary question --
+    # "is the proxy structurally a duplicate of features we already have?" --
+    # by computing Pearson correlations between each proxy (aggregated to
+    # item-level) and the Tier-0 NN baseline columns + the OOF baseline
+    # logit ``p_base``. Highly-correlated rows are redundant regardless of
+    # ΔNLL noise; low-correlation rows + a signal hit on ΔNLL are the
+    # genuinely orthogonal wins we're hunting for.
+    print("\n" + "=" * 78)
+    print("[proxy probe] CORRELATION ANALYSIS")
+    print("=" * 78)
+
+    try:
+        from src.nn_features import NN_FEATURE_NAMES as _NN_NAMES
+    except Exception:  # pragma: no cover - very defensive
+        _NN_NAMES = tuple(f"nn_{i:02d}" for i in range(nn_train_mat.shape[1]))
+
+    # 1) Per-item aggregation of every numeric quantity (proxies + baselines).
+    _items_in_sample = sorted(_sample_items)
+    if not _items_in_sample:
+        print("[proxy probe] no sampled items -> skipping correlation analysis.")
+    else:
+        import pandas as _pd_probe
+        _row_idx = _np_probe.where(_row_in_sample)[0]
+        _items_arr = _item_key_rows[_row_idx]
+        # Baseline matrix: Tier-0 NN columns + p_base logit. We aggregate to
+        # one row per item by mean (NN features are item-level by
+        # construction; p_base is a per-row OOF logit and we average the
+        # rows that share an item_key).
+        _tier0_cols = list(_NN_NAMES[: min(8, nn_train_mat.shape[1])])
+        _base_df = _pd_probe.DataFrame(
+            nn_train_mat[_row_idx, : len(_tier0_cols)], columns=_tier0_cols,
+        )
+        _base_df["p_base"] = _p_base[_row_idx]
+        _base_df["item_key"] = _items_arr.astype(str)
+        _base_item = _base_df.groupby("item_key").mean(numeric_only=True)
+        # Proxy matrix: every entry in `_proxy_per_item`.
+        _proxy_item = _pd_probe.DataFrame(index=_items_in_sample)
+        _proxy_item.index = _proxy_item.index.astype(str)
+        for _name, _per_item in _proxy_per_item.items():
+            _proxy_item[_name] = _proxy_item.index.map(_per_item).astype(float)
+        # Align both frames on the same item index.
+        _common = _proxy_item.index.intersection(_base_item.index)
+        _proxy_item = _proxy_item.loc[_common]
+        _base_item = _base_item.loc[_common]
+        # NaN-clean per column: drop proxies that are all-NaN (e.g. column
+        # absent from cache). The rest get mean-imputed so correlations
+        # are well-defined for items where the solver refused.
+        _proxy_item = _proxy_item.dropna(axis=1, how="all")
+        _proxy_item = _proxy_item.fillna(_proxy_item.mean(numeric_only=True))
+        # Drop near-constant columns (corr is undefined; zero variance).
+        _keep = [c for c in _proxy_item.columns
+                 if float(_proxy_item[c].std(ddof=0)) > 1e-9]
+        _proxy_item = _proxy_item[_keep]
+
+        # 2) Proxy x baseline correlation table -- the redundancy answer.
+        _proxy_vs_base = _proxy_item.apply(
+            lambda col: _base_item.apply(
+                lambda b: float(_np_probe.corrcoef(col.to_numpy(), b.to_numpy())[0, 1])
+                if float(b.std()) > 1e-9 else float("nan")
+            ),
+            axis=0,
+        ).T  # rows = proxies, cols = baseline features
+        print(
+            f"[proxy probe] proxy x baseline Pearson correlations on "
+            f"{len(_common):,} items:"
+        )
+        with _pd_probe.option_context(
+            "display.width", 200, "display.max_columns", 20,
+            "display.float_format", "{:+.3f}".format,
+        ):
+            print(_proxy_vs_base)
+        # Compact "max abs corr" summary -- the single number per proxy that
+        # tells you "this is a dupe of some baseline column" vs "this is
+        # structurally orthogonal".
+        _max_abs = _proxy_vs_base.abs().max(axis=1)
+        _max_col = _proxy_vs_base.abs().idxmax(axis=1)
+        print("\n[proxy probe] max |corr| with ANY Tier-0 NN feature or p_base "
+              "(< 0.20 ~= orthogonal candidate):")
+        for _p in _proxy_vs_base.index:
+            _mc = float(_max_abs[_p])
+            _name = str(_max_col[_p])
+            _flag = "  <-- ORTHOGONAL" if _mc < 0.20 else (
+                "  <-- redundant" if _mc > 0.70 else ""
+            )
+            print(f"  {_p:<32} max|r|={_mc:.3f}  (vs {_name}){_flag}")
+
+        # 3) Proxy x proxy correlation matrix + heatmap (visual diagnostic).
+        _proxy_corr = _proxy_item.corr()
+        print(f"\n[proxy probe] proxy x proxy correlation matrix "
+              f"({_proxy_corr.shape[0]} features):")
+        with _pd_probe.option_context(
+            "display.width", 200, "display.max_columns", 24,
+            "display.float_format", "{:+.2f}".format,
+        ):
+            print(_proxy_corr)
+        try:
+            import matplotlib.pyplot as _plt_probe
+            _fig, _axes = _plt_probe.subplots(
+                1, 2, figsize=(max(14, 0.6 * _proxy_corr.shape[0] + 6),
+                               max(6, 0.4 * _proxy_corr.shape[0] + 3)),
+                gridspec_kw={"width_ratios": [3, 2]},
+            )
+            _ax = _axes[0]
+            _im = _ax.imshow(_proxy_corr.to_numpy(), vmin=-1, vmax=1, cmap="RdBu_r")
+            _ax.set_xticks(range(_proxy_corr.shape[0]))
+            _ax.set_yticks(range(_proxy_corr.shape[0]))
+            _ax.set_xticklabels(_proxy_corr.columns, rotation=75, ha="right", fontsize=8)
+            _ax.set_yticklabels(_proxy_corr.index, fontsize=8)
+            _ax.set_title("proxy x proxy correlation (item-level)")
+            _fig.colorbar(_im, ax=_ax, fraction=0.04, pad=0.02)
+            _ax2 = _axes[1]
+            _vb = _proxy_vs_base.to_numpy()
+            _im2 = _ax2.imshow(_vb, vmin=-1, vmax=1, cmap="RdBu_r")
+            _ax2.set_xticks(range(_proxy_vs_base.shape[1]))
+            _ax2.set_yticks(range(_proxy_vs_base.shape[0]))
+            _ax2.set_xticklabels(_proxy_vs_base.columns, rotation=75, ha="right", fontsize=8)
+            _ax2.set_yticklabels(_proxy_vs_base.index, fontsize=8)
+            _ax2.set_title("proxy x baseline correlation (redundancy check)")
+            _fig.colorbar(_im2, ax=_ax2, fraction=0.04, pad=0.02)
+            _fig.tight_layout()
+            _plt_probe.show()
+        except Exception as _e:  # pragma: no cover - notebooks-only
+            print(f"[proxy probe] heatmap skipped: {_e!r}")
+
+        # 4) Overall verdict: count proxies that BOTH cleared ΔNLL CI in any
+        #    slice AND have a low max|corr| with the baseline.
+        _passed_signal = {k for k, v in _probe_summary.items()
+                          if v.get("all", 0.0) < 0.0}
+        # Aliases: ΔNLL keys may not exactly match item-level column names
+        # (the per-item dict uses the same name as the probe loop). Build a
+        # quick lookup by stripping the ``::short_model`` suffix when needed.
+        def _strip_suffix(_n):
+            return _n.split("::")[0]
+        _orthogonal = {k for k in _proxy_item.columns
+                       if float(_max_abs.get(k, float("nan"))) < 0.20}
+        _both = {k for k in _proxy_item.columns
+                 if _strip_suffix(k) in {_strip_suffix(p) for p in _passed_signal}
+                 and k in _orthogonal}
+        print("\n[proxy probe] VERDICT (correlation + signal joint):")
+        if _both:
+            print(
+                "  proxies that BOTH cleared ΔNLL CI AND are orthogonal "
+                "(|r|<0.20) to the baseline:"
+            )
+            for _k in sorted(_both):
+                print(f"    - {_k}")
+        else:
+            print("  NO proxy is simultaneously signal-positive AND orthogonal "
+                  "to the baseline. Either the solver has nothing to add, or "
+                  "anything it adds is already covered by the NN features.")
 
     if bool(_PP["stop_after"]):
         print(

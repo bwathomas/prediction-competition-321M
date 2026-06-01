@@ -46,7 +46,13 @@ import pandas as pd
 
 LOG = logging.getLogger("solver_proxy")
 
-PROXY_FEATURE_NAMES: tuple[str, ...] = (
+# Schema version of the extracted feature set. Bumped whenever the schema
+# changes (new columns or renamed columns) so config_hash flips and the
+# parquet cache invalidates cleanly. Independent of model-id / template.
+PROXY_FEATURE_SCHEMA_VERSION: str = "v2_extended_2026_05"
+
+# Core self-consistency / verification block (Tier 1+2 in the literature).
+_CORE_FEATURE_NAMES: tuple[str, ...] = (
     "self_consistency",
     "answer_entropy",
     "fsd",
@@ -55,6 +61,25 @@ PROXY_FEATURE_NAMES: tuple[str, ...] = (
     "refusal_rate",
     "p_true",
 )
+
+# Extended length/format/step features distilled from the LLM-as-Student
+# diagnostics literature (Kuhn et al. semantic-uncertainty / Lin et al.
+# "generating with confidence" / Manakul et al. SelfCheckGPT). All are
+# pure functions of the sampled traces -- no extra forward passes.
+_EXTENDED_FEATURE_NAMES: tuple[str, ...] = (
+    "answer_chars_mean",      # mean char length of extracted answer per sample
+    "answer_chars_std",       # variability of answer length across samples
+    "answer_tokens_mean",     # mean token length of extracted answer
+    "answer_tokens_std",
+    "trace_steps_mean",       # mean reasoning steps per sample (numbered list -> paragraphs -> lines)
+    "trace_steps_std",
+    "trace_tokens_std",       # std of full trace length in tokens (path-variance proxy)
+    "boxed_rate",             # fraction of samples with \boxed{...}
+    "first_line_chars_mean",  # mean char length of first non-empty line ("warm-up" length)
+    "answer_format_consistency",  # fraction whose answer TYPE (num/mc/text) matches modal type
+)
+
+PROXY_FEATURE_NAMES: tuple[str, ...] = _CORE_FEATURE_NAMES + _EXTENDED_FEATURE_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +198,134 @@ def vote_statistics(answers: Sequence[str]) -> dict[str, float]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Extended sample-level features (length / step / format diagnostics)
+# ---------------------------------------------------------------------------
+
+
+_RE_NUMBERED_STEP = re.compile(
+    r"(?im)^\s*(?:\d+\s*[\.\)]|step\s+\d+\s*[:\.])"
+)
+
+
+def _count_steps(text: str) -> int:
+    """Count reasoning steps in one CoT sample.
+
+    Preference order:
+      1. Explicit numbered steps ("1.", "1)", "Step 1:") when >=2 occur.
+      2. Non-empty double-newline-separated paragraphs.
+      3. Non-empty single-newline-separated lines.
+    Always >= 0. Empty input -> 0.
+    """
+    if not text:
+        return 0
+    s = str(text)
+    numbered = _RE_NUMBERED_STEP.findall(s)
+    if len(numbered) >= 2:
+        return int(len(numbered))
+    paras = [p for p in re.split(r"\n\s*\n", s) if p.strip()]
+    if len(paras) >= 1:
+        return int(len(paras))
+    return int(sum(1 for ln in s.split("\n") if ln.strip()))
+
+
+_RE_NUM_EXACT = re.compile(r"^-?\d+(?:\.\d+)?$")
+_RE_MC_EXACT = re.compile(r"^[a-e]$")
+
+
+def _answer_type(parsed: str) -> str:
+    """One-of {"number", "mc", "text", "none"} for a parsed answer token."""
+    if not parsed or parsed == _NO_ANSWER:
+        return "none"
+    p = str(parsed).strip().lower()
+    if _RE_NUM_EXACT.match(p):
+        return "number"
+    if _RE_MC_EXACT.match(p):
+        return "mc"
+    return "text"
+
+
+def extended_sample_features(
+    samples: Sequence[str],
+    parsed: Sequence[str],
+    *,
+    tokenizer=None,
+) -> dict[str, float]:
+    """Per-sample length/step/format diagnostics aggregated to one item.
+
+    All keys in :data:`_EXTENDED_FEATURE_NAMES` are returned (0.0 on empty
+    input). ``tokenizer`` is optional; when omitted, token-length features
+    fall back to whitespace token counts so the helper stays GPU-free for
+    unit tests.
+    """
+    n = int(len(samples))
+    out = {name: 0.0 for name in _EXTENDED_FEATURE_NAMES}
+    if n == 0:
+        return out
+    if int(len(parsed)) != n:
+        raise ValueError(
+            f"extended_sample_features: parsed length {len(parsed)} != samples length {n}"
+        )
+
+    def _tok_len(text: str) -> int:
+        if not text:
+            return 0
+        if tokenizer is not None:
+            try:
+                return int(len(tokenizer.encode(text, add_special_tokens=False)))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return int(len(text.split()))
+
+    ans_chars: list[int] = []
+    ans_tokens: list[int] = []
+    for p in parsed:
+        if p and p != _NO_ANSWER:
+            ans_chars.append(int(len(str(p))))
+            ans_tokens.append(_tok_len(str(p)))
+        else:
+            ans_chars.append(0)
+            ans_tokens.append(0)
+
+    step_counts = [_count_steps(s) for s in samples]
+    trace_tokens = [_tok_len(s) for s in samples]
+    boxed = [1.0 if _BOXED_RE.search(s or "") else 0.0 for s in samples]
+    first_line_chars: list[int] = []
+    for s in samples:
+        if not s:
+            first_line_chars.append(0)
+            continue
+        first = next((ln for ln in str(s).split("\n") if ln.strip()), "")
+        first_line_chars.append(int(len(first)))
+
+    types = [_answer_type(p) for p in parsed]
+    valid_types = [t for t in types if t != "none"]
+    if valid_types:
+        modal_type = Counter(valid_types).most_common(1)[0][0]
+        fmt_consistency = sum(1 for t in valid_types if t == modal_type) / float(len(valid_types))
+    else:
+        fmt_consistency = 0.0
+
+    arr_chars = np.asarray(ans_chars, dtype=np.float64)
+    arr_tokens = np.asarray(ans_tokens, dtype=np.float64)
+    arr_steps = np.asarray(step_counts, dtype=np.float64)
+    arr_trace_tok = np.asarray(trace_tokens, dtype=np.float64)
+    arr_boxed = np.asarray(boxed, dtype=np.float64)
+    arr_first = np.asarray(first_line_chars, dtype=np.float64)
+
+    out["answer_chars_mean"] = float(arr_chars.mean())
+    out["answer_chars_std"] = float(arr_chars.std())
+    out["answer_tokens_mean"] = float(arr_tokens.mean())
+    out["answer_tokens_std"] = float(arr_tokens.std())
+    out["trace_steps_mean"] = float(arr_steps.mean())
+    out["trace_steps_std"] = float(arr_steps.std())
+    out["trace_tokens_std"] = float(arr_trace_tok.std())
+    out["boxed_rate"] = float(arr_boxed.mean())
+    out["first_line_chars_mean"] = float(arr_first.mean())
+    out["answer_format_consistency"] = float(fmt_consistency)
+    return out
+
+
 def modal_answer(answers: Sequence[str]) -> str:
     """Most-common non-refusal parsed answer (``"<none>"`` if all refuse)."""
     valid = [a for a in answers if a != _NO_ANSWER]
@@ -267,7 +420,12 @@ class SolverProxyConfig:
 
 
 def config_hash(cfg: SolverProxyConfig) -> str:
-    """Stable hash of everything that changes the produced scores."""
+    """Stable hash of everything that changes the produced scores.
+
+    Includes the feature-schema version so adding new columns invalidates
+    any prior cache (the old parquet has fewer columns and would not merge
+    cleanly).
+    """
     h = hashlib.sha256()
     for part in (
         cfg.solve_template, cfg.verify_template,
@@ -276,6 +434,7 @@ def config_hash(cfg: SolverProxyConfig) -> str:
         str(cfg.compute_p_true), str(cfg.use_chat_template), str(cfg.enable_thinking),
         cfg.system_prompt,
         "|".join(cfg.yes_tokens), "|".join(cfg.no_tokens),
+        PROXY_FEATURE_SCHEMA_VERSION,
     ):
         h.update(part.encode("utf-8", errors="replace"))
         h.update(b"\x00")
@@ -561,25 +720,32 @@ class SolverProxy:
                     vs = vote_statistics(parsed)
                     lens = [len(tok.encode(t, add_special_tokens=False)) for t in samples]
                     vs["mean_trace_len"] = float(np.mean(lens)) if lens else 0.0
+                    # Extended length/step/format diagnostics (cheap; no
+                    # extra forward passes).
+                    ext = extended_sample_features(samples, parsed, tokenizer=tok)
+                    vs.update(ext)
                     feats.append(vs)
                     modal_list.append(modal_answer(parsed))
                 if self.cfg.compute_p_true:
                     p_true = self._p_true(chunk_rows, modal_list)
                 else:
                     p_true = np.full(len(chunk_rows), 0.5, dtype=np.float64)
-                new_df = pd.DataFrame({
+                _row_dict = {
                     "item_key": todo.iloc[cs:ce]["item_key"].astype(str).values,
-                    "self_consistency": [f["self_consistency"] for f in feats],
-                    "answer_entropy": [f["answer_entropy"] for f in feats],
-                    "fsd": [f["fsd"] for f in feats],
-                    "n_distinct": [f["n_distinct"] for f in feats],
-                    "mean_trace_len": [f["mean_trace_len"] for f in feats],
-                    "refusal_rate": [f["refusal_rate"] for f in feats],
-                    "p_true": p_true,
-                    "modal_answer": modal_list,
-                    "model_id": self.cfg.model_id,
-                    "config_hash": ch_hash,
-                })
+                }
+                # Core columns (existing schema).
+                for _core_col in _CORE_FEATURE_NAMES:
+                    if _core_col == "p_true":
+                        _row_dict[_core_col] = p_true
+                    else:
+                        _row_dict[_core_col] = [f[_core_col] for f in feats]
+                # Extended columns (new in v2 schema).
+                for _ext_col in _EXTENDED_FEATURE_NAMES:
+                    _row_dict[_ext_col] = [f[_ext_col] for f in feats]
+                _row_dict["modal_answer"] = modal_list
+                _row_dict["model_id"] = self.cfg.model_id
+                _row_dict["config_hash"] = ch_hash
+                new_df = pd.DataFrame(_row_dict)
                 # Flush each chunk so progress is durable and the run resumes.
                 if write_cache:
                     append_cache(self.cfg, new_df)
@@ -650,12 +816,14 @@ def build_proxy_row_vector(
 __all__ = [
     "PROXY_CACHE_COLUMNS",
     "PROXY_FEATURE_NAMES",
+    "PROXY_FEATURE_SCHEMA_VERSION",
     "SolverProxy",
     "SolverProxyConfig",
     "append_cache",
     "build_proxy_row_vector",
     "config_hash",
     "cross_model_disagreement",
+    "extended_sample_features",
     "load_cache",
     "modal_answer",
     "normalize_answer",
