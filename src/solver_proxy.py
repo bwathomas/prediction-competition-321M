@@ -233,12 +233,22 @@ class SolverProxyConfig:
     trust_remote_code: bool = False
     compute_p_true: bool = True
     cache_dir: str = "artifacts/solver_proxy"
+    # Use the model's chat template (instruct models emit EOS and stop early
+    # -> far faster than raw prompting, which runs the full max_new_tokens).
+    use_chat_template: bool = True
+    # Qwen3 (and other hybrid) models default to long <think> traces that
+    # blow past a small token budget and never reach the answer. Off by
+    # default: we still ask for step-by-step reasoning in the prompt, which
+    # gives CoT-style consistency without the heavy thinking budget.
+    enable_thinking: bool = False
+    # Items per cache flush: generation + parse + append happen per chunk so
+    # progress is visible and the run is resumable mid-way.
+    chunk_items: int = 32
     solve_template: str = (
-        "Solve the following evaluation item. Reason step by step, then state "
-        "your final answer on the last line as 'Answer: <answer>'.\n\n"
+        "Solve the following evaluation item. Reason briefly step by step, then "
+        "state your final answer on the last line as 'Answer: <answer>'.\n\n"
         "Benchmark: {benchmark}\n"
-        "Item: {item_content}\n\n"
-        "Solution:"
+        "Item: {item_content}"
     )
     verify_template: str = (
         "Item: {item_content}\n"
@@ -257,7 +267,7 @@ def config_hash(cfg: SolverProxyConfig) -> str:
         cfg.solve_template, cfg.verify_template,
         str(cfg.n_samples), str(round(cfg.temperature, 4)), str(round(cfg.top_p, 4)),
         str(cfg.max_new_tokens), str(cfg.max_prompt_tokens), str(cfg.seed),
-        str(cfg.compute_p_true),
+        str(cfg.compute_p_true), str(cfg.use_chat_template), str(cfg.enable_thinking),
         "|".join(cfg.yes_tokens), "|".join(cfg.no_tokens),
     ):
         h.update(part.encode("utf-8", errors="replace"))
@@ -375,28 +385,62 @@ class SolverProxy:
         self._model.to(self.device)
         self._yes_ids = _resolve_token_ids(self._tok, self.cfg.yes_tokens)
         self._no_ids = _resolve_token_ids(self._tok, self.cfg.no_tokens)
+        # Stop tokens for generation: the tokenizer EOS plus an <|im_end|>-style
+        # turn terminator when present (Qwen/ChatML). Instruct models emit one
+        # of these after the answer, so sequences finish well before the cap.
+        eos_ids: list[int] = []
+        if self._tok.eos_token_id is not None:
+            eos_ids.append(int(self._tok.eos_token_id))
+        for extra in ("<|im_end|>", "<end_of_turn>"):
+            tid = self._tok.convert_tokens_to_ids(extra)
+            if isinstance(tid, int) and tid >= 0 and tid != self._tok.unk_token_id:
+                eos_ids.append(int(tid))
+        self._gen_eos_ids = sorted(set(eos_ids)) or None
+        # Whether prompts already carry special tokens (chat template does).
+        self._chat_on = bool(self.cfg.use_chat_template and getattr(self._tok, "chat_template", None))
         self._loaded = True
-        LOG.info("Solver %s loaded on %s (slug=%s)", self.cfg.model_id, self.device, self.slug)
+        LOG.info(
+            "Solver %s loaded on %s (slug=%s, chat_template=%s, thinking=%s)",
+            self.cfg.model_id, self.device, self.slug, self._chat_on, self.cfg.enable_thinking,
+        )
 
-    def _build_solve_prompt(self, row: Mapping[str, object]) -> str:
-        text = self.cfg.solve_template.format(
+    def _format_prompt(self, row: Mapping[str, object]) -> str:
+        """Render one item into a ready-to-tokenize prompt string.
+
+        Uses the model's chat template when available (so instruct models behave
+        and terminate), otherwise falls back to the raw solve template.
+        """
+        user = self.cfg.solve_template.format(
             benchmark=str(row.get("benchmark", "") or ""),
             item_content=str(row.get("item_content", "") or ""),
         )
-        return text
+        if self.cfg.use_chat_template and getattr(self._tok, "chat_template", None):
+            msgs = [{"role": "user", "content": user}]
+            try:
+                return self._tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=bool(self.cfg.enable_thinking),
+                )
+            except TypeError:
+                # Tokenizer without an ``enable_thinking`` kwarg.
+                return self._tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+        return user
 
     def _generate_samples(self, prompts: Sequence[str]) -> list[list[str]]:
-        """Return ``n_samples`` decoded completions for each prompt."""
+        """Return ``n_samples`` decoded completions for each prompt (one batch)."""
         import torch
 
         n = len(prompts)
         out: list[list[str]] = [[] for _ in range(n)]
         bs = max(1, int(self.cfg.batch_size))
+        add_special = not getattr(self, "_chat_on", False)
         for s in range(0, n, bs):
             chunk = list(prompts[s : s + bs])
             enc = self._tok(
                 chunk, return_tensors="pt", padding=True, truncation=True,
-                max_length=int(self.cfg.max_prompt_tokens), add_special_tokens=True,
+                max_length=int(self.cfg.max_prompt_tokens), add_special_tokens=add_special,
             ).to(self.device)
             with torch.inference_mode():
                 gen = self._model.generate(
@@ -407,11 +451,11 @@ class SolverProxy:
                     max_new_tokens=int(self.cfg.max_new_tokens),
                     num_return_sequences=int(self.cfg.n_samples),
                     pad_token_id=self._tok.pad_token_id,
+                    eos_token_id=getattr(self, "_gen_eos_ids", None),
                 )
             prompt_len = enc["input_ids"].shape[1]
             completions = gen[:, prompt_len:]
             decoded = self._tok.batch_decode(completions, skip_special_tokens=True)
-            # decoded is [chunk * n_samples] grouped per prompt.
             ns = int(self.cfg.n_samples)
             for j in range(len(chunk)):
                 out[s + j] = decoded[j * ns : (j + 1) * ns]
@@ -478,44 +522,58 @@ class SolverProxy:
         )
         if len(todo) > 0:
             self._load()
-            rows = todo.to_dict(orient="records")
-            prompts = [self._build_solve_prompt(r) for r in rows]
             try:
-                from tqdm.auto import tqdm
-                rng = tqdm(range(0, len(rows), self.cfg.batch_size), disable=not progress,
-                           desc=f"solve {self.cfg.model_id.split('/')[-1]}")
-            except Exception:
-                rng = range(0, len(rows), self.cfg.batch_size)
-            feats: list[dict] = []
-            modal_list: list[str] = []
-            samples_all = self._generate_samples(prompts)
+                from tqdm.auto import tqdm as _tqdm
+            except Exception:  # pragma: no cover
+                def _tqdm(x, **k):
+                    return x
+
+            chunk = max(1, int(self.cfg.chunk_items))
+            n_todo = len(todo)
+            ch_hash = config_hash(self.cfg)
+            short = self.cfg.model_id.split("/")[-1]
+            bar = _tqdm(
+                range(0, n_todo, chunk), disable=not progress,
+                desc=f"solve {short}", unit="chunk",
+            )
             tok = self._tok
-            for i, samples in enumerate(samples_all):
-                parsed = [normalize_answer(t) for t in samples]
-                vs = vote_statistics(parsed)
-                lens = [len(tok.encode(t, add_special_tokens=False)) for t in samples]
-                vs["mean_trace_len"] = float(np.mean(lens)) if lens else 0.0
-                feats.append(vs)
-                modal_list.append(modal_answer(parsed))
-            if self.cfg.compute_p_true:
-                p_true = self._p_true(rows, modal_list)
-            else:
-                p_true = np.full(len(rows), 0.5, dtype=np.float64)
-            new_df = pd.DataFrame({
-                "item_key": todo["item_key"].astype(str).values,
-                "self_consistency": [f["self_consistency"] for f in feats],
-                "answer_entropy": [f["answer_entropy"] for f in feats],
-                "fsd": [f["fsd"] for f in feats],
-                "n_distinct": [f["n_distinct"] for f in feats],
-                "mean_trace_len": [f["mean_trace_len"] for f in feats],
-                "refusal_rate": [f["refusal_rate"] for f in feats],
-                "p_true": p_true,
-                "modal_answer": modal_list,
-                "model_id": self.cfg.model_id,
-                "config_hash": config_hash(self.cfg),
-            })
-            if write_cache:
-                append_cache(self.cfg, new_df)
+            for cs in bar:
+                ce = min(cs + chunk, n_todo)
+                chunk_rows = todo.iloc[cs:ce].to_dict(orient="records")
+                prompts = [self._format_prompt(r) for r in chunk_rows]
+                # Generation + parse + (optional) P(True) for this chunk only.
+                samples_all = self._generate_samples(prompts)
+                feats: list[dict] = []
+                modal_list: list[str] = []
+                for samples in samples_all:
+                    parsed = [normalize_answer(t) for t in samples]
+                    vs = vote_statistics(parsed)
+                    lens = [len(tok.encode(t, add_special_tokens=False)) for t in samples]
+                    vs["mean_trace_len"] = float(np.mean(lens)) if lens else 0.0
+                    feats.append(vs)
+                    modal_list.append(modal_answer(parsed))
+                if self.cfg.compute_p_true:
+                    p_true = self._p_true(chunk_rows, modal_list)
+                else:
+                    p_true = np.full(len(chunk_rows), 0.5, dtype=np.float64)
+                new_df = pd.DataFrame({
+                    "item_key": todo.iloc[cs:ce]["item_key"].astype(str).values,
+                    "self_consistency": [f["self_consistency"] for f in feats],
+                    "answer_entropy": [f["answer_entropy"] for f in feats],
+                    "fsd": [f["fsd"] for f in feats],
+                    "n_distinct": [f["n_distinct"] for f in feats],
+                    "mean_trace_len": [f["mean_trace_len"] for f in feats],
+                    "refusal_rate": [f["refusal_rate"] for f in feats],
+                    "p_true": p_true,
+                    "modal_answer": modal_list,
+                    "model_id": self.cfg.model_id,
+                    "config_hash": ch_hash,
+                })
+                # Flush each chunk so progress is durable and the run resumes.
+                if write_cache:
+                    append_cache(self.cfg, new_df)
+                if hasattr(bar, "set_postfix"):
+                    bar.set_postfix(done=ce, refusal=f"{float(new_df['refusal_rate'].mean()):.2f}")
             cached = load_cache(self.cfg)
         # Return rows for the requested items, in input order.
         want = uniq[["item_key"]].astype(str)

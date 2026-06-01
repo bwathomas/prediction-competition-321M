@@ -1427,6 +1427,9 @@ _PP.setdefault("max_new_tokens", 512)
 _PP.setdefault("temperature", 0.8)
 _PP.setdefault("batch_size", 16)
 _PP.setdefault("compute_p_true", True)
+_PP.setdefault("use_chat_template", True)   # instruct models -> emit EOS, finish early (fast)
+_PP.setdefault("enable_thinking", False)    # Qwen3 etc.: skip long <think> traces
+_PP.setdefault("chunk_items", 32)           # items per cache flush (visible/resumable progress)
 _PP.setdefault("multi_model", True)         # run ALL models for disagreement + per-model consistency
 _PP.setdefault("n_boot", 500)
 _PP.setdefault("support_col", 7)            # nn_train_mat col 7 = n_labeled_neighbors_log1p
@@ -1499,6 +1502,9 @@ else:
             batch_size=int(_PP["batch_size"]),
             # P(True) only on the primary model (cheap extra; others skip it).
             compute_p_true=bool(_PP["compute_p_true"]) and (_mi == 0),
+            use_chat_template=bool(_PP["use_chat_template"]),
+            enable_thinking=bool(_PP["enable_thinking"]),
+            chunk_items=int(_PP["chunk_items"]),
             cache_dir=str(ROOT / "artifacts" / "solver_proxy"),
         )
         print(
