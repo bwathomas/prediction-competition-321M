@@ -1186,18 +1186,31 @@ def _nll(p, y):
     return float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
 
 
+def _aux_zeros(n: int) -> np.ndarray:
+    return np.zeros(int(n), dtype=np.float32)
+
+
+def _aux_half(n: int) -> np.ndarray:
+    return np.full(int(n), 0.5, dtype=np.float32)
+
+
 def _platt(p_oof, p_val):
+    # Aux arrays are sized from p_oof / p_val so this works whether
+    # p_val has N_VAL rows (the apply-to-val case) or N_TRAIN rows
+    # (the calibrate-OOF-on-OOF case used by cal_oof below).
+    n_o = int(len(p_oof))
+    n_v = int(len(p_val))
     Xo = build_stacker_features(
-        member_probs=p_oof[:, None], bench_present=_zeros_tr,
-        nn_neighbor_support=_zeros_tr, nn_mean_similarity=_zeros_tr,
-        centroid_distance=_half_tr,
+        member_probs=p_oof[:, None], bench_present=_aux_zeros(n_o),
+        nn_neighbor_support=_aux_zeros(n_o), nn_mean_similarity=_aux_zeros(n_o),
+        centroid_distance=_aux_half(n_o),
     )
     st = fit_stacker(X=Xo, y=y_train, feature_names=stacker_feature_names(1),
                      seed=SEED, n_iters=1500)
     Xv = build_stacker_features(
-        member_probs=p_val[:, None], bench_present=_zeros_va,
-        nn_neighbor_support=_zeros_va, nn_mean_similarity=_zeros_va,
-        centroid_distance=_half_va,
+        member_probs=p_val[:, None], bench_present=_aux_zeros(n_v),
+        nn_neighbor_support=_aux_zeros(n_v), nn_mean_similarity=_aux_zeros(n_v),
+        centroid_distance=_aux_half(n_v),
     )
     return stacker_apply_batch(st, Xv).astype(np.float32)
 
