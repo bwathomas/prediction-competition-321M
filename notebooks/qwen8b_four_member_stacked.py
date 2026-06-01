@@ -623,7 +623,12 @@ CFG["dense_item_features"].setdefault("add_cot_interactions", True)
 # enabled=False to revert to the plain (non-NCL) members instantly.
 CFG.setdefault("ncl", {})
 CFG["ncl"].setdefault("enabled", True)
-CFG["ncl"].setdefault("lambda_", 0.30)
+# Raised from 0.30 -> 2.0: at 0.30 the NCL penalty (~0.02-0.04 in
+# magnitude) was a rounding error against the dense members' data-loss
+# gradient, so M2/M4/M7 barely decorrelated from their anchors. 2.0 is
+# in the range where the penalty actually bites; tune via the pre-OOF
+# diagnostic cell below before paying for the full OOF compute.
+CFG["ncl"].setdefault("lambda_", 2.0)
 CFG["ncl"].setdefault("anchors", ("member1", "member6", "member8"))
 CFG["ncl"].setdefault("penalized", ("member2", "member4", "member7"))
 # Member 9 (FwFM clone) decorrelates from this (smaller) anchor set so it
@@ -636,7 +641,12 @@ CFG["ncl"].setdefault("m9_anchors", ("member1", "member8"))
 # the ensemble a "diversified" factorization machine alongside the pure M6.
 CFG.setdefault("member9", {})
 CFG["member9"].setdefault("enabled", True)
-CFG["member9"].setdefault("ncl_lambda", 0.50)
+# Raised from 0.50 -> 3.0. M9 is identical to M6 except for this NCL
+# penalty against {M1, M8}; at 0.50 their weight norms tracked each
+# other almost exactly (M9 was a near-duplicate of M6 => wasted compute).
+# 3.0 forces a visible divergence. The pre-OOF diagnostic prints
+# corr(err_M9, err_M6) so you can confirm M9 is no longer a clone.
+CFG["member9"].setdefault("ncl_lambda", 3.0)
 
 CFG.setdefault("judge", {})
 CFG["judge"]["enabled"] = False
@@ -4599,6 +4609,152 @@ else:
     p_member9_val = None
     nll_m9 = float("nan")
     print("[Member 9] DISABLED (needs member9.enabled and member6.enabled)")
+
+# %% [markdown]
+# ## 9e-quater. NCL pre-OOF diagnostic (accuracy + error-correlation heatmap)
+#
+# CHEAP NCL GO/NO-GO. Before paying for the full per-fold OOF compute
+# (~hours), use the GLOBAL (full-train) val predictions -- which already
+# reflect NCL at the current ``CFG["ncl"]["lambda_"]`` /
+# ``CFG["member9"]["ncl_lambda"]`` -- to check whether NCL is actually
+# buying decorrelation.
+#
+# The decisive A/B is **Member 6 (plain FwFM) vs Member 9 (identical FwFM
+# + NCL against {M1, M8})**: if NCL works, M9's errors are LESS
+# correlated with the {M1, M8} anchors than M6's, while M9's own val NLL
+# stays close to M6's. We also print ``corr(err_M2, err_M1)`` (the
+# pre-NCL baseline was ~ +0.866) for the penalized dense members.
+#
+# Read it like this:
+#   * ``corr(err_M9, err_M6)`` near 1.0  => M9 is still a clone of M6,
+#     NCL is not biting -> raise the M9 lambda (or drop M9).
+#   * M9 less correlated with M1/M8 than M6, at similar NLL => NCL helps.
+#   * ``corr(err_M2, err_M1)`` dropping well below +0.866 => NCL is
+#     decorrelating the penalized dense members too.
+
+# %%
+import matplotlib.pyplot as plt
+
+_y_diag = np.asarray(ylab_val, dtype=np.float64)
+
+# (label, global val preds) for every member that produced them.
+_diag_candidates = [
+    ("M1", p_a_val),
+    ("M2", p_member2_val),
+    ("M3", p_member3_val),
+    ("M4", p_member4_val),
+    ("M5", p_member5_val),
+    ("M6", p_member6_val),
+    ("M7", p_member7_val),
+    ("M8", p_member8_val),
+    ("M9", p_member9_val),
+]
+_diag_members = [
+    (lbl, np.asarray(p, dtype=np.float64))
+    for (lbl, p) in _diag_candidates
+    if p is not None and len(p) == len(_y_diag)
+]
+
+
+def _diag_nll(p):
+    pc = np.clip(p, 1e-6, 1.0 - 1e-6)
+    return float(-(_y_diag * np.log(pc) + (1.0 - _y_diag) * np.log(1.0 - pc)).mean())
+
+
+def _diag_acc(p):
+    return float(((np.asarray(p) >= 0.5).astype(np.float64) == _y_diag).mean())
+
+
+print("\n" + "=" * 70)
+print(
+    "[NCL pre-OOF diagnostic] GLOBAL val accuracy / NLL  "
+    f"(ncl_enabled={_NCL_ENABLED}, lambda={_NCL_LAMBDA}, "
+    f"m9_lambda={_M9_NCL_LAMBDA if _M9_ENABLED else 'n/a'})"
+)
+print("=" * 70)
+print(f"{'member':<8}{'val NLL':>12}{'val acc':>12}")
+_diag_labels = []
+_diag_errs = []
+for _lbl, _p in _diag_members:
+    print(f"{_lbl:<8}{_diag_nll(_p):>12.6f}{_diag_acc(_p):>12.4f}")
+    _diag_labels.append(_lbl)
+    _diag_errs.append(_p - _y_diag)
+
+# Error-correlation matrix across members (corr of residual vectors).
+_err_mat = np.vstack(_diag_errs)              # [M, N_val]
+_corr = np.corrcoef(_err_mat)                 # [M, M]
+_idx = {lbl: i for i, lbl in enumerate(_diag_labels)}
+
+
+def _cc(a, b):
+    if a in _idx and b in _idx:
+        return float(_corr[_idx[a], _idx[b]])
+    return float("nan")
+
+
+print("\n[NCL A/B] error-correlation vs anchors (lower = more diverse):")
+if "M6" in _idx and "M9" in _idx:
+    print(
+        f"  M6 (no NCL): corr w/ M1 = {_cc('M6', 'M1'):+.4f}   "
+        f"corr w/ M8 = {_cc('M6', 'M8'):+.4f}"
+    )
+    print(
+        f"  M9 (+NCL)  : corr w/ M1 = {_cc('M9', 'M1'):+.4f}   "
+        f"corr w/ M8 = {_cc('M9', 'M8'):+.4f}   (NCL should LOWER these)"
+    )
+    print(
+        f"  corr(err_M9, err_M6) = {_cc('M9', 'M6'):+.4f}   "
+        "(near 1.0 => M9 still a clone of M6 => raise m9 lambda / drop M9)"
+    )
+    print(
+        f"  val NLL: M6={_diag_nll(p_member6_val):.6f}  "
+        f"M9={_diag_nll(p_member9_val):.6f}  "
+        "(NCL trades a little NLL for decorrelation)"
+    )
+print(
+    f"  corr(err_M2, err_M1) = {_cc('M2', 'M1'):+.4f}   "
+    "(pre-NCL baseline ~ +0.866; NCL should LOWER this)"
+)
+if "M4" in _idx:
+    print(f"  corr(err_M4, err_M1) = {_cc('M4', 'M1'):+.4f}")
+if "M7" in _idx:
+    print(f"  corr(err_M7, err_M1) = {_cc('M7', 'M1'):+.4f}")
+
+# Heatmap of the error-correlation matrix.
+_nm = len(_diag_labels)
+_fig, _ax = plt.subplots(figsize=(1.05 * _nm + 2.0, 1.0 * _nm + 1.5))
+_im = _ax.imshow(_corr, vmin=-1.0, vmax=1.0, cmap="coolwarm")
+_ax.set_xticks(range(_nm))
+_ax.set_yticks(range(_nm))
+_ax.set_xticklabels(_diag_labels)
+_ax.set_yticklabels(_diag_labels)
+for _i in range(_nm):
+    for _j in range(_nm):
+        _ax.text(
+            _j, _i, f"{_corr[_i, _j]:.2f}",
+            ha="center", va="center", color="black", fontsize=8,
+        )
+_ax.set_title(
+    f"Global val error-correlation  (NCL lambda={_NCL_LAMBDA}, "
+    f"m9={_M9_NCL_LAMBDA if _M9_ENABLED else 'n/a'})"
+)
+_fig.colorbar(_im, ax=_ax, fraction=0.046, pad=0.04)
+plt.tight_layout()
+plt.show()
+
+print(
+    "\n[NCL pre-OOF diagnostic] DECISION: if M9 is not meaningfully less "
+    "correlated with {M1,M8} than M6 (and corr(err_M9,err_M6) stays ~1), "
+    "raise CFG['member9']['ncl_lambda'] or set CFG['member9']['enabled']="
+    "False. Same logic for M2/M4/M7 via CFG['ncl']['lambda_']. Only then "
+    "is it worth running the full OOF section below."
+)
+print("=" * 70)
+
+# Diagnostic-only scratch; drop before the heavy OOF allocations.
+del _diag_candidates, _diag_members, _diag_errs, _err_mat, _corr
+del _fig, _ax, _im
+gc.collect()
 
 # %% [markdown]
 # ## 9e-bis. Pre-OOF memory reclamation
