@@ -384,6 +384,11 @@ CFG["oof"].setdefault("optimism_threshold_nats", 0.03)
 # 14 mean-encoded marginals). No item embeddings -- structurally orthogonal
 # to M1/M3/M4/M6.
 CFG.setdefault("member2_mlp", {})
+# DROPPED from the final roster. On the pre-NCL run M2 was weak solo
+# (val 0.524), 0.866-correlated with M1, and the stacker gave it ~0
+# (slightly negative) weight -- it never earned its slot. Disabled by
+# default; flip to True to re-enable. Final kept set: M1, M3, M4, M6, M8.
+CFG["member2_mlp"].setdefault("enabled", False)
 # Feature-composition mode.
 #
 # "metadata_only" (default after the May 2026 diagnostic):
@@ -464,7 +469,10 @@ CFG["member2_mlp"].setdefault("mixup_alpha", 0.0)
 # Set `enabled=False` to skip Member 5 and revert to the 4-member stacker
 # (legacy / Task-3 behavior) for A/B comparison.
 CFG.setdefault("member5", {})
-CFG["member5"].setdefault("enabled", True)
+# DROPPED from the final roster. M5 was 0.987-correlated with M3 (pure
+# redundancy, flagged by Gate 4b) and carried ~0 stacker weight. Disabled
+# by default; flip to True to re-enable. Final kept set: M1, M3, M4, M6, M8.
+CFG["member5"].setdefault("enabled", False)
 # v2: pick the Member 5 *variant*. The legacy "difficulty_knn" path is
 # kept for A/B comparison; "residual_cluster" is the new default and
 # uses src/member5_subject_cluster_residual.py -- a pure-lookup
@@ -572,7 +580,10 @@ CFG["member5"].setdefault("tail_quantization", "int8")
 # no raw metadata). Captures non-linear interactions among the marginals
 # that the additive-linear M4 and field-bilinear M6 cannot express.
 CFG.setdefault("member7", {})
-CFG["member7"].setdefault("enabled", True)
+# DROPPED from the final roster. M7 (marginal MLP) was weak solo (val
+# 0.519), highly correlated with M1, and the stacker gave it ~0 weight.
+# Disabled by default; flip to True to re-enable. Kept set: M1, M3, M4, M6, M8.
+CFG["member7"].setdefault("enabled", False)
 CFG["member7"].setdefault("hid1", 64)
 CFG["member7"].setdefault("hid2", 32)
 CFG["member7"].setdefault("learning_rate", 1.0e-3)
@@ -2793,6 +2804,11 @@ from src.member2_metadata_mlp import (
     numerical_feature_names as m2_numerical_feature_names,
 )
 
+# Member 2 was dropped from the final roster (weak + redundant with M1).
+# All M2 compute below (global fit, val scoring, OOF per-fold fit) and its
+# stacker/diagnostic wiring are gated on this flag.
+_M2_ENABLED = bool(CFG.get("member2_mlp", {}).get("enabled", False))
+
 # ---- Per-row metadata arrays (shared by global / OOF / shuffled fits) ----
 # Build once on the full train/val partitions; per-fold sections just
 # slice these by ``fold.train_row_idx`` / ``fold.oof_row_idx`` (or
@@ -3323,28 +3339,33 @@ member2_mlp_state = cache_or_compute(
         (_content_digest(p_a_train, k_rows=4096) if _ncl_lambda_for("member2") > 0 else "noncl"),
     ),
     compute_fn=_fit_member2_mlp_global,
-)
+) if _M2_ENABLED else None
 
-p_member2_val = m2_apply_state_batch(
-    member2_mlp_state,
-    subject_ids=_mef_val_subj,
-    bc_ids=_mef_val_bc,
-    cluster_ids=_mef_val_cluster,
-    family_ids=_m2_meta_val["family_ids"],
-    macro_family_ids=_m2_meta_val["macro_family_ids"],
-    organization_ids=_m2_meta_val["organization_ids"],
-    bench_topic_ids=_m2_meta_val["bench_topic_ids"],
-    numerical=m2_numerical_val,
-)
-nll_m2 = float(
-    -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
-      + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean()
-)
-print(f"[Member 2 MLP] val log-loss: {nll_m2:.6f}")
-print(
-    f"[Member 2 MLP] train/val NLL in state: "
-    f"{member2_mlp_state.train_loss:.6f} / {member2_mlp_state.val_loss:.6f}"
-)
+if _M2_ENABLED:
+    p_member2_val = m2_apply_state_batch(
+        member2_mlp_state,
+        subject_ids=_mef_val_subj,
+        bc_ids=_mef_val_bc,
+        cluster_ids=_mef_val_cluster,
+        family_ids=_m2_meta_val["family_ids"],
+        macro_family_ids=_m2_meta_val["macro_family_ids"],
+        organization_ids=_m2_meta_val["organization_ids"],
+        bench_topic_ids=_m2_meta_val["bench_topic_ids"],
+        numerical=m2_numerical_val,
+    )
+    nll_m2 = float(
+        -(ylab_val * np.log(np.clip(p_member2_val, 1e-6, 1 - 1e-6))
+          + (1 - ylab_val) * np.log(1 - np.clip(p_member2_val, 1e-6, 1 - 1e-6))).mean()
+    )
+    print(f"[Member 2 MLP] val log-loss: {nll_m2:.6f}")
+    print(
+        f"[Member 2 MLP] train/val NLL in state: "
+        f"{member2_mlp_state.train_loss:.6f} / {member2_mlp_state.val_loss:.6f}"
+    )
+else:
+    p_member2_val = None
+    nll_m2 = float("nan")
+    print("[Member 2 MLP] DISABLED via CFG['member2_mlp']['enabled']=False")
 
 # %% [markdown]
 # ## 9d. Train Member 3 (FAISS-free kNN-similarity)
@@ -5316,8 +5337,9 @@ for fold in folds:
         del nn_train_mat_fold, nn_oof_mat_fold
         gc.collect()
 
-    # ----- Fold Member 2 (dense metadata MLP) -----
-    print(f"[OOF f{fold.fold_id}] Training fold Member 2 (dense metadata MLP)...")
+    # ----- Fold Member 2 (dense metadata MLP) -- DROPPED, gated off -----
+    if _M2_ENABLED:
+        print(f"[OOF f{fold.fold_id}] Training fold Member 2 (dense metadata MLP)...")
     _m2_holdout_fold = np.array(
         [int(_item_to_train_idx.get(str(k), -1)) for k in fold_train_df["item_key"]],
         dtype=np.int64,
@@ -5493,19 +5515,22 @@ for fold in folds:
             ("ncl", round(_ncl_lambda_for("member2"), 5)),
         ),
         compute_fn=_fit_fold_m2_mlp,
-    )
-    p2_oof_fold = m2_apply_state_batch(
-        _fold_m2_state,
-        subject_ids=_mef_subj_fold_oof,
-        bc_ids=_mef_bc_fold_oof,
-        cluster_ids=_mef_cluster_fold_oof,
-        family_ids=_m2_meta_fold_oof["family_ids"],
-        macro_family_ids=_m2_meta_fold_oof["macro_family_ids"],
-        organization_ids=_m2_meta_fold_oof["organization_ids"],
-        bench_topic_ids=_m2_meta_fold_oof["bench_topic_ids"],
-        numerical=_m2_num_fold_oof,
-    )
-    p2_train_oof_acc.write_fold(fold.oof_row_idx, p2_oof_fold)
+    ) if _M2_ENABLED else None
+    if _M2_ENABLED:
+        p2_oof_fold = m2_apply_state_batch(
+            _fold_m2_state,
+            subject_ids=_mef_subj_fold_oof,
+            bc_ids=_mef_bc_fold_oof,
+            cluster_ids=_mef_cluster_fold_oof,
+            family_ids=_m2_meta_fold_oof["family_ids"],
+            macro_family_ids=_m2_meta_fold_oof["macro_family_ids"],
+            organization_ids=_m2_meta_fold_oof["organization_ids"],
+            bench_topic_ids=_m2_meta_fold_oof["bench_topic_ids"],
+            numerical=_m2_num_fold_oof,
+        )
+        p2_train_oof_acc.write_fold(fold.oof_row_idx, p2_oof_fold)
+    else:
+        p2_oof_fold = None
 
     # ----- Fold Member 3 (kNN-similarity) -----
     print(f"[OOF f{fold.fold_id}] Training fold Member 3 (kNN)...")
@@ -6317,8 +6342,9 @@ for fold in folds:
         p = np.clip(p, 1e-6, 1 - 1e-6)
         return float(-(_y_fold_oof * np.log(p) + (1 - _y_fold_oof) * np.log(1 - p)).mean())
     print(
-        f"  M1={_nll(p_a_oof_fold):.5f}  M2={_nll(p2_oof_fold):.5f}  "
-        f"M3={_nll(p3_oof_fold):.5f}  M4={_nll(p4_oof_fold):.5f}"
+        f"  M1={_nll(p_a_oof_fold):.5f}  "
+        + (f"M2={_nll(p2_oof_fold):.5f}  " if (_M2_ENABLED and p2_oof_fold is not None) else "")
+        + f"M3={_nll(p3_oof_fold):.5f}  M4={_nll(p4_oof_fold):.5f}"
         + (f"  M5={_nll(p5_oof_fold):.5f}" if _M5_ENABLED else "")
         + (f"  M6={_nll(p6_oof_fold):.5f}" if _M6_ENABLED else "")
         + (f"  M7={_nll(p7_oof_fold):.5f}" if (_M7_ENABLED and p7_oof_fold is not None) else "")
@@ -6349,7 +6375,10 @@ for fold in folds:
 # Finalize OOF accumulators -- raises if anything is missing / non-finite.
 print("\n[OOF] Finalizing per-fold OOF accumulators...")
 p_a_train_oof = p_a_train_oof_acc.finalize()
-p2_train_oof = p2_train_oof_acc.finalize()
+if _M2_ENABLED:
+    p2_train_oof = p2_train_oof_acc.finalize()
+else:
+    p2_train_oof = None
 p3_train_oof = p3_train_oof_acc.finalize()
 p4_train_oof = p4_train_oof_acc.finalize()
 if _M5_ENABLED:
@@ -6383,7 +6412,8 @@ def _nll_full(p):
 
 print("\n[OOF] Train-row OOF NLL per member (aggregated across all folds):")
 print(f"  M1 OOF: {_nll_full(p_a_train_oof):.5f}  vs in-sample p_a_train: {_nll_full(p_a_train):.5f}")
-print(f"  M2 OOF: {_nll_full(p2_train_oof):.5f}")
+if _M2_ENABLED:
+    print(f"  M2 OOF: {_nll_full(p2_train_oof):.5f}")
 print(f"  M3 OOF: {_nll_full(p3_train_oof):.5f}")
 print(f"  M4 OOF: {_nll_full(p4_train_oof):.5f}")
 if _M5_ENABLED:
@@ -6480,9 +6510,17 @@ else:
 # Build the per-row [N, n_members] member-probability stack. Column order
 # is LOCKED across val and OOF-train so the runtime's stacker.apply_one
 # sees a consistent ordering. The stacker column order is always:
-# M1, M2, M3, M4, [M5], [M6]. Disabled members are silently skipped.
-_stacker_member_list_val = [p_a_val, p_member2_val, p_member3_val, p_member4_val]
-_stacker_member_names_val = ["M1 (p_a_val)", "M2 (p_member2_val)", "M3 (p_member3_val)", "M4 (p_member4_val)"]
+# M1, [M2], M3, M4, [M5], [M6], [M7], [M8], [M9]. Disabled members are
+# silently skipped (M2 dropped from the final roster).
+_stacker_member_list_val = [p_a_val]
+_stacker_member_names_val = ["M1 (p_a_val)"]
+if _M2_ENABLED and p_member2_val is not None:
+    _stacker_member_list_val.append(p_member2_val)
+    _stacker_member_names_val.append("M2 (p_member2_val)")
+_stacker_member_list_val.append(p_member3_val)
+_stacker_member_names_val.append("M3 (p_member3_val)")
+_stacker_member_list_val.append(p_member4_val)
+_stacker_member_names_val.append("M4 (p_member4_val)")
 if _M5_ENABLED:
     _stacker_member_list_val.append(p_member5_val)
     _stacker_member_names_val.append("M5 (p_member5_val)")
@@ -6569,7 +6607,7 @@ stacker_X_val = build_stacker_features(
     nn_mean_similarity=val_nn_mean_sim,
     centroid_distance=val_centroid_dist,
 )
-_n_members_dyn = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED) + int(_M9_ENABLED)
+_n_members_dyn = 3 + int(_M2_ENABLED) + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED) + int(_M9_ENABLED)
 print(f"[Stacker] X_val (final-reporting view): {stacker_X_val.shape} "
       f"(n_members={_n_members_dyn})")
 
@@ -6582,16 +6620,15 @@ _train_bench_present = np.array(
     ],
     dtype=np.float32,
 )
-_stacker_member_list_train_oof = [
-    p_a_train_oof.astype(np.float32),
-    p2_train_oof.astype(np.float32),
-    p3_train_oof.astype(np.float32),
-    p4_train_oof.astype(np.float32),
-]
-_stacker_oof_names = [
-    "M1 (p_a_train_oof)", "M2 (p2_train_oof)",
-    "M3 (p3_train_oof)", "M4 (p4_train_oof)",
-]
+_stacker_member_list_train_oof = [p_a_train_oof.astype(np.float32)]
+_stacker_oof_names = ["M1 (p_a_train_oof)"]
+if _M2_ENABLED and p2_train_oof is not None:
+    _stacker_member_list_train_oof.append(p2_train_oof.astype(np.float32))
+    _stacker_oof_names.append("M2 (p2_train_oof)")
+_stacker_member_list_train_oof.append(p3_train_oof.astype(np.float32))
+_stacker_oof_names.append("M3 (p3_train_oof)")
+_stacker_member_list_train_oof.append(p4_train_oof.astype(np.float32))
+_stacker_oof_names.append("M4 (p4_train_oof)")
 if _M5_ENABLED:
     _stacker_member_list_train_oof.append(p5_train_oof.astype(np.float32))
     _stacker_oof_names.append("M5 (p5_train_oof)")
@@ -6666,7 +6703,7 @@ ylab_train_np = primary.train["label"].astype(float).to_numpy().astype(np.float3
 print(f"[Stacker] X_train_oof: {stacker_X_train_oof.shape}  ylab_train: {ylab_train_np.shape}")
 
 
-_n_stacker_members = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED) + int(_M9_ENABLED)
+_n_stacker_members = 3 + int(_M2_ENABLED) + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED) + int(_M9_ENABLED)
 _stacker_feature_names = stacker_feature_names(_n_stacker_members)
 assert int(stacker_X_train_oof.shape[1]) == len(_stacker_feature_names), (
     f"stacker_X_train_oof has {stacker_X_train_oof.shape[1]} cols but "
@@ -6824,27 +6861,27 @@ if nll_stack_val > nll_uniform_val + 1e-3:
     )
 
 # Gate 3e (RED-TEAM): error-correlation between Member 2 and Member 1 on val.
-# If the metadata MLP is still highly correlated with Member 1's errors,
-# it's contributing redundant signal to the stacker and Task 3 didn't
-# achieve its decorrelation goal.
-_y64 = ylab_val.astype(np.float64)
-_err_m1 = p_a_val.astype(np.float64) - _y64
-_err_m2 = p_member2_val.astype(np.float64) - _y64
-_corr_m2_m1 = float(np.corrcoef(_err_m2, _err_m1)[0, 1])
-print(
-    f"\n[Gate 3e] Member 2 MLP vs Member 1 error correlation (val): "
-    f"corr(err_m2, err_m1) = {_corr_m2_m1:+.4f}"
-)
-if abs(_corr_m2_m1) > 0.85:
+# Member 2 was dropped from the final roster, so this gate only runs when
+# M2 is re-enabled for experiments.
+if _M2_ENABLED and p_member2_val is not None:
+    _y64 = ylab_val.astype(np.float64)
+    _err_m1 = p_a_val.astype(np.float64) - _y64
+    _err_m2 = p_member2_val.astype(np.float64) - _y64
+    _corr_m2_m1 = float(np.corrcoef(_err_m2, _err_m1)[0, 1])
     print(
-        f"[Gate 3e] FLAG: |corr|={abs(_corr_m2_m1):.4f} > 0.85 -- Member 2 is still "
-        "strongly correlated with Member 1."
+        f"\n[Gate 3e] Member 2 MLP vs Member 1 error correlation (val): "
+        f"corr(err_m2, err_m1) = {_corr_m2_m1:+.4f}"
     )
-else:
-    print(
-        f"[Gate 3e] PASS: |corr|={abs(_corr_m2_m1):.4f} <= 0.85; Member 2 errors are "
-        "sufficiently decorrelated from Member 1."
-    )
+    if abs(_corr_m2_m1) > 0.85:
+        print(
+            f"[Gate 3e] FLAG: |corr|={abs(_corr_m2_m1):.4f} > 0.85 -- Member 2 is still "
+            "strongly correlated with Member 1."
+        )
+    else:
+        print(
+            f"[Gate 3e] PASS: |corr|={abs(_corr_m2_m1):.4f} <= 0.85; Member 2 errors are "
+            "sufficiently decorrelated from Member 1."
+        )
 
 # Gate 4b (RED-TEAM, Task 4): error-correlation between Member 5
 # (difficulty-projected kNN) and Member 3 (raw-embedding kNN) on val.
@@ -6906,8 +6943,9 @@ if _M5_ENABLED and p_member5_val is not None:
     # Report Member 5's stacker weight per bucket as a final diversity
     # diagnostic: a weight near zero (in BOTH buckets) means the
     # stacker found nothing to add.
-    _w5_known = float(stacker_state.known.weights[4])  # logit_member5 is column 4
-    _w5_unknown = float(stacker_state.unknown.weights[4])
+    _w5_col = 3 + int(_M2_ENABLED)  # M5 follows M1 + [M2] + M3 + M4
+    _w5_known = float(stacker_state.known.weights[_w5_col])
+    _w5_unknown = float(stacker_state.unknown.weights[_w5_col])
     _w5_max = max(abs(_w5_known), abs(_w5_unknown))
     print(
         f"[Task 4] Member 5 stacker weight: "
@@ -6929,10 +6967,13 @@ if _M6_ENABLED and p_member6_val is not None:
     _err_m4 = p_member4_val.astype(np.float64) - _y64_g6
     _err_m6 = p_member6_val.astype(np.float64) - _y64_g6
     _err_m1 = p_a_val.astype(np.float64) - _y64_g6
-    _err_m2 = p_member2_val.astype(np.float64) - _y64_g6
     _corr_m6_m4 = float(np.corrcoef(_err_m6, _err_m4)[0, 1])
-    _corr_m6_m2 = float(np.corrcoef(_err_m6, _err_m2)[0, 1])
     _corr_m6_m1 = float(np.corrcoef(_err_m6, _err_m1)[0, 1])
+    if _M2_ENABLED and p_member2_val is not None:
+        _err_m2 = p_member2_val.astype(np.float64) - _y64_g6
+        _corr_m6_m2 = float(np.corrcoef(_err_m6, _err_m2)[0, 1])
+    else:
+        _corr_m6_m2 = float("nan")
     print(
         f"\n[Gate 6] Member 6 (FwFM) error correlations on val:\n"
         f"  corr(err_m6, err_m4) = {_corr_m6_m4:+.4f}  "
@@ -6955,9 +6996,10 @@ if _M6_ENABLED and p_member6_val is not None:
             f"[Gate 6] PASS: |corr(err_m6, err_m4)|={abs(_corr_m6_m4):.4f} "
             "< 0.95; FwFM's bilinear term provides signal independent of M4."
         )
-    # M6 stacker weight (column index = 4 + int(_M5_ENABLED)),
-    # reported per bucket.
-    _w6_col = 4 + int(_M5_ENABLED)
+    # M6 stacker weight column. Base members before the diversification
+    # block = M1 + [M2] + M3 + M4 = 3 + int(_M2_ENABLED) (M2 dropped by
+    # default), then [M5] precedes M6.
+    _w6_col = 3 + int(_M2_ENABLED) + int(_M5_ENABLED)
     _w6_known = float(stacker_state.known.weights[_w6_col])
     _w6_unknown = float(stacker_state.unknown.weights[_w6_col])
     _w6_max = max(abs(_w6_known), abs(_w6_unknown))
@@ -6992,7 +7034,7 @@ if _M9_ENABLED and p_member9_val is not None:
         f"corr(err_m9, err_m8) = {_corr_m9_m8:+.4f}  "
         f"corr(err_m9, err_m6) = {_corr_m9_m6:+.4f}"
     )
-    _w9_col = 4 + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED)
+    _w9_col = 3 + int(_M2_ENABLED) + int(_M5_ENABLED) + int(_M6_ENABLED) + int(_M7_ENABLED) + int(_M8_ENABLED)
     _w9_known = float(stacker_state.known.weights[_w9_col])
     _w9_unknown = float(stacker_state.unknown.weights[_w9_col])
     print(
@@ -7030,13 +7072,16 @@ except Exception as _hm_exc:
     print(f"[Heatmaps] SKIP: matplotlib unavailable ({_hm_exc!r})")
 
 if _HEATMAP_OK:
-    _hm_names = ["M1", "M2", "M3", "M4"]
-    _hm_preds = [
-        p_a_val.astype(np.float64),
-        p_member2_val.astype(np.float64),
+    _hm_names = ["M1"]
+    _hm_preds = [p_a_val.astype(np.float64)]
+    if _M2_ENABLED and p_member2_val is not None:
+        _hm_names.append("M2")
+        _hm_preds.append(p_member2_val.astype(np.float64))
+    _hm_names.extend(["M3", "M4"])
+    _hm_preds.extend([
         p_member3_val.astype(np.float64),
         p_member4_val.astype(np.float64),
-    ]
+    ])
     if _M5_ENABLED and p_member5_val is not None:
         _hm_names.append("M5")
         _hm_preds.append(p_member5_val.astype(np.float64))
@@ -7763,13 +7808,16 @@ def _fit_nn_calibrator():
     """
     print("[Calibrator] Using OOF member predictions on train (from section 9.5)...")
     p1_train_local = p_a_train_oof.astype(np.float32)
-    p2_train_local = p2_train_oof.astype(np.float32)
+    p2_train_local = (
+        p2_train_oof.astype(np.float32)
+        if (_M2_ENABLED and p2_train_oof is not None) else None
+    )
     p3_train_local = p3_train_oof.astype(np.float32)
     p4_train_local = p4_train_oof.astype(np.float32)
-    for _name, _arr in [
-        ("p1", p1_train_local), ("p2", p2_train_local),
-        ("p3", p3_train_local), ("p4", p4_train_local),
-    ]:
+    _cal_report = [("p1", p1_train_local), ("p3", p3_train_local), ("p4", p4_train_local)]
+    if p2_train_local is not None:
+        _cal_report.insert(1, ("p2", p2_train_local))
+    for _name, _arr in _cal_report:
         _nll = -(y_train * np.log(np.clip(_arr, 1e-6, 1 - 1e-6))
                  + (1 - y_train) * np.log(1 - np.clip(_arr, 1e-6, 1 - 1e-6))).mean()
         print(f"[Calibrator] {_name}_train_oof: shape={_arr.shape}  log-loss={float(_nll):.6f}")
@@ -7864,7 +7912,7 @@ def _fit_nn_calibrator():
         "nll_final": float(nll_final_local),
         "p_a_train": p1_train_local.astype(np.float32),
         "p1_train": p1_train_local,
-        "p2_train": p2_train_local.astype(np.float32),
+        "p2_train": (None if p2_train_local is None else p2_train_local.astype(np.float32)),
         "p3_train": p3_train_local.astype(np.float32),
         "p4_train": p4_train_local.astype(np.float32),
     }
@@ -7874,9 +7922,10 @@ def _fit_nn_calibrator():
 # depends on, plus the calibrator's own config. Any change in Model A
 # weights, GBDT trees, kNN tables, LogReg weights, stacker weights, or
 # the calibrator hyperparameters auto-invalidates the cache.
-_oof_member_preds_for_digest = [
-    p_a_train_oof, p2_train_oof, p3_train_oof, p4_train_oof,
-]
+_oof_member_preds_for_digest = [p_a_train_oof]
+if _M2_ENABLED and p2_train_oof is not None:
+    _oof_member_preds_for_digest.append(p2_train_oof)
+_oof_member_preds_for_digest.extend([p3_train_oof, p4_train_oof])
 if _M5_ENABLED:
     _oof_member_preds_for_digest.append(p5_train_oof)
 if _M6_ENABLED:
@@ -8254,12 +8303,19 @@ def _ll(p):
 
 
 print(f"  Member 1 (Model A IRT-MLP)        : {_ll(p_a_val):.6f}")
-print(f"  Member 2 (metadata MLP)           : {_ll(p_member2_val):.6f}")
+if _M2_ENABLED and p_member2_val is not None:
+    print(f"  Member 2 (metadata MLP)           : {_ll(p_member2_val):.6f}")
 print(f"  Member 3 (kNN-similarity)         : {_ll(p_member3_val):.6f}")
 print(f"  Member 4 (LogReg)                 : {_ll(p_member4_val):.6f}")
-if _M5_ENABLED:
+if _M5_ENABLED and p_member5_val is not None:
     print(f"  Member 5 (difficulty-kNN)         : {_ll(p_member5_val):.6f}")
-print(f"  Uniform avg of {'5' if _M5_ENABLED else '4'}                  : "
+if _M6_ENABLED and p_member6_val is not None:
+    print(f"  Member 6 (FwFM)                   : {_ll(p_member6_val):.6f}")
+if _M7_ENABLED and p_member7_val is not None:
+    print(f"  Member 7 (marginal MLP)           : {_ll(p_member7_val):.6f}")
+if _M8_ENABLED and p_member8_val is not None:
+    print(f"  Member 8 (embedding MLP)          : {_ll(p_member8_val):.6f}")
+print(f"  Uniform avg of {_n_members_dyn} members          : "
       f"{_ll(stacker_member_probs_val.mean(axis=1)):.6f}")
 print(f"  Stacker only                      : {_ll(p_stacker_val):.6f}")
 print(f"  Stacker + NN calibrator (FINAL)   : {_ll(p_final_val):.6f}")
