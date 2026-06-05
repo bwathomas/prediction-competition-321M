@@ -24,14 +24,23 @@ def _drop_set(entities, rate: float, rng) -> set:
     return {e for e in uniq if rng.random() < rate}
 
 
-def apply_proxy_dropout(X, feature_columns, *, subjects, benchmarks,
-                        rng, subject_rate: float, benchmark_rate: float):
-    """Return (X_masked, info). Does not mutate X.
+def choose_dropped(*, subjects, benchmarks, subject_rate: float, benchmark_rate: float, rng):
+    """Draw the dropped subject/benchmark sets ONCE (subject then benchmark).
 
-    info = {
-      "dropped_subjects": set, "dropped_benchmarks": set,
-      "drop_rows": {root: bool ndarray of masked rows},
-    }
+    Split out from masking so the SAME set can be applied to both the train and the
+    test matrices of a fold — otherwise reusing an advancing rng across two calls would
+    drop different entities in train vs test (train/serve skew + scoring-time leak).
+    """
+    return (_drop_set(subjects, subject_rate, rng),
+            _drop_set(benchmarks, benchmark_rate, rng))
+
+
+def mask_dropped(X, feature_columns, *, subjects, benchmarks,
+                 dropped_subjects, dropped_benchmarks):
+    """Apply explicit dropped sets (no rng). Return (X_masked, info). Does not mutate X.
+
+    info = {"dropped_subjects": set, "dropped_benchmarks": set,
+            "drop_rows": {root: bool ndarray of masked rows}}
     """
     X = np.asarray(X, dtype=np.float32).copy()
     cols = list(feature_columns)
@@ -39,25 +48,34 @@ def apply_proxy_dropout(X, feature_columns, *, subjects, benchmarks,
         raise ValueError("duplicate feature column names — masking would be ambiguous (m1)")
     col_idx = {c: i for i, c in enumerate(cols)}
 
-    # entity array + rate per identity root; iterate roots from the tree, not literals
-    entity_map = {
-        "subject": (subjects, subject_rate),
-        "benchmark": (benchmarks, benchmark_rate),
+    drop_map = {
+        "subject": (subjects, set(map(str, dropped_subjects))),
+        "benchmark": (benchmarks, set(map(str, dropped_benchmarks))),
     }
-    info = {"dropped_subjects": set(), "dropped_benchmarks": set(), "drop_rows": {}}
-
+    info = {
+        "dropped_subjects": set(map(str, dropped_subjects)),
+        "dropped_benchmarks": set(map(str, dropped_benchmarks)),
+        "drop_rows": {},
+    }
     for root in PROXY_TREE:
-        if root not in entity_map:
+        if root not in drop_map:
             continue
-        entities, rate = entity_map[root]
+        entities, dropped = drop_map[root]
         ent_arr = np.array([str(e) for e in entities])
-        dropped = _drop_set(entities, rate, rng)
         rows = (np.isin(ent_arr, list(dropped)) if dropped
                 else np.zeros(len(ent_arr), dtype=bool))
         idx = [col_idx[c] for c in all_masked_columns([root], cols) if c in col_idx]
         if dropped and idx:
             X[np.ix_(rows, idx)] = 0.0
         info["drop_rows"][root] = rows
-        info["dropped_subjects" if root == "subject" else "dropped_benchmarks"] = dropped
-
     return X, info
+
+
+def apply_proxy_dropout(X, feature_columns, *, subjects, benchmarks,
+                        rng, subject_rate: float, benchmark_rate: float):
+    """Convenience: choose the dropped sets from rng, then mask. Return (X_masked, info)."""
+    dropped_subjects, dropped_benchmarks = choose_dropped(
+        subjects=subjects, benchmarks=benchmarks,
+        subject_rate=subject_rate, benchmark_rate=benchmark_rate, rng=rng)
+    return mask_dropped(X, feature_columns, subjects=subjects, benchmarks=benchmarks,
+                        dropped_subjects=dropped_subjects, dropped_benchmarks=dropped_benchmarks)

@@ -24,6 +24,14 @@ def test_diversity_anticorrelated_member_is_above_one():
     assert diversity_score(r, [anti]) > 1.5
 
 
+def test_diversity_ignores_degenerate_zero_variance_pool_member():
+    # m1: a constant pool member must not inflate diversity toward "promote".
+    r = [1.0, -1.0, 1.0, -1.0]
+    constant = [0.3, 0.3, 0.3, 0.3]
+    assert diversity_score(r, [r, constant]) == diversity_score(r, [r])  # constant skipped
+    assert diversity_score(r, [constant]) == 1.0  # only degenerate -> treated as empty
+
+
 def test_gate_competitive_promotes():
     assert promotion_gate(0.40, 0.40, 0.01, diversity=0.0, D=0.4) is True
 

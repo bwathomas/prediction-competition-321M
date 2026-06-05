@@ -27,7 +27,9 @@ def diversity_score(residuals, pool_residuals) -> float:
     in the stack (cf. negative-correlation learning). Empty pool -> 1.0 (maximally
     diverse: nothing to be correlated with).
     """
-    pool = list(pool_residuals)
+    # skip degenerate (zero-variance) pool members: correlation with a constant is
+    # undefined, and counting it as corr=0 would falsely inflate diversity (m1).
+    pool = [pr for pr in pool_residuals if np.asarray(pr, dtype=float).std() > 0.0]
     if not pool:
         return 1.0
     corrs = [_safe_corr(residuals, pr) for pr in pool]

@@ -1,5 +1,23 @@
 import numpy as np
-from aide.hygiene.dropout import apply_proxy_dropout
+from aide.hygiene.dropout import apply_proxy_dropout, choose_dropped, mask_dropped
+
+
+def test_one_chosen_set_masks_train_and_test_consistently():
+    # C1 (harness) foundation: a single dropped set applied to two disjoint row groups
+    # masks the SAME entities in both — proving train/test can share one set.
+    cols = ["subject_key", "benchmark"]
+    rng = np.random.default_rng(0)
+    dsubj, dbench = choose_dropped(subjects=["s1", "s2", "s3"], benchmarks=["b1"],
+                                   subject_rate=0.5, benchmark_rate=0.0, rng=rng)
+    subj_tr, subj_te = ["s1", "s2", "s3"], ["s1", "s3", "s2"]
+    Xtr, _ = mask_dropped(np.ones((3, 2), np.float32), cols, subjects=subj_tr,
+                          benchmarks=["b1"] * 3, dropped_subjects=dsubj, dropped_benchmarks=dbench)
+    Xte, _ = mask_dropped(np.ones((3, 2), np.float32), cols, subjects=subj_te,
+                          benchmarks=["b1"] * 3, dropped_subjects=dsubj, dropped_benchmarks=dbench)
+    j = cols.index("subject_key")
+    for X, subs in [(Xtr, subj_tr), (Xte, subj_te)]:
+        for i, s in enumerate(subs):
+            assert X[i, j] == (0.0 if s in dsubj else 1.0)
 
 
 def _toy():

@@ -37,11 +37,37 @@ def test_subject_dropout_zeros_subject_proxy_in_training_X():
     ds = make_dataset(seed=4)
     captured = []
     oof_predict(lambda: CaptureModel(captured), ds, _manifest(ds),
-                dropout=DropoutConfig(subject_rate=1.0), rng=np.random.default_rng(0))
+                dropout=DropoutConfig(subject_rate=1.0), seed=0)
     j = ds.feature_columns.index("subject_key")
     assert captured  # models were fit
     for m in captured:
         assert np.all(m.fit_X[:, j] == 0.0)
+
+
+def test_evaluate_is_reproducible_under_partial_dropout():
+    # C1 regression: a fold-deterministic dropped set (not an advancing rng) makes the
+    # score independent of evaluation order — two runs with the same seed must match.
+    ds = make_dataset(seed=7)
+    m = _manifest(ds)
+    cfg = DropoutConfig(subject_rate=0.5, benchmark_rate=0.3)
+    r1 = evaluate(lambda: LogisticModel(), ds, m, dropout=cfg, seed=0)
+    r2 = evaluate(lambda: LogisticModel(), ds, m, dropout=cfg, seed=0)
+    assert r1.nll == r2.nll
+
+
+def test_column_coverage_passes_with_neutral_prefixes():
+    ds = make_dataset(seed=8)
+    # subject_key/benchmark are proxies (covered by the tree); the rest are neutral
+    evaluate(lambda: LogisticModel(), ds, _manifest(ds),
+             neutral_prefixes=["item_id", "sig0", "sig1"])
+
+
+def test_column_coverage_raises_on_unclassified_column():
+    import pytest
+    ds = make_dataset(seed=8)
+    with pytest.raises(AssertionError):
+        evaluate(lambda: LogisticModel(), ds, _manifest(ds),
+                 neutral_prefixes=["item_id"])  # sig0/sig1 unclassified
 
 
 def test_build_oof_meta_is_nested_leakage_free():

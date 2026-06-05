@@ -25,3 +25,11 @@ def test_auc_single_class_is_none():
 
 def test_auc_nonbinary_is_none():
     assert auc_roc([0, 1, 2], [0.1, 0.5, 0.9]) is None
+
+
+def test_log_loss_aborts_on_non_finite_predictions():
+    import pytest
+    with pytest.raises(ValueError):
+        log_loss([1, 0], [np.nan, 0.5])
+    with pytest.raises(ValueError):
+        log_loss([1, 0], [np.inf, 0.5])

@@ -8,7 +8,12 @@ import numpy as np
 
 def log_loss(y, p, eps: float = 1e-7) -> float:
     y = np.asarray(y, dtype=float)
-    p = np.clip(np.asarray(p, dtype=float), eps, 1.0 - eps)
+    p = np.asarray(p, dtype=float)
+    # the agents' sole objective: a non-finite prediction must abort, not be silently
+    # clipped into a finite loss (m3).
+    if not np.all(np.isfinite(p)):
+        raise ValueError("log_loss received non-finite predictions (NaN/inf)")
+    p = np.clip(p, eps, 1.0 - eps)
     return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
 
 
