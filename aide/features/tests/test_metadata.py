@@ -7,10 +7,17 @@ from aide.features.metadata import (age_bin, extract_subject_name, row_benchmark
 from aide.harness.funnel import FeatureBlock
 
 
+class _Row(dict):
+    """Row whose truth value is ambiguous, like a pandas Series — so `x.get() or y`
+    raises and the code must use an explicit `is None` check."""
+    def __bool__(self):
+        raise ValueError("truth value of a Row is ambiguous (mimics pandas Series)")
+
+
 class _DF:
-    """Minimal DataFrame stand-in exposing iterrows() over a list of dict rows."""
+    """Minimal DataFrame stand-in exposing iterrows() over Series-like rows."""
     def __init__(self, rows):
-        self._rows = rows
+        self._rows = [_Row(r) for r in rows]
 
     def iterrows(self):
         for i, r in enumerate(self._rows):

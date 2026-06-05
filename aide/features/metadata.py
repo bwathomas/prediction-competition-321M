@@ -51,7 +51,9 @@ def row_subject_meta(subject_names, model_info):
     org, fam, macro = [], [], []
     hits = 0
     for nm in subject_names:
-        r = exact.get(str(nm)) or suffix.get(str(nm).split("/")[-1])
+        r = exact.get(str(nm))                       # explicit None check: a pandas Series
+        if r is None:                                # is truthy-ambiguous, so no `or`
+            r = suffix.get(str(nm).split("/")[-1])
         if r is not None:
             hits += 1
             org.append(str(r["organization"])); fam.append(str(r["family"]))
