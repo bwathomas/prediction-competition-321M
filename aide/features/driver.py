@@ -23,7 +23,8 @@ import numpy as np
 FAMILY_SLUG = {
     "llama": "nvidia__llama-embed-nemotron-8b",
     "qwen": "Qwen__Qwen3-Embedding-8B",
-    "mistral": "embedding_cache_lgai_preview_fa2",
+    # lgai cache is nested one level under the cache dir (confirmed on Drive)
+    "mistral": "embedding_cache_lgai_preview_fa2/annamodels__LGAI-Embedding-Preview",
 }
 
 LABEL_COLS = ["subject_key", "item_key", "item_split_key", "label"]
