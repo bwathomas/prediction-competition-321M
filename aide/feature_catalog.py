@@ -98,6 +98,50 @@ CATALOG = (
     FeatureGroup("mean_encoded_benchmark", ("m2_bc", "m2_subj_bc"), "benchmark",
                  "benchmark_proxy", "mean_encoded_features.py",
                  "m2_bc_* benchmark x condition shrunk passrates (m2_subj_bc dual-keyed)"),
+
+    # ===== Kaggle-recommended derivatives (quality_reports/kaggle_feature_recommendations.md) =====
+    # Naming: neutral item-geometry uses geo__/clu__ (never masked); label-based neighbour/
+    # cluster features use nn__/clu_subj__ (subject_proxy); metadata groupbys split subj/bench.
+
+    # ---- NEUTRAL item geometry (reliability gates; survive subject dropout) ----------
+    FeatureGroup("nn_geometry", ("geo",), "item", "neutral_item", "nn_features.py:NEW",
+                 "geo__local_density, geo__lid_estimate, geo__dist_gap_1_to_K, "
+                 "geo__reciprocal_neighbor_frac — embedding-geometry NN-reliability gates"),
+    FeatureGroup("cluster_geometry", ("clu", "clu_id"), "item", "neutral_item",
+                 "clustering.py:NEW",
+                 "clu__soft_responsibility_top{1..3}, clu__margin_1to2, "
+                 "clu__responsibility_entropy, clu__typicality, clu__size_log1p, "
+                 "clu__cluster_difficulty_std; clu_id__{coarse,fine} multi-resolution ids"),
+
+    # ---- SUBJECT-keyed label derivatives (masked under subject dropout) --------------
+    FeatureGroup("nn_label_derivatives", ("nn",), "pair", "subject_proxy", "nn_features.py:NEW",
+                 "multi-K: nn__passrate_mean_K{4,8,32,64}, nn__passrate_K_slope, "
+                 "nn__coverage_K_slope; shape: nn__passrate_weighted_var, "
+                 "nn__passrate_q25/q50/q75/iqr, nn__frac_neighbors_pass; radius: "
+                 "nn__label_entropy_innerK/outerK, nn__agreement_radius_decay; "
+                 "rank/calibration: nn__local_difficulty_rank, nn__calibration_residual, "
+                 "nn__subjfamily_minus_global_gap (all nn__* already classified via 'nn')"),
+    FeatureGroup("cluster_subject", ("clu_subj",), "pair", "subject_proxy",
+                 "clustering.py:NEW",
+                 "clu_subj__subject_minus_cluster_gap, clu_subj__cluster_obs_count_log1p, "
+                 "clu_subj__subject_cluster_affinity, clu_subj__soft_weighted_subject_passrate"),
+    FeatureGroup("groupby_subject_metadata", ("grp_subj",), "subject", "subject_proxy",
+                 "metadata_features.py:NEW",
+                 "grp_subj__{organization,family,macro_family}_passrate_{mean,std} "
+                 "(shrunk, OOF) — the playbook's #1 family, std channel is new"),
+    FeatureGroup("interactions_subject", ("int", "ratio"), "pair", "subject_proxy",
+                 "NEW",
+                 "int__subjectmean_x_clusterdiff, int__params_x_release, "
+                 "ratio__coverage_over_lid (single trust scalar)"),
+    FeatureGroup("counts_subject", ("cnt",), "pair", "subject_proxy", "nn_features.py:NEW",
+                 "cnt__neighbor_subject_support (raw labelled-neighbour count behind nn__*), "
+                 "cnt__cluster_obs_count_log1p"),
+
+    # ---- BENCHMARK-keyed metadata groupbys (masked under benchmark dropout) ----------
+    FeatureGroup("groupby_benchmark_metadata", ("grp_bench",), "benchmark", "benchmark_proxy",
+                 "metadata_features.py:NEW",
+                 "grp_bench__topic_passrate_mean, grp_bench__age_bin_passrate_mean, "
+                 "grp_bench__has_conditions_x_topic (CSV groupby target-encodings, OOF)"),
 )
 
 

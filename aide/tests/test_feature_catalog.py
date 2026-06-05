@@ -45,6 +45,31 @@ def test_learned_param_axis_theta_is_not_neutral_nor_proxy_it_is_simply_gone():
         assert_columns_covered(["theta_s", "u_s_0"], neutral_prefixes=list(fc.NEUTRAL_ITEM))
 
 
+def test_recommended_derivatives_are_wired_with_correct_classes():
+    names = {g.name for g in fc.CATALOG}
+    for n in ["nn_geometry", "cluster_geometry", "nn_label_derivatives", "cluster_subject",
+              "groupby_subject_metadata", "interactions_subject", "counts_subject",
+              "groupby_benchmark_metadata"]:
+        assert n in names, n
+    # neutral item-geometry must NOT be masked under subject dropout
+    for p in ["geo", "clu", "clu_id"]:
+        assert p in fc.NEUTRAL_ITEM and p not in fc.SUBJECT_PROXY and p not in fc.BENCHMARK_PROXY
+    # subject-keyed derivatives are subject proxies
+    for p in ["clu_subj", "grp_subj", "int", "ratio", "cnt"]:
+        assert p in fc.SUBJECT_PROXY and p not in fc.NEUTRAL_ITEM
+    # benchmark metadata groupby is a benchmark proxy
+    assert "grp_bench" in fc.BENCHMARK_PROXY and "grp_bench" not in fc.NEUTRAL_ITEM
+
+
+def test_geometry_prefix_does_not_collide_with_subject_cluster_prefix():
+    from aide.feature_catalog import matches
+    # the neutral 'clu' prefix must NOT match a subject 'clu_subj__' column, and vice versa
+    assert not matches("clu_subj__gap", "clu")
+    assert not matches("clu__margin_1to2", "clu_subj")
+    # nor should neutral 'cluster' (one-hot) match 'clu__' geometry
+    assert not matches("clu__margin", "cluster")
+
+
 def test_group_names_are_the_agent_menu():
     assert "item_pool" in fc.group_names()
     assert "nn_passrate" in fc.group_names()
