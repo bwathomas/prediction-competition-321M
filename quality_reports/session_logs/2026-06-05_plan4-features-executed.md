@@ -67,3 +67,26 @@ derive→write→route→load seam works on real data.
    write to Drive `features/qwen/...`, wrapped in `run_bg` with idempotent INDEX resume;
    then replicate to llama + mistral (colab/colab3).
 4. Leakage audit on real shards (Plan 4 Task 7).
+
+---
+## Update 2 — full walk launched; two scaling findings (2026-06-05)
+
+Driver extended to the full per-family walk (`derive_family`, commits up to `de5c22b`):
+geometry at fold=all (per unique item) + per-fold label groups over OOF-of-that-fold rows,
+chunked, idempotent, FAISS index built once per fold (`make_faiss_knn`), `include_cluster`
+and `features_root`/`max_rows` switches. qwen NN-only validation launched via `run_bg`.
+
+**Scaling findings (flagged; gate the full multi-family run):**
+1. **derive_cluster is O(rows × K_fine × members)** — intractable at 311k items × fine=256
+   (and the label loop runs even in the geometry pass). Gated behind `include_cluster=False`.
+   Fix: precompute per-(subject,cluster) pooled means ONCE per fold (vectorized over the
+   CSR + assignment); OOF makes per-row self/alias exclusion a no-op (query items ∉ train),
+   so the fast path is exact in-regime. Then re-enable cluster groups.
+2. **Embedding load via pyarrow `to_pylist`** of 311k×4096 float64 (~10 GB) is slow and
+   RAM-heavy. One-time convert to float16 `.npy` + `np.load(mmap_mode="r")` (Plan §B.2).
+3. **NN per-row Python loop** (derive_nn aggregation) is the other throughput cost at 5.3M
+   rows; per-unique-item dedup (search once per item, expand labels per subject) is the win.
+
+**Deferred for full Task 6 completion:** cluster vectorization (#1), tabular metadata-groupby
+groups (need model_info/benchmark_info join), mean_encoded_subject (global OOF target-encode),
+per-item NN dedup (#3), faster embedding load (#2), then replicate to llama + mistral.
