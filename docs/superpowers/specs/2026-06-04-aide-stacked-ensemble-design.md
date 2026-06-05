@@ -65,7 +65,9 @@ aide/
     funnel.py        # cached-feature router (LOAD ONLY; cache-miss is a hard error)
     registry.py      # architecture + ablation-set registry AIDE composes against
   ensemble/
-    architectures/   # mlp, irt_2pl, knn, fwfm, gbdt_numpy, logreg, metadata_mlp ...
+    architectures/   # gbdt(lgbm/xgb/catboost), mlp, tabnet, ft_transformer, tabpfn,
+                     # fm/ffm/fwfm, ridge/elasticnet/svm, knn, rf/extratrees,
+                     # irt_2pl, kfactor_cf, mean_encode_glm ...  (see §6.1)
     ablations.py     # feature-ablation spec per architecture
     linear_stacker.py# the linear stacker used at BOTH layers (from src/stacker.py)
   agents/
@@ -137,26 +139,74 @@ search knobs but the *atomic node+descendants masking* is invariant, not optiona
   optimizes. AIDE supplies a `model_factory` (a `fit(features)->preds` slot); it never
   receives held-out labels (see §8 boundary).
 - **Train harness** (`harness/train.py`): two phases. **Trial** = item-subsampled data, few
-  epochs — a fast directional gate; a candidate that fails to clear a configured threshold
-  is dropped *without* a full run. **Full** = all data, full (recursive) OOF. Only
+  epochs — a fast directional gate (§5.1). **Full** = all data, full (recursive) OOF. Only
   trial-survivors reach full.
 - **Funnel harness** (`harness/funnel.py`): routes the right **cached** features
   (per-agent embeddings, judge, NN-passrate, pool, metadata, cluster) to the right
   architecture at the right layer. **Load-only**: a cache miss is a hard error with a clear
   message, never a silent recompute.
 
+### 5.1 Trial promotion gate (diversity-aware)
+
+A linear stacker gains as much from *uncorrelated* members as from individually-strong
+ones, so the gate rewards both. A trial candidate `c` (in a "comparable architecture group"
+`g` — e.g. all GBDT variants, all MLP variants) is promoted to full eval if **either**:
+
+1. **Competitive:** `NLL_trial(c) ≤ min_NLL(g) + X` — within `X` of the best run of a
+   comparable architecture part; **or**
+2. **Diversifying:** `diversity(c) ≥ D` — it adds orthogonal signal even when its standalone
+   NLL is *worse* than clause-1's bar. (I read your "lower NLL but high diversity" as *admit
+   diverse-but-weaker members*, since that is what a diversity exception is for — flag if you
+   meant the literal reading.)
+
+**Diversity score.** `diversity(c) = 1 − ρ̄`, where `ρ̄` is the mean pairwise correlation of
+`c`'s **OOF residuals** (and, secondarily, its OOF predictions) with the existing member
+pool. High = weakly correlated errors. Because all three agents share the byte-identical
+`SplitManifest`, OOF predictions are **row-aligned across agents**, so the pool includes
+*both* this agent's current members *and* the other agents' current-best members, read from
+a shared **OOF board** on Drive (`Drive/Prediction-Competition-321M/oof_board/<agent>/…`,
+append-only, manifest-keyed). So "weakly correlated with other agents" is a measured
+quantity, not a heuristic. `X`, `D` are logged per candidate (defaults set in
+implementation, e.g. `X≈0.01` nats, `D≈0.4`).
+
 ---
 
-## 6. Two-layer stacked ensemble & the search space
+## 6. Two-layer stacked ensemble & the architecture canon
 
-- **Top layer:** a linear stacker over *N* models, each a distinct **architecture**
-  (MLP, IRT/2PL, kNN, FwFM, GBDT-as-numpy, logreg, metadata-MLP, …).
+- **Top layer:** a linear stacker (or, as a search knob, a GBDT/logistic meta-learner) over
+  *N* models, each a distinct **architecture**.
 - **Layer below:** each top-layer "model" is itself a linear stacker over
   **feature-ablated variants of the same architecture** (different ablation sets allowed
   per architecture).
 - **AIDE's search space:** {which architectures at the top; which ablation sets per
-  architecture below; per-architecture hyperparameters; dropout rates}. **Objective:** full
-  recursive-OOF val NLL.
+  architecture below; per-architecture hyperparameters; dropout rates; meta-learner choice}.
+  **Objective:** full recursive-OOF val NLL.
+
+### 6.1 The canon (Kaggle-grounded, training-only)
+
+Grounded in current Kaggle stacking practice (e.g. Deotte's 1st-place April-2025 build:
+72 models / 3 levels of XGBoost · LightGBM · CatBoost · NN · TabPFN · KNN · SVR · Ridge ·
+RandomForest, meta-learned with Ridge+GBDT). This phase trains on the A100 with full
+libraries, so the canon is **not** limited by `RUNTIME_ENV.md` (a later ship phase, out of
+scope, would numpy-export the tree/sklearn members). Registry groups:
+
+- **GBDT:** LightGBM, XGBoost, CatBoost, HistGradientBoosting (cheap variant).
+- **Deep tabular:** MLP-with-embeddings (have), TabNet, FT-Transformer, TabPFN
+  (subsample/foundation member — strong diversifier), optional NODE/SAINT.
+- **Factorization / interaction** (native to subject×item×benchmark sparsity): FM, FFM,
+  FwFM (have), optional DeepFM/xDeepFM.
+- **Classical / linear** (cheap, strong stack diversifiers): logistic (have), Ridge,
+  ElasticNet, SVM/SVR, kNN (have), RandomForest/ExtraTrees.
+- **Domain-specific (psychometric / CF):** IRT-2PL & multidim IRT (have), latent-factor /
+  matrix-factorization CF (have, `kfactor`), target/mean-encoding + GLM (have:
+  subject-mean, bc-shrinkage).
+- **Meta-learners (top stacker):** Ridge / logistic over OOF (have `linear_stacker`),
+  optional GBDT-on-OOF.
+
+"(have)" = already in `src/`, promoted into `ensemble/architectures/`; the rest are new
+wrappers conforming to the same `fit(features)->preds` registry slot. **Smoke-test gate:**
+each new architecture must pass a one-fold trial-mode smoke run (finite NLL, correct OOF
+shape, leakage probes green) before AIDE may compose it.
 
 ---
 
