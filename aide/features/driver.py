@@ -111,6 +111,18 @@ def _row_ids(subj, items):
     return [f"{s}|{i}" for s, i in zip(subj, items)]
 
 
+def _concat_blocks(blocks):
+    """Row-concatenate same-schema FeatureBlocks (chunks of one (group, fold) shard).
+
+    A shard holds ALL rows for its (group, fold); the cache is write-once-per-key (no
+    append), so chunked derivation must accumulate then write a single concatenated block.
+    """
+    from aide.harness.funnel import FeatureBlock
+    X = np.concatenate([b.X for b in blocks], axis=0)
+    rids = np.concatenate([np.asarray(b.row_ids).astype(str) for b in blocks])
+    return FeatureBlock(X=X.astype(np.float32), columns=list(blocks[0].columns), row_ids=rids)
+
+
 def make_faiss_knn(index_emb):
     """Build ONE FAISS IndexFlatIP (GPU if available) and return a reusable
     ``knn_fn(_, query, k) -> (idx, sim)`` closure, so the index is not rebuilt per chunk.
@@ -145,6 +157,7 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
     empty = CsrPassrate.empty([], all_item_keys)
     knn = make_faiss_knn(all_emb)
     n = len(all_item_keys)
+    acc = {}  # group -> [chunk blocks], concatenated + written once at the end
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
         keys = [str(k) for k in all_item_keys[s:e]]
@@ -153,20 +166,20 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
         nn = derive_nn(query_emb=q, query_item_keys=keys, query_subjects=[""] * len(keys),
                        row_ids=rids, index_emb=all_emb, index_item_keys=all_item_keys,
                        passrate=empty, Ks=(4, 8, 32, 64), knn_fn=knn)
-        store.write_group("nn_geometry", "all", nn["nn_geometry"],
-                          inputs_hash=content_inputs_hash(family, "nn_geometry", "all", code_version),
-                          overwrite=overwrite)
+        acc.setdefault("nn_geometry", []).append(nn["nn_geometry"])
         if include_cluster:
             cl = derive_cluster(query_emb=q, query_item_keys=keys,
                                 query_subjects=[""] * len(keys), row_ids=rids,
                                 centroids_by_res=centroids, train_emb=all_emb,
                                 train_item_keys=all_item_keys, passrate=empty)
             for g in ["cluster_geometry", "centroid_distance", "item_cluster"]:
-                store.write_group(g, "all", cl[g],
-                                  inputs_hash=content_inputs_hash(family, g, "all", code_version),
-                                  overwrite=overwrite)
+                acc.setdefault(g, []).append(cl[g])
         if progress:
             progress(f"geometry {e}/{n}", 0.1 + 0.2 * e / n, geom_items=e)
+    for g, blocks in acc.items():
+        store.write_group(g, "all", _concat_blocks(blocks),
+                          inputs_hash=content_inputs_hash(family, g, "all", code_version),
+                          overwrite=overwrite)
 
 
 def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, train_emb,
@@ -185,6 +198,7 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
     subj = rows_df["subject_key"].astype(str).to_numpy()
     n = len(items)
     knn = make_faiss_knn(train_emb)
+    acc = {}  # group -> [chunk blocks], concatenated + written once per (group, fold)
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
         ci, cs = items[s:e], subj[s:e]
@@ -194,19 +208,19 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
                        row_ids=rids, index_emb=train_emb, index_item_keys=train_item_keys,
                        passrate=passrate, Ks=(4, 8, 32, 64), knn_fn=knn)
         for g in ["nn_label_derivatives", "counts_subject"]:
-            store.write_group(g, fold, nn[g],
-                              inputs_hash=content_inputs_hash(family, g, fold, code_version),
-                              overwrite=overwrite)
+            acc.setdefault(g, []).append(nn[g])
         if include_cluster:
             cl = derive_cluster(query_emb=q, query_item_keys=list(ci), query_subjects=list(cs),
                                 row_ids=rids, centroids_by_res=centroids, train_emb=train_emb,
                                 train_item_keys=train_item_keys, passrate=passrate)
             for g in ["cluster_passrate", "cluster_subject"]:
-                store.write_group(g, fold, cl[g],
-                                  inputs_hash=content_inputs_hash(family, g, fold, code_version),
-                                  overwrite=overwrite)
+                acc.setdefault(g, []).append(cl[g])
         if progress:
             progress(f"fold{fold} labels {e}/{n}", fold=fold, rows=e, total=n)
+    for g, blocks in acc.items():
+        store.write_group(g, fold, _concat_blocks(blocks),
+                          inputs_hash=content_inputs_hash(family, g, fold, code_version),
+                          overwrite=overwrite)
 
 
 def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
