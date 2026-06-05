@@ -42,3 +42,28 @@ existing OOF test caught it — fixed with a self-excluded prior.
   literal wording, approved).
 - Interaction parent wiring: cluster difficulty column is `m2_cluster_mean` (driver must map
   it to the `cluster_difficulty` parent name; partial wiring now raises).
+
+---
+## Update — Task 6 driver built + validated on real Colab data (2026-06-05)
+
+Committed (pushed to origin):
+- `237c556` foundation: `colab_runtime.py` (run_bg/poll) + `passrate.py` (CsrPassrate,
+  proven bit-identical to DensePassrate).
+- `cd346d7` `driver.py` — chunkable per-family orchestration (load_embeddings/load_labels/
+  build_fold_passrate[reuses src.build_passrate_table]/derive_nn_chunk). Suite: 156 passed.
+
+**Real-data end-to-end validation (Colab2/A100, qwen):** loaded 5.36M labels / 311k items /
+906 subjects; slice 300 train + 80 OOF items, real 4096-d embeddings; fold-0 CSR passrate
+(global 0.581); `derive_nn_chunk` ran real FAISS, wrote nn_label_derivatives/nn_geometry/
+counts_subject shards; `FoldFeatureStore.assemble` read back (1020,15), all finite. The
+derive→write→route→load seam works on real data.
+
+### Remaining for the FULL production run (Task 6 completion)
+1. **Per-item NN dedup** — search once per unique item (311k) not per row (5.3M); expand label
+   gather per subject. (`unique_item_rows` stub present.)
+2. Wire **derive_cluster + derive_tabular** chunks into the walk (same pattern as NN;
+   codecs already unit-tested + a real-data smoke).
+3. **Full walk**: 3 folds × {fold=all invariant groups once, label groups per fold},
+   write to Drive `features/qwen/...`, wrapped in `run_bg` with idempotent INDEX resume;
+   then replicate to llama + mistral (colab/colab3).
+4. Leakage audit on real shards (Plan 4 Task 7).
