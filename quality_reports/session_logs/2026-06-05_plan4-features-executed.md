@@ -135,3 +135,27 @@ the fast paths (and now cluster groups too).
 - Full run per family with `include_cluster=True` (now scalable) on colab/colab2/colab3.
 - `derive_tabular_global` for the metadata/subject-encoding groups (check join coverage).
 - Confirm the mistral embedding-cache dir name (FAMILY_SLUG["mistral"] is a guess).
+
+---
+## Update 5 — qwen FULL run COMPLETE on fast paths + validated (2026-06-05)
+
+User restarted the Colab runtime; relaunched cleanly at HEAD 0a8fbd4 with the fast paths:
+`derive_family(family="qwen", include_cluster=True, code_version="v2")`.
+
+**Result: 17 shards, 2556 s (~43 min)** (vs ~3-4 h projected for the pre-nn_fast slow run).
+Geometry+kmeans+embedding-load dominate; the 5.3M label rows now fly via nn_fast/cluster_fast.
+
+v2 shards on Drive `features/qwen/`: nn_geometry, cluster_geometry, centroid_distance,
+item_cluster (fold=all) + nn_label_derivatives, counts_subject, cluster_passrate,
+cluster_subject (× folds 0/1/2). **Read-back validated:** fold0 labels (1,821,262 × 18) all
+finite; geometry (311,130 × 525) all finite; m2_cluster_mean ∈ [0.002, 0.983].
+
+Note: `assemble` aligns WHOLE blocks by row order (load-only, no row subsetting); label
+groups share row order per fold and assemble together; geometry is per-item (different grain),
+joined by item downstream.
+
+### Task 6 status: qwen COMPLETE. Remaining (all code prepped + tested):
+- llama + mistral: `derive_family(family="llama"/"mistral", include_cluster=True)` (confirm
+  mistral FAMILY_SLUG dir on Drive).
+- Tabular metadata groups: `derive_tabular_global` (check subject-join coverage).
+- One-time `.npy` conversion to kill the ~5 min embedding load on repeat runs.
