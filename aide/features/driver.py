@@ -105,7 +105,8 @@ def _row_ids(subj, items):
 
 
 def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
-                        code_version, progress=None, chunk=40000, overwrite=False):
+                        code_version, progress=None, chunk=40000, overwrite=False,
+                        include_cluster=True):
     """fold='all' geometry, one row per UNIQUE item (compact, fold-invariant).
 
     Writes nn_geometry, cluster_geometry, centroid_distance, item_cluster. Labels are not
@@ -127,20 +128,22 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
         store.write_group("nn_geometry", "all", nn["nn_geometry"],
                           inputs_hash=content_inputs_hash(family, "nn_geometry", "all", code_version),
                           overwrite=overwrite)
-        cl = derive_cluster(query_emb=q, query_item_keys=keys, query_subjects=[""] * len(keys),
-                            row_ids=rids, centroids_by_res=centroids, train_emb=all_emb,
-                            train_item_keys=all_item_keys, passrate=empty)
-        for g in ["cluster_geometry", "centroid_distance", "item_cluster"]:
-            store.write_group(g, "all", cl[g],
-                              inputs_hash=content_inputs_hash(family, g, "all", code_version),
-                              overwrite=overwrite)
+        if include_cluster:
+            cl = derive_cluster(query_emb=q, query_item_keys=keys,
+                                query_subjects=[""] * len(keys), row_ids=rids,
+                                centroids_by_res=centroids, train_emb=all_emb,
+                                train_item_keys=all_item_keys, passrate=empty)
+            for g in ["cluster_geometry", "centroid_distance", "item_cluster"]:
+                store.write_group(g, "all", cl[g],
+                                  inputs_hash=content_inputs_hash(family, g, "all", code_version),
+                                  overwrite=overwrite)
         if progress:
             progress(f"geometry {e}/{n}", 0.1 + 0.2 * e / n, geom_items=e)
 
 
 def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, train_emb,
                        all_item_keys, centroids, passrate, family, code_version,
-                       progress=None, chunk=60000, overwrite=False):
+                       progress=None, chunk=60000, overwrite=False, include_cluster=True):
     """Per-fold label groups over rows whose item is OOF in this fold.
 
     Writes nn_label_derivatives, counts_subject (nn) and cluster_passrate, cluster_subject
@@ -165,19 +168,21 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
             store.write_group(g, fold, nn[g],
                               inputs_hash=content_inputs_hash(family, g, fold, code_version),
                               overwrite=overwrite)
-        cl = derive_cluster(query_emb=q, query_item_keys=list(ci), query_subjects=list(cs),
-                            row_ids=rids, centroids_by_res=centroids, train_emb=train_emb,
-                            train_item_keys=train_item_keys, passrate=passrate)
-        for g in ["cluster_passrate", "cluster_subject"]:
-            store.write_group(g, fold, cl[g],
-                              inputs_hash=content_inputs_hash(family, g, fold, code_version),
-                              overwrite=overwrite)
+        if include_cluster:
+            cl = derive_cluster(query_emb=q, query_item_keys=list(ci), query_subjects=list(cs),
+                                row_ids=rids, centroids_by_res=centroids, train_emb=train_emb,
+                                train_item_keys=train_item_keys, passrate=passrate)
+            for g in ["cluster_passrate", "cluster_subject"]:
+                store.write_group(g, fold, cl[g],
+                                  inputs_hash=content_inputs_hash(family, g, fold, code_version),
+                                  overwrite=overwrite)
         if progress:
             progress(f"fold{fold} labels {e}/{n}", fold=fold, rows=e, total=n)
 
 
 def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
-                  coarse_k=32, fine_k=256, progress=None, overwrite=False, max_rows=None):
+                  coarse_k=32, fine_k=256, progress=None, overwrite=False, max_rows=None,
+                  include_cluster=True):
     """Walk the full §D DAG for one embedding family; write shards to
     ``{drive_root}/features``. Idempotent: existing shards are skipped. ``max_rows`` caps
     per-fold rows for a validation run."""
@@ -216,7 +221,7 @@ def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
 
     derive_geometry_all(store=store, all_item_keys=all_item_keys, all_emb=all_emb,
                         centroids=centroids, family=family, code_version=code_version,
-                        progress=progress, overwrite=overwrite)
+                        progress=progress, overwrite=overwrite, include_cluster=include_cluster)
 
     man = build_manifest(list(emb_set), n_folds=n_folds, seed=seed)
     folds = outer_folds(man)
@@ -233,6 +238,6 @@ def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
                            train_item_keys=train_keys, train_emb=train_emb,
                            all_item_keys=all_item_keys, centroids=centroids,
                            passrate=passrate, family=family, code_version=code_version,
-                           progress=progress, overwrite=overwrite)
+                           progress=progress, overwrite=overwrite, include_cluster=include_cluster)
         del train_emb, passrate
     return {"family": family, "n_shards": len(store.cache.load_index())}
