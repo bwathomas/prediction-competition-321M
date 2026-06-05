@@ -167,3 +167,20 @@ The artifact is byte-identical across agents (sorted keys, no floats) — correc
 ---
 
 ## VERDICT: BLOCK
+
+---
+
+## Resolution (2026-06-04)
+
+All findings addressed on `clean/aide-stacked-ensemble` (commit `ab64da0`) and confirmed
+by an independent fresh-context re-review (suite: 33 passed):
+
+- C1 RESOLVED — `apply_proxy_dropout` returns `info["drop_rows"][root]`; `assert_no_proxy_leak(..., rows=)` is row-aware. Regression: `test_probe_wired_to_dropout_passes_under_partial_rate`.
+- C2 RESOLVED — `_matches` requires exact or `proxy + "__"` boundary. Regression: `test_startswith_boundary_does_not_over_mask_near_miss_names`.
+- M1 RESOLVED — `_require_enough_items` in `outer_folds`/`inner_folds`. Regressions in `test_splits.py`.
+- M2 RESOLVED — `_inner_seed` = hash(seed, outer_index).
+- M3 RESOLVED — PROXY_TREE expanded (judge/cluster/subj-emb/mean-enc/toklen/lang) + `assert_columns_covered` ("unlisted ⇒ blocked").
+- M4 RESOLVED — dropout iterates `PROXY_TREE` roots; benchmark-side cross-axis passrate masked. Regression: `test_benchmark_dropout_masks_condition_and_cross_axis_passrate`.
+- m1/m6 RESOLVED — duplicate-column guard; `descendants()` raises on unknown node.
+
+**VERDICT: ALL-RESOLVED** (was BLOCK).
