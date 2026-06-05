@@ -204,10 +204,11 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
 
 def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
                   coarse_k=32, fine_k=256, progress=None, overwrite=False, max_rows=None,
-                  include_cluster=True):
-    """Walk the full §D DAG for one embedding family; write shards to
-    ``{drive_root}/features``. Idempotent: existing shards are skipped. ``max_rows`` caps
-    per-fold rows for a validation run."""
+                  include_cluster=True, features_root=None):
+    """Walk the full §D DAG for one embedding family; write shards to ``features_root``
+    (default ``{drive_root}/features``). Inputs (embeddings, labels) are read from
+    ``drive_root``. Idempotent: existing shards are skipped. ``max_rows`` caps per-fold
+    rows for a validation run (point ``features_root`` at a temp dir for validation)."""
     import numpy as _np
     from aide.features.cache import FeatureCache
     from aide.features.derive_cluster import fit_multi_kmeans
@@ -235,7 +236,8 @@ def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
     emb_set = set(all_item_keys)
     labels = labels[labels["item_key"].isin(emb_set)]
 
-    store = FoldFeatureStore(FeatureCache(f"{drive_root}/features", code_version=code_version),
+    feat_root = features_root or f"{drive_root}/features"
+    store = FoldFeatureStore(FeatureCache(feat_root, code_version=code_version),
                              embedding_family=family, seed=seed, n_folds=n_folds)
 
     progress("fitting k-means", 0.07)
