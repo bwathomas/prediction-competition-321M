@@ -52,6 +52,13 @@ def test_pooled_mean_default_for_empty():
     assert c.pooled_mean(["unknown"], default=0.7) == 0.7   # no observed cols -> default
 
 
+def test_empty_passrate_has_no_observations():
+    c = CsrPassrate.empty(["s0", "s1"], ["i0", "i1", "i2"])
+    assert np.all(np.isnan(c.gather("s0", ["i0", "i1", "i2"])))
+    assert c.pooled_mean(["i0"], default=0.3) == 0.3
+    assert c.global_mean() == 0.0
+
+
 def test_codec_runs_on_csr_passrate():
     """Smoke: derive_nn produces the same leakage-safe output on a CSR passrate."""
     from aide.features.derive_nn import bruteforce_knn, derive_nn

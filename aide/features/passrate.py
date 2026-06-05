@@ -47,6 +47,13 @@ class CsrPassrate:
         return cls(subject_keys, item_keys, indptr, indices, data)
 
     @classmethod
+    def empty(cls, subject_keys, item_keys):
+        """A passrate with zero observations (every ``gather`` is nan). Used for the
+        fold=all geometry pass, where labels are not read but a passrate is required by
+        the codec signature. Builds no dense matrix (safe for 906×311k)."""
+        return cls(subject_keys, item_keys, [0] * (len(subject_keys) + 1), [], [])
+
+    @classmethod
     def from_scipy(cls, subject_keys, item_keys, passrate_csr, mask_csr=None):
         """Build from ``src.nn_features.build_passrate_table`` output (Colab).
 
