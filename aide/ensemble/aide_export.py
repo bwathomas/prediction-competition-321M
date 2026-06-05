@@ -31,14 +31,17 @@ def item_fold_split(item_keys, manifest, holdout_fold=0):
     return train, holdout
 
 
-def export_for_aide(ds, manifest, *, out_dir, holdout_fold=0):
-    """Write ``train.parquet`` (features + item_key + label), ``holdout_features.parquet``
-    (features + item_key, no label) and ``holdout_labels.parquet`` (the secret labels) under
-    ``out_dir``. Returns the paths. Colab (needs pyarrow)."""
+def export_for_aide(ds, manifest, *, out_dir, secret_dir=None, holdout_fold=0):
+    """Write ``train.parquet`` (features + item_key + label) and ``holdout_features.parquet``
+    (features + item_key, NO label) to ``out_dir`` — the directory AIDE sees and copies into
+    its workspace. The secret ``holdout_labels.parquet`` goes to ``secret_dir`` (a SIBLING by
+    default, NOT under out_dir) so the agent can never read the answers. Colab (needs pyarrow)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     from pathlib import Path
+    secret_dir = secret_dir or f"{out_dir}_secret"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
+    Path(secret_dir).mkdir(parents=True, exist_ok=True)
     train, holdout = item_fold_split(ds.item_keys, manifest, holdout_fold)
     cols = list(ds.feature_columns)
 
@@ -54,7 +57,7 @@ def export_for_aide(ds, manifest, *, out_dir, holdout_fold=0):
     pq.write_table(_table(train, True), paths["train"])
     paths["holdout_features"] = f"{out_dir}/holdout_features.parquet"
     pq.write_table(_table(holdout, False), paths["holdout_features"])
-    paths["holdout_labels"] = f"{out_dir}/holdout_labels.parquet"
+    paths["holdout_labels"] = f"{secret_dir}/holdout_labels.parquet"
     pq.write_table(pa.table({"item_key": pa.array(np.asarray(ds.item_keys)[holdout].astype(str)),
                              "label": pa.array(ds.y[holdout].astype(np.float32))}),
                    paths["holdout_labels"])
