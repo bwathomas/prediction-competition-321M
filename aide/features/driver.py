@@ -240,8 +240,10 @@ def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
     store = FoldFeatureStore(FeatureCache(feat_root, code_version=code_version),
                              embedding_family=family, seed=seed, n_folds=n_folds)
 
-    progress("fitting k-means", 0.07)
-    centroids = fit_multi_kmeans(all_emb, {"coarse": coarse_k, "fine": fine_k}, seed=seed)
+    centroids = None
+    if include_cluster:   # k-means is only needed by the cluster groups; skip it otherwise
+        progress("fitting k-means", 0.07)
+        centroids = fit_multi_kmeans(all_emb, {"coarse": coarse_k, "fine": fine_k}, seed=seed)
 
     derive_geometry_all(store=store, all_item_keys=all_item_keys, all_emb=all_emb,
                         centroids=centroids, family=family, code_version=code_version,
