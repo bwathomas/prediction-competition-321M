@@ -1,55 +1,29 @@
-"""Proxy dependency tree: fields/feature-groups that proxy subject/benchmark identity.
+"""Proxy dependency tree — DERIVED from the canonical feature catalog
+(``aide.feature_catalog``) so the dropout/coverage classification always uses the REAL
+column names of the included data suite (not placeholder prefixes).
 
-Dropping an identity node must atomically mask ALL of its descendants, else a proxy
-(e.g. model family, a judge score, or an NN-passrate feature aggregated over the
-subject) silently re-leaks the identity the dropout was meant to hide.
+Dropping an identity node atomically masks ALL of its descendants. Matching uses the
+"__" boundary rule (``matches``): a pattern ``p`` masks column ``c`` iff ``c == p`` or
+``c.startswith(p + "__")`` — so "benchmark" does not mask "benchmark_id" and "subj_cat"
+masks every "subj_cat__*" aggregate together.
 
-Matching rule (C2 fix): a proxy entry `p` masks a column `c` iff `c == p` (exact) OR
-`c.startswith(p + "__")` (a namespaced aggregate group, e.g. "feat:nn_passrate__mean").
-A bare prefix WITHOUT the "__" boundary never matches — so "benchmark" does NOT mask
-"benchmark_id" and "meta:family" does NOT mask "meta:family_size". The "__" separator is
-the project convention for aggregate columns, so the mask boundary is well-defined and
-reproducible across agents regardless of incidental column naming.
-
-Default posture (M3): "unlisted ⇒ exposed" is dangerous for a leakage core. Use
-``assert_columns_covered`` (in probes.py) to invert it to "unlisted ⇒ blocked": any
-feature column that is neither identity-neutral nor a known proxy fails loudly.
+``NEUTRAL_ITEM`` (item-content prefixes) is the allowlist for ``assert_columns_covered``:
+item content is usable signal, never masked. Anything that is neither a known proxy nor
+neutral fails the coverage probe ("unlisted => blocked").
 """
 from __future__ import annotations
 
+from ..feature_catalog import (
+    matches as _matches, SUBJECT_PROXY, BENCHMARK_PROXY, NEUTRAL_ITEM)
+
+# Built from the catalog; keys are exactly the two identity roots.
 PROXY_TREE = {
-    "subject": [
-        "subject_key",
-        "subject_content",
-        # static metadata (each an exact column)
-        "meta:family",
-        "meta:macro-family",
-        "meta:parameters",
-        "meta:organization",
-        "meta:release_date",
-        # derived feature groups that proxy the subject
-        "feat:nn_passrate",        # passrate aggregates over the subject
-        "feat:subject_mean",       # subject-mean encoding
-        "feat:judge",              # judge scores proxy subject (and benchmark)
-        "feat:subject_cluster",    # subject k-means cluster id/embedding
-        "feat:subj_emb",           # subject-level text embedding
-        "feat:subject_toklen",     # subject_content length stats
-        "feat:subject_lang",       # subject_content language id
-    ],
-    "benchmark": [
-        "benchmark",
-        "condition",               # conditions proxy benchmarks
-        "data_category",
-        # derived feature groups that proxy the benchmark
-        "feat:pool",               # benchmark-derived pool features
-        "feat:benchmark_mean",     # benchmark mean-encoding
-        "feat:bench_cond_mean",    # benchmark x condition mean-encoding
-        "feat:benchmark_passrate", # cross-axis passrate, benchmark side
-        "feat:judge",              # judge scores also proxy the benchmark
-        "feat:benchmark_toklen",   # benchmark/item text length stats keyed to benchmark
-        "feat:benchmark_lang",     # benchmark content language id
-    ],
+    "subject": list(SUBJECT_PROXY),
+    "benchmark": list(BENCHMARK_PROXY),
 }
+
+# Re-exported for the coverage probe.
+NEUTRAL_ITEM = list(NEUTRAL_ITEM)
 
 
 def descendants(node: str) -> list:
@@ -58,16 +32,8 @@ def descendants(node: str) -> list:
     return list(PROXY_TREE[node])
 
 
-def _matches(column: str, proxy: str) -> bool:
-    return column == proxy or column.startswith(proxy + "__")
-
-
 def all_masked_columns(dropped_nodes, feature_columns) -> list:
-    """Concrete, sorted, de-duplicated list of columns to mask for the dropped nodes.
-
-    Sorted for deterministic iteration on the boundary (m3). Membership (`in`) works
-    on the returned list as before.
-    """
+    """Concrete, sorted, de-duplicated columns to mask for the dropped identity nodes."""
     cols = list(feature_columns)
     masked = set()
     for node in dropped_nodes:

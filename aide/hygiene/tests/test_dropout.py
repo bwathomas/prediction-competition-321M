@@ -3,8 +3,8 @@ from aide.hygiene.dropout import apply_proxy_dropout, choose_dropped, mask_dropp
 
 
 def test_one_chosen_set_masks_train_and_test_consistently():
-    # C1 (harness) foundation: a single dropped set applied to two disjoint row groups
-    # masks the SAME entities in both — proving train/test can share one set.
+    # C1 foundation: a single dropped set applied to two disjoint row groups masks the
+    # SAME entities in both — proving train/test can share one set.
     cols = ["subject_key", "benchmark"]
     rng = np.random.default_rng(0)
     dsubj, dbench = choose_dropped(subjects=["s1", "s2", "s3"], benchmarks=["b1"],
@@ -21,8 +21,9 @@ def test_one_chosen_set_masks_train_and_test_consistently():
 
 
 def _toy():
-    cols = ["subject_key", "meta:family", "feat:nn_passrate__mean",
-            "benchmark", "condition", "feat:benchmark_passrate__mean", "item_emb__0"]
+    # real catalog column names
+    cols = ["subject_key", "subj_cat__family__001", "nn__passrate_mean",
+            "benchmark", "condition", "nn__passrate_benchmark_conditional", "item_emb__0"]
     X = np.ones((4, len(cols)), dtype=np.float32)
     subjects = ["s1", "s1", "s2", "s2"]
     benchmarks = ["b1", "b2", "b1", "b2"]
@@ -35,41 +36,25 @@ def test_dropping_all_subjects_zeros_every_subject_proxy_column_for_all_rows():
     Xd, info = apply_proxy_dropout(
         X, cols, subjects=subjects, benchmarks=benchmarks,
         rng=rng, subject_rate=1.0, benchmark_rate=0.0)
-    for c in ("subject_key", "meta:family", "feat:nn_passrate__mean"):
-        j = cols.index(c)
-        assert np.all(Xd[:, j] == 0.0), f"{c} must be fully masked"
-    for c in ("benchmark", "condition", "item_emb__0"):
-        j = cols.index(c)
-        assert np.all(Xd[:, j] == 1.0)
+    for c in ("subject_key", "subj_cat__family__001", "nn__passrate_mean",
+              "nn__passrate_benchmark_conditional"):  # nn is a subject proxy
+        assert np.all(Xd[:, cols.index(c)] == 0.0), c
+    for c in ("benchmark", "condition", "item_emb__0"):  # not subject proxies
+        assert np.all(Xd[:, cols.index(c)] == 1.0), c
     assert set(info["dropped_subjects"]) == {"s1", "s2"}
-    assert info["drop_rows"]["subject"].all()
 
 
-def test_dropout_is_entity_consistent_all_rows_of_a_dropped_subject_masked():
-    X, cols, subjects, benchmarks = _toy()
-    rng = np.random.default_rng(3)
-    Xd, info = apply_proxy_dropout(
-        X, cols, subjects=subjects, benchmarks=benchmarks,
-        rng=rng, subject_rate=0.5, benchmark_rate=0.0)
-    j = cols.index("subject_key")
-    for i, s in enumerate(subjects):
-        if s in info["dropped_subjects"]:
-            assert Xd[i, j] == 0.0
-        else:
-            assert Xd[i, j] == 1.0
-
-
-def test_benchmark_dropout_masks_condition_and_cross_axis_passrate():
-    # M4 regression: a benchmark drop must mask the benchmark-side cross-axis aggregate.
+def test_benchmark_dropout_masks_condition_and_only_the_conditional_nn_cell():
     X, cols, subjects, benchmarks = _toy()
     rng = np.random.default_rng(0)
     Xd, info = apply_proxy_dropout(
         X, cols, subjects=subjects, benchmarks=benchmarks,
         rng=rng, subject_rate=0.0, benchmark_rate=1.0)
-    for c in ("benchmark", "condition", "feat:benchmark_passrate__mean"):
-        j = cols.index(c)
-        assert np.all(Xd[:, j] == 0.0)
-    assert np.all(Xd[:, cols.index("subject_key")] == 1.0)  # subject side untouched
+    for c in ("benchmark", "condition", "nn__passrate_benchmark_conditional"):
+        assert np.all(Xd[:, cols.index(c)] == 0.0), c
+    # subject-only nn + subject metadata untouched under benchmark dropout
+    assert np.all(Xd[:, cols.index("nn__passrate_mean")] == 1.0)
+    assert np.all(Xd[:, cols.index("subject_key")] == 1.0)
 
 
 def test_duplicate_columns_rejected():

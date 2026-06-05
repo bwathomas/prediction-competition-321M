@@ -29,13 +29,13 @@ def test_assert_row_uniform_safe_raises_when_item_split_across_folds():
 
 
 def test_assert_no_proxy_leak_passes_when_dropped_columns_are_zero():
-    cols = ["subject_key", "meta:family", "benchmark"]
+    cols = ["subject_key", "subj_cat__family", "benchmark"]
     X = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
     assert_no_proxy_leak(X, cols, dropped_nodes=["subject"])  # no raise (all rows dropped)
 
 
 def test_assert_no_proxy_leak_raises_when_a_proxy_survives():
-    cols = ["subject_key", "meta:family", "benchmark"]
+    cols = ["subject_key", "subj_cat__family", "benchmark"]
     X = np.array([[0.0, 0.7, 1.0]], dtype=np.float32)  # meta:family survived
     with pytest.raises(AssertionError):
         assert_no_proxy_leak(X, cols, dropped_nodes=["subject"])
@@ -44,7 +44,7 @@ def test_assert_no_proxy_leak_raises_when_a_proxy_survives():
 def test_probe_wired_to_dropout_passes_under_partial_rate():
     # C1 regression: the probe must NOT fire on legitimate partial-rate dropout when
     # given the dropped-row mask; it checks only the rows that were supposed to be masked.
-    cols = ["subject_key", "meta:family", "benchmark", "condition", "item_emb__0"]
+    cols = ["subject_key", "subj_cat__family", "benchmark", "condition", "item_emb__0"]
     X = np.ones((6, len(cols)), dtype=np.float32)
     subjects = ["s1", "s2", "s3", "s1", "s2", "s3"]
     benchmarks = ["b1", "b1", "b1", "b2", "b2", "b2"]
@@ -61,8 +61,8 @@ def test_probe_wired_to_dropout_passes_under_partial_rate():
 
 
 def test_assert_columns_covered_passes_when_all_classified():
-    cols = ["subject_key", "meta:family", "benchmark", "condition",
-            "feat:nn_passrate__mean", "item_emb__0", "item_content"]
+    cols = ["subject_key", "subj_cat__family", "benchmark", "condition",
+            "nn__passrate_mean", "item_emb__0", "item_content"]
     assert_columns_covered(cols, neutral_prefixes=["item_emb", "item_content"])  # no raise
 
 

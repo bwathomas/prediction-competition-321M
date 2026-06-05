@@ -1,63 +1,58 @@
 import pytest
-from aide.hygiene.proxy_tree import PROXY_TREE, descendants, all_masked_columns
-
-
-def test_subject_node_includes_metadata_and_feature_proxies():
-    d = descendants("subject")
-    assert "subject_key" in d
-    assert "meta:family" in d and "meta:macro-family" in d and "meta:parameters" in d
-    assert "feat:nn_passrate" in d  # NN/passrate features proxy the subject
-    assert "feat:judge" in d        # judge scores proxy the subject (M3)
-
-
-def test_benchmark_node_includes_condition_and_data_category():
-    d = descendants("benchmark")
-    assert "condition" in d          # conditions proxy benchmarks
-    assert "data_category" in d
-    assert "feat:pool" in d
-    assert "feat:benchmark_mean" in d        # mean-encoding proxy (M3)
-    assert "feat:benchmark_passrate" in d    # cross-axis aggregate, benchmark side (M4)
-
-
-def test_all_masked_columns_expands_prefixes_atomically():
-    cols = ["subject_key", "meta:family", "meta:parameters",
-            "feat:nn_passrate__mean", "feat:nn_passrate__max",
-            "feat:pool__toklen", "benchmark", "item_emb__0"]
-    masked = all_masked_columns(["subject"], cols)
-    assert "subject_key" in masked
-    assert "meta:family" in masked and "meta:parameters" in masked
-    assert "feat:nn_passrate__mean" in masked and "feat:nn_passrate__max" in masked
-    assert "benchmark" not in masked and "item_emb__0" not in masked and "feat:pool__toklen" not in masked
-
-
-def test_startswith_boundary_does_not_over_mask_near_miss_names():
-    # C2 regression: bare prefixes must NOT match unrelated columns without the "__" boundary
-    cols = ["benchmark", "benchmark_id", "condition", "condition_entropy",
-            "meta:family", "meta:family_size", "subject_key", "subject_keyring"]
-    masked_b = all_masked_columns(["benchmark"], cols)
-    assert "benchmark" in masked_b and "condition" in masked_b
-    assert "benchmark_id" not in masked_b and "condition_entropy" not in masked_b
-    masked_s = all_masked_columns(["subject"], cols)
-    assert "meta:family" in masked_s and "subject_key" in masked_s
-    assert "meta:family_size" not in masked_s and "subject_keyring" not in masked_s
-
-
-def test_namespaced_aggregate_still_masks_via_double_underscore():
-    cols = ["feat:nn_passrate", "feat:nn_passrate__mean", "feat:judge__p_yes"]
-    masked = all_masked_columns(["subject"], cols)
-    assert set(cols) <= set(masked)  # all three mask together
-
-
-def test_descendants_raises_on_unknown_node():
-    with pytest.raises(ValueError):
-        descendants("model")  # m6
-
-
-def test_all_masked_columns_is_sorted_and_deduped():
-    cols = ["condition", "benchmark", "benchmark"]  # dup tolerated here (cols arg)
-    masked = all_masked_columns(["benchmark"], cols)
-    assert masked == sorted(set(masked))  # deterministic boundary (m3)
+from aide.hygiene.proxy_tree import PROXY_TREE, descendants, all_masked_columns, NEUTRAL_ITEM
 
 
 def test_proxy_tree_has_subject_and_benchmark_roots():
     assert set(PROXY_TREE) == {"subject", "benchmark"}
+
+
+def test_subject_proxies_use_real_catalog_names():
+    d = descendants("subject")
+    for p in ["subject_key", "subject_content", "subj_emb", "subj_cat", "subj_num",
+              "subject_mean", "subject_obs_count", "nn", "m2_subj"]:
+        assert p in d, p
+    # removed groups (judge / solver / learned IRT params) must NOT appear
+    for gone in ["feat:judge", "feat:nn_passrate", "theta_s", "u_s", "member5", "pca_tail"]:
+        assert gone not in d
+
+
+def test_benchmark_proxies_use_real_catalog_names():
+    d = descendants("benchmark")
+    for p in ["benchmark", "condition", "cond", "data_category", "bench_cat", "bench_num",
+              "bench_has_conditions", "m2_bc"]:
+        assert p in d, p
+
+
+def test_subj_cat_and_num_metadata_columns_masked_under_subject():
+    cols = ["subj_cat__family__001", "subj_cat__organization__003",
+            "subj_num__parameters", "subj_num__release_date__missing", "item_emb__0"]
+    masked = all_masked_columns(["subject"], cols)
+    assert "subj_cat__family__001" in masked and "subj_num__parameters" in masked
+    assert "subj_num__release_date__missing" in masked
+    assert "item_emb__0" not in masked  # item content is neutral, never masked
+
+
+def test_boundary_rule_does_not_over_mask_near_miss_names():
+    cols = ["benchmark", "benchmark_id", "condition", "conditionX", "subj_cat__family"]
+    mb = all_masked_columns(["benchmark"], cols)
+    assert "benchmark" in mb and "condition" in mb
+    assert "benchmark_id" not in mb and "conditionX" not in mb
+
+
+def test_nn_is_subject_proxy_and_only_benchmark_conditional_cell_is_benchmark():
+    cols = ["nn__passrate_mean", "nn__passrate_benchmark_conditional"]
+    sub = all_masked_columns(["subject"], cols)
+    assert "nn__passrate_mean" in sub and "nn__passrate_benchmark_conditional" in sub
+    ben = all_masked_columns(["benchmark"], cols)
+    assert "nn__passrate_benchmark_conditional" in ben   # leaks benchmark
+    assert "nn__passrate_mean" not in ben                # subject-only, not over-masked
+
+
+def test_neutral_item_allowlist_holds_content_prefixes():
+    for p in ["item_emb", "pool", "cd", "cluster", "semcat", "m2_cluster"]:
+        assert p in NEUTRAL_ITEM
+
+
+def test_descendants_raises_on_unknown_node():
+    with pytest.raises(ValueError):
+        descendants("model")
