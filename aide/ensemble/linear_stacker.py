@@ -37,7 +37,7 @@ class LinearStacker:
         Z = _logit(P)
         self.mu = Z.mean(axis=0)
         self.sd = Z.std(axis=0)
-        self.sd[self.sd == 0] = 1.0
+        self.sd[self.sd < 1e-8] = 1.0  # near-constant columns too, not just exact 0 (M1)
         Xb = self._design(P)
         w = np.zeros(Xb.shape[1])
         for _ in range(self.iters):

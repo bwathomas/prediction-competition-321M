@@ -31,6 +31,21 @@ def test_smoke_catches_broken_factory():
     assert r.ok is False and r.error is not None
 
 
+def test_smoke_gate_rejects_out_of_range_predictor():
+    # M2 regression: a model that "forgot the sigmoid" (returns 1.5) is finite-NLL but
+    # out of [0,1] — the smoke gate must reject it.
+    class OutOfRange:
+        def fit(self, X, y):
+            return self
+
+        def predict(self, X):
+            return np.full(len(np.asarray(X)), 1.5)
+
+    ds = make_dataset(seed=2)
+    r = smoke_test(lambda: OutOfRange(), ds, _manifest(ds))
+    assert r.ok is False
+
+
 def test_unknown_arch_raises():
     with pytest.raises(KeyError):
         get("does_not_exist")

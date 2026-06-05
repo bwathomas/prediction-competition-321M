@@ -19,6 +19,20 @@ def test_stacker_is_no_worse_than_its_best_member():
     assert (pred >= 0).all() and (pred <= 1).all()
 
 
+def test_stacker_handles_near_constant_member_without_blowup():
+    # M1 regression: a near-constant member (std ~1e-12, not exactly 0) must be neutralized
+    # by the variance guard, not amplified by division into an O(1) noise feature.
+    rng = np.random.default_rng(2)
+    y = (rng.random(300) < 0.5).astype(float)
+    good = _noisy_member(y, 5, 0.2)
+    near_const = np.full(len(y), 0.5) + rng.normal(0, 1e-12, len(y))
+    P = np.column_stack([good, near_const])
+    s = LinearStacker().fit(P, y)
+    pred = s.predict(P)
+    assert np.all(np.isfinite(pred)) and (pred >= 0).all() and (pred <= 1).all()
+    assert log_loss(y, pred) <= log_loss(y, good) + 1e-2  # constant member doesn't hurt
+
+
 def test_nonneg_keeps_member_weights_nonnegative():
     rng = np.random.default_rng(1)
     y = (rng.random(300) < 0.5).astype(float)

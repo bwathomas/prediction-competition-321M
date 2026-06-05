@@ -17,7 +17,7 @@ class _Standardizer:
         X = np.asarray(X, dtype=float)
         self.mu = X.mean(axis=0)
         self.sd = X.std(axis=0)
-        self.sd[self.sd == 0] = 1.0
+        self.sd[self.sd < 1e-8] = 1.0  # near-constant columns too, not just exact 0 (M1)
         return self
 
     def __call__(self, X):
@@ -122,7 +122,8 @@ class _LightGBMWrapper:  # pragma: no cover - Colab-only
         return self
 
     def predict(self, X):
-        return self._clf.predict_proba(np.asarray(X, dtype=float))[:, 1]
+        proba = self._clf.predict_proba(np.asarray(X, dtype=float))
+        return proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]  # single-class fold (m2)
 
 
 lazy_lightgbm = _lazy("lightgbm", _build_lightgbm)

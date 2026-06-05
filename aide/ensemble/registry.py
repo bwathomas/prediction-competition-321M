@@ -6,6 +6,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
+
 from ..harness.eval import evaluate
 from .architectures import LogisticArchitecture, MLPArchitecture, lazy_lightgbm
 from .linear_stacker import LinearStacker
@@ -42,7 +44,8 @@ def smoke_test(model_factory, ds, manifest, *, dropout=None, neutral_prefixes=No
     try:
         res = evaluate(model_factory, ds, manifest, dropout=dropout,
                        neutral_prefixes=neutral_prefixes)
-        ok = bool(math.isfinite(res.nll) and res.oof.shape == (len(ds.y),))
+        in_range = bool(np.nanmin(res.oof) >= 0.0 and np.nanmax(res.oof) <= 1.0)
+        ok = bool(math.isfinite(res.nll) and res.oof.shape == (len(ds.y),) and in_range)
         return SmokeResult(ok=ok, nll=res.nll, auc=res.auc, error=None)
     except Exception as exc:  # noqa: BLE001
         return SmokeResult(ok=False, nll=float("nan"), auc=None, error=repr(exc))
