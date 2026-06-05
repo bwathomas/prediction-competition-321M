@@ -37,6 +37,11 @@ def load_embeddings(parquet_path):
     Python list materialization) — ~10× faster and lower-RAM than ``to_pylist`` on the
     311k×4096 cache, then reshapes + casts to float32 in one shot.
     """
+    from aide.features.embed_io import load_embeddings_npy, npy_paths
+    npy, keys_path = npy_paths(parquet_path)
+    if npy.exists() and keys_path.exists():        # fast path: float16 .npy sibling
+        keys, emb = load_embeddings_npy(npy, keys_path, mmap=False)
+        return keys, np.asarray(emb, dtype=np.float32)
     import pyarrow.parquet as pq
     t = pq.read_table(parquet_path)
     key_col = t.column_names[0]
@@ -192,7 +197,7 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
     """
     import numpy as _np
     from aide.features.cluster_fast import cluster_labels_fast
-    from aide.features.derive_nn import derive_nn
+    from aide.features.nn_fast import derive_nn_labels_fast
     items = rows_df["item_key"].astype(str).to_numpy()
     subj = rows_df["subject_key"].astype(str).to_numpy()
     n = len(items)
@@ -203,9 +208,10 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
         ci, cs = items[s:e], subj[s:e]
         rids = _row_ids(cs, ci)
         q = _np.asarray([emb_lookup[k] for k in ci], dtype=_np.float32)
-        nn = derive_nn(query_emb=q, query_item_keys=list(ci), query_subjects=list(cs),
-                       row_ids=rids, index_emb=train_emb, index_item_keys=train_item_keys,
-                       passrate=passrate, Ks=(4, 8, 32, 64), knn_fn=knn)
+        nn = derive_nn_labels_fast(query_emb=q, query_item_keys=list(ci),
+                                   query_subjects=list(cs), row_ids=rids, index_emb=train_emb,
+                                   index_item_keys=train_item_keys, passrate=passrate,
+                                   Ks=(4, 8, 32, 64), knn_fn=knn)
         for g in ["nn_label_derivatives", "counts_subject"]:
             acc.setdefault(g, []).append(nn[g])
         if include_cluster:  # vectorized OOF label aggregates (query items ∉ train)

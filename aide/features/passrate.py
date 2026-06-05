@@ -31,6 +31,12 @@ class CsrPassrate:
         np.add.at(self._col_cnt, self.indices, 1.0)
         self._tot_sum = float(self.data.sum())
         self._tot_cnt = float(self.data.size)
+        # sorted (subject*n_items + item_col) keys for vectorized pair gather
+        subj_nz = np.repeat(np.arange(len(self.s_idx)), np.diff(self.indptr))
+        self._pair_keys = subj_nz.astype(np.int64) * self.n_items + self.indices
+        order = np.argsort(self._pair_keys, kind="stable")
+        self._pair_keys = self._pair_keys[order]
+        self._pair_vals = self.data[order]
 
     # --- constructors ----------------------------------------------------------------
     @classmethod
@@ -93,6 +99,21 @@ class CsrPassrate:
 
     def global_mean(self) -> float:
         return self._tot_sum / self._tot_cnt if self._tot_cnt > 0 else 0.0
+
+    def gather_pairs(self, subject_rows, item_cols) -> np.ndarray:
+        """Vectorized parallel-array gather: value at (subject_rows[i], item_cols[i]) or
+        ``nan`` if unobserved. The kernel behind a vectorized NN label aggregation — replaces
+        the per-row Python ``gather`` loop. O((n log nnz)) via searchsorted on packed keys."""
+        sr = np.asarray(subject_rows, dtype=np.int64)
+        ic = np.asarray(item_cols, dtype=np.int64)
+        out = np.full(sr.shape, np.nan)
+        valid = (sr >= 0) & (ic >= 0)
+        qk = sr * self.n_items + ic
+        pos = np.searchsorted(self._pair_keys, qk)
+        pos_c = np.clip(pos, 0, max(self._pair_keys.size - 1, 0))
+        hit = valid & (self._pair_keys.size > 0) & (self._pair_keys[pos_c] == qk)
+        out[hit] = self._pair_vals[pos_c[hit]]
+        return out
 
     def cluster_aggregates(self, item_to_cluster, n_clusters):
         """Vectorized per-cluster label aggregates in O(nnz) — the fast path that replaces
