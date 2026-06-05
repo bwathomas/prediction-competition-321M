@@ -1,6 +1,18 @@
-import numpy as np
+import pytest
 from aide.hygiene.manifest import build_manifest
 from aide.hygiene.splits import outer_folds, inner_folds, row_fold_ids
+
+
+def test_outer_folds_raise_when_fewer_unique_items_than_folds():
+    # M1 regression: <n_folds unique items would make empty folds — must raise, not pass.
+    m = build_manifest(["only_one_item"], n_folds=3, seed=0)
+    with pytest.raises(ValueError):
+        outer_folds(m)
+
+
+def test_inner_folds_raise_when_fewer_unique_items_than_folds():
+    with pytest.raises(ValueError):
+        inner_folds(["a", "b"], n_folds=3, seed=0, outer_index=0)
 
 
 def test_outer_folds_are_item_disjoint_and_cover_all_items():
