@@ -90,3 +90,23 @@ and `features_root`/`max_rows` switches. qwen NN-only validation launched via `r
 **Deferred for full Task 6 completion:** cluster vectorization (#1), tabular metadata-groupby
 groups (need model_info/benchmark_info join), mean_encoded_subject (global OOF target-encode),
 per-item NN dedup (#3), faster embedding load (#2), then replicate to llama + mistral.
+
+---
+## Update 3 — qwen full NN-only run LAUNCHED (2026-06-05)
+
+- Live-monitoring the capped validation caught a **chunk-accumulation bug**: writing each
+  chunk to the same (group,fold) shard key kept only the first chunk (cache is write-once;
+  geometry persisted 40k/311k). Fixed (`292de66`): accumulate chunk blocks, write one
+  concatenated shard per (group,fold); regression test `test_concat_blocks_*`. Suite 153.
+- Capped validation (max_rows=15k/fold, NN-only) completed end-to-end in **240 s**, 7 shards
+  — proves the walk runs at real scale. Dominant costs: full-311k geometry + 3× full-data
+  passrate builds (the 15k label rows are cheap; full run's 1.7M rows/fold add ~15–30 min).
+- **Full uncapped qwen NN-only run launched** via `run_bg("qwen_full")` at HEAD `292de66`,
+  writing to Drive `features/qwen/` (code_version v1). Groups: nn_geometry (fold=all) +
+  nn_label_derivatives/counts_subject (per fold). ETA ~30–45 min (Drive I/O + per-row loop).
+  Poll: `/content/qwen_full.json`.
+
+### Still open after this run
+- Re-enable cluster groups after the O(rows×K×members) → vectorized rewrite.
+- Tabular metadata-groupby groups + mean_encoded_subject (global OOF encode).
+- Per-item NN dedup + float16 .npy embeddings (throughput); then llama + mistral.
