@@ -110,3 +110,28 @@ per-item NN dedup (#3), faster embedding load (#2), then replicate to llama + mi
 - Re-enable cluster groups after the O(rows×K×members) → vectorized rewrite.
 - Tabular metadata-groupby groups + mean_encoded_subject (global OOF encode).
 - Per-item NN dedup + float16 .npy embeddings (throughput); then llama + mistral.
+
+---
+## Update 4 — three action items PREPPED (2026-06-05)
+
+All three remaining items built, proven equal to the codec oracles, tested, pushed:
+- **A — vectorized cluster** (`cluster_fast.py`, `CsrPassrate.cluster_aggregates`): O(nnz+rows*K)
+  replacing O(rows*K*members); exact vs `derive_cluster` in the OOF regime. Wired into driver
+  behind `include_cluster`. (`31a30dd`)
+- **B — tabular metadata** (`metadata.py`): subject↔model + benchmark joins, `derive_tabular_global`
+  (global leave-own-fold-out encode → split per OOF fold). Pure helpers tested; validate subject
+  join coverage on Colab. (`fe030e4`)
+- **C — throughput** (`nn_fast.py`, `embed_io.py`, `CsrPassrate.gather_pairs`): vectorized NN
+  label aggregation (exact vs `derive_nn` in-regime), float16 .npy embeddings (kills slow Drive
+  parquet read). Driver hot path now uses nn_fast + cluster_fast. (`c1d78fc`)
+
+Suite 167. **NOTE:** the in-flight `qwen_full` run was launched at `292de66` (pre-nn_fast), so it
+uses the SLOW per-row loop (~400 rows/s, ~1-2h ETA). The pushed code would finish the same run in
+minutes — restart runtime + relaunch `derive_family(family="qwen", include_cluster=True)` to use
+the fast paths (and now cluster groups too).
+
+### To run later (all code ready)
+- One-time: `convert_embeddings_to_npy` per family parquet (fast subsequent loads).
+- Full run per family with `include_cluster=True` (now scalable) on colab/colab2/colab3.
+- `derive_tabular_global` for the metadata/subject-encoding groups (check join coverage).
+- Confirm the mistral embedding-cache dir name (FAMILY_SLUG["mistral"] is a guess).
