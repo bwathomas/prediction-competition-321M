@@ -93,3 +93,32 @@ class CsrPassrate:
 
     def global_mean(self) -> float:
         return self._tot_sum / self._tot_cnt if self._tot_cnt > 0 else 0.0
+
+    def cluster_aggregates(self, item_to_cluster, n_clusters):
+        """Vectorized per-cluster label aggregates in O(nnz) — the fast path that replaces
+        ``derive_cluster``'s O(rows × K × members) loop.
+
+        ``item_to_cluster``: int array of length ``n_items`` giving each item column's
+        cluster id. Returns ``(difficulty[K], subj_cluster_mean[S,K], subj_cluster_cnt[S,K])``:
+          * ``difficulty[k]`` = pooled mean over ALL observed cells whose item is in cluster
+            k (empty cluster → global mean). Since the CSR is built from fold-TRAIN rows,
+            this is the train-only cluster difficulty — and because the query item is OOF
+            (not in train), it is automatically self-excluded.
+          * ``subj_cluster_mean[s,k]`` / ``subj_cluster_cnt[s,k]`` = subject s's mean / count
+            of observed labels on cluster-k items.
+        """
+        item_to_cluster = np.asarray(item_to_cluster, dtype=np.int64)
+        n_subj = len(self.s_idx)
+        cl_nz = item_to_cluster[self.indices]                 # cluster per nonzero
+        subj_nz = np.repeat(np.arange(n_subj), np.diff(self.indptr))  # subject per nonzero
+        csum = np.zeros(n_clusters); ccnt = np.zeros(n_clusters)
+        np.add.at(csum, cl_nz, self.data)
+        np.add.at(ccnt, cl_nz, 1.0)
+        gm = self.global_mean()
+        difficulty = np.where(ccnt > 0, csum / np.maximum(ccnt, 1.0), gm)
+        ssum = np.zeros((n_subj, n_clusters)); scnt = np.zeros((n_subj, n_clusters))
+        np.add.at(ssum, (subj_nz, cl_nz), self.data)
+        np.add.at(scnt, (subj_nz, cl_nz), 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            smean = np.where(scnt > 0, ssum / np.maximum(scnt, 1.0), np.nan)
+        return difficulty, smean, scnt

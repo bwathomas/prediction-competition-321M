@@ -151,7 +151,7 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
     Writes nn_geometry, cluster_geometry, centroid_distance, item_cluster. Labels are not
     read (empty passrate); the index for the nn-geometry pass is ALL items (self-excluded).
     """
-    from aide.features.derive_cluster import derive_cluster
+    from aide.features.cluster_fast import cluster_geometry_fast
     from aide.features.derive_nn import derive_nn
     from aide.features.passrate import CsrPassrate
     empty = CsrPassrate.empty([], all_item_keys)
@@ -167,13 +167,11 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
                        row_ids=rids, index_emb=all_emb, index_item_keys=all_item_keys,
                        passrate=empty, Ks=(4, 8, 32, 64), knn_fn=knn)
         acc.setdefault("nn_geometry", []).append(nn["nn_geometry"])
-        if include_cluster:
-            cl = derive_cluster(query_emb=q, query_item_keys=keys,
-                                query_subjects=[""] * len(keys), row_ids=rids,
-                                centroids_by_res=centroids, train_emb=all_emb,
-                                train_item_keys=all_item_keys, passrate=empty)
+        if include_cluster:  # vectorized geometry (fold-invariant); sizes from all items
+            cg = cluster_geometry_fast(query_emb=q, row_ids=rids,
+                                       centroids_by_res=centroids, all_emb=all_emb)
             for g in ["cluster_geometry", "centroid_distance", "item_cluster"]:
-                acc.setdefault(g, []).append(cl[g])
+                acc.setdefault(g, []).append(cg[g])
         if progress:
             progress(f"geometry {e}/{n}", 0.1 + 0.2 * e / n, geom_items=e)
     for g, blocks in acc.items():
@@ -184,7 +182,8 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
 
 def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, train_emb,
                        all_item_keys, centroids, passrate, family, code_version,
-                       progress=None, chunk=60000, overwrite=False, include_cluster=True):
+                       progress=None, chunk=60000, overwrite=False, include_cluster=True,
+                       item_to_cluster_fine=None):
     """Per-fold label groups over rows whose item is OOF in this fold.
 
     Writes nn_label_derivatives, counts_subject (nn) and cluster_passrate, cluster_subject
@@ -192,7 +191,7 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
     fold-train labels. (mean_encoded_subject / metadata groupbys are a separate global pass.)
     """
     import numpy as _np
-    from aide.features.derive_cluster import derive_cluster
+    from aide.features.cluster_fast import cluster_labels_fast
     from aide.features.derive_nn import derive_nn
     items = rows_df["item_key"].astype(str).to_numpy()
     subj = rows_df["subject_key"].astype(str).to_numpy()
@@ -209,10 +208,10 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
                        passrate=passrate, Ks=(4, 8, 32, 64), knn_fn=knn)
         for g in ["nn_label_derivatives", "counts_subject"]:
             acc.setdefault(g, []).append(nn[g])
-        if include_cluster:
-            cl = derive_cluster(query_emb=q, query_item_keys=list(ci), query_subjects=list(cs),
-                                row_ids=rids, centroids_by_res=centroids, train_emb=train_emb,
-                                train_item_keys=train_item_keys, passrate=passrate)
+        if include_cluster:  # vectorized OOF label aggregates (query items ∉ train)
+            cl = cluster_labels_fast(query_emb=q, query_subjects=list(cs), row_ids=rids,
+                                     centroids_by_res=centroids, passrate=passrate,
+                                     item_to_cluster_fine=item_to_cluster_fine)
             for g in ["cluster_passrate", "cluster_subject"]:
                 acc.setdefault(g, []).append(cl[g])
         if progress:
@@ -262,9 +261,13 @@ def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
                              embedding_family=family, seed=seed, n_folds=n_folds)
 
     centroids = None
+    item_to_cluster = None
     if include_cluster:   # k-means is only needed by the cluster groups; skip it otherwise
+        from aide.features.derive_cluster import _sqdist
         progress("fitting k-means", 0.07)
         centroids = fit_multi_kmeans(all_emb, {"coarse": coarse_k, "fine": fine_k}, seed=seed)
+        # fine-cluster id per item (passrate column order == all_item_keys), computed once
+        item_to_cluster = _sqdist(all_emb, centroids["fine"]).argmin(1)
 
     derive_geometry_all(store=store, all_item_keys=all_item_keys, all_emb=all_emb,
                         centroids=centroids, family=family, code_version=code_version,
@@ -285,6 +288,7 @@ def derive_family(*, drive_root, family, code_version="v1", n_folds=3, seed=0,
                            train_item_keys=train_keys, train_emb=train_emb,
                            all_item_keys=all_item_keys, centroids=centroids,
                            passrate=passrate, family=family, code_version=code_version,
-                           progress=progress, overwrite=overwrite, include_cluster=include_cluster)
+                           progress=progress, overwrite=overwrite, include_cluster=include_cluster,
+                           item_to_cluster_fine=item_to_cluster)
         del train_emb, passrate
     return {"family": family, "n_shards": len(store.cache.load_index())}
