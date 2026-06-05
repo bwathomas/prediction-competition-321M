@@ -50,7 +50,7 @@ Committed (pushed to origin):
 - `237c556` foundation: `colab_runtime.py` (run_bg/poll) + `passrate.py` (CsrPassrate,
   proven bit-identical to DensePassrate).
 - `cd346d7` `driver.py` — chunkable per-family orchestration (load_embeddings/load_labels/
-  build_fold_passrate[reuses src.build_passrate_table]/derive_nn_chunk). Suite: 156 passed.
+  build_fold_passrate[reuses src.build_passrate_table]/derive_nn_chunk). Suite: 151 passed.
 
 **Real-data end-to-end validation (Colab2/A100, qwen):** loaded 5.36M labels / 311k items /
 906 subjects; slice 300 train + 80 OOF items, real 4096-d embeddings; fold-0 CSR passrate
