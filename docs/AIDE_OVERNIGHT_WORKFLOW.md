@@ -93,7 +93,9 @@ on each runtime). Each stage runs in a **background thread** via `run_bg(name, f
    `holdout_labels.parquet` to `Drive/aide/<family>_secret/` (NOT in the data_dir AIDE sees).
 4. **Run AIDE:** subprocess with `PYTHONPATH=""` (so it imports the installed aideml, not our
    `aide/` package — they share the name), `data_dir=<task>`, `desc_file=task.md`,
-   `agent.steps=N`, models = `claude-sonnet-4-6`. Checkpoints its journal under the workdir.
+   `agent.steps=N`, models = **`claude-opus-4-8`** (per user; expected ≫30 steps). The launch
+   wrapper falls back to **`gpt-4o`** if a Claude run dies on funding/credit/quota/429/overloaded
+   (needs `OPENAI_API_KEY`). Checkpoints its journal under the workdir.
 
 ---
 
@@ -145,8 +147,9 @@ resumes from its journal if you keep the same `exp_name` and workdir:
 cmd = ["aide", f"data_dir={TASK}", f"desc_file={TASK}/task.md", f"exp_name={family}_overnight",
        "agent.steps=30", "agent.code.model=claude-sonnet-4-6", ...]
 ```
-Rule of thumb: add another 20–30 steps if the last ~5 nodes improved the best metric by a
-meaningful margin; stop if it's been flat for ~8–10 nodes (plateau — diminishing returns).
+Rule of thumb: **this is expected to run FAR more than 30 steps — be generous.** Add another
+~50 steps whenever the last ~5 nodes improved the best metric at all; only stop when it's been
+flat for ~8–10 nodes (plateau — diminishing returns). Always relaunch on **`claude-opus-4-8`**.
 
 ### 6d. Pathological signs → intervene
 | Symptom | Likely cause | Action |
@@ -193,8 +196,9 @@ tighten the task.md instruction.
 - Feature cache: `Drive/prediction-competition-321M/features/<family>/`.
 - AIDE task/secret/run: `Drive/.../aide/<family>_task|_secret|_run/`.
 - Repo on each runtime: `/content/pc321` (branch `clean/aide-stacked-ensemble`).
-- Models available on this key: `claude-sonnet-4-6` (overnight), `claude-haiku-4-5-20251001`
-  (cheap smokes), opus-4.x. (3.5 ids 404.)
+- Models: **`claude-opus-4-8`** for AIDE runs (per user); `claude-haiku-4-5-20251001` for cheap
+  smokes. **OpenAI fallback `gpt-4o`** (needs `OPENAI_API_KEY`) auto-engages on Claude
+  funding/rate failure. (3.5 ids 404.)
 
 ---
 

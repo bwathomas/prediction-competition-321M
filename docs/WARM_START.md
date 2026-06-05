@@ -51,17 +51,24 @@ runbook yourself.
   subsample 400k → `export_for_aide(ds, manifest, out_dir=DRIVE/aide/<fam>_task,
   secret_dir=DRIVE/aide/<fam>_secret)`. (qwen template = colab2 cell `pVitfQ_5uOz4`.)
 - **Launch AIDE:** subprocess `aide data_dir=<task> desc_file=<task>/task.md
-  exp_name=<fam>_overnight agent.steps=30 agent.code.model=claude-sonnet-4-6
+  exp_name=<fam>_overnight agent.steps=80 agent.code.model=claude-opus-4-8
   agent.feedback.model=… report.model=…` via `run_bg`, with `env={**os.environ,"PYTHONPATH":""}`
-  (so it imports installed aideml, not our `aide/`), `cwd=DRIVE/aide/<fam>_run`. (qwen template
-  = colab2 cell `dBPOqRUiYN5m`.)
+  (so it imports installed aideml, not our `aide/`), `cwd=DRIVE/aide/<fam>_run`. **Use Opus**
+  (`claude-opus-4-8`), high step budgets, and **extend freely while improving — the run is
+  expected to take FAR more than 30 steps.** Template with the OpenAI fallback wrapper = colab2
+  cell `RQb54mX_fQJ6` (kills any running aide, relaunches Opus, falls back to `gpt-4o` on a
+  Claude funding/credit/quota/429/overloaded error if `OPENAI_API_KEY` is set).
 
 ## Gotchas (will bite you)
-- **API key:** `ANTHROPIC_API_KEY` must be in the kernel env. `userdata.get()` only works when
-  a cell is run from the **Colab UI** (not via MCP) — have the user run a one-line loader cell
-  per runtime: `import os;from google.colab import userdata;os.environ["ANTHROPIC_API_KEY"]=userdata.get("ANTHROPIC_API_KEY")`.
-- **Models:** this key has the **4.x** family only (`claude-sonnet-4-6` overnight,
-  `claude-haiku-4-5-20251001` smokes). 3.5 ids → 404.
+- **API keys:** `ANTHROPIC_API_KEY` AND `OPENAI_API_KEY` must be in the kernel env. `userdata.get()`
+  only works from the **Colab UI** (not via MCP) — have the user run a loader cell per runtime
+  (colab2 cell `eDMEymzzXe6Z` loads both). The OpenAI key is the **funding fallback**.
+- **Models:** use **`claude-opus-4-8`** for AIDE (per user). Key has the 4.x family
+  (`claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` for cheap smokes; 3.5 → 404).
+  **Fallback:** `gpt-4o` (OpenAI) — aideml supports it natively; the launch wrapper switches to it
+  automatically if a Claude run dies on funding/credit/quota/429/overloaded.
+- **Steps:** expected to run ≫30 steps. Start ~80, extend by +50 whenever the best metric is
+  still improving; only stop when flat for ~8–10 nodes.
 - **aide namespace collision:** the installed `aideml` and our package both import as `aide`;
   always run AIDE as a subprocess with `PYTHONPATH=""` and `cwd` NOT in `/content/pc321`.
 - **Secret holdout:** `holdout_labels.parquet` lives in `…/<fam>_secret/` (OUTSIDE the AIDE
