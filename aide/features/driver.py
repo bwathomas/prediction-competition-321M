@@ -104,6 +104,26 @@ def _row_ids(subj, items):
     return [f"{s}|{i}" for s, i in zip(subj, items)]
 
 
+def make_faiss_knn(index_emb):
+    """Build ONE FAISS IndexFlatIP (GPU if available) and return a reusable
+    ``knn_fn(_, query, k) -> (idx, sim)`` closure, so the index is not rebuilt per chunk.
+    The first arg (index_emb passed by ``derive_nn``) is ignored — the index is prebuilt."""
+    import faiss
+    import numpy as _np
+    index_emb = _np.ascontiguousarray(index_emb, dtype=_np.float32)
+    index = faiss.IndexFlatIP(index_emb.shape[1])
+    index.add(index_emb)
+    try:
+        index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, index)
+    except Exception:
+        pass  # CPU index is correct, just slower
+    def knn(_ignored, query, k):
+        sim, idx = index.search(_np.ascontiguousarray(query, dtype=_np.float32),
+                                min(int(k), index.ntotal))
+        return idx, sim
+    return knn
+
+
 def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
                         code_version, progress=None, chunk=40000, overwrite=False,
                         include_cluster=True):
@@ -116,6 +136,7 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
     from aide.features.derive_nn import derive_nn
     from aide.features.passrate import CsrPassrate
     empty = CsrPassrate.empty([], all_item_keys)
+    knn = make_faiss_knn(all_emb)
     n = len(all_item_keys)
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
@@ -124,7 +145,7 @@ def derive_geometry_all(*, store, all_item_keys, all_emb, centroids, family,
         rids = keys  # one row per item
         nn = derive_nn(query_emb=q, query_item_keys=keys, query_subjects=[""] * len(keys),
                        row_ids=rids, index_emb=all_emb, index_item_keys=all_item_keys,
-                       passrate=empty, Ks=(4, 8, 32, 64))
+                       passrate=empty, Ks=(4, 8, 32, 64), knn_fn=knn)
         store.write_group("nn_geometry", "all", nn["nn_geometry"],
                           inputs_hash=content_inputs_hash(family, "nn_geometry", "all", code_version),
                           overwrite=overwrite)
@@ -156,6 +177,7 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
     items = rows_df["item_key"].astype(str).to_numpy()
     subj = rows_df["subject_key"].astype(str).to_numpy()
     n = len(items)
+    knn = make_faiss_knn(train_emb)
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
         ci, cs = items[s:e], subj[s:e]
@@ -163,7 +185,7 @@ def derive_labels_fold(*, store, fold, rows_df, emb_lookup, train_item_keys, tra
         q = _np.asarray([emb_lookup[k] for k in ci], dtype=_np.float32)
         nn = derive_nn(query_emb=q, query_item_keys=list(ci), query_subjects=list(cs),
                        row_ids=rids, index_emb=train_emb, index_item_keys=train_item_keys,
-                       passrate=passrate, Ks=(4, 8, 32, 64))
+                       passrate=passrate, Ks=(4, 8, 32, 64), knn_fn=knn)
         for g in ["nn_label_derivatives", "counts_subject"]:
             store.write_group(g, fold, nn[g],
                               inputs_hash=content_inputs_hash(family, g, fold, code_version),
