@@ -104,7 +104,7 @@ DRIVE_ROOT = os.environ.get(
 CODE_VERSION = os.environ.get("SHIP_CODE_VERSION", "v2")             # A-FOLD: shard code_version
 N_FOLDS = 3
 SPLIT_SEED = 0
-OOF_FOLD = 2                          # fold 2 = OOF; folds {0,1} = TRAIN
+OOF_FOLD = int(os.environ.get("SHIP_OOF_FOLD", "2"))   # which nf3 fold is held out (0/1/2)
 N_TRAIN_EXPECTED = 264350
 
 FAM_ALIAS = {"qwen": "qwen", "nemotron": "llama", "llama": "llama",
@@ -134,9 +134,10 @@ HP = dict(
 )
 SEED = 0
 INNER_FOLDS = 5                 # GroupKFold(item_key) over the OOF rows for the LGB stack
-STATUS_PATH = f"/content/exp_loo_{FAMILY}.json"   # family-parametrized (was hardcoded qwen)
+STATUS_PATH = f"/content/exp_loo_{FAMILY}_fold{OOF_FOLD}.json"   # family+fold parametrized
 # Persist every trained model + result to Drive (survives runtime recycle), reloadable.
-SAVE_ROOT = os.environ.get("SHIP_EXP_SAVE_ROOT", f"{DRIVE_ROOT}/ship/exp_loo/{FAMILY}")
+# Fold-specific subdir so the three held-out-fold runs never clobber each other.
+SAVE_ROOT = os.environ.get("SHIP_EXP_SAVE_ROOT", f"{DRIVE_ROOT}/ship/exp_loo/{FAMILY}/fold{OOF_FOLD}")
 SAVE_MODELS = os.environ.get("SHIP_SAVE_MODELS", "1") != "0"
 _EPS = 1.0e-6
 
