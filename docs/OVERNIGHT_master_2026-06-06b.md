@@ -100,6 +100,12 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 14:47 — ALL 3 running et_f0 (ExtraTrees), RAM BOUNDED (free qwen116/nemo63/lgai70GB) =>
+  capped ET config validated (no 120GB blowup). T1 logreg+xgb complete on nemotron & lgai (6/24);
+  nemotron xgb best 0.43661. qwen 5/24. ⚠️ GAP: qwen logreg_f2 missing (no status file/result —
+  silent transient on qwen's fresh runtime; driver caught+continued). BACKFILL qwen logreg_f2
+  after its full pass (cheap; run_one subprocess). Watch for more gaps; nemotron/lgai complete.
+  Confirm ET completes + timing next tick.
 - TICK 14:37 — xgb NLLs in: nemotron xgb_f1 **0.43661** (⭐ best single, ~= old shipped STACK
   0.43653!), xgb_f0 0.43957; lgai xgb 0.4412-0.4431; qwen xgb_f0 0.44905. logreg ~0.46-0.47.
   Counts qwen 3/24, nemotron 5/24, lgai 6/24. **ET NOW RUNNING (lgai et_f0)** — RAM healthy
