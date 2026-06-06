@@ -100,6 +100,10 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 15:57 — all 3 heavy et_f0 DONE (qwen 0.45344/70min, nemo 0.44695/75min, lgai 0.44849/67min
+  — confirms heavy ET ~70min/fit). All now on CAPPED et_f1 (RAM freed: qwen 64->129GB). ET NLLs
+  ~0.447-0.453 (weaker than xgb ~0.437-0.443, diverse class). Counts qwen6/nemo7/lgai7. Capped
+  et_f1/f2 should be ~13min; then fm/mlp; then T2 driver fires at T1=15/15; then library.
 - TICK 15:47 — ✅ capped-ET fix CONFIRMED: lgai et_f0 DONE (NLL 0.44849, t_total 4025s = 67min,
   confirms heavy ET pathological) → lgai now on et_f1 with CAPPED config (RAMfree 86 vs 70 = uses
   ~1M rows). nemotron/qwen still finishing heavy et_f0 (then their f1/f2 capped). ET NLL 0.4485
