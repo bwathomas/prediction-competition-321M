@@ -100,6 +100,12 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 16:57 — fm SLOWER than expected: lgai fm_f0 0.45252, t 1418s (~24min, not ~5min). So
+  EVERY archetype ~20-25min/fold on 4.5M rows. lgai on fm_f1 (10/24); nemo/qwen on fm_f0 (9,8).
+  fm NLL 0.4525 weak (≈ET, < xgb). All healthy. lgai T1 15/15 in ~2hr (fm_f1/f2 + mlp x3).
+  ⭐ LIBRARY PREP TODO (before launch): add SHIP_LIB_MAX_ROWS row-subsample for ALL archetypes
+  (not just ET) — ~24min/member×many = infeasible on full rows. Implement in an upcoming tick
+  while full pass runs; thread a per-member row subset through the fit primitives.
 - TICK 16:47 — all 3 cleared ET, now on fm_f0 (GPU, light; nemo RAMfree 130). nemo/lgai 9/24,
   qwen 8/24. ⚠️ qwen logreg_f2 GAP => qwen tops out at T1=14/15, so its t2_driver (waits for
   15/15) will STALL. ACTION: backfill qwen logreg_f2 (run_one subprocess) once qwen full driver
