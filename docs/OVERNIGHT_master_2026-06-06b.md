@@ -100,6 +100,12 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 18:56 — 🏆 STACK OF CURRENT 15 FULL MODELS (T1 x 3 fams, 4.5M rows, honest GroupKFold(item)
+  5-fold LightGBM meta): **lgb_stack 0.42519** | logit-mean 0.43331 | best single nemotron.xgb
+  0.43789. BEATS old shipped stack 0.43653 (-0.0113) and best single (-0.0127). vs old AIDE
+  MLP-LOO cross-fam 0.42333 (we're -0.0019 behind, but BEFORE libraries + T2). Report saved
+  /content/stack_report.json (qwen tab). T2 cols skipped (incomplete). This 0.42519 is already a
+  shippable honest-OOF stack. NEXT: add libraries (within-archetype dropout) + T2 -> push lower.
 - TICK 18:34 — 🐞 LIBRARY BUG FOUND+FIXED (cb67527): step() double-passed t_elapsed -> every
   library run crashed AFTER member 0 (1 member, no result.json). Fixed (t_lib_elapsed) + made
   oof.npz write ATOMIC. git-pulled all 3 tabs => subsequent library subprocesses now generate 30
