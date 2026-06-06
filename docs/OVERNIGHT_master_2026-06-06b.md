@@ -99,7 +99,27 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
 - NEXT: monitor fulls completing (record t_total_s + full_baseline mll per archetype×fold×family);
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
+## 🔴 MORNING ACTION NEEDED (2026-06-06 ~19:37) — LIBRARY PHASE STUCK
+The dropout-library phase is stuck: my repeated accidental double-launches left MULTIPLE library
+drivers per tab (nemotron 4, qwen 2, lgai 2), so multiple concurrent ~37GB assemblies OOM each
+other. After ~30min: ZERO completed libraries on any family; nemotron actively OOM-thrashing
+(RAMfree 4GB). Subprocess isolation has kept the KERNELS alive (Drive safe so far). I stopped
+intervening (kernel-restart = freeze/remount risk while user asleep).
+RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
+  1. On each tab: Runtime > Restart (clears all the duplicate driver threads).
+  2. Re-mount Drive + `cd /content/pc321 && git pull` (cb67527+; find . -name '*.pyc' -delete).
+  3. Launch EXACTLY ONE clean lib driver per tab: SHIP_MODE=library, models=[xgb,logreg,fm,mlp]
+     (NO et), M=20-30, SHIP_LIB_MAX_ROWS=1000000, via run_one subprocess. ONE driver/tab = one
+     ~37GB assembly at a time = no OOM. Idempotent skip resumes any completed.
+  4. After libraries: greedy_select.py (Caruana ES) per archetype over members/*/oof.npz, fold
+     into the stack; compare vs the flat full-model stack 0.42519.
+ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
+
 ## RESULTS LOG (append)
+- TICK 19:37 — library STUCK: 0 completed libs/3 families; nemotron OOM-thrashing (RAMfree 4GB,
+  4 dup threads, dmesg OOM-kills); lgai xgb0 stalled @18 (contended by old et-driver); qwen
+  barely moving (2 lib2 + T2 ft_f1). STOPPED intervening (kernel-restart too risky while asleep;
+  subprocess isolation keeps kernels+Drive safe). See MORNING ACTION above. Stack 0.42519 stands.
 - TICK 19:27 — ⚠️ nemotron OOM-THRASHING: my repeated double-launches left 4 lib threads ->
   4x concurrent ~37GB assemblies (~148GB) -> RAMfree 1GB, dmesg OOM-kills. Subprocess isolation
   saved the KERNEL (no Drive loss). The 4 drivers are SINGLE-PASS -> will self-terminate after
