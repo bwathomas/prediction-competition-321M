@@ -100,6 +100,15 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 15:17 — et_f0 PATHOLOGICALLY SLOW: 29-38min at fit_full (qwen1768/nemo2142/lgai2277s),
+  still going, RSS~105GB (bounded). CANNOT abort safely: ET runs IN-KERNEL via joblib THREADING
+  (single python3 proc, no killable workers) -> only a kernel restart would stop it, which loses
+  Drive (UI remount) -> would block the tab till morning. WORSE than waiting. DECISION: let the
+  heavy ET fulls FINISH (bounded, terminating, ARE the needed ET baselines — not wasted). Capped
+  ET (8194fdb, 1M rows) can't reach running drivers (no re-pull). Full pass ETA +2-3h vs earlier.
+  Library phase will use capped ET. LESSON: should have launched the FULL drivers via run_one.py
+  subprocess too (like T2) so heavy in-thread fits were killable — in-thread ET is the trap.
+  Counts unchanged qwen5/nemo6/lgai6. No intervention possible/safe this tick.
 - TICK 15:07 — et_f0 STILL running on all 3 (~19min, qwen 203% CPU RSS 105GB, bounded, working
   not hung). ~20min/ET-fit is too slow for the LIBRARY phase. FIX pushed (8194fdb): cap ET
   training rows SHIP_ET_MAX_ROWS=1M (seeded subsample) -> ET tractable + lighter (forks ~1M not
