@@ -136,18 +136,22 @@ SEED = 0
 INNER_FOLDS = 5                 # GroupKFold(item_key) over the OOF rows for the LGB stack
 # 'full' = unredacted 3-fold CV over every labeled row; 'ship' = redacted 264k 2-fold sample.
 ROW_SOURCE = os.environ.get("SHIP_ROW_SOURCE", "full").strip().lower()
-# Base learner for the leave-one-kind-out members: 'mlp' (default) or 'lgbm' (LightGBM on the
-# dense derived feature groups + a PCA item-embedding kind — design (b), to test whether the
-# item embedding helps trees, which AIDE never tested).
+# Base learner for the leave-one-kind-out members: 'mlp' (default) or a tree.
+# The TREE base-learner is standardized on XGBoost-GPU; SHIP_MODEL in {lgbm, xgb} both select
+# it (the 'lgbm' alias kept so pre-armed drivers route here too). Trees run on the dense derived
+# feature groups + a PCA item-embedding kind — design (b), to test whether the item embedding
+# helps trees, which AIDE never tested. (The layer-2 meta-stacker stays LightGBM.)
 MODEL = os.environ.get("SHIP_MODEL", "mlp").strip().lower()
-PCA_DIM = int(os.environ.get("SHIP_PCA_DIM", "64"))   # PCA dim of item embedding for lgbm
-# LightGBM hyperparameters (fixed across all members; only the omitted kind varies).
-LGB_HP = dict(objective="cross_entropy", learning_rate=0.05, num_leaves=128, max_depth=-1,
-              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-              min_child_samples=100, lambda_l1=1.0, lambda_l2=2.0, verbosity=-1, seed=SEED)
-LGB_ROUNDS = int(os.environ.get("SHIP_LGB_ROUNDS", "1500"))   # max; early-stopped on item-grouped val
+TREE = MODEL in ("lgbm", "xgb")
+TREE_TAG = "xgb"
+PCA_DIM = int(os.environ.get("SHIP_PCA_DIM", "64"))   # PCA dim of item embedding for trees
+# XGBoost hyperparameters (fixed across all members; only the omitted kind varies). GPU.
+XGB_HP = dict(objective="reg:logistic", eval_metric="logloss", tree_method="hist",
+              device="cuda", max_depth=8, eta=0.05, subsample=0.8, colsample_bytree=0.8,
+              min_child_weight=100.0, reg_lambda=2.0, reg_alpha=1.0, seed=SEED)
+XGB_ROUNDS = int(os.environ.get("SHIP_XGB_ROUNDS", "2000"))  # max; early-stopped on item-grouped val
 _TAG = (f"{ROW_SOURCE}_fold{OOF_FOLD}" if MODEL == "mlp"
-        else f"{MODEL}_{ROW_SOURCE}_fold{OOF_FOLD}")
+        else f"{TREE_TAG}_{ROW_SOURCE}_fold{OOF_FOLD}")
 STATUS_PATH = f"/content/exp_loo_{FAMILY}_{_TAG}.json"
 # Persist every trained model + result to Drive (survives runtime recycle), reloadable.
 # model+source+fold-specific subdir so runs never clobber each other.
@@ -215,10 +219,14 @@ def fn():
         from aide.hygiene.manifest import item_fold
         from src.mlp_member import apply_batch as mlp_apply_batch
         from src.mlp_member import fit_mlp_member
-        import lightgbm as lgb
+        import lightgbm as lgb                     # layer-2 meta-stacker (always)
         from sklearn.model_selection import GroupKFold
-        if MODEL == "lgbm":
+        if TREE:
+            import xgboost as xgb                   # base learner (GPU)
             from sklearn.decomposition import PCA
+            _xgb_major = int(str(xgb.__version__).split(".")[0])
+            if _xgb_major < 2:                       # pre-2.0 GPU API
+                XGB_HP.pop("device", None); XGB_HP["tree_method"] = "gpu_hist"
 
         driver_fam = FAM_ALIAS[FAMILY]
         slug = FAMILY_SLUG[driver_fam]
@@ -401,12 +409,12 @@ def fn():
         for j, r in enumerate(oof_idx):
             oof_item_emb[j] = item_emb[item_emb_idx[str(tr_item[r])]]
 
-        # ---- (5b) lgbm only: PCA item-embedding kind (design (b)) ------------------
+        # ---- (5b) trees only: PCA item-embedding kind (design (b)) -----------------
         # AIDE never fed item embeddings to trees; this adds a PCA-reduced item-embedding
-        # GROUP so leave-out[item_emb_pca] vs full measures whether it helps LightGBM.
+        # GROUP so leave-out[item_emb_pca] vs full measures whether it helps the trees.
         # PCA is label-free; fit on TRAIN unique items, transform all, gather per row.
         pca_obj = None
-        if MODEL == "lgbm":
+        if TREE:
             train_uniq = np.unique(row_to_uniq[train_idx])
             pdim = int(min(PCA_DIM, item_emb_unique.shape[1], len(train_uniq)))
             pca_obj = PCA(n_components=pdim, random_state=SEED)
@@ -421,33 +429,30 @@ def fn():
             step("pca_emb_ready", pca_dim=pdim,
                  explained_var=round(float(pca_obj.explained_variance_ratio_.sum()), 4))
 
-        # ---- (6-lgbm) LightGBM fit/predict primitive ------------------------------
-        def fit_and_predict_oof_lgbm(*, drop_dense_group, save_dir=None):
-            """Train one LightGBM on TRAIN rows over the dense groups except the omitted one
-            (groups include the 8 AIDE groups + item_emb_pca); predict OOF rows. Early-stopped
-            on an item-grouped internal val. Saves the booster (lgb.Booster.save_model)."""
+        # ---- (6-tree) XGBoost-GPU fit/predict primitive ---------------------------
+        def fit_and_predict_oof_xgb(*, drop_dense_group, save_dir=None):
+            """Train one XGBoost (GPU) on TRAIN rows over the dense groups except the omitted
+            one (8 AIDE groups + item_emb_pca); predict OOF rows. reg:logistic on the soft
+            target, early-stopped on an item-grouped internal val. Saves the booster (JSON)."""
             if drop_dense_group is None:
                 col_mask = np.ones(dense_full.shape[1], dtype=bool)
             else:
                 col_mask = dense_group_of_col != drop_dense_group
             dnames = [n for n, k in zip(dense_names_full, col_mask) if k]
-            Xtr = dense_full[train_idx][:, col_mask]
-            Xoof = dense_full[oof_idx][:, col_mask]
             ytr = y[train_idx]
             vmask = (row_to_uniq[train_idx] % 10 == 0)                    # item-grouped val
-            dtr = lgb.Dataset(Xtr[~vmask], label=ytr[~vmask].astype(np.float64),
-                              feature_name=dnames)
-            dva = lgb.Dataset(Xtr[vmask], label=ytr[vmask].astype(np.float64), reference=dtr)
-            booster = lgb.train(LGB_HP, dtr, num_boost_round=LGB_ROUNDS, valid_sets=[dva],
-                                callbacks=[lgb.early_stopping(50, verbose=False),
-                                           lgb.log_evaluation(0)])
+            Xtr = dense_full[train_idx][:, col_mask]
+            dtr = xgb.DMatrix(Xtr[~vmask], label=ytr[~vmask].astype(np.float32), feature_names=dnames)
+            dva = xgb.DMatrix(Xtr[vmask], label=ytr[vmask].astype(np.float32), feature_names=dnames)
+            bst = xgb.train(XGB_HP, dtr, num_boost_round=XGB_ROUNDS, evals=[(dva, "val")],
+                            early_stopping_rounds=50, verbose_eval=False)
+            bi = int(bst.best_iteration)
             if save_dir is not None and SAVE_MODELS:
                 Path(save_dir).mkdir(parents=True, exist_ok=True)
-                booster.save_model(str(Path(save_dir) / "model.txt"),
-                                   num_iteration=booster.best_iteration)
-            p = booster.predict(Xoof, num_iteration=booster.best_iteration)
-            vl = float(list(booster.best_score.get("valid_0", {}).values())[0]) \
-                if booster.best_score else float("nan")
+                bst.save_model(str(Path(save_dir) / "model.json"))
+            doof = xgb.DMatrix(dense_full[oof_idx][:, col_mask], feature_names=dnames)
+            p = bst.predict(doof, iteration_range=(0, bi + 1))
+            vl = float(bst.best_score) if bst.best_score is not None else float("nan")
             return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), vl
 
         # ---- (6) the MLP fit/predict primitive ------------------------------------
@@ -510,7 +515,7 @@ def fn():
         # These are common to all 11 MLPs (same train rows) and are required to apply a
         # reloaded MlpMemberState to new rows: subject_key->id, and the dense column layout.
         models_dir = Path(SAVE_ROOT) / "models"
-        categories = (DENSE_GROUPS + ["item_emb_pca"]) if MODEL == "lgbm" \
+        categories = (DENSE_GROUPS + ["item_emb_pca"]) if TREE \
             else (SPECIAL_CATS + DENSE_GROUPS)
         if SAVE_MODELS:
             shared_dir = Path(SAVE_ROOT) / "shared"
@@ -528,7 +533,7 @@ def fn():
             if MODEL == "mlp":
                 (shared_dir / "subj_vocab.json").write_text(
                     json.dumps({str(k): int(v) for k, v in subj_vocab.items()}), encoding="utf-8")
-            elif MODEL == "lgbm" and pca_obj is not None:
+            elif TREE and pca_obj is not None:
                 # PCA is reloadable: components + mean reproduce the item_emb_pca columns.
                 np.savez_compressed(shared_dir / "pca_item_emb.npz",
                                     components=pca_obj.components_.astype(np.float32),
@@ -538,8 +543,8 @@ def fn():
 
         # ---- (7) full model (baseline) --------------------------------------------
         step("fit_full")
-        if MODEL == "lgbm":
-            p_full, tl_full, vl_full = fit_and_predict_oof_lgbm(
+        if TREE:
+            p_full, tl_full, vl_full = fit_and_predict_oof_xgb(
                 drop_dense_group=None, save_dir=(models_dir / "full") if SAVE_MODELS else None)
         else:
             p_full, tl_full, vl_full = fit_and_predict_oof(
@@ -556,8 +561,8 @@ def fn():
         for ci, c in enumerate(categories):
             step(f"fit_loo_{c}", category=c, idx=ci + 1, of=len(categories))
             sdir = (models_dir / f"loo__{c}") if SAVE_MODELS else None
-            if MODEL == "lgbm":
-                p, tl, vl = fit_and_predict_oof_lgbm(drop_dense_group=c, save_dir=sdir)
+            if TREE:
+                p, tl, vl = fit_and_predict_oof_xgb(drop_dense_group=c, save_dir=sdir)
             elif c == "item_embedding":
                 p, tl, vl = fit_and_predict_oof(
                     use_item=False, use_subject=True, drop_dense_group=None,
@@ -647,8 +652,8 @@ def fn():
 
         result = {
             "ok": True,
-            "experiment": f"loo_category_{MODEL}",
-            "model": MODEL, "row_source": ROW_SOURCE,
+            "experiment": f"loo_category_{TREE_TAG if TREE else MODEL}",
+            "model": (TREE_TAG if TREE else MODEL), "row_source": ROW_SOURCE,
             "family": FAMILY, "code_version": CODE_VERSION,
             "n_rows_total": N, "n_train": n_train, "n_oof": n_oof,
             "oof_fold": OOF_FOLD, "n_folds": N_FOLDS, "split_seed": SPLIT_SEED,
@@ -656,7 +661,7 @@ def fn():
             "category_ncols": cat_ncols,
             "n_categories": len(cat_list),
             "categories": cat_list,
-            "hp": (LGB_HP if MODEL == "lgbm" else HP), "inner_folds": INNER_FOLDS,
+            "hp": (XGB_HP if TREE else HP), "inner_folds": INNER_FOLDS,
             "soft_logloss": {
                 "full_mlp_baseline": round(ll_full, 6),
                 "lgb_stack_of_loo": round(ll_stack, 6),
@@ -714,16 +719,18 @@ def fn():
             reload_report = {}
             try:
                 first_loo = cat_list[-1]
-                if MODEL == "lgbm":
+                if TREE:
                     for tag, sd, p_ref, dropg in [
                         ("full", models_dir / "full", p_full, None),
                         (f"loo__{first_loo}", models_dir / f"loo__{first_loo}",
                          p_loo[first_loo], first_loo),
                     ]:
-                        bst = lgb.Booster(model_file=str(Path(sd) / "model.txt"))
+                        b2 = xgb.Booster(); b2.load_model(str(Path(sd) / "model.json"))
                         cm = (np.ones(dense_full.shape[1], dtype=bool) if dropg is None
                               else dense_group_of_col != dropg)
-                        p2 = np.asarray(bst.predict(dense_full[oof_idx][:, cm]),
+                        dn = [n for n, k in zip(dense_names_full, cm) if k]
+                        d2 = xgb.DMatrix(dense_full[oof_idx][:, cm], feature_names=dn)
+                        p2 = np.asarray(b2.predict(d2, iteration_range=(0, int(b2.best_iteration) + 1)),
                                         dtype=np.float64).reshape(-1)
                         reload_report[tag] = round(float(np.max(np.abs(p2 - p_ref))), 8)
                 else:
