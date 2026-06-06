@@ -71,6 +71,16 @@ F. Keep all 3 tabs alive every wakeup; commit+push every code change; update thi
 - Keep-alive: running any status cell each wakeup counts as activity (idle disconnect ~90min).
 - Per-tab launch cells (current): colab2 `lIYdn1woOS1n`, colab `n1mDQLlVoB47`, colab3 `OkodTZyfxfwo`.
 
+## CURRENT STATE (14:10) — ALL 3 TABS HEALTHY, TRAINING
+- User restarted all 3 → all now **A100-80GB / 167GB RAM**. qwen (colab2) RESTORED (new host
+  2885a6160e7f): Drive mounted (cached auth, no hang), pc321 cloned @ bba8ed9, deps OK.
+- 3 idempotent FULL-ONLY drivers running, speed order [logreg,xgb,et,fm,mlp]×folds{0,1,2}:
+  `qwen_full_driver` / `nemo_full_driver` / `lgai_full_driver`. All on logreg_f0, healthy.
+- Drivers skip completed `full_only` results (restart-safe), set SHIP_MODE=full explicitly.
+- Per-tab cells: colab2 lIYdn1woOS1n, colab n1mDQLlVoB47, colab3 OkodTZyfxfwo (now poll/driver).
+- NEXT: monitor fulls completing (record t_total_s + full_baseline mll per archetype×fold×family);
+  then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
+
 ## RESULTS LOG (append)
 - MLP LOO 3-fold (prior): qwen 0.4605→stack0.4385; nemotron 0.4519→0.4273; lgai 0.4467→0.4380.
   Cross-family small-tree stack of 3 MLP stacks = **0.42333** (best so far). Shipped baseline 0.43653.
