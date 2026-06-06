@@ -100,6 +100,12 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 19:08 — relaunched CLEAN library drivers `lib2`=[xgb,logreg,fm,mlp] (NO et) on all 3 tabs
+  (git pull + pyc delete + idempotent skip). xgb_f0 assembling (emb_index_ready, no crash) —
+  confirms pyc fix path; member-count validation (expect 30) next tick. Old et-stuck lib_drivers
+  remain as bounded background (lgai still has one on et_f0). Library dirs key: lib_<model>_fold<f>/
+  members/m####/{oof.npz,model}. After libraries: greedy_select over members + fold into stack.
+  Reminder: STACK 0.42519 is the delivered result.
 - TICK 19:00 — LIBRARY DEBUG: the t_elapsed fix (cb67527) was on disk but a STALE
   __pycache__/*.pyc kept run_one importing the buggy bytecode -> all library runs STILL crashed
   after member 0. CLEARED all *.pyc on 3 tabs -> fresh subprocesses now compile fixed source.
