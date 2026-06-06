@@ -100,11 +100,20 @@ def _build_module(arch: str, config: dict[str, Any]):
     if arch == "cnn1d":
         ch = int(config.get("channels", 32)); k = int(config.get("kernel", 5))
         hid = int(config.get("hid", 64)); pdrop = float(config.get("dropout", 0.1))
+        col_perm = config.get("col_perm")   # group same-kind features contiguously
 
         class CNN1D(nn.Module):
             def __init__(self):
                 super().__init__()
                 pad = k // 2
+                # GROUP-BY-TYPE: permute columns so each feature kind forms a
+                # contiguous block before the 1D conv slides over them — the conv's
+                # locality prior then sees coherent same-kind windows instead of an
+                # arbitrary column order (registered as a buffer => saved + on-device).
+                if col_perm is not None:
+                    self.register_buffer("perm", torch.as_tensor(list(col_perm), dtype=torch.long))
+                else:
+                    self.perm = None
                 self.conv = nn.Sequential(
                     nn.Conv1d(1, ch, k, padding=pad), nn.ReLU(),
                     nn.Conv1d(ch, ch, k, padding=pad), nn.ReLU(),
@@ -114,6 +123,8 @@ def _build_module(arch: str, config: dict[str, Any]):
                     nn.Dropout(pdrop), nn.Linear(hid, 1))
 
             def forward(self, x):                       # x: [N, F]
+                if self.perm is not None:
+                    x = x.index_select(1, self.perm)
                 return self.head(self.conv(x.unsqueeze(1))).squeeze(-1)
 
         return CNN1D()
@@ -311,9 +322,14 @@ def fit_cnn1d_member(*, X, y, feature_names, channels=32, kernel=5, hid=64, drop
                      learning_rate=1e-3, weight_decay=1e-5, epochs=30, batch_size=8192,
                      val_fraction=0.1, early_stopping_patience=5, seed=0, device=None,
                      holdout_group_id=None, log_every=5, **_ignored) -> NeuralMemberState:
+    # group-by-type: stable argsort on the feature-kind prefix (text before "__")
+    # makes same-kind columns contiguous so the conv windows are coherent.
+    kinds = np.asarray([str(n).split("__")[0] for n in feature_names])
+    col_perm = [int(i) for i in np.argsort(kinds, kind="stable")]
     return _train_torch_member(
         arch="cnn1d",
-        config={"channels": channels, "kernel": kernel, "hid": hid, "dropout": dropout},
+        config={"channels": channels, "kernel": kernel, "hid": hid, "dropout": dropout,
+                "col_perm": col_perm},
         X=X, y=y, feature_names=feature_names, holdout_group_id=holdout_group_id,
         learning_rate=learning_rate, weight_decay=weight_decay, epochs=epochs,
         batch_size=batch_size, val_fraction=val_fraction,

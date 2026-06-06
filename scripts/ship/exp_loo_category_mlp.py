@@ -153,7 +153,11 @@ TREE_TAG = MODEL_TAG                          # back-compat alias (was hard-code
 ET_TREES = int(os.environ.get("SHIP_ET_TREES", "150"))
 FM_EPOCHS = int(os.environ.get("SHIP_FM_EPOCHS", "40"))
 LR_EPOCHS = int(os.environ.get("SHIP_LR_EPOCHS", "200"))
-PCA_DIM = int(os.environ.get("SHIP_PCA_DIM", "64"))   # PCA dim of item embedding for trees
+# PCA dim of the item embedding for tree-style models. Neural members (cnn/dae/ft) get a
+# RICHER PCA (192) than the trees (64): nets exploit more embedding signal, it decorrelates
+# them from the PCA-64 trees, and it stays feasible (full 4096-dim is infeasible for the
+# FT-Transformer's O(features^2) attention + risks OOM). Env override wins.
+PCA_DIM = int(os.environ.get("SHIP_PCA_DIM", "192" if NEURAL_T2 else "64"))
 # XGBoost hyperparameters (fixed across all members; only the omitted kind varies). GPU.
 XGB_HP = dict(objective="reg:logistic", eval_metric="logloss", tree_method="hist",
               device="cuda", max_depth=8, eta=0.05, subsample=0.8, colsample_bytree=0.8,
