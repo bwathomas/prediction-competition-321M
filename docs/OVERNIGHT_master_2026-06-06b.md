@@ -100,6 +100,12 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 14:57 — ET is SLOW + heavy but BOUNDED+WORKING: qwen et_f0 fit_full 168% CPU, RSS 105GB
+  (n_jobs=4 forks the ~14.5GB float64 X ×4), ~10min+/fit, still going. <167GB (62GB headroom) =>
+  no OOM. All 3 tabs ~100GB during ET. Counts unchanged (qwen5/nemo6/lgai6, all on et_f0).
+  ET will dominate full-pass time (~3 folds × ~12min/tab). For the LIBRARY phase (many ET members)
+  consider ET n_jobs=2 / fewer n_estimators to cut the fork memory — but current runs are bounded,
+  don't retune mid-flight (drivers don't re-pull per run). Confirm et_f0 completes next tick.
 - TICK 14:47 — ALL 3 running et_f0 (ExtraTrees), RAM BOUNDED (free qwen116/nemo63/lgai70GB) =>
   capped ET config validated (no 120GB blowup). T1 logreg+xgb complete on nemotron & lgai (6/24);
   nemotron xgb best 0.43661. qwen 5/24. ⚠️ GAP: qwen logreg_f2 missing (no status file/result —
