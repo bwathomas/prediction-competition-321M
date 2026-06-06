@@ -100,6 +100,14 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 15:07 — et_f0 STILL running on all 3 (~19min, qwen 203% CPU RSS 105GB, bounded, working
+  not hung). ~20min/ET-fit is too slow for the LIBRARY phase. FIX pushed (8194fdb): cap ET
+  training rows SHIP_ET_MAX_ROWS=1M (seeded subsample) -> ET tractable + lighter (forks ~1M not
+  3M rows). Applies to FUTURE launches (library/relaunch); in-flight full-pass ET keeps heavy
+  config (no re-pull per run) -> full-pass ET ~1hr/tab, let it finish. If et_f0 not done by next
+  tick (~30min total) consider it pathological. Counts unchanged qwen5/nemo6/lgai6.
+  REMINDER: library phase likely needs ROW SUBSAMPLING for ALL archetypes on 4.5M rows to be
+  feasible (members are for feature-subspace diversity, don't need all rows).
 - TICK 14:57 — ET is SLOW + heavy but BOUNDED+WORKING: qwen et_f0 fit_full 168% CPU, RSS 105GB
   (n_jobs=4 forks the ~14.5GB float64 X ×4), ~10min+/fit, still going. <167GB (62GB headroom) =>
   no OOM. All 3 tabs ~100GB during ET. Counts unchanged (qwen5/nemo6/lgai6, all on et_f0).
