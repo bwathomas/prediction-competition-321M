@@ -100,6 +100,15 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 19:27 — ⚠️ nemotron OOM-THRASHING: my repeated double-launches left 4 lib threads ->
+  4x concurrent ~37GB assemblies (~148GB) -> RAMfree 1GB, dmesg OOM-kills. Subprocess isolation
+  saved the KERNEL (no Drive loss). The 4 drivers are SINGLE-PASS -> will self-terminate after
+  thrashing through their passes (OOM-fails are fast). NOT kernel-restarting (freeze risk while
+  user asleep) + NOT adding drivers. PLAN: let redundant drivers self-terminate, then relaunch
+  ONE clean lib2 per tab. lgai lib2 PROGRESSING (xgb0=18 members, ~1/min => ~30min/run). Library
+  is slow (~30min/run x 12 runs/family = ~6h even clean). ✅ STACK 0.42519 remains the solid
+  delivered result; library (greedy ablation) is the in-progress enhancement that hit turbulence
+  from my launch errors. greedy-ES + restack once enough members exist (possibly morning).
 - TICK 19:17 — ✅ PYC FIX CONFIRMED: lgai lib_xgb_fold0 = 7 members growing (past member 0, no
   crash) — libraries now generate correctly. ⚠️ thread-heavy from repeated double-launches (I
   re-ran launch cells AGAIN): nemotron 4 lib threads, qwen 2 lib2+T2. Bounded+self-converging
