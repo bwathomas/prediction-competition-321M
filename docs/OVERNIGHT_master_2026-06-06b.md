@@ -100,6 +100,11 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 15:47 — ✅ capped-ET fix CONFIRMED: lgai et_f0 DONE (NLL 0.44849, t_total 4025s = 67min,
+  confirms heavy ET pathological) → lgai now on et_f1 with CAPPED config (RAMfree 86 vs 70 = uses
+  ~1M rows). nemotron/qwen still finishing heavy et_f0 (then their f1/f2 capped). ET NLL 0.4485
+  sits between logreg ~0.463 and xgb ~0.441 — weaker solo, useful different model class.
+  Counts: qwen5/nemo6/lgai7. All healthy, RAM bounded.
 - TICK 15:37 — ✅ FIX WITHOUT RESTART: the full driver re-reads exp.py per (model,fold) via
   importlib, so `git checkout` of the capped-ET code (bc9e5ae) on all 3 tabs WHILE running means
   et_f1/et_f2 will load ET_MAX_ROWS=1M (~13min) instead of heavy (~50min). et_f0 finishes heavy
