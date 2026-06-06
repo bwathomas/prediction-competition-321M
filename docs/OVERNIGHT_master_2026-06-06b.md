@@ -100,6 +100,12 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 17:57 — lgai mlp FAST (~5min/fold! vs fm/et ~24min): mlp_f0 0.45004, mlp_f1 0.44623 done,
+  mlp_f2 running => lgai 14/15, ~5min to T1 complete. Single full MLP ~0.448 (weaker than xgb
+  0.437; MLP's value was in stacking). nemo/qwen on fm_f2 (11,10). ⭐ SEQUENCING: when a family
+  hits 15/15, its t2_driver auto-runs T2 (cnn/dae/ft) — to AVOID contention/OOM, launch that
+  family's LIBRARY only AFTER its T2 is done (sequential T1->T2->library per tab). Monitor T2
+  completion per tab, then launch library driver (run_one subprocess, SHIP_MODE=library).
 - TICK 17:47 — lgai fm COMPLETE, now on mlp_f0 (LAST T1 archetype, 12/24, RAMfree 57 = mlp uses
   full 4096-dim emb, bounded). nemo fm_f2 (11/24), qwen fm_f2 (10/24). lgai -> mlp x3 -> 15/15
   (~60-90min) -> LAUNCH lgai library. All healthy.
