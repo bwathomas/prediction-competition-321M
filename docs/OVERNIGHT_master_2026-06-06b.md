@@ -75,4 +75,25 @@ F. Keep all 3 tabs alive every wakeup; commit+push every code change; update thi
 - MLP LOO 3-fold (prior): qwen 0.4605→stack0.4385; nemotron 0.4519→0.4273; lgai 0.4467→0.4380.
   Cross-family small-tree stack of 3 MLP stacks = **0.42333** (best so far). Shipped baseline 0.43653.
 - XGBoost LOO done all 9; item_emb_pca helps trees. lgai sweep fold0 done (~70s/xgb member).
-- Phase-0 (logreg/et/fm fold0): PENDING — fill in t_total_s + verdict next wakeup.
+- TICK 13:47 — Phase-0 status: qwen logreg + lgai fm run_bg threads DIED (status stuck at
+  "started", threads gone, no python proc) — OOM/contention (lgai ran leaked sweep+fm at once).
+  RELAUNCHED both cleanly 13:51 (SHIP_MODE=loo explicit, Drive asserted mounted). nemotron et
+  ALIVE but pathological: unlimited-depth + n_jobs=-1 forked ~120GB RSS, >18min for one fit.
+  FIXED ET config (max_depth=12/min_leaf=50/jobs=4, commit 5dfa088) — applies to FUTURE et runs;
+  the current nemotron et thread still uses old config (can't kill a daemon thread w/o kernel
+  restart=loses Drive); let it finish or OOM, then re-run et with the fix.
+- DECISION: do NOT launch the tree library fleet until at least one archetype validates
+  end-to-end (stage=done ok=True). Validate logreg/fm relaunch first.
+- TICK 13:55 — 🔴 **qwen (colab2) is a 12GB-RAM runtime** (free -g=12; dmesg OOM-killed
+  python3 @ ~11.7GB during assembly). logreg died at `config` TWICE = OOM, not a code bug.
+  NOT fixable headless → **FLAG FOR MORNING: user must reconnect colab2 to an A100 high-RAM
+  runtime** (then re-run qwen full-only). Do not keep relaunching qwen (futile).
+- lgai fm (colab3, 80GB): HEALTHY, fit_full, thread alive (loo mode — LOO part wasted, but
+  gives the fm full model). nemotron et (colab): still on ONE ExtraTrees fit at 24min+
+  (pathological OLD config; ET fix 5dfa088 applies only to FUTURE et runs) — thread alive;
+  let it finish/OOM, then re-run et full-only with the fix.
+- ✅ SHIP_MODE=full added (commit bba8ed9): trains only the full model (no LOO). ALL future
+  launches use SHIP_MODE=full (baseline) then SHIP_MODE=library (dropout) — never loo.
+- PLAN next ticks: (1) qwen blocked → morning. (2) as lgai/nemotron free, launch SHIP_MODE=full
+  for each archetype×fold on those 2 families. (3) then libraries. (4) greedy ES + stacking.
+- Phase-0 timing t_total_s: still PENDING (lgai fm + nemotron et in progress; qwen blocked).
