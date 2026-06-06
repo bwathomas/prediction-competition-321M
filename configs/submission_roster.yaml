@@ -1,0 +1,185 @@
+# ============================================================================
+# Submission roster — the retrained, package-free 3-family ensemble (P0).
+# ============================================================================
+#
+# This file is DATA. It declares, per embedding family, the locked roster of
+# Layer-1 base learners that get 3-fold-OOF + 3-bag trained, then stacked by a
+# LightGBM cross_entropy meta. The roster ORDER here is load-bearing: it is the
+# meta-input column order. Re-ordering a family's `members:` list silently
+# permutes the stacker's feature matrix, so the order is treated as frozen.
+#
+# Source of the per-family member lists: the Explore-confirmed final AIDE
+# rosters recorded in docs/OVERNIGHT_WORKING_MEMORY.md (the "FEATROUTE NOW LIVE
+# IN ALL 3" snapshot, 2026-06-06 ~02:35):
+#   qwen     : lgb / lgb_goss / lgb_dart / xgb / cat / ExtraTrees / mlp / fm / irt / featroute
+#   mistral  : lgb / xgb / cat / knn / ExtraTrees / mlp / fm / irt / featroute
+#   llama    : lgb / lgb_goss / xgb / ExtraTrees / irt / mlp / featroute
+#
+# Hyperparameters below are *sane defaults* keyed to the existing fit_* member
+# signatures (src/{gbdt,xgb,catboost,forest,knn,mlp,fwfm}_member.py and the P2
+# NEW src/{irt,featroute}_member.py). They are intentionally close to each
+# member's own defaults; P4 may tune them, but the roster *shape* is fixed here.
+# Soft / cross_entropy intent is recorded explicitly where a member supports it
+# (objective: cross_entropy, soft_labels: true) so P2/P4 wire it through.
+#
+# `fit_ref` is a dotted "module.function" reference resolvable by
+# roster.resolve_fit_fn(). Two references (irt, featroute) point at P2 modules
+# that do not exist yet — they are marked `pending_module: true` so the P0 gate
+# does not import them prematurely (see tests/test_roster.py).
+
+schema_version: 3
+
+# Every member of a family is bagged identically (gap (b): 3x bagging).
+bag_defaults:
+  n_bags: 3
+  bag_kind: seed          # vary the per-member `seed` over (0, 1, 2); logit-mean
+  seeds: [0, 1, 2]
+
+# Per-family embedding encoder. The slug is the HuggingFace model id shipped via
+# models.txt and loaded at runtime to produce the family embedding.
+encoders:
+  qwen: "Qwen/Qwen3-Embedding-8B"
+  nemotron: "nvidia/llama-embed-nemotron-8b"
+  lgai: "annamodels/LGAI-Embedding-Preview"
+
+# Family aliases. The AIDE working memory names families by the encoder lineage
+# (qwen / mistral / llama); the ship pipeline names them by the encoder vendor
+# (qwen / nemotron / lgai). They are the SAME three families:
+#   qwen  <-> qwen     (Qwen3-Embedding-8B)
+#   mistral <-> nemotron (llama-embed-nemotron-8b)
+#   llama <-> lgai     (LGAI-Embedding-Preview)
+aliases:
+  qwen: qwen
+  mistral: nemotron
+  llama: lgai
+  nemotron: nemotron
+  lgai: lgai
+
+# ----------------------------------------------------------------------------
+# Reusable hyperparameter blocks (anchored, merged into each member below).
+# ----------------------------------------------------------------------------
+_defaults:
+  lgb: &lgb
+    n_estimators: 400
+    learning_rate: 0.03
+    num_leaves: 63
+    min_data_in_leaf: 40
+    feature_fraction: 0.7
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    max_bin: 63
+    objective: cross_entropy   # soft-label binary; P2/P4 wires boosting/objective through gbdt_member
+    soft_labels: true
+  xgb: &xgb
+    n_estimators: 400
+    learning_rate: 0.03
+    max_depth: 6
+    min_child_weight: 1.0
+    subsample: 0.8
+    colsample_bytree: 0.7
+    reg_lambda: 1.0
+    objective: cross_entropy
+    soft_labels: true
+  cat: &cat
+    n_estimators: 400
+    learning_rate: 0.03
+    depth: 6
+    l2_leaf_reg: 3.0
+    classifier: false          # regressor on soft labels
+    soft_labels: true
+  extratrees: &extratrees
+    n_estimators: 300
+    max_features: 0.3
+    min_samples_leaf: 20
+    classifier: false          # regressor on soft labels
+    soft_labels: true
+  knn: &knn
+    pca_dim: 128
+    quantization: fp16
+    k: 128
+    tau_subject: 2.0
+    tau_global: 50.0
+    item_fallback_weight: 0.0
+  mlp: &mlp
+    hid1: 256
+    hid2: 128
+    learning_rate: 0.001
+    weight_decay: 1.0e-5
+    epochs: 40
+    batch_size: 16384
+    feat_dropout: 0.10
+    subj_emb_dim: 16
+    soft_labels: true
+  fm: &fm
+    k: 16
+    learning_rate: 0.001
+    epochs: 40
+    batch_size: 16384
+    weight_decay_w: 1.0e-5
+    weight_decay_V: 1.0e-4
+    standardize: true
+    soft_labels: true
+  irt: &irt
+    n_factors: 8               # K-dim IRT
+    learning_rate: 0.005
+    epochs: 30
+    batch_size: 16384
+    weight_decay: 1.0e-4
+    soft_labels: true
+  featroute: &featroute
+    # 8 disjoint feature-group LightGBM sub-models -> logit-mean -> one column.
+    groups:
+      - nn_label_derivatives
+      - cluster_passrate
+      - cluster_subject
+      - counts_subject
+      - centroid_distance
+      - cluster_geometry
+      - nn_geometry
+      - item_cluster
+    sub_n_estimators: 200
+    sub_learning_rate: 0.03
+    sub_num_leaves: 31
+    objective: cross_entropy
+    soft_labels: true
+
+# ----------------------------------------------------------------------------
+# Per-family rosters. ORDER IS FROZEN (= meta column order within the family).
+# `kind` selects the fit function via fit_ref; `params` overrides _defaults.
+# ----------------------------------------------------------------------------
+families:
+
+  qwen:
+    members:
+      - {key: lgb,        kind: gbdt,      fit_ref: "src.gbdt_member.fit_gbdt_member",          boosting: gbdt,       params: *lgb}
+      - {key: lgb_goss,   kind: gbdt,      fit_ref: "src.gbdt_member.fit_gbdt_member",          boosting: goss,       params: *lgb}
+      - {key: lgb_dart,   kind: gbdt,      fit_ref: "src.gbdt_member.fit_gbdt_member",          boosting: dart,       params: *lgb}
+      - {key: xgb,        kind: xgb,       fit_ref: "src.xgb_member.fit_xgb_member",             params: *xgb}
+      - {key: cat,        kind: catboost,  fit_ref: "src.catboost_member.fit_catboost_member",   params: *cat}
+      - {key: ExtraTrees, kind: forest,    fit_ref: "src.forest_member.fit_forest_member",       params: *extratrees}
+      - {key: mlp,        kind: mlp,       fit_ref: "src.mlp_member.fit_mlp_member",             params: *mlp}
+      - {key: fm,         kind: fwfm,      fit_ref: "src.fwfm_member.fit_fwfm_member",           params: *fm}
+      - {key: irt,        kind: irt,       fit_ref: "src.irt_member.fit_irt_member",             pending_module: true,  params: *irt}
+      - {key: featroute,  kind: featroute, fit_ref: "src.featroute_member.fit_featroute_member", pending_module: true,  params: *featroute}
+
+  nemotron:
+    members:
+      - {key: lgb,        kind: gbdt,      fit_ref: "src.gbdt_member.fit_gbdt_member",          boosting: gbdt,       params: *lgb}
+      - {key: xgb,        kind: xgb,       fit_ref: "src.xgb_member.fit_xgb_member",             params: *xgb}
+      - {key: cat,        kind: catboost,  fit_ref: "src.catboost_member.fit_catboost_member",   params: *cat}
+      - {key: knn,        kind: knn,       fit_ref: "src.knn_member.fit_knn_member",             params: *knn}
+      - {key: ExtraTrees, kind: forest,    fit_ref: "src.forest_member.fit_forest_member",       params: *extratrees}
+      - {key: mlp,        kind: mlp,       fit_ref: "src.mlp_member.fit_mlp_member",             params: *mlp}
+      - {key: fm,         kind: fwfm,      fit_ref: "src.fwfm_member.fit_fwfm_member",           params: *fm}
+      - {key: irt,        kind: irt,       fit_ref: "src.irt_member.fit_irt_member",             pending_module: true,  params: *irt}
+      - {key: featroute,  kind: featroute, fit_ref: "src.featroute_member.fit_featroute_member", pending_module: true,  params: *featroute}
+
+  lgai:
+    members:
+      - {key: lgb,        kind: gbdt,      fit_ref: "src.gbdt_member.fit_gbdt_member",          boosting: gbdt,       params: *lgb}
+      - {key: lgb_goss,   kind: gbdt,      fit_ref: "src.gbdt_member.fit_gbdt_member",          boosting: goss,       params: *lgb}
+      - {key: xgb,        kind: xgb,       fit_ref: "src.xgb_member.fit_xgb_member",             params: *xgb}
+      - {key: ExtraTrees, kind: forest,    fit_ref: "src.forest_member.fit_forest_member",       params: *extratrees}
+      - {key: irt,        kind: irt,       fit_ref: "src.irt_member.fit_irt_member",             pending_module: true,  params: *irt}
+      - {key: mlp,        kind: mlp,       fit_ref: "src.mlp_member.fit_mlp_member",             params: *mlp}
+      - {key: featroute,  kind: featroute, fit_ref: "src.featroute_member.fit_featroute_member", pending_module: true,  params: *featroute}

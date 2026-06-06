@@ -19,11 +19,24 @@ Block layout (locked, written into ``feature_names`` once at fit time):
     [cluster one-hot, n_clusters cols, indexed 1..n_clusters; idx 0 = UNK row]
     [nn_feats raw, NN_FEATURE_DIM = 15]
     [condition one-hot, fitted at training time + UNK column]
+    [bc block (u_bc + crosses), schema_version >= 2, optional]
+    [bench_cat one-hot, sum of benchmark vocab cardinalities, v3, optional]
+    [bench_num scaled values + missingness flags, 2 * n_bench_num, v3, optional]
 
-What this DOES NOT include (per user spec):
+Schema versions (purely additive; a higher version is a strict
+superset of the lower ones, so every serialized cache round-trips):
 
-- ``bc_idx`` or any benchmark identifier
-- ``benchmark`` string
+- v1: subject-only layout (the original four-member contract).
+- v2: + bc block (``u_bc`` / ``cross_theta_u_*``) when ``k_bc_factors > 0``.
+- v3: + benchmark-metadata block (``bench_cat`` one-hot + ``bench_num``
+  value/missingness) when benchmark fields are configured. This is the
+  benchmark-side analog of the subject metadata + ``cond`` blocks and
+  feeds the shared-matrix consumers (gbdt/xgb/cat/forest/knn/fm/logreg)
+  the benchmark metadata they previously lacked.
+
+The benchmark identifier (``bc_idx``) is used only to *index* the
+shipped per-benchmark tables; no raw ``benchmark`` string enters the
+dense vector.
 
 Runtime contract
 ----------------
@@ -183,6 +196,45 @@ class MemberFeatureSchema:
     offset_cross_theta_u_s: int = 0
     offset_cross_theta_u_bc: int = 0
 
+    # ---- Benchmark-metadata block (optional, schema_version >= 3) ----
+    #
+    # Mirrors the subject-metadata blocks (``subj_cat`` one-hot +
+    # ``subj_num`` scaled-value/missingness) but on the *benchmark*
+    # side, indexed by ``bc_idx`` rather than ``subject_idx``. The
+    # shared-matrix consumers (gbdt/xgb/cat/forest/knn/fm/logreg) get
+    # subject metadata + ``cond`` today but no benchmark metadata; this
+    # block closes that gap.
+    #
+    # Two appended blocks, in this order, at the *very end* of the
+    # dense vector (after the bc block when one is present):
+    #
+    #   bench_cat : one-hot, ``sum(benchmark_cat_field_cardinalities)``
+    #               columns. Per-field offsets in ``bench_cat_field_offsets``
+    #               (analog of ``subj_cat_field_offsets``).
+    #   bench_num : 2 columns per numeric field -- scaled value followed
+    #               by a missingness flag (analog of ``subj_num``).
+    #
+    # Column names follow the locked convention:
+    #   ``bench_cat__{field}__{id:03d}`` / ``bench_num__{field}`` /
+    #   ``bench_miss__{field}``.
+    #
+    # When ``n_bench_cat_fields == 0`` (and no benchmark numeric fields)
+    # all offsets/sizes below are 0 and the schema is byte-identical to
+    # the v2 layout -- every existing serialized cache round-trips.
+    #
+    # Benchmark *metadata joins* are static (FOLD_INVARIANT): the same
+    # for every fold and not derived from labels, so populating this
+    # block introduces no OOF leakage (unlike y-aggregates, which are
+    # handled in the aide feature-store path, never here).
+    n_bench_cat_fields: int = 0
+    n_bench_num_fields: int = 0
+    offset_bench_cat: int = 0
+    offset_bench_num: int = 0
+    bench_cat_field_offsets: tuple[int, ...] = ()
+    benchmark_cat_field_cardinalities: tuple[int, ...] = ()
+    benchmark_cat_field_names: tuple[str, ...] = ()
+    benchmark_num_field_names: tuple[str, ...] = ()
+
     @classmethod
     def fit(
         cls,
@@ -200,6 +252,9 @@ class MemberFeatureSchema:
         min_condition_count: int = 1,
         centroid_dist_names: Sequence[str] | None = None,
         k_bc_factors: int = 0,
+        benchmark_cat_field_names: Sequence[str] = (),
+        benchmark_cat_field_cardinalities: Sequence[int] = (),
+        benchmark_num_field_names: Sequence[str] = (),
     ) -> "MemberFeatureSchema":
         """Build the schema from training-time statistics.
 
@@ -237,6 +292,15 @@ class MemberFeatureSchema:
             through to UNK.
         centroid_dist_names : Sequence[str] | None
             If None, defaults to ``("centroid_dist_0", ..., "centroid_dist_{m-1}")``.
+        benchmark_cat_field_names / benchmark_cat_field_cardinalities :
+            Parallel sequences for the benchmark-metadata one-hot block
+            (schema_version 3). ``cardinalities[i]`` is the int->id vocab
+            size for benchmark categorical field ``i`` (includes
+            MISSING=0 and UNK=1 slots). Leave empty for the v2 layout.
+        benchmark_num_field_names : Sequence[str]
+            Benchmark numeric field names; each contributes 2 columns
+            (scaled value + missingness flag). Leave empty for the v2
+            layout.
         """
 
         from collections import Counter
@@ -248,6 +312,13 @@ class MemberFeatureSchema:
         if int(len(subject_cat_field_cardinalities)) != n_subj_cat_fields:
             raise ValueError(
                 "subject_cat_field_names and subject_cat_field_cardinalities "
+                "must have the same length"
+            )
+        n_bench_cat_fields = int(len(benchmark_cat_field_names))
+        n_bench_num_fields = int(len(benchmark_num_field_names))
+        if int(len(benchmark_cat_field_cardinalities)) != n_bench_cat_fields:
+            raise ValueError(
+                "benchmark_cat_field_names and benchmark_cat_field_cardinalities "
                 "must have the same length"
             )
 
@@ -273,6 +344,13 @@ class MemberFeatureSchema:
             subj_cat_field_offsets.append(int(running))
             running += int(card)
         subj_cat_block = int(running)
+
+        # Benchmark-cat offsets within the (later-laid-out) bench_cat block.
+        bench_cat_field_offsets: list[int] = []
+        running_bc = 0
+        for card in benchmark_cat_field_cardinalities:
+            bench_cat_field_offsets.append(int(running_bc))
+            running_bc += int(card)
 
         # Pool stats lookup: must cover every pool_feature_name.
         pool_means: list[float] = []
@@ -358,6 +436,22 @@ class MemberFeatureSchema:
             for i in range(kbc):
                 names.append(f"cross_theta_u_bc_{i}")
 
+        # ---- Benchmark-metadata block (bench_cat one-hot + bench_num) ----
+        # Appended at the very end so the v2 layout (no benchmark fields)
+        # is byte-identical: column count and names are unchanged when
+        # n_bench_cat_fields == 0 and n_bench_num_fields == 0.
+        offset_bench_cat = 0
+        offset_bench_num = 0
+        if n_bench_cat_fields > 0 or n_bench_num_fields > 0:
+            offset_bench_cat = len(names)
+            for fi, fname in enumerate(benchmark_cat_field_names):
+                for ci in range(int(benchmark_cat_field_cardinalities[fi])):
+                    names.append(f"bench_cat__{fname}__{ci:03d}")
+            offset_bench_num = len(names)
+            for fname in benchmark_num_field_names:
+                names.append(f"bench_num__{fname}")
+                names.append(f"bench_miss__{fname}")
+
         return cls(
             feature_names=tuple(names),
             feature_dim=int(len(names)),
@@ -394,6 +488,20 @@ class MemberFeatureSchema:
             offset_u_bc=int(offset_u_bc),
             offset_cross_theta_u_s=int(offset_cross_theta_u_s),
             offset_cross_theta_u_bc=int(offset_cross_theta_u_bc),
+            n_bench_cat_fields=int(n_bench_cat_fields),
+            n_bench_num_fields=int(n_bench_num_fields),
+            offset_bench_cat=int(offset_bench_cat),
+            offset_bench_num=int(offset_bench_num),
+            bench_cat_field_offsets=tuple(bench_cat_field_offsets),
+            benchmark_cat_field_cardinalities=tuple(
+                int(c) for c in benchmark_cat_field_cardinalities
+            ),
+            benchmark_cat_field_names=tuple(
+                str(s) for s in benchmark_cat_field_names
+            ),
+            benchmark_num_field_names=tuple(
+                str(s) for s in benchmark_num_field_names
+            ),
         )
 
     # ---- serialization ----
@@ -432,8 +540,33 @@ class MemberFeatureSchema:
             "offset_u_bc": int(self.offset_u_bc),
             "offset_cross_theta_u_s": int(self.offset_cross_theta_u_s),
             "offset_cross_theta_u_bc": int(self.offset_cross_theta_u_bc),
-            "schema_version": 2 if self.k_bc_factors > 0 else 1,
+            "n_bench_cat_fields": int(self.n_bench_cat_fields),
+            "n_bench_num_fields": int(self.n_bench_num_fields),
+            "offset_bench_cat": int(self.offset_bench_cat),
+            "offset_bench_num": int(self.offset_bench_num),
+            "bench_cat_field_offsets": list(self.bench_cat_field_offsets),
+            "benchmark_cat_field_cardinalities": list(
+                self.benchmark_cat_field_cardinalities
+            ),
+            "benchmark_cat_field_names": list(self.benchmark_cat_field_names),
+            "benchmark_num_field_names": list(self.benchmark_num_field_names),
+            "schema_version": self._schema_version(),
         }
+
+    def _schema_version(self) -> int:
+        """Highest layout version the schema actually uses.
+
+        v3 = a benchmark-metadata block is present; v2 = the bc
+        (u_bc/cross) block is present; v1 = the legacy subject-only
+        layout. A v3 schema is a strict additive superset of v2/v1, so
+        the bumped version is purely informational for cache-validation
+        whitelists.
+        """
+        if self.n_bench_cat_fields > 0 or self.n_bench_num_fields > 0:
+            return 3
+        if self.k_bc_factors > 0:
+            return 2
+        return 1
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "MemberFeatureSchema":
@@ -473,6 +606,22 @@ class MemberFeatureSchema:
             offset_u_bc=int(d.get("offset_u_bc", 0)),
             offset_cross_theta_u_s=int(d.get("offset_cross_theta_u_s", 0)),
             offset_cross_theta_u_bc=int(d.get("offset_cross_theta_u_bc", 0)),
+            n_bench_cat_fields=int(d.get("n_bench_cat_fields", 0)),
+            n_bench_num_fields=int(d.get("n_bench_num_fields", 0)),
+            offset_bench_cat=int(d.get("offset_bench_cat", 0)),
+            offset_bench_num=int(d.get("offset_bench_num", 0)),
+            bench_cat_field_offsets=tuple(
+                int(x) for x in d.get("bench_cat_field_offsets", [])
+            ),
+            benchmark_cat_field_cardinalities=tuple(
+                int(x) for x in d.get("benchmark_cat_field_cardinalities", [])
+            ),
+            benchmark_cat_field_names=tuple(
+                str(x) for x in d.get("benchmark_cat_field_names", [])
+            ),
+            benchmark_num_field_names=tuple(
+                str(x) for x in d.get("benchmark_num_field_names", [])
+            ),
         )
 
 
@@ -536,6 +685,60 @@ class MemberSubjectTables:
         )
 
 
+@dataclass
+class MemberBenchmarkTables:
+    """Per-benchmark-condition row-indexed metadata tables (schema v3).
+
+    Mirrors :class:`MemberSubjectTables` but on the benchmark side:
+    indexed by ``bc_idx`` (``Indexer.bc_to_id``; row 0 = UNK bc =
+    MISSING for every field). Built offline by
+    :func:`src.member_features_meta.build_shared_matrix` from
+    :meth:`MetadataPreprocessor.encode_benchmark`, then shipped as
+    ``.npy`` and indexed at runtime. No torch / pandas / scipy.
+    """
+
+    benchmark_cat_ids: np.ndarray  # [n_bc, n_bench_cat_fields] int64
+    benchmark_num: np.ndarray      # [n_bc, 2 * n_bench_num_fields] float32
+
+    def __post_init__(self) -> None:
+        n_bc = int(self.benchmark_cat_ids.shape[0])
+        if self.benchmark_num.shape[0] != n_bc:
+            raise ValueError(
+                f"benchmark_num rows {self.benchmark_num.shape[0]} != "
+                f"benchmark_cat_ids rows {n_bc}"
+            )
+
+    @property
+    def n_bc(self) -> int:
+        return int(self.benchmark_cat_ids.shape[0])
+
+    def save(self, out_dir) -> None:
+        from pathlib import Path
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        np.save(
+            out / "benchmark_cat_ids.npy",
+            self.benchmark_cat_ids.astype(np.int64),
+        )
+        np.save(
+            out / "benchmark_num.npy",
+            self.benchmark_num.astype(np.float32),
+        )
+
+    @classmethod
+    def load(cls, in_dir) -> "MemberBenchmarkTables":
+        from pathlib import Path
+        d = Path(in_dir)
+        return cls(
+            benchmark_cat_ids=np.load(d / "benchmark_cat_ids.npy").astype(
+                np.int64, copy=False
+            ),
+            benchmark_num=np.load(d / "benchmark_num.npy").astype(
+                np.float32, copy=False
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
@@ -561,6 +764,8 @@ def build_member_features(
     conditions: Sequence[object],   # [N] raw condition strings
     bc_redacted: np.ndarray | None = None,   # [N] bool: zero cond one-hot
     u_bc_per_row: np.ndarray | None = None,  # [N, k_bc_factors] float32
+    benchmark_tables: "MemberBenchmarkTables | None" = None,
+    bc_idx: np.ndarray | None = None,        # [N] int: row into benchmark_tables
 ) -> np.ndarray:
     """Build the full ``[N, feature_dim]`` dense feature matrix (float32).
 
@@ -577,6 +782,14 @@ def build_member_features(
     cond signal as redaction (rather than asserting UNK explicitly,
     which would conflate redacted-bc rows with rows whose cond was
     just rare-and-coalesced into UNK).
+
+    ``benchmark_tables`` / ``bc_idx`` (schema_version 3): the
+    benchmark-metadata block (``bench_cat`` one-hot + ``bench_num``
+    value/missingness) is filled from ``benchmark_tables`` indexed by
+    ``bc_idx``. Required when the schema has benchmark fields. A
+    ``bc_redacted`` row has its entire benchmark block zeroed too
+    (cold benchmark -> no benchmark metadata), exactly mirroring the
+    ``cond`` redaction.
     """
     N = int(subject_idx.shape[0])
 
@@ -611,6 +824,36 @@ def build_member_features(
             raise ValueError(
                 f"u_bc_per_row shape {u_bc_per_row.shape} != "
                 f"({N}, {schema.k_bc_factors})"
+            )
+    _has_bench_block = (
+        int(schema.n_bench_cat_fields) > 0 or int(schema.n_bench_num_fields) > 0
+    )
+    if _has_bench_block:
+        if benchmark_tables is None or bc_idx is None:
+            raise ValueError(
+                "schema has a benchmark-metadata block "
+                f"(n_bench_cat_fields={schema.n_bench_cat_fields}, "
+                f"n_bench_num_fields={schema.n_bench_num_fields}) but "
+                "benchmark_tables / bc_idx were not provided"
+            )
+        bc_idx_arr = np.asarray(bc_idx)
+        if bc_idx_arr.shape != (N,):
+            raise ValueError(f"bc_idx shape {bc_idx_arr.shape} != ({N},)")
+        if benchmark_tables.benchmark_cat_ids.shape[1] != int(
+            schema.n_bench_cat_fields
+        ):
+            raise ValueError(
+                "benchmark_tables.benchmark_cat_ids has "
+                f"{benchmark_tables.benchmark_cat_ids.shape[1]} fields != "
+                f"schema.n_bench_cat_fields {schema.n_bench_cat_fields}"
+            )
+        if benchmark_tables.benchmark_num.shape[1] != 2 * int(
+            schema.n_bench_num_fields
+        ):
+            raise ValueError(
+                "benchmark_tables.benchmark_num has "
+                f"{benchmark_tables.benchmark_num.shape[1]} cols != "
+                f"2 * schema.n_bench_num_fields {2 * schema.n_bench_num_fields}"
             )
 
     out = np.zeros((N, schema.feature_dim), dtype=np.float32)
@@ -671,15 +914,19 @@ def build_member_features(
         np.float32, copy=False
     )
 
+    # ---- per-row redaction mask (hoisted so every downstream block can
+    # reference it without a possibly-unbound hazard). None when there is
+    # no per-row redaction signal at all. ----
+    red = np.asarray(bc_redacted, dtype=bool) if bc_redacted is not None else None
+
     # ---- condition one-hot ----
-    if bc_redacted is None:
+    if red is None:
         for i, c in enumerate(conditions):
             col = schema.condition_to_col.get(_canonicalize_condition(c), 0)
             out[i, schema.offset_cond + col] = 1.0
     else:
         # Per-row redaction: redacted rows leave the entire cond block
         # at zero; non-redacted rows light up their canonical column.
-        red = np.asarray(bc_redacted, dtype=bool)
         for i, c in enumerate(conditions):
             if bool(red[i]):
                 continue
@@ -694,7 +941,7 @@ def build_member_features(
         # If the row is bc-redacted, zero u_bc and the cross_theta_u_bc
         # block. cross_theta_u_s remains nonzero -- it depends only on
         # subject-side state and is not affected by bc redaction.
-        if bc_redacted is not None:
+        if red is not None:
             u_bc_f32 = u_bc_f32 * (1.0 - red.astype(np.float32))[:, None]
         out[:, schema.offset_u_bc : schema.offset_u_bc + kbc] = u_bc_f32
 
@@ -710,6 +957,49 @@ def build_member_features(
             schema.offset_cross_theta_u_bc
             : schema.offset_cross_theta_u_bc + kbc
         ] = theta_col * u_bc_f32
+
+    # ---- Benchmark-metadata block (bench_cat + bench_num), v3 ----
+    if _has_bench_block:
+        # _has_bench_block implies both were validated as non-None above;
+        # re-assert here so the deref below is provably safe (not just at
+        # runtime). These are no-ops on the validated path.
+        assert benchmark_tables is not None and bc_idx is not None, (
+            "internal error: _has_bench_block is True but benchmark_tables / "
+            "bc_idx is None (should have been caught by validation above)"
+        )
+        bc_rows = np.asarray(bc_idx).astype(np.int64, copy=False)
+        # Per-row redaction mask: a cold benchmark contributes no
+        # benchmark metadata (entire block zeroed), mirroring cond.
+        if red is not None:
+            keep = (~red)
+        else:
+            keep = np.ones(N, dtype=bool)
+
+        # bench_cat one-hot.
+        n_bcat = int(schema.n_bench_cat_fields)
+        if n_bcat > 0:
+            bcat_ids = benchmark_tables.benchmark_cat_ids[bc_rows]  # [N, n_bcat]
+            base_bc = schema.offset_bench_cat
+            for fi, field_off in enumerate(schema.bench_cat_field_offsets):
+                card = int(schema.benchmark_cat_field_cardinalities[fi])
+                ids = np.clip(
+                    bcat_ids[:, fi].astype(np.int64, copy=False), 0, card - 1
+                )
+                lit = keep  # redacted rows leave the field all-zero
+                if int(lit.sum()) > 0:
+                    lit_rows = np.where(lit)[0]
+                    out[lit_rows, base_bc + field_off + ids[lit]] = 1.0
+
+        # bench_num scaled value + missingness.
+        n_bnum = int(schema.n_bench_num_fields)
+        if n_bnum > 0:
+            bnum = benchmark_tables.benchmark_num[bc_rows].astype(
+                np.float32, copy=False
+            )  # [N, 2 * n_bnum]
+            bnum = bnum * keep.astype(np.float32)[:, None]
+            out[
+                :, schema.offset_bench_num : schema.offset_bench_num + 2 * n_bnum
+            ] = bnum
 
     # Belt-and-suspenders against NaN / Inf in any block.
     np.nan_to_num(out, copy=False, nan=0.0, posinf=_CENTROID_DIST_CLAMP, neginf=0.0)
@@ -730,6 +1020,8 @@ def build_member_features_one(
     condition: object,
     bc_redacted: bool = False,
     u_bc: np.ndarray | None = None,   # [k_bc_factors] float32, required when schema enables bc block
+    benchmark_cat_ids: np.ndarray | None = None,  # [n_bench_cat_fields] int
+    benchmark_num: np.ndarray | None = None,      # [2 * n_bench_num_fields] float32
 ) -> np.ndarray:
     """Build a single ``[feature_dim]`` row. Used by the runtime ``predict``.
 
@@ -743,6 +1035,14 @@ def build_member_features_one(
 
     ``u_bc`` is required when ``schema.k_bc_factors > 0``; pass an
     all-zero vector for redacted / unknown bcs.
+
+    ``benchmark_cat_ids`` / ``benchmark_num`` (schema_version 3) are
+    required when the schema has a benchmark-metadata block. They are
+    the per-row slices of :class:`MemberBenchmarkTables` for this row's
+    ``bc_idx`` (``benchmark_cat_ids`` length ``n_bench_cat_fields``;
+    ``benchmark_num`` length ``2 * n_bench_num_fields``, interleaved
+    ``[value, miss, value, miss, ...]``). ``bc_redacted=True`` zeroes
+    the entire benchmark block too.
     """
     out = np.zeros(schema.feature_dim, dtype=np.float32)
 
@@ -820,6 +1120,51 @@ def build_member_features_one(
             : schema.offset_cross_theta_u_bc + kbc
         ] = theta_val * u_bc_use
 
+    # ---- Benchmark-metadata block (bench_cat + bench_num), v3 ----
+    n_bcat = int(schema.n_bench_cat_fields)
+    n_bnum = int(schema.n_bench_num_fields)
+    if n_bcat > 0 or n_bnum > 0:
+        if benchmark_cat_ids is None and n_bcat > 0:
+            raise ValueError(
+                "schema has a benchmark-cat block but benchmark_cat_ids "
+                "was not provided (pass an all-MISSING vector for "
+                "redacted/unknown bcs)"
+            )
+        if benchmark_num is None and n_bnum > 0:
+            raise ValueError(
+                "schema has a benchmark-num block but benchmark_num "
+                "was not provided (pass zeros for redacted/unknown bcs)"
+            )
+        # Cold benchmark -> entire benchmark block stays zero.
+        if not bool(bc_redacted):
+            base_bc = schema.offset_bench_cat
+            if n_bcat > 0:
+                # n_bcat > 0 implies benchmark_cat_ids is non-None (the
+                # guard above raised otherwise); re-assert so the subscript
+                # is provably safe. No-op on the validated path.
+                assert benchmark_cat_ids is not None, (
+                    "internal error: n_bench_cat_fields > 0 but "
+                    "benchmark_cat_ids is None"
+                )
+                for fi, field_off in enumerate(schema.bench_cat_field_offsets):
+                    card = int(schema.benchmark_cat_field_cardinalities[fi])
+                    ci = int(benchmark_cat_ids[fi])
+                    if ci < 0 or ci >= card:
+                        ci = 1  # fall through to UNK
+                    out[base_bc + field_off + ci] = 1.0
+            if n_bnum > 0:
+                bnum_vec = np.asarray(benchmark_num, dtype=np.float32).reshape(-1)
+                if int(bnum_vec.shape[0]) != 2 * n_bnum:
+                    raise ValueError(
+                        f"benchmark_num shape {bnum_vec.shape} != "
+                        f"({2 * n_bnum},)"
+                    )
+                out[
+                    schema.offset_bench_num
+                    : schema.offset_bench_num + 2 * n_bnum
+                ] = bnum_vec
+        # else: redacted -> benchmark block left all-zero.
+
     # Belt-and-suspenders.
     np.nan_to_num(out, copy=False, nan=0.0, posinf=_CENTROID_DIST_CLAMP, neginf=0.0)
     return out
@@ -828,6 +1173,7 @@ def build_member_features_one(
 __all__ = [
     "MemberFeatureSchema",
     "MemberSubjectTables",
+    "MemberBenchmarkTables",
     "build_member_features",
     "build_member_features_one",
     "POOL_FEATURE_NAMES_DEFAULT",
