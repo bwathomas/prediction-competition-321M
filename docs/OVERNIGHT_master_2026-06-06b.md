@@ -71,6 +71,24 @@ F. Keep all 3 tabs alive every wakeup; commit+push every code change; update thi
 - Keep-alive: running any status cell each wakeup counts as activity (idle disconnect ~90min).
 - Per-tab launch cells (current): colab2 `lIYdn1woOS1n`, colab `n1mDQLlVoB47`, colab3 `OkodTZyfxfwo`.
 
+## ⭐ USER DIRECTIVE (2026-06-06, going to bed): GREEDY FEATURE ABLATION AFTER THE FIRST PASS
+The "first pass" = the full models now training (SHIP_MODE=full per archetype×fold×family).
+**As soon as a family's full models are done, run the greedy feature ablation for it** = the
+per-archetype random-subspace feature-dropout LIBRARY (SHIP_MODE=library, rho~U[0.3,0.9]) ->
+greedy ensemble selection (greedy_select.py, Caruana: with-replacement + sorted-init + bagged)
+over the cached member OOF, per archetype, compared vs the full-model baseline NLL. This is the
+core deliverable — do NOT stop at the full pass. Launch libraries via the SUBPROCESS runner
+(scripts/ship/run_one.py, commit 0adfb27) for OOM isolation. SAVE_MODELS=1 throughout.
+Speed order logreg,xgb,et,fm,mlp then T2 (cnn,dae,ft after smoke). Then Layer-3 tree stacks.
+
+## OOM AUDIT (14:12) — runs CANNOT OOM on current tabs
+Measured peak during assembly: ~31-38GB RSS on 167GB tabs (>4x headroom); GPU 0-7.6/80GB.
+3 historical OOM causes all eliminated: (1) 12GB qwen box -> now 167GB A100; (2) ExtraTrees
+unlimited-depth+n_jobs=-1 -> capped (max_depth12/leaf50/jobs4, 5dfa088); (3) concurrent
+assemblies (lgai sweep+fm) -> drivers now strictly SEQUENTIAL (one model/tab at a time).
+Residual: accumulation over 15 sequential in-thread runs -> mitigated by run_one.py subprocess
+isolation for the library phase (full reclaim per run; an OOM kills only the subprocess).
+
 ## CURRENT STATE (14:10) — ALL 3 TABS HEALTHY, TRAINING
 - User restarted all 3 → all now **A100-80GB / 167GB RAM**. qwen (colab2) RESTORED (new host
   2885a6160e7f): Drive mounted (cached auth, no hang), pc321 cloned @ bba8ed9, deps OK.
