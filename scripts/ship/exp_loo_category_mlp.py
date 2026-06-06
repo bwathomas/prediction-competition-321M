@@ -136,11 +136,23 @@ SEED = 0
 INNER_FOLDS = 5                 # GroupKFold(item_key) over the OOF rows for the LGB stack
 # 'full' = unredacted 3-fold CV over every labeled row; 'ship' = redacted 264k 2-fold sample.
 ROW_SOURCE = os.environ.get("SHIP_ROW_SOURCE", "full").strip().lower()
-STATUS_PATH = f"/content/exp_loo_{FAMILY}_{ROW_SOURCE}_fold{OOF_FOLD}.json"   # family+source+fold
+# Base learner for the leave-one-kind-out members: 'mlp' (default) or 'lgbm' (LightGBM on the
+# dense derived feature groups + a PCA item-embedding kind — design (b), to test whether the
+# item embedding helps trees, which AIDE never tested).
+MODEL = os.environ.get("SHIP_MODEL", "mlp").strip().lower()
+PCA_DIM = int(os.environ.get("SHIP_PCA_DIM", "64"))   # PCA dim of item embedding for lgbm
+# LightGBM hyperparameters (fixed across all members; only the omitted kind varies).
+LGB_HP = dict(objective="cross_entropy", learning_rate=0.05, num_leaves=128, max_depth=-1,
+              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+              min_child_samples=100, lambda_l1=1.0, lambda_l2=2.0, verbosity=-1, seed=SEED)
+LGB_ROUNDS = int(os.environ.get("SHIP_LGB_ROUNDS", "1500"))   # max; early-stopped on item-grouped val
+_TAG = (f"{ROW_SOURCE}_fold{OOF_FOLD}" if MODEL == "mlp"
+        else f"{MODEL}_{ROW_SOURCE}_fold{OOF_FOLD}")
+STATUS_PATH = f"/content/exp_loo_{FAMILY}_{_TAG}.json"
 # Persist every trained model + result to Drive (survives runtime recycle), reloadable.
-# source+fold-specific subdir so runs never clobber each other.
+# model+source+fold-specific subdir so runs never clobber each other.
 SAVE_ROOT = os.environ.get("SHIP_EXP_SAVE_ROOT",
-                           f"{DRIVE_ROOT}/ship/exp_loo/{FAMILY}/{ROW_SOURCE}_fold{OOF_FOLD}")
+                           f"{DRIVE_ROOT}/ship/exp_loo/{FAMILY}/{_TAG}")
 SAVE_MODELS = os.environ.get("SHIP_SAVE_MODELS", "1") != "0"
 _EPS = 1.0e-6
 
@@ -205,6 +217,8 @@ def fn():
         from src.mlp_member import fit_mlp_member
         import lightgbm as lgb
         from sklearn.model_selection import GroupKFold
+        if MODEL == "lgbm":
+            from sklearn.decomposition import PCA
 
         driver_fam = FAM_ALIAS[FAMILY]
         slug = FAMILY_SLUG[driver_fam]
@@ -387,7 +401,56 @@ def fn():
         for j, r in enumerate(oof_idx):
             oof_item_emb[j] = item_emb[item_emb_idx[str(tr_item[r])]]
 
-        # ---- (6) the fit/predict primitive ----------------------------------------
+        # ---- (5b) lgbm only: PCA item-embedding kind (design (b)) ------------------
+        # AIDE never fed item embeddings to trees; this adds a PCA-reduced item-embedding
+        # GROUP so leave-out[item_emb_pca] vs full measures whether it helps LightGBM.
+        # PCA is label-free; fit on TRAIN unique items, transform all, gather per row.
+        pca_obj = None
+        if MODEL == "lgbm":
+            train_uniq = np.unique(row_to_uniq[train_idx])
+            pdim = int(min(PCA_DIM, item_emb_unique.shape[1], len(train_uniq)))
+            pca_obj = PCA(n_components=pdim, random_state=SEED)
+            pca_obj.fit(item_emb_unique[train_uniq])
+            emb_pca_uniq = pca_obj.transform(item_emb_unique).astype(np.float32)
+            Xpca = emb_pca_uniq[row_to_uniq].astype(np.float32)          # [N, pdim]
+            dense_full = np.concatenate([dense_full, Xpca], axis=1).astype(np.float32)
+            dense_group_of_col = np.concatenate(
+                [dense_group_of_col, np.array(["item_emb_pca"] * pdim, dtype=object)])
+            dense_names_full = dense_names_full + tuple(f"item_emb_pca__c{i}" for i in range(pdim))
+            cat_ncols["item_emb_pca"] = pdim
+            step("pca_emb_ready", pca_dim=pdim,
+                 explained_var=round(float(pca_obj.explained_variance_ratio_.sum()), 4))
+
+        # ---- (6-lgbm) LightGBM fit/predict primitive ------------------------------
+        def fit_and_predict_oof_lgbm(*, drop_dense_group, save_dir=None):
+            """Train one LightGBM on TRAIN rows over the dense groups except the omitted one
+            (groups include the 8 AIDE groups + item_emb_pca); predict OOF rows. Early-stopped
+            on an item-grouped internal val. Saves the booster (lgb.Booster.save_model)."""
+            if drop_dense_group is None:
+                col_mask = np.ones(dense_full.shape[1], dtype=bool)
+            else:
+                col_mask = dense_group_of_col != drop_dense_group
+            dnames = [n for n, k in zip(dense_names_full, col_mask) if k]
+            Xtr = dense_full[train_idx][:, col_mask]
+            Xoof = dense_full[oof_idx][:, col_mask]
+            ytr = y[train_idx]
+            vmask = (row_to_uniq[train_idx] % 10 == 0)                    # item-grouped val
+            dtr = lgb.Dataset(Xtr[~vmask], label=ytr[~vmask].astype(np.float64),
+                              feature_name=dnames)
+            dva = lgb.Dataset(Xtr[vmask], label=ytr[vmask].astype(np.float64), reference=dtr)
+            booster = lgb.train(LGB_HP, dtr, num_boost_round=LGB_ROUNDS, valid_sets=[dva],
+                                callbacks=[lgb.early_stopping(50, verbose=False),
+                                           lgb.log_evaluation(0)])
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                booster.save_model(str(Path(save_dir) / "model.txt"),
+                                   num_iteration=booster.best_iteration)
+            p = booster.predict(Xoof, num_iteration=booster.best_iteration)
+            vl = float(list(booster.best_score.get("valid_0", {}).values())[0]) \
+                if booster.best_score else float("nan")
+            return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), vl
+
+        # ---- (6) the MLP fit/predict primitive ------------------------------------
         def fit_and_predict_oof(*, use_item, use_subject, drop_dense_group, tag, seed_off,
                                 save_dir=None):
             """Train one MLP on TRAIN rows with all categories except the omitted one;
@@ -447,39 +510,55 @@ def fn():
         # These are common to all 11 MLPs (same train rows) and are required to apply a
         # reloaded MlpMemberState to new rows: subject_key->id, and the dense column layout.
         models_dir = Path(SAVE_ROOT) / "models"
+        categories = (DENSE_GROUPS + ["item_emb_pca"]) if MODEL == "lgbm" \
+            else (SPECIAL_CATS + DENSE_GROUPS)
         if SAVE_MODELS:
             shared_dir = Path(SAVE_ROOT) / "shared"
             shared_dir.mkdir(parents=True, exist_ok=True)
-            (shared_dir / "subj_vocab.json").write_text(
-                json.dumps({str(k): int(v) for k, v in subj_vocab.items()}), encoding="utf-8")
             (shared_dir / "dense_layout.json").write_text(json.dumps({
+                "model": MODEL,
                 "dense_names_full": list(dense_names_full),
                 "dense_group_of_col": [str(g) for g in dense_group_of_col.tolist()],
-                "categories": SPECIAL_CATS + DENSE_GROUPS,
+                "categories": categories,
                 "category_ncols": cat_ncols,
                 "d_emb": int(D_EMB), "subj_emb_dim": int(HP["subj_emb_dim"]),
                 "embedding_slug": slug,
                 "items_parquet": f"{emb_dir}/items.parquet",
             }, indent=2), encoding="utf-8")
+            if MODEL == "mlp":
+                (shared_dir / "subj_vocab.json").write_text(
+                    json.dumps({str(k): int(v) for k, v in subj_vocab.items()}), encoding="utf-8")
+            elif MODEL == "lgbm" and pca_obj is not None:
+                # PCA is reloadable: components + mean reproduce the item_emb_pca columns.
+                np.savez_compressed(shared_dir / "pca_item_emb.npz",
+                                    components=pca_obj.components_.astype(np.float32),
+                                    mean=pca_obj.mean_.astype(np.float32),
+                                    explained_variance_ratio=pca_obj.explained_variance_ratio_.astype(np.float32))
             step("shared_state_saved", save_root=str(SAVE_ROOT))
 
-        # ---- (7) full MLP (baseline) ----------------------------------------------
+        # ---- (7) full model (baseline) --------------------------------------------
         step("fit_full")
-        p_full, tl_full, vl_full = fit_and_predict_oof(
-            use_item=True, use_subject=True, drop_dense_group=None, tag="FULL", seed_off=900,
-            save_dir=(models_dir / "full") if SAVE_MODELS else None)
+        if MODEL == "lgbm":
+            p_full, tl_full, vl_full = fit_and_predict_oof_lgbm(
+                drop_dense_group=None, save_dir=(models_dir / "full") if SAVE_MODELS else None)
+        else:
+            p_full, tl_full, vl_full = fit_and_predict_oof(
+                use_item=True, use_subject=True, drop_dense_group=None, tag="FULL", seed_off=900,
+                save_dir=(models_dir / "full") if SAVE_MODELS else None)
         ll_full = soft_logloss(oof_y, p_full)
         step("full_done", soft_logloss_full=round(ll_full, 6), val_loss=round(vl_full, 5))
 
-        # ---- (8) leave-one-category-out MLPs --------------------------------------
-        categories = SPECIAL_CATS + DENSE_GROUPS          # 2 + 8 = 10 categories
+        # ---- (8) leave-one-kind-out members ---------------------------------------
+        # categories set above (mlp: 2 special + 8 dense; lgbm: 8 dense + item_emb_pca)
         p_loo = {}
         loo_ll = {}
         loo_meta = {}
         for ci, c in enumerate(categories):
             step(f"fit_loo_{c}", category=c, idx=ci + 1, of=len(categories))
             sdir = (models_dir / f"loo__{c}") if SAVE_MODELS else None
-            if c == "item_embedding":
+            if MODEL == "lgbm":
+                p, tl, vl = fit_and_predict_oof_lgbm(drop_dense_group=c, save_dir=sdir)
+            elif c == "item_embedding":
                 p, tl, vl = fit_and_predict_oof(
                     use_item=False, use_subject=True, drop_dense_group=None,
                     tag=c, seed_off=100 + ci, save_dir=sdir)
@@ -568,7 +647,8 @@ def fn():
 
         result = {
             "ok": True,
-            "experiment": "loo_category_mlp",
+            "experiment": f"loo_category_{MODEL}",
+            "model": MODEL, "row_source": ROW_SOURCE,
             "family": FAMILY, "code_version": CODE_VERSION,
             "n_rows_total": N, "n_train": n_train, "n_oof": n_oof,
             "oof_fold": OOF_FOLD, "n_folds": N_FOLDS, "split_seed": SPLIT_SEED,
@@ -576,7 +656,7 @@ def fn():
             "category_ncols": cat_ncols,
             "n_categories": len(cat_list),
             "categories": cat_list,
-            "hp": HP, "inner_folds": INNER_FOLDS,
+            "hp": (LGB_HP if MODEL == "lgbm" else HP), "inner_folds": INNER_FOLDS,
             "soft_logloss": {
                 "full_mlp_baseline": round(ll_full, 6),
                 "lgb_stack_of_loo": round(ll_stack, 6),
@@ -630,29 +710,42 @@ def fn():
             (Path(SAVE_ROOT) / "result.json").write_text(
                 json.dumps(result, indent=2, default=str), encoding="utf-8")
 
-            # reload-verify: load `full` + first LOO model from disk and re-predict OOF.
-            from src.mlp_member import MlpMemberState as _MMS
+            # reload-verify: load `full` + last LOO model from disk and re-predict OOF.
             reload_report = {}
             try:
-                first_loo = cat_list[-1]  # a dense-group LOO (uses item+subject+dense)
-                for tag, sd, p_ref, use_it, use_sub, dropg in [
-                    ("full", models_dir / "full", p_full, True, True, None),
-                    (f"loo__{first_loo}", models_dir / f"loo__{first_loo}",
-                     p_loo[first_loo], first_loo != "item_embedding",
-                     first_loo != "subject_embedding",
-                     first_loo if first_loo in DENSE_GROUPS else None),
-                ]:
-                    st = _MMS.load(sd)
-                    ap = {}
-                    if use_sub: ap["subject_ids"] = sid[oof_idx]
-                    if use_it: ap["item_emb"] = oof_item_emb
-                    if dropg is None and st.dense_dim > 0:
-                        ap["dense_X"] = dense_full[oof_idx]
-                    elif st.dense_dim > 0:
-                        cm = dense_group_of_col != dropg
-                        ap["dense_X"] = dense_full[oof_idx][:, cm]
-                    p2 = np.asarray(mlp_apply_batch(st, **ap), dtype=np.float64).reshape(-1)
-                    reload_report[tag] = round(float(np.max(np.abs(p2 - p_ref))), 8)
+                first_loo = cat_list[-1]
+                if MODEL == "lgbm":
+                    for tag, sd, p_ref, dropg in [
+                        ("full", models_dir / "full", p_full, None),
+                        (f"loo__{first_loo}", models_dir / f"loo__{first_loo}",
+                         p_loo[first_loo], first_loo),
+                    ]:
+                        bst = lgb.Booster(model_file=str(Path(sd) / "model.txt"))
+                        cm = (np.ones(dense_full.shape[1], dtype=bool) if dropg is None
+                              else dense_group_of_col != dropg)
+                        p2 = np.asarray(bst.predict(dense_full[oof_idx][:, cm]),
+                                        dtype=np.float64).reshape(-1)
+                        reload_report[tag] = round(float(np.max(np.abs(p2 - p_ref))), 8)
+                else:
+                    from src.mlp_member import MlpMemberState as _MMS
+                    for tag, sd, p_ref, use_it, use_sub, dropg in [
+                        ("full", models_dir / "full", p_full, True, True, None),
+                        (f"loo__{first_loo}", models_dir / f"loo__{first_loo}",
+                         p_loo[first_loo], first_loo != "item_embedding",
+                         first_loo != "subject_embedding",
+                         first_loo if first_loo in DENSE_GROUPS else None),
+                    ]:
+                        st = _MMS.load(sd)
+                        ap = {}
+                        if use_sub: ap["subject_ids"] = sid[oof_idx]
+                        if use_it: ap["item_emb"] = oof_item_emb
+                        if dropg is None and st.dense_dim > 0:
+                            ap["dense_X"] = dense_full[oof_idx]
+                        elif st.dense_dim > 0:
+                            cm = dense_group_of_col != dropg
+                            ap["dense_X"] = dense_full[oof_idx][:, cm]
+                        p2 = np.asarray(mlp_apply_batch(st, **ap), dtype=np.float64).reshape(-1)
+                        reload_report[tag] = round(float(np.max(np.abs(p2 - p_ref))), 8)
                 result["reload_verify_max_abs_diff"] = reload_report
                 ok_reload = all(v < 1e-5 for v in reload_report.values())
                 result["reload_verify_ok"] = bool(ok_reload)
