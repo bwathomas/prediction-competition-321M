@@ -144,7 +144,9 @@ ROW_SOURCE = os.environ.get("SHIP_ROW_SOURCE", "full").strip().lower()
 MODEL = os.environ.get("SHIP_MODEL", "mlp").strip().lower()
 IS_XGB = MODEL in ("lgbm", "xgb")
 # All non-mlp learners use the dense+PCA feature space with explicit column masks ("tree-style").
-TREE = MODEL in ("lgbm", "xgb", "et", "fm", "logreg")
+# Tier-2 neural members (cnn1d/dae/ft) consume the same dense+PCA matrix => tree-style assembly.
+TREE = MODEL in ("lgbm", "xgb", "et", "fm", "logreg", "cnn1d", "dae", "ft")
+NEURAL_T2 = MODEL in ("cnn1d", "dae", "ft")
 MODEL_TAG = "xgb" if IS_XGB else MODEL      # Drive dir / result tag (mlp handled separately)
 TREE_TAG = MODEL_TAG                          # back-compat alias (was hard-coded "xgb")
 # tree-style member hyperparams (per-model; env-overridable)
@@ -540,9 +542,38 @@ def fn():
             vl = float(getattr(state, "val_loss", float("nan")) or float("nan"))
             return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), vl
 
+        # ---- (6-tree) Tier-2 neural members (1D-CNN / DAE-MLP / FT-Transformer) ----
+        # Same dense+PCA + col_mask interface; torch on GPU, soft BCE. State saves a
+        # torch state_dict (model.pt) + std stats; apply reloads + forwards.
+        def _fit_neural(fit_fn, drop_dense_group, col_mask, save_dir):
+            from src.neural_members import apply_state_batch as _napply
+            col_mask, dnames = _tree_cols(drop_dense_group, col_mask)
+            Xtr = dense_full[train_idx][:, col_mask].astype(np.float32)
+            state = fit_fn(X=Xtr, y=y[train_idx].astype(np.float32), feature_names=dnames,
+                           seed=SEED, device="cuda", holdout_group_id=row_to_uniq[train_idx])
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True); state.save(save_dir)
+            p = _napply(state, dense_full[oof_idx][:, col_mask].astype(np.float32))
+            vl = float(getattr(state, "val_loss", float("nan")) or float("nan"))
+            return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), vl
+
+        def fit_and_predict_oof_cnn1d(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            from src.neural_members import fit_cnn1d_member
+            return _fit_neural(fit_cnn1d_member, drop_dense_group, col_mask, save_dir)
+
+        def fit_and_predict_oof_dae(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            from src.neural_members import fit_dae_mlp_member
+            return _fit_neural(fit_dae_mlp_member, drop_dense_group, col_mask, save_dir)
+
+        def fit_and_predict_oof_ft(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            from src.neural_members import fit_ft_transformer_member
+            return _fit_neural(fit_ft_transformer_member, drop_dense_group, col_mask, save_dir)
+
         _TREE_FIT = {"xgb": fit_and_predict_oof_xgb, "lgbm": fit_and_predict_oof_xgb,
                      "et": fit_and_predict_oof_et, "fm": fit_and_predict_oof_fm,
-                     "logreg": fit_and_predict_oof_logreg}
+                     "logreg": fit_and_predict_oof_logreg,
+                     "cnn1d": fit_and_predict_oof_cnn1d, "dae": fit_and_predict_oof_dae,
+                     "ft": fit_and_predict_oof_ft}
 
         def fit_and_predict_oof_tree(*, drop_dense_group=None, col_mask=None, save_dir=None):
             """Dispatch the tree-style primitive on MODEL (xgb/lgbm/et/fm/logreg)."""
@@ -551,16 +582,19 @@ def fn():
 
         # ---- (6) the MLP fit/predict primitive ------------------------------------
         def fit_and_predict_oof(*, use_item, use_subject, drop_dense_group, tag, seed_off,
-                                save_dir=None):
+                                save_dir=None, col_mask=None):
             """Train one MLP on TRAIN rows with all categories except the omitted one;
             predict OOF rows. ``drop_dense_group`` in {None} or a DENSE_GROUPS name.
-            If ``save_dir`` is given, persist the trained MlpMemberState there (reloadable
-            via MlpMemberState.load(save_dir))."""
-            # dense columns: drop the omitted group's columns (or keep all)
-            if drop_dense_group is None:
-                col_mask = np.ones(dense_full.shape[1], dtype=bool)
-            else:
-                col_mask = dense_group_of_col != drop_dense_group
+            ``col_mask`` (optional) overrides drop_dense_group with an explicit dense-column
+            mask — used by the random-subspace LIBRARY (item_emb + subject channels are kept;
+            only dense feature columns are dropped). If ``save_dir`` is given, persist the
+            trained MlpMemberState there (reloadable via MlpMemberState.load(save_dir))."""
+            # dense columns: explicit mask (library) > drop the omitted group > keep all
+            if col_mask is None:
+                if drop_dense_group is None:
+                    col_mask = np.ones(dense_full.shape[1], dtype=bool)
+                else:
+                    col_mask = dense_group_of_col != drop_dense_group
             dnames = tuple(n for n, keep_c in zip(dense_names_full, col_mask) if keep_c)
             dX_tr = dense_full[train_idx][:, col_mask]
             dX_oof = dense_full[oof_idx][:, col_mask]
@@ -697,9 +731,6 @@ def fn():
         # from (LIB_SEED, i) and uses the SAME columns in every fold (rgen independent of fold) ->
         # its per-fold OOF preds concatenate into one coherent full-OOF vector for that member.
         if LIBRARY:
-            if not TREE:
-                raise ValueError("SHIP_MODE=library currently supports tree models "
-                                 "(SHIP_MODEL in xgb/et/fm/logreg); mlp library is TODO")
             ncol = int(dense_full.shape[1])
             oof_subj = np.asarray([tr_subj[r] for r in oof_idx])
             mem_dir = Path(SAVE_ROOT) / "members"
@@ -724,7 +755,12 @@ def fn():
                 cm = np.zeros(ncol, dtype=bool); cm[cols] = True
                 # SAVE THE TRAINED MODEL (reloadable) per member, not just its OOF vector.
                 mdir = (mem_dir / f"m{i:04d}") if SAVE_MODELS else None
-                p, _, _ = fit_and_predict_oof_tree(col_mask=cm, save_dir=mdir)
+                if TREE:
+                    p, _, _ = fit_and_predict_oof_tree(col_mask=cm, save_dir=mdir)
+                else:  # mlp random-subspace member (keeps item_emb + subject channels)
+                    p, _, _ = fit_and_predict_oof(
+                        use_item=True, use_subject=True, drop_dense_group=None,
+                        tag=f"lib{i}", seed_off=1000 + i, save_dir=mdir, col_mask=cm)
                 mll = soft_logloss(oof_y, p)
                 if SAVE_MODELS:
                     mdir.mkdir(parents=True, exist_ok=True)
