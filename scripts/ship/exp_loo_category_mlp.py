@@ -688,6 +688,73 @@ def fn():
                     pass
             return result
 
+        # ---- (LIBRARY) random-subspace member library for greedy ensemble selection ---
+        # Canonical member-generation (deep-research verdict): train a rich library of
+        # random-subspace members, each on a random fraction rho of the dense feature COLUMNS,
+        # rho drawn PER-MEMBER from U[RHO_LO, RHO_HI] (Random Subspace Method; inherently
+        # multi-rho). Persist every member's OOF prediction vector + (rho, seed, cols) so
+        # greedy_select.py (Caruana ES) picks/weights on cached vectors. Member i is reproducible
+        # from (LIB_SEED, i) and uses the SAME columns in every fold (rgen independent of fold) ->
+        # its per-fold OOF preds concatenate into one coherent full-OOF vector for that member.
+        if LIBRARY:
+            if not TREE:
+                raise ValueError("SHIP_MODE=library currently supports tree models "
+                                 "(SHIP_MODEL in xgb/et/fm/logreg); mlp library is TODO")
+            ncol = int(dense_full.shape[1])
+            oof_subj = np.asarray([tr_subj[r] for r in oof_idx])
+            mem_dir = Path(SAVE_ROOT) / "members"
+            if SAVE_MODELS:
+                mem_dir.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(Path(SAVE_ROOT) / "oof_meta.npz",
+                                    oof_items=np.asarray(oof_items), oof_subj=oof_subj,
+                                    oof_y=oof_y.astype(np.float32))
+            step("library_start", n_cols=ncol, rho_lo=RHO_LO, rho_hi=RHO_HI,
+                 lib_m=LIB_M, lib_budget_s=LIB_BUDGET_S, seed=LIB_SEED)
+            members, t_lib0, i = [], time.time(), 0
+            while True:
+                if LIB_BUDGET_S > 0:
+                    if (time.time() - t_lib0) >= LIB_BUDGET_S and i > 0:
+                        break
+                elif i >= LIB_M:
+                    break
+                rgen = np.random.default_rng((LIB_SEED, i))   # fold-independent => coherent OOF
+                rho = float(rgen.uniform(RHO_LO, RHO_HI))
+                keep_n = max(1, int(round(rho * ncol)))
+                cols = np.sort(rgen.choice(ncol, size=keep_n, replace=False))
+                cm = np.zeros(ncol, dtype=bool); cm[cols] = True
+                p, _, _ = fit_and_predict_oof_tree(col_mask=cm)
+                mll = soft_logloss(oof_y, p)
+                if SAVE_MODELS:
+                    np.savez_compressed(mem_dir / f"m{i:04d}.npz",
+                                        p=np.asarray(p, dtype=np.float32), cols=cols.astype(np.int32),
+                                        rho=np.float32(rho), keep_n=np.int32(keep_n),
+                                        seed=np.int64(i), mll=np.float32(mll))
+                members.append({"idx": i, "rho": round(rho, 4), "keep_n": keep_n, "mll": round(mll, 6)})
+                if (i % 5) == 0 or LIB_BUDGET_S > 0:
+                    step("library_member", idx=i, rho=round(rho, 4), keep_n=keep_n, mll=round(mll, 6),
+                         t_elapsed=round(time.time() - t_lib0, 1),
+                         best_mll=round(min(m["mll"] for m in members), 6))
+                i += 1
+            mll_arr = [m["mll"] for m in members]
+            result = {"ok": True, "experiment": "subspace_library", "model": MODEL_TAG,
+                      "family": FAMILY, "oof_fold": OOF_FOLD, "row_source": ROW_SOURCE,
+                      "n_rows_total": N, "n_train": n_train, "n_oof": n_oof, "n_cols": ncol,
+                      "rho_lo": RHO_LO, "rho_hi": RHO_HI, "lib_seed": LIB_SEED,
+                      "n_members": len(members),
+                      "member_mll_mean": round(float(np.mean(mll_arr)), 6) if members else None,
+                      "member_mll_min": round(float(np.min(mll_arr)), 6) if members else None,
+                      "members": members,
+                      "t_per_member_s": round((time.time() - t_lib0) / max(1, len(members)), 2),
+                      "t_total_s": round(time.time() - t0, 1)}
+            if SAVE_MODELS:
+                (Path(SAVE_ROOT) / "result.json").write_text(
+                    json.dumps(result, indent=2, default=str), encoding="utf-8")
+            print(f"\nLIBRARY ({MODEL_TAG}) fam={FAMILY} fold={OOF_FOLD}: M={len(members)} members, "
+                  f"mean_mll={result['member_mll_mean']} min_mll={result['member_mll_min']} "
+                  f"~{result['t_per_member_s']}s/member", flush=True)
+            prog.update(stage="done", **result); _write_status(dict(prog))
+            return result
+
         # ---- (6b) persist SHARED reload state (subject vocab + dense layout) -------
         # These are common to all 11 MLPs (same train rows) and are required to apply a
         # reloaded MlpMemberState to new rows: subject_key->id, and the dense column layout.
