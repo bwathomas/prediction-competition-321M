@@ -116,6 +116,13 @@ RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
 ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
 
 ## RESULTS LOG (append)
+- TICK 19:48 — ✅ nemotron SELF-HEALED (4 dup threads finished their passes -> 0 lib threads,
+  164GB free). Launched ONE clean single lib driver (libclean: xgb,logreg,fm,mlp; xgb_f0 running,
+  151GB free) — clean no-contention progress. Cell now POLL-ONLY (no more re-launch). lgai still
+  2 threads (et-stuck + lib2 stalled@18, RAMfree 24); qwen still 2 lib2. They'll self-terminate
+  like nemotron -> then launch ONE clean driver each. Recovery is self-executing per tab. So the
+  morning-action is partially auto-running; user may not need to manually restart if tabs free
+  themselves. Stack 0.42519 stands.
 - TICK 19:37 — library STUCK: 0 completed libs/3 families; nemotron OOM-thrashing (RAMfree 4GB,
   4 dup threads, dmesg OOM-kills); lgai xgb0 stalled @18 (contended by old et-driver); qwen
   barely moving (2 lib2 + T2 ft_f1). STOPPED intervening (kernel-restart too risky while asleep;
