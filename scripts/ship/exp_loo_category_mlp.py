@@ -722,10 +722,13 @@ def fn():
                 keep_n = max(1, int(round(rho * ncol)))
                 cols = np.sort(rgen.choice(ncol, size=keep_n, replace=False))
                 cm = np.zeros(ncol, dtype=bool); cm[cols] = True
-                p, _, _ = fit_and_predict_oof_tree(col_mask=cm)
+                # SAVE THE TRAINED MODEL (reloadable) per member, not just its OOF vector.
+                mdir = (mem_dir / f"m{i:04d}") if SAVE_MODELS else None
+                p, _, _ = fit_and_predict_oof_tree(col_mask=cm, save_dir=mdir)
                 mll = soft_logloss(oof_y, p)
                 if SAVE_MODELS:
-                    np.savez_compressed(mem_dir / f"m{i:04d}.npz",
+                    mdir.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(mdir / "oof.npz",
                                         p=np.asarray(p, dtype=np.float32), cols=cols.astype(np.int32),
                                         rho=np.float32(rho), keep_n=np.int32(keep_n),
                                         seed=np.int64(i), mll=np.float32(mll))
