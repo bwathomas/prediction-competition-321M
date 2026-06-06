@@ -100,6 +100,9 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 16:07 — all 3 on capped et_f1 (~10min in; capped ET ~20min/fold on 1M rows, vs 70min
+  heavy — big win). RAM bounded (free 80/80/94GB). Counts unchanged qwen6/nemo7/lgai7 (et_f1
+  spans ~2 ticks). Healthy. No action.
 - TICK 15:57 — all 3 heavy et_f0 DONE (qwen 0.45344/70min, nemo 0.44695/75min, lgai 0.44849/67min
   — confirms heavy ET ~70min/fit). All now on CAPPED et_f1 (RAM freed: qwen 64->129GB). ET NLLs
   ~0.447-0.453 (weaker than xgb ~0.437-0.443, diverse class). Counts qwen6/nemo7/lgai7. Capped
