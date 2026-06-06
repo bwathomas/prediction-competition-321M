@@ -100,6 +100,11 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 16:47 — all 3 cleared ET, now on fm_f0 (GPU, light; nemo RAMfree 130). nemo/lgai 9/24,
+  qwen 8/24. ⚠️ qwen logreg_f2 GAP => qwen tops out at T1=14/15, so its t2_driver (waits for
+  15/15) will STALL. ACTION: backfill qwen logreg_f2 (run_one subprocess) once qwen full driver
+  finishes (after mlp); then qwen=15/15 -> t2_driver fires. nemo/lgai will hit 15/15 cleanly
+  after fm+mlp (~40min) -> launch their LIBRARIES then. RAM healthy.
 - TICK 16:37 — lgai ET COMPLETE (et 0.4485/0.4464/0.4475), now on fm_f0 (9/24). nemotron/qwen
   still on et_f2 (8/24, 7/24). fm next (fast GPU), then mlp -> T1 15/15. lgai will finish T1 first
   => launch its greedy-ablation LIBRARY when it hits 15/15. RAM 81-87GB free, healthy.
