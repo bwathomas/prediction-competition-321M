@@ -100,6 +100,16 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 14:17 — FULL-ONLY VALIDATED end-to-end. ⚠️ KEY: ROW_SOURCE=full = **UNREDACTED ~4.5M
+  rows** (qwen fold0: n_train=2.97M, n_oof=1.52M), NOT the 264k redacted sample. This is the
+  intended full-data base learners; explains the ~37GB assembly. logreg full_baseline mll:
+  nemotron 0.46439 (282s), lgai 0.46584 (264s), qwen 0.46~ (427s, cold cache). All 3 drivers
+  progressing in speed order (nemotron/lgai on logreg_f1; qwen finished logreg_f0).
+- ⚠️ LIBRARY BUDGET must be RECOMPUTED for 4.5M rows: my earlier 8h estimate (137 xgb members/
+  family) assumed 264k rows / ~70s per member. On ~3M train rows per fold, per-member time is
+  much higher (measure when libraries start; logreg full ≈ 270-430s). Pick SHIP_LIB_BUDGET_S /
+  SHIP_LIB_M from the MEASURED per-member time on 4.5M, not the old 264k numbers.
+
 - MLP LOO 3-fold (prior): qwen 0.4605→stack0.4385; nemotron 0.4519→0.4273; lgai 0.4467→0.4380.
   Cross-family small-tree stack of 3 MLP stacks = **0.42333** (best so far). Shipped baseline 0.43653.
 - XGBoost LOO done all 9; item_emb_pca helps trees. lgai sweep fold0 done (~70s/xgb member).
