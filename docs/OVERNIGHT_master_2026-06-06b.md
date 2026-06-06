@@ -100,6 +100,13 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 17:07 — ✅ LIBRARY PREP DONE (c7a02ef): SHIP_LIB_MAX_ROWS=1M subsamples each fold's train
+  rows once for ALL library members (fit primitives read train_idx as closure -> uniform); OOF
+  coverage preserved; members differ by feature subspace. Library now tractable for all 8
+  archetypes (+ ET keeps its own cap). LIBRARY LAUNCH PLAN (when a family hits T1 15/15): per
+  family x model[logreg,xgb,et,fm] x fold, SHIP_MODE=library SHIP_LIB_RHO=0.3,0.9 SHIP_LIB_M=~30
+  (or SHIP_LIB_BUDGET_S), via run_one.py subprocess driver (OOM-isolated). Progress: qwen8/nemo9/
+  lgai10, all on fm (~24min/fold). Healthy.
 - TICK 16:57 — fm SLOWER than expected: lgai fm_f0 0.45252, t 1418s (~24min, not ~5min). So
   EVERY archetype ~20-25min/fold on 4.5M rows. lgai on fm_f1 (10/24); nemo/qwen on fm_f0 (9,8).
   fm NLL 0.4525 weak (≈ET, < xgb). All healthy. lgai T1 15/15 in ~2hr (fm_f1/f2 + mlp x3).
