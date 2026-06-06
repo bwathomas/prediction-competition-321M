@@ -244,9 +244,12 @@ def fn():
             raise ValueError("tr_item / tr_subj length mismatch")
         step("loaded_rows", n_train=N_tr)
 
-        # restrict to rows that actually have features (the derivation's emb_set)
+        # restrict to rows that actually have features (the derivation's emb_set).
+        # Feature shards are keyed by the DRIVER family name (FAM_ALIAS): nemotron->llama,
+        # lgai->mistral (qwen->qwen). Use driver_fam so the cache path matches the shards
+        # on Drive (features/<driver_fam>/...), not the raw SHIP_FAMILY alias.
         store = FoldFeatureStore(FeatureCache(f"{DRIVE_ROOT}/features", code_version=CODE_VERSION),
-                                 embedding_family=FAMILY, seed=SPLIT_SEED, n_folds=N_FOLDS)
+                                 embedding_family=driver_fam, seed=SPLIT_SEED, n_folds=N_FOLDS)
         geo0 = store.cache.read_shard(store._key(GEOM_GROUPS[0], "all"))
         feat_items = set(str(k) for k in geo0.row_ids)
         geo_index = {str(k): i for i, k in enumerate(geo0.row_ids)}
