@@ -97,3 +97,14 @@ F. Keep all 3 tabs alive every wakeup; commit+push every code change; update thi
 - PLAN next ticks: (1) qwen blocked → morning. (2) as lgai/nemotron free, launch SHIP_MODE=full
   for each archetype×fold on those 2 families. (3) then libraries. (4) greedy ES + stacking.
 - Phase-0 timing t_total_s: still PENDING (lgai fm + nemotron et in progress; qwen blocked).
+- TICK 14:00 — RECLAIMED nemotron: the runaway ET was orphaned **pid 599 (121GB RSS, swapping)**,
+  separate from the kernel → `kill -9 599` freed it WITHOUT losing Drive. nemotron is a **167GB
+  high-RAM** tab (163GB free after kill). Launched **`nemo_full_driver`** (run_bg): SHIP_MODE=full
+  for logreg,xgb,et,fm,mlp × folds 0,1,2 sequentially (try/except per run). logreg_f0 validated
+  past `config`→`loaded_embeddings` (full-only path works; ET now uses the capped config).
+- lgai (colab3): fm still running healthy in loo mode (will finish full+LOO; harvest fm full,
+  ignore LOO). When it frees → launch an lgai full-only driver (same as nemo). Can't kill the
+  fm thread (torch, in-kernel, no child proc to target) without kernel restart.
+- qwen (colab2): STILL 12GB (free -g=12) — confirmed not upgraded. BLOCKED → morning.
+- LESSON: a runaway joblib/compute can be a separate PID killable without kernel restart
+  (check `ps`); a pure in-kernel torch thread cannot (only kernel restart, which loses Drive).
