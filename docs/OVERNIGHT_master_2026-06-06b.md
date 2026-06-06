@@ -100,6 +100,10 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 16:27 — all 3 on FINAL ET fold (et_f2, capped). et_f1 done: qwen 0.45044/24min,
+  nemo 0.44388/26min, lgai 0.44638/23min. Counts qwen7/nemo8/lgai8. RAM 81-82GB free, healthy.
+  After et_f2 -> fm (fast) -> mlp finishes T1(15/15) -> T2 drivers fire. THEN (cron must launch):
+  greedy-ablation LIBRARY per user directive (T2 driver only does T2 FULLS, not the library).
 - TICK 16:17 — lgai capped et_f1 DONE: NLL 0.44638, t 1364s (~23min) vs heavy et_f0 67min =>
   3x faster AND slightly BETTER than heavy (0.4464<0.4485) — row cap validated (forests don't
   need all 3M rows). lgai on et_f2 (8/24); nemotron/qwen finishing capped et_f1 (6-7/24). Healthy.
