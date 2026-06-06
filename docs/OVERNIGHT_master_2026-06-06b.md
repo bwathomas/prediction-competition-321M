@@ -100,6 +100,17 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 19:00 — LIBRARY DEBUG: the t_elapsed fix (cb67527) was on disk but a STALE
+  __pycache__/*.pyc kept run_one importing the buggy bytecode -> all library runs STILL crashed
+  after member 0. CLEARED all *.pyc on 3 tabs -> fresh subprocesses now compile fixed source.
+  ALSO: ET library members PATHOLOGICALLY SLOW (et_f0: 1 member in ~14min; 30-member ET lib =
+  hours) -> DROP et from the library (its full model already gives ET diversity in the 0.42519
+  stack). LIBRARY = xgb,logreg,fm,mlp only. ⚠️ messy thread state (old lib_drivers stuck on et;
+  nemotron has dup from my earlier re-run). RECOVERY (next tick): validate 1 fresh xgb library
+  run = 30 members (confirms pyc fix), then relaunch CLEAN lib_drivers [xgb,logreg,fm,mlp] per
+  tab (idempotent skip regenerates crashed xgb/logreg with fixed code); accept old drivers as
+  bounded background (subprocess-isolated, deterministic members, atomic oof => no corruption).
+  ✅ Stack 0.42519 is the solid delivered result regardless of library state.
 - TICK 18:56 — 🏆 STACK OF CURRENT 15 FULL MODELS (T1 x 3 fams, 4.5M rows, honest GroupKFold(item)
   5-fold LightGBM meta): **lgb_stack 0.42519** | logit-mean 0.43331 | best single nemotron.xgb
   0.43789. BEATS old shipped stack 0.43653 (-0.0113) and best single (-0.0127). vs old AIDE
