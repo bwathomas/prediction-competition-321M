@@ -134,10 +134,13 @@ HP = dict(
 )
 SEED = 0
 INNER_FOLDS = 5                 # GroupKFold(item_key) over the OOF rows for the LGB stack
-STATUS_PATH = f"/content/exp_loo_{FAMILY}_fold{OOF_FOLD}.json"   # family+fold parametrized
+# 'full' = unredacted 3-fold CV over every labeled row; 'ship' = redacted 264k 2-fold sample.
+ROW_SOURCE = os.environ.get("SHIP_ROW_SOURCE", "full").strip().lower()
+STATUS_PATH = f"/content/exp_loo_{FAMILY}_{ROW_SOURCE}_fold{OOF_FOLD}.json"   # family+source+fold
 # Persist every trained model + result to Drive (survives runtime recycle), reloadable.
-# Fold-specific subdir so the three held-out-fold runs never clobber each other.
-SAVE_ROOT = os.environ.get("SHIP_EXP_SAVE_ROOT", f"{DRIVE_ROOT}/ship/exp_loo/{FAMILY}/fold{OOF_FOLD}")
+# source+fold-specific subdir so runs never clobber each other.
+SAVE_ROOT = os.environ.get("SHIP_EXP_SAVE_ROOT",
+                           f"{DRIVE_ROOT}/ship/exp_loo/{FAMILY}/{ROW_SOURCE}_fold{OOF_FOLD}")
 SAVE_MODELS = os.environ.get("SHIP_SAVE_MODELS", "1") != "0"
 _EPS = 1.0e-6
 
@@ -235,15 +238,22 @@ def fn():
             labels_df["subject_key"].to_numpy(), labels_df["item_key"].to_numpy(),
             labels_df["label"].to_numpy())}
 
-        rows_dir = f"{DRIVE_ROOT}/ship/rows"
-        tr_item = _load_keys_npy(f"{rows_dir}/_tr_item.npy")
-        tr_subj = _load_keys_npy(f"{rows_dir}/_tr_subj.npy")
+        # ROW SOURCE (module-level ROW_SOURCE): 'full' = every labeled (subject,item) row ->
+        # all 3 nf3 folds populated (unredacted 3-fold CV: hold out fold f, train on other two).
+        # 'ship' = the curated redacted 264350-row sample (folds 1&2 only) AIDE trained on.
+        if ROW_SOURCE == "ship":
+            rows_dir = f"{DRIVE_ROOT}/ship/rows"
+            tr_item = _load_keys_npy(f"{rows_dir}/_tr_item.npy")
+            tr_subj = _load_keys_npy(f"{rows_dir}/_tr_subj.npy")
+        else:
+            tr_subj = [str(s) for s in labels_df["subject_key"].to_numpy()]
+            tr_item = [str(i) for i in labels_df["item_key"].to_numpy()]
         N_tr = len(tr_item)
-        if N_tr != N_TRAIN_EXPECTED:
+        if ROW_SOURCE == "ship" and N_tr != N_TRAIN_EXPECTED:
             print(f"[exp-loo] WARN: N_tr={N_tr} != expected {N_TRAIN_EXPECTED}", flush=True)
         if len(tr_subj) != N_tr:
             raise ValueError("tr_item / tr_subj length mismatch")
-        step("loaded_rows", n_train=N_tr)
+        step("loaded_rows", n_train=N_tr, row_source=ROW_SOURCE)
 
         # restrict to rows that actually have features (the derivation's emb_set).
         # Feature shards are keyed by the DRIVER family name (FAM_ALIAS): nemotron->llama,
