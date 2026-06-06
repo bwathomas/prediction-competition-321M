@@ -356,7 +356,7 @@ def fit_ft_transformer_member(*, X, y, feature_names, d_token=16, n_layers=2, n_
                               dropout=0.1, learning_rate=1e-3, weight_decay=1e-5, epochs=25,
                               batch_size=2048, val_fraction=0.1, early_stopping_patience=4,
                               seed=0, device=None, holdout_group_id=None, log_every=2,
-                              **_ignored) -> NeuralMemberState:
+                              step_fn=None, **_ignored) -> NeuralMemberState:
     return _train_torch_member(
         arch="ft_transformer",
         config={"d_token": d_token, "n_layers": n_layers, "n_heads": n_heads, "dropout": dropout},
@@ -364,7 +364,7 @@ def fit_ft_transformer_member(*, X, y, feature_names, d_token=16, n_layers=2, n_
         learning_rate=learning_rate, weight_decay=weight_decay, epochs=epochs,
         batch_size=batch_size, val_fraction=val_fraction,
         early_stopping_patience=early_stopping_patience, seed=seed, device=device,
-        log_every=log_every)
+        log_every=log_every, step_fn=step_fn)
 
 
 __all__ = ["NeuralMemberState", "apply_state_batch", "fit_cnn1d_member",

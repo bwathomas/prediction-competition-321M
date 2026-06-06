@@ -177,6 +177,10 @@ LR_EPOCHS = int(os.environ.get("SHIP_LR_EPOCHS", "200"))
 # them from the PCA-64 trees, and it stays feasible (full 4096-dim is infeasible for the
 # FT-Transformer's O(features^2) attention + risks OOM). Env override wins.
 PCA_DIM = int(os.environ.get("SHIP_PCA_DIM", "192" if NEURAL_T2 else "64"))
+# Neural speed knobs (0 => use each member's built-in default). ft default batch=2048 is tiny
+# (=> ~48 min/fold); raise batch massively + cut epochs for a big speedup.
+NEURAL_EPOCHS = int(os.environ.get("SHIP_NEURAL_EPOCHS", "0"))
+NEURAL_BATCH = int(os.environ.get("SHIP_NEURAL_BATCH", "0"))
 # XGBoost hyperparameters (fixed across all members; only the omitted kind varies). GPU.
 XGB_HP = dict(objective="reg:logistic", eval_metric="logloss", tree_method="hist",
               device="cuda", max_depth=8, eta=0.05, subsample=0.8, colsample_bytree=0.8,
@@ -612,8 +616,16 @@ def fn():
             from src.neural_members import apply_state_batch as _napply
             col_mask, dnames = _tree_cols(drop_dense_group, col_mask)
             Xtr = dense_full[train_idx][:, col_mask].astype(np.float32)
-            state = fit_fn(X=Xtr, y=y[train_idx].astype(np.float32), feature_names=dnames,
-                           seed=SEED, device="cuda", holdout_group_id=row_to_uniq[train_idx])
+            nkw = dict(X=Xtr, y=y[train_idx].astype(np.float32), feature_names=dnames,
+                       seed=SEED, device="cuda", holdout_group_id=row_to_uniq[train_idx],
+                       step_fn=lambda ep, nep, vl, bv: step(
+                           "fit_epoch", epoch=int(ep), n_epochs=int(nep),
+                           val_loss=round(float(vl), 5), best=round(float(bv), 5)))
+            if NEURAL_EPOCHS:
+                nkw["epochs"] = NEURAL_EPOCHS
+            if NEURAL_BATCH:
+                nkw["batch_size"] = NEURAL_BATCH
+            state = fit_fn(**nkw)
             if save_dir is not None and SAVE_MODELS:
                 Path(save_dir).mkdir(parents=True, exist_ok=True); state.save(save_dir)
             p = _napply(state, dense_full[oof_idx][:, col_mask].astype(np.float32))
