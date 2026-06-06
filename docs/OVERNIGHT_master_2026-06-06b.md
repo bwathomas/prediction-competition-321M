@@ -100,6 +100,14 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 18:31 — STATUS + NLL. Full-model NLL (mean/3 folds): xgb best — nemo 0.43788 (f1 0.43661,
+  ~= old shipped stack 0.43653!), lgai 0.44198, qwen 0.44722. et ~0.445-0.452, fm ~0.450-0.458,
+  mlp ~0.447-0.460, logreg ~0.462-0.469, cnn1d 0.4753 (weakest, as predicted). All SINGLE models
+  (no ensembling yet). nemotron T1 COMPLETE (15/15) -> launched nemotron LIBRARY. qwen 14/15
+  (logreg_f2 gap) -> launched logreg_f2 BACKFILL (->15/15 unblocks its t2_driver). lgai library
+  (xgb members) + T2 running. 3 families now in library/T2 phase. RAM: lgai 116, qwen 148, nemo 52
+  free. run_one subprocess isolation => concurrent library+T2 can't OOM the kernel.
+  NEXT: qwen library after backfill; validate library members emit; greedy_select over members.
 - TICK 18:09 — 🎉 lgai T1 COMPLETE (15/15). LAUNCHED lgai LIBRARY (lib_driver: xgb,logreg,et,fm,
   mlp x folds, M=30, capped 1M rows, run_one subprocess) — GREEDY-ABLATION DELIVERABLE STARTED
   (xgb_f0 assembling). ✅ T2 NEURAL VALIDATED: cnn1d_full_fold0 done ok=True (neural_members.py

@@ -796,14 +796,20 @@ def fn():
                 mll = soft_logloss(oof_y, p)
                 if SAVE_MODELS:
                     mdir.mkdir(parents=True, exist_ok=True)
-                    np.savez_compressed(mdir / "oof.npz",
+                    # atomic oof write (tmp + os.replace) so a concurrent/duplicate writer or a
+                    # crash can't leave a torn oof.npz that greedy_select would choke on.
+                    _tmp = mdir / "_oof_tmp.npz"
+                    np.savez_compressed(_tmp,
                                         p=np.asarray(p, dtype=np.float32), cols=cols.astype(np.int32),
                                         rho=np.float32(rho), keep_n=np.int32(keep_n),
                                         seed=np.int64(i), mll=np.float32(mll))
+                    os.replace(_tmp, mdir / "oof.npz")
                 members.append({"idx": i, "rho": round(rho, 4), "keep_n": keep_n, "mll": round(mll, 6)})
                 if (i % 5) == 0 or LIB_BUDGET_S > 0:
+                    # NOTE: step() already injects t_elapsed — do NOT pass it here (caused
+                    # TypeError: dict.update() got multiple values for 't_elapsed').
                     step("library_member", idx=i, rho=round(rho, 4), keep_n=keep_n, mll=round(mll, 6),
-                         t_elapsed=round(time.time() - t_lib0, 1),
+                         t_lib_elapsed=round(time.time() - t_lib0, 1),
                          best_mll=round(min(m["mll"] for m in members), 6))
                 i += 1
             mll_arr = [m["mll"] for m in members]
