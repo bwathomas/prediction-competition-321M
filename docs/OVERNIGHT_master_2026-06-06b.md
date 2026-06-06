@@ -35,7 +35,12 @@ Greedy-ES plateaus at a few dozen from a library of hundreds → these M are amp
 - ✅ `SHIP_MODE=library` built (tree models): M random-subspace members/fold, rho~U[lo,hi],
   per-member OOF saved to `<SAVE_ROOT>/members/m####.npz` + `oof_meta.npz`; stop on SHIP_LIB_M
   or SHIP_LIB_BUDGET_S. Commit 115cff2. Member i cols fold-independent => coherent OOF.
-- ⬜ MLP library: needs col_mask added to the MLP primitive (`fit_and_predict_oof`) — TODO.
+- ✅ SAVE ALL MODELS (user mandate): library members persist their trained model to
+  `members/m####/` (xgb model.json / et|fm|logreg .npz) + `members/m####/oof.npz`. Keep
+  SAVE_MODELS=1 everywhere (full + LOO + library + future mlp/T2). greedy_select reads
+  `members/*/oof.npz`. Commit f25e48a.
+- ⬜ MLP library: needs col_mask added to the MLP primitive (`fit_and_predict_oof`) — TODO
+  (must also pass save_dir per member so MLP library models are saved too).
 - ⬜ Tier-2 neural members (cnn1d, dae_mlp, ft_transformer): NOT in repo — must write torch
   impls with .save/.load + apply, smoke tiny, then wire into the dispatcher + library.
 - ⬜ `greedy_select.py`: extend to (a) per-archetype member-ES across the 3 folds' members/*.npz,
