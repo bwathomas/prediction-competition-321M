@@ -105,6 +105,12 @@ F. Keep all 3 tabs alive every wakeup; commit+push every code change; update thi
 - lgai (colab3): fm still running healthy in loo mode (will finish full+LOO; harvest fm full,
   ignore LOO). When it frees → launch an lgai full-only driver (same as nemo). Can't kill the
   fm thread (torch, in-kernel, no child proc to target) without kernel restart.
-- qwen (colab2): STILL 12GB (free -g=12) — confirmed not upgraded. BLOCKED → morning.
+- qwen (colab2): Colab DOWNGRADED it to free-tier CPU (12GB RAM, 2 cores, NO GPU —
+  nvidia-smi absent). Can't run here (OOM + no cuda). Hardware is UI/Google-provisioned; no
+  API to upgrade; bridge only attaches. Morning: user picks A100+High-RAM in UI to restore tab.
+- ✅ KEY WORKAROUND: tab != family. qwen's embeddings/features are on SHARED Drive, so the
+  **qwen FAMILY can run on any healthy GPU tab** via SHIP_FAMILY=qwen. Don't wait on the dead
+  tab — once nemotron/lgai have spare capacity, run the qwen family there too. The dead qwen
+  tab is just lost compute, NOT a blocker for the qwen-family deliverable.
 - LESSON: a runaway joblib/compute can be a separate PID killable without kernel restart
   (check `ps`); a pure in-kernel torch thread cannot (only kernel restart, which loses Drive).
