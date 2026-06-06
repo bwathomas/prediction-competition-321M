@@ -156,6 +156,10 @@ ET_TREES = int(os.environ.get("SHIP_ET_TREES", "150"))
 ET_MAX_DEPTH = int(os.environ.get("SHIP_ET_MAX_DEPTH", "12"))
 ET_MIN_LEAF = int(os.environ.get("SHIP_ET_MIN_LEAF", "50"))
 ET_JOBS = int(os.environ.get("SHIP_ET_JOBS", "4"))
+# ExtraTrees on the full ~3M train rows took ~20min/fit + ~105GB (n_jobs forks the data). A
+# forest does not need all rows — cap the ET training rows (seeded subsample) so ET is tractable
+# for the LIBRARY phase (many members) and lighter on memory. Set SHIP_ET_MAX_ROWS=0 to disable.
+ET_MAX_ROWS = int(os.environ.get("SHIP_ET_MAX_ROWS", "1000000"))
 FM_EPOCHS = int(os.environ.get("SHIP_FM_EPOCHS", "40"))
 LR_EPOCHS = int(os.environ.get("SHIP_LR_EPOCHS", "200"))
 # PCA dim of the item embedding for tree-style models. Neural members (cnn/dae/ft) get a
@@ -515,9 +519,12 @@ def fn():
             """sklearn ExtraTrees REGRESSOR on soft labels over a column subset (CPU, n_jobs=-1)."""
             from src.forest_member import fit_forest_member, apply_batch as _forest_apply
             col_mask, dnames = _tree_cols(drop_dense_group, col_mask)
-            Xtr = dense_full[train_idx][:, col_mask]
+            tr_idx = train_idx
+            if ET_MAX_ROWS and tr_idx.shape[0] > ET_MAX_ROWS:   # seeded row subsample (tractability)
+                tr_idx = np.sort(np.random.default_rng(SEED).choice(tr_idx, size=ET_MAX_ROWS, replace=False))
+            Xtr = dense_full[tr_idx][:, col_mask]
             state = fit_forest_member(
-                X=Xtr, y=y[train_idx], feature_names=dnames, classifier=False,
+                X=Xtr, y=y[tr_idx], feature_names=dnames, classifier=False,
                 n_estimators=ET_TREES, max_features=0.3, min_samples_leaf=ET_MIN_LEAF,
                 max_depth=ET_MAX_DEPTH, seed=SEED, num_threads=ET_JOBS)
             if save_dir is not None and SAVE_MODELS:
