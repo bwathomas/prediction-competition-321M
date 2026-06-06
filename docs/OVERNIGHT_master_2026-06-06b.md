@@ -100,6 +100,13 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 15:37 — ✅ FIX WITHOUT RESTART: the full driver re-reads exp.py per (model,fold) via
+  importlib, so `git checkout` of the capped-ET code (bc9e5ae) on all 3 tabs WHILE running means
+  et_f1/et_f2 will load ET_MAX_ROWS=1M (~13min) instead of heavy (~50min). et_f0 finishes heavy
+  (already-loaded module). Saves ~1.5h/tab, NO kernel restart, NO Drive risk. (git checkout is a
+  quick main-thread subprocess; ET runs in a daemon thread — no disruption.) Minor: et_f0 uncapped
+  vs et_f1/f2 capped (mixed ET baseline across folds) — acceptable; can re-run et_f0 capped later.
+  et_f0 still grinding (~50-58min); will finish then capped f1/f2 follow.
 - TICK 15:27 — et_f0 still grinding (qwen 39min/nemo 45min/lgai 48min), 203% CPU, RSS 105GB
   (computing, not deadlocked). Will finish; folds 1/2 follow heavy => ~2.5h/tab uncapped ET.
   Considered kernel-restart->capped-ET relaunch (would cut ET to ~13min/fold) but REJECTED as too
