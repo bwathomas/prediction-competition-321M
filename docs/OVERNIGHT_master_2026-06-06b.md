@@ -100,6 +100,13 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 18:09 — 🎉 lgai T1 COMPLETE (15/15). LAUNCHED lgai LIBRARY (lib_driver: xgb,logreg,et,fm,
+  mlp x folds, M=30, capped 1M rows, run_one subprocess) — GREEDY-ABLATION DELIVERABLE STARTED
+  (xgb_f0 assembling). ✅ T2 NEURAL VALIDATED: cnn1d_full_fold0 done ok=True (neural_members.py
+  works on real data!); t2_driver on cnn1d_f1. ✅ Concurrent library+T2 SAFE on 167GB: RAMfree
+  116GB (no OOM). mlp full NLLs lgai 0.4500/0.4462/0.4438. nemo/qwen on mlp (12/24 each).
+  NEXT: validate library xgb_f0 produces members/ + result; launch nemo/qwen libraries when
+  their T1 done; backfill qwen logreg_f2; then greedy_select.py (Caruana) over cached members.
 - TICK 17:57 — lgai mlp FAST (~5min/fold! vs fm/et ~24min): mlp_f0 0.45004, mlp_f1 0.44623 done,
   mlp_f2 running => lgai 14/15, ~5min to T1 complete. Single full MLP ~0.448 (weaker than xgb
   0.437; MLP's value was in stacking). nemo/qwen on fm_f2 (11,10). ⭐ SEQUENCING: when a family
