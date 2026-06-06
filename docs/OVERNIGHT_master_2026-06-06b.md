@@ -100,6 +100,17 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 14:22 — full_only logreg NLLs: qwen_f0 0.47131 | nemotron_f0 0.46439 f1 0.46125 |
+  lgai_f0 0.46584 f1 0.46360. (logreg = linear baseline, weakest; xgb/mlp expected lower.)
+  All 3 T1 drivers healthy (nemotron/lgai on logreg_f2; qwen catching up after cold-cache f0).
+- TICK 14:22 — T2 DRIVERS LAUNCHED on all 3 tabs (`t2_driver`): each waits for its family's 15
+  T1 fulls, THEN runs cnn1d/dae/ft × folds via run_one.py SUBPROCESS (OOM-isolated, idempotent
+  skip, 3h timeout/run; ft may truncate). Second run_bg thread per tab, idle-waits => no
+  contention with T1. So full pass = ALL 8 archetypes (T1 then T2) per family.
+- 10-min cron f1d71779 confirmed ACTIVE (recurring 2-59/10).
+- SEQUENCE REMINDER: after the FULL pass (T1+T2 fulls) → GREEDY FEATURE ABLATION (library +
+  greedy-ES) per archetype per user directive. Recompute library budget from MEASURED 4.5M-row
+  per-member times; likely T1 archetypes first; T2 libraries may be cost-limited.
 - TICK 14:17 — FULL-ONLY VALIDATED end-to-end. ⚠️ KEY: ROW_SOURCE=full = **UNREDACTED ~4.5M
   rows** (qwen fold0: n_train=2.97M, n_oof=1.52M), NOT the 264k redacted sample. This is the
   intended full-data base learners; explains the ~37GB assembly. logreg full_baseline mll:
