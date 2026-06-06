@@ -100,6 +100,12 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 14:27 — progress healthy, all 6 drivers (3 full + 3 t2-waiting) alive. Dataset confirmed
+  4,496,223 rows, y_mean 0.6918. NLLs: logreg ~0.460-0.471 (linear baseline). **lgai xgb_f0 =
+  0.44307** (strong; ~best-single territory). full-only run time ~254-282s (xgb ~= logreg; GPU
+  hist fast), qwen cold-cache f0 was 428s. Counts: qwen 2/15, nemotron 3/15, lgai 4/15 T1.
+  WATCH NEXT: `et` (ExtraTrees) full on 3M rows — the memory/time wildcard (now capped
+  depth12/leaf50/jobs4); confirm it completes in reasonable time + RSS next tick.
 - TICK 14:22 — full_only logreg NLLs: qwen_f0 0.47131 | nemotron_f0 0.46439 f1 0.46125 |
   lgai_f0 0.46584 f1 0.46360. (logreg = linear baseline, weakest; xgb/mlp expected lower.)
   All 3 T1 drivers healthy (nemotron/lgai on logreg_f2; qwen catching up after cold-cache f0).
