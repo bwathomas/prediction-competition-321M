@@ -151,6 +151,11 @@ MODEL_TAG = "xgb" if IS_XGB else MODEL      # Drive dir / result tag (mlp handle
 TREE_TAG = MODEL_TAG                          # back-compat alias (was hard-coded "xgb")
 # tree-style member hyperparams (per-model; env-overridable)
 ET_TREES = int(os.environ.get("SHIP_ET_TREES", "150"))
+# ExtraTrees memory/speed guards: unlimited depth + n_jobs=-1 forked ~120GB RSS and ran for
+# >18min on one fit (176k x 607). Cap depth, raise min-leaf, bound parallelism.
+ET_MAX_DEPTH = int(os.environ.get("SHIP_ET_MAX_DEPTH", "12"))
+ET_MIN_LEAF = int(os.environ.get("SHIP_ET_MIN_LEAF", "50"))
+ET_JOBS = int(os.environ.get("SHIP_ET_JOBS", "4"))
 FM_EPOCHS = int(os.environ.get("SHIP_FM_EPOCHS", "40"))
 LR_EPOCHS = int(os.environ.get("SHIP_LR_EPOCHS", "200"))
 # PCA dim of the item embedding for tree-style models. Neural members (cnn/dae/ft) get a
@@ -509,8 +514,8 @@ def fn():
             Xtr = dense_full[train_idx][:, col_mask]
             state = fit_forest_member(
                 X=Xtr, y=y[train_idx], feature_names=dnames, classifier=False,
-                n_estimators=ET_TREES, max_features=0.3, min_samples_leaf=20,
-                seed=SEED, num_threads=-1)
+                n_estimators=ET_TREES, max_features=0.3, min_samples_leaf=ET_MIN_LEAF,
+                max_depth=ET_MAX_DEPTH, seed=SEED, num_threads=ET_JOBS)
             if save_dir is not None and SAVE_MODELS:
                 Path(save_dir).mkdir(parents=True, exist_ok=True); state.save(save_dir)
             p = _forest_apply(state, dense_full[oof_idx][:, col_mask])
