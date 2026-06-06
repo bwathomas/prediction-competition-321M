@@ -39,10 +39,16 @@ Greedy-ES plateaus at a few dozen from a library of hundreds → these M are amp
   `members/m####/` (xgb model.json / et|fm|logreg .npz) + `members/m####/oof.npz`. Keep
   SAVE_MODELS=1 everywhere (full + LOO + library + future mlp/T2). greedy_select reads
   `members/*/oof.npz`. Commit f25e48a.
-- ⬜ MLP library: needs col_mask added to the MLP primitive (`fit_and_predict_oof`) — TODO
-  (must also pass save_dir per member so MLP library models are saved too).
-- ⬜ Tier-2 neural members (cnn1d, dae_mlp, ft_transformer): NOT in repo — must write torch
-  impls with .save/.load + apply, smoke tiny, then wire into the dispatcher + library.
+- ✅ MLP library: col_mask added to `fit_and_predict_oof`; SHIP_MODE=library now covers mlp
+  (random dense-column subspace, keeps item_emb+subject channels, saves model). Commit ac34a73.
+- ✅ Tier-2 neural members WRITTEN: `src/neural_members.py` (cnn1d/dae/ft) wired into
+  fit_and_predict_oof_tree + TREE set. SHIP_MODEL in {cnn1d,dae,ft}; full/LOO/library all work.
+  Commit ac34a73. ⚠️ NOT smoke-tested on real data yet — FIRST run each once (fold0, small,
+  SHIP_MODE=loo or a tiny library) and watch for: FT-Transformer OOM/slowness (attention over
+  ~600 tokens; cut batch_size or skip), DAE swap-noise shapes, torch state_dict reload-verify.
+  Fix+commit before launching their full libraries. Speed order puts them last anyway.
+- ALL 8 archetypes (logreg/xgb/et/fm/mlp/cnn1d/dae/ft) now run full/LOO/library; every member
+  saves its model (SAVE_MODELS=1).
 - ⬜ `greedy_select.py`: extend to (a) per-archetype member-ES across the 3 folds' members/*.npz,
   (b) hierarchical A→B tree stack, (c) flat C tree stack; compare. (Base greedy ES exists.)
 
