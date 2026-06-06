@@ -145,7 +145,7 @@ MODEL = os.environ.get("SHIP_MODEL", "mlp").strip().lower()
 IS_XGB = MODEL in ("lgbm", "xgb")
 # All non-mlp learners use the dense+PCA feature space with explicit column masks ("tree-style").
 # Tier-2 neural members (cnn1d/dae/ft) consume the same dense+PCA matrix => tree-style assembly.
-TREE = MODEL in ("lgbm", "xgb", "et", "fm", "logreg", "cnn1d", "dae", "ft")
+TREE = MODEL in ("lgbm", "xgb", "et", "etbig", "fm", "logreg", "cnn1d", "dae", "ft")
 NEURAL_T2 = MODEL in ("cnn1d", "dae", "ft")
 MODEL_TAG = "xgb" if IS_XGB else MODEL      # Drive dir / result tag (mlp handled separately)
 TREE_TAG = MODEL_TAG                          # back-compat alias (was hard-coded "xgb")
@@ -160,6 +160,16 @@ ET_JOBS = int(os.environ.get("SHIP_ET_JOBS", "4"))
 # forest does not need all rows — cap the ET training rows (seeded subsample) so ET is tractable
 # for the LIBRARY phase (many members) and lighter on memory. Set SHIP_ET_MAX_ROWS=0 to disable.
 ET_MAX_ROWS = int(os.environ.get("SHIP_ET_MAX_ROWS", "1000000"))
+# REAL correctly-sized forest (user mandate): the capped sklearn ET above (depth 12, 1M-row
+# subsample, 4 threads) is a tractability hack, not a true forest. MODEL='etbig' trains a
+# full-size GPU forest via cuML RandomForest on the A100 -> ALL train rows, proper depth, fast.
+# cuML has no literal ExtraTrees; GPU RF with strong column subsampling (max_features) fills the
+# same decorrelated bagged-tree role. Distinct Drive tag 'etbig' => does not clobber 'et'.
+ETB_TREES = int(os.environ.get("SHIP_ETB_TREES", "300"))
+ETB_DEPTH = int(os.environ.get("SHIP_ETB_DEPTH", "18"))
+ETB_MAXFEAT = float(os.environ.get("SHIP_ETB_MAXFEAT", "0.3"))
+ETB_BINS = int(os.environ.get("SHIP_ETB_BINS", "128"))
+ETB_MAX_ROWS = int(os.environ.get("SHIP_ETB_MAX_ROWS", "0"))   # 0 = ALL rows (real/full)
 FM_EPOCHS = int(os.environ.get("SHIP_FM_EPOCHS", "40"))
 LR_EPOCHS = int(os.environ.get("SHIP_LR_EPOCHS", "200"))
 # PCA dim of the item embedding for tree-style models. Neural members (cnn/dae/ft) get a
@@ -537,6 +547,34 @@ def fn():
             p = _forest_apply(state, dense_full[oof_idx][:, col_mask])
             return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), float("nan")
 
+        def fit_and_predict_oof_etbig(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            """REAL full-size forest via cuML GPU RandomForest (A100). Trains on ALL train rows
+            (no 1M cap), proper depth/tree-count; the fast, correctly-sized stand-in for the
+            crippled sklearn ET. Soft-label regressor; saves a pickled cuML model if requested."""
+            from cuml.ensemble import RandomForestRegressor as cuRF
+            col_mask, dnames = _tree_cols(drop_dense_group, col_mask)
+            tr_idx = train_idx
+            if ETB_MAX_ROWS and tr_idx.shape[0] > ETB_MAX_ROWS:
+                tr_idx = np.sort(np.random.default_rng(SEED).choice(tr_idx, size=ETB_MAX_ROWS, replace=False))
+            Xtr = np.ascontiguousarray(dense_full[tr_idx][:, col_mask], dtype=np.float32)
+            ytr = np.ascontiguousarray(y[tr_idx], dtype=np.float32)
+            m = cuRF(n_estimators=ETB_TREES, max_depth=ETB_DEPTH, max_features=ETB_MAXFEAT,
+                     n_bins=ETB_BINS, bootstrap=True, random_state=SEED, n_streams=1)
+            m.fit(Xtr, ytr)
+            Xoof = np.ascontiguousarray(dense_full[oof_idx][:, col_mask], dtype=np.float32)
+            p = m.predict(Xoof)
+            p = p.get() if hasattr(p, "get") else np.asarray(p)
+            p = np.clip(np.asarray(p, dtype=np.float64).reshape(-1), _EPS, 1.0 - _EPS)
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                try:
+                    import pickle
+                    with open(Path(save_dir) / "cuml_rf.pkl", "wb") as fh:
+                        pickle.dump(m, fh)
+                except Exception as _e:
+                    print("etbig model save skipped:", _e)
+            return p, float("nan"), float("nan")
+
         def fit_and_predict_oof_fm(*, drop_dense_group=None, col_mask=None, save_dir=None):
             """Factorization machine (FwFM, torch GPU) on soft labels over a column subset."""
             from src.fwfm_member import fit_fwfm_member, apply_state_batch as _fwfm_apply
@@ -595,7 +633,8 @@ def fn():
             return _fit_neural(fit_ft_transformer_member, drop_dense_group, col_mask, save_dir)
 
         _TREE_FIT = {"xgb": fit_and_predict_oof_xgb, "lgbm": fit_and_predict_oof_xgb,
-                     "et": fit_and_predict_oof_et, "fm": fit_and_predict_oof_fm,
+                     "et": fit_and_predict_oof_et, "etbig": fit_and_predict_oof_etbig,
+                     "fm": fit_and_predict_oof_fm,
                      "logreg": fit_and_predict_oof_logreg,
                      "cnn1d": fit_and_predict_oof_cnn1d, "dae": fit_and_predict_oof_dae,
                      "ft": fit_and_predict_oof_ft}
