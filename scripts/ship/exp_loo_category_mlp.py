@@ -182,6 +182,10 @@ SWEEP_FRACS = [float(x) for x in os.environ.get("SHIP_SWEEP_FRACS", "0.9,0.7,0.5
 # multi-rho). Save every member's OOF prediction vector (+ rho, seed, cols) so greedy ensemble
 # selection (Caruana) can pick/weight on cached vectors. Members are reproducible from (LIB_SEED, i).
 LIBRARY = SHIP_MODE == "library"
+# SHIP_MODE='full': train ONLY the full model (all features), save it + its OOF, write
+# result, and return — NO leave-one-kind-out members, NO stack. The per-archetype diversity
+# comes from the random-subspace LIBRARY, not LOO; 'full' is the Layer-0 baseline + timing.
+FULL_ONLY = SHIP_MODE == "full"
 LIB_M = int(os.environ.get("SHIP_LIB_M", "0"))                 # member count (0 => use wall budget)
 LIB_BUDGET_S = float(os.environ.get("SHIP_LIB_BUDGET_S", "0")) # per-cell wall budget for members (0 => use LIB_M)
 _rho = os.environ.get("SHIP_LIB_RHO", "0.3,0.9").split(",")
@@ -844,6 +848,28 @@ def fn():
                 save_dir=(models_dir / "full") if SAVE_MODELS else None)
         ll_full = soft_logloss(oof_y, p_full)
         step("full_done", soft_logloss_full=round(ll_full, 6), val_loss=round(vl_full, 5))
+
+        # ---- (7b) FULL-ONLY early return (no LOO; diversity comes from the LIBRARY) -
+        if FULL_ONLY:
+            result = {"ok": True, "experiment": f"full_only_{TREE_TAG if TREE else MODEL}",
+                      "model": (TREE_TAG if TREE else MODEL), "family": FAMILY,
+                      "oof_fold": OOF_FOLD, "row_source": ROW_SOURCE, "n_rows_total": N,
+                      "n_train": n_train, "n_oof": n_oof,
+                      "soft_logloss": {"full_baseline": round(ll_full, 6)},
+                      "full_val_loss": round(vl_full, 6),
+                      "t_total_s": round(time.time() - t0, 1)}
+            if SAVE_MODELS:
+                preds_dir = Path(SAVE_ROOT) / "preds"; preds_dir.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(preds_dir / "oof_preds.npz",
+                                    oof_items=np.asarray(oof_items),
+                                    oof_subj=np.asarray([tr_subj[r] for r in oof_idx]),
+                                    oof_y=oof_y.astype(np.float32), p_full=p_full.astype(np.float32))
+                (Path(SAVE_ROOT) / "result.json").write_text(
+                    json.dumps(result, indent=2, default=str), encoding="utf-8")
+            print(f"FULL-ONLY {MODEL} fam={FAMILY} fold={OOF_FOLD}: "
+                  f"full_mll={ll_full:.6f} ~{result['t_total_s']}s", flush=True)
+            prog.update(stage="done", **result); _write_status(dict(prog))
+            return result
 
         # ---- (8) leave-one-kind-out members ---------------------------------------
         # categories set above (mlp: 2 special + 8 dense; lgbm: 8 dense + item_emb_pca)
