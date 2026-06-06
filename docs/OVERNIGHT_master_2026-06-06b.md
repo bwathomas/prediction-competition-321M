@@ -100,6 +100,8 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 17:27 — lgai on fm_f2 (last fm fold, 11/24, leading); nemo/qwen fm_f1 (10,9). fm NLLs
+  ~0.450-0.460. Healthy, RAM bounded. lgai -> mlp x3 -> T1 15/15 (~1h+) then library launch.
 - TICK 17:17 — all 3 on fm_f1 (fm_f0 done: qwen 0.4597/nemo 0.4503/lgai 0.4525, ~24min). Counts
   qwen9/nemo10/lgai10. fm weak (~0.45-0.46). Healthy, RAM bounded. ~2h to nemo/lgai T1 15/15.
 - TICK 17:07 — ✅ LIBRARY PREP DONE (c7a02ef): SHIP_LIB_MAX_ROWS=1M subsamples each fold's train
