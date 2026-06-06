@@ -100,6 +100,17 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 18:34 — 🐞 LIBRARY BUG FOUND+FIXED (cb67527): step() double-passed t_elapsed -> every
+  library run crashed AFTER member 0 (1 member, no result.json). Fixed (t_lib_elapsed) + made
+  oof.npz write ATOMIC. git-pulled all 3 tabs => subsequent library subprocesses now generate 30
+  members + result.json. ⚠️ I ALSO double-launched (re-ran launch cells): nemotron has 2
+  lib_drivers, qwen 2 backfills — WASTEFUL but NOT corrupting (members deterministic from
+  (LIB_SEED,i) + atomic oof writes; subprocess isolation => no kernel OOM). Drivers are
+  single-pass forward loops => self-terminate. RECOVERY: early folds that crashed pre-fix
+  (lgai xgb_f0/1/2, logreg_f0, etc.) were SKIPPED by the forward drivers -> relaunch ONE clean
+  lib_driver per tab AFTER current passes finish (idempotent skip re-runs gappy folds, skips
+  completed). LESSON: overwrite launch cells to poll/pull content immediately after launching.
+  lgai T2 on ft_f0 (cnn1d+dae done). NEXT: validate a post-fix library run = 30 members.
 - TICK 18:31 — STATUS + NLL. Full-model NLL (mean/3 folds): xgb best — nemo 0.43788 (f1 0.43661,
   ~= old shipped stack 0.43653!), lgai 0.44198, qwen 0.44722. et ~0.445-0.452, fm ~0.450-0.458,
   mlp ~0.447-0.460, logreg ~0.462-0.469, cnn1d 0.4753 (weakest, as predicted). All SINGLE models
