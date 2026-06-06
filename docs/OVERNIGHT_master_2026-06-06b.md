@@ -100,6 +100,11 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 14:37 — xgb NLLs in: nemotron xgb_f1 **0.43661** (⭐ best single, ~= old shipped STACK
+  0.43653!), xgb_f0 0.43957; lgai xgb 0.4412-0.4431; qwen xgb_f0 0.44905. logreg ~0.46-0.47.
+  Counts qwen 3/24, nemotron 5/24, lgai 6/24. **ET NOW RUNNING (lgai et_f0)** — RAM healthy
+  (145GB free) => capped config keeping ET bounded; confirm et completes + timing next tick.
+  RAM free: qwen 94 / nemotron 64 / lgai 145 GB — all safe. full-only ~260-290s/run.
 - TICK 14:27 — progress healthy, all 6 drivers (3 full + 3 t2-waiting) alive. Dataset confirmed
   4,496,223 rows, y_mean 0.6918. NLLs: logreg ~0.460-0.471 (linear baseline). **lgai xgb_f0 =
   0.44307** (strong; ~best-single territory). full-only run time ~254-282s (xgb ~= logreg; GPU
