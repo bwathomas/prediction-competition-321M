@@ -90,6 +90,7 @@ import os
 import sys
 import time
 import traceback
+from pathlib import Path
 
 import numpy as np
 
@@ -133,7 +134,10 @@ HP = dict(
 )
 SEED = 0
 INNER_FOLDS = 5                 # GroupKFold(item_key) over the OOF rows for the LGB stack
-STATUS_PATH = "/content/exp_loo_qwen.json"
+STATUS_PATH = f"/content/exp_loo_{FAMILY}.json"   # family-parametrized (was hardcoded qwen)
+# Persist every trained model + result to Drive (survives runtime recycle), reloadable.
+SAVE_ROOT = os.environ.get("SHIP_EXP_SAVE_ROOT", f"{DRIVE_ROOT}/ship/exp_loo/{FAMILY}")
+SAVE_MODELS = os.environ.get("SHIP_SAVE_MODELS", "1") != "0"
 _EPS = 1.0e-6
 
 
@@ -370,9 +374,12 @@ def fn():
             oof_item_emb[j] = item_emb[item_emb_idx[str(tr_item[r])]]
 
         # ---- (6) the fit/predict primitive ----------------------------------------
-        def fit_and_predict_oof(*, use_item, use_subject, drop_dense_group, tag, seed_off):
+        def fit_and_predict_oof(*, use_item, use_subject, drop_dense_group, tag, seed_off,
+                                save_dir=None):
             """Train one MLP on TRAIN rows with all categories except the omitted one;
-            predict OOF rows. ``drop_dense_group`` in {None} or a DENSE_GROUPS name."""
+            predict OOF rows. ``drop_dense_group`` in {None} or a DENSE_GROUPS name.
+            If ``save_dir`` is given, persist the trained MlpMemberState there (reloadable
+            via MlpMemberState.load(save_dir))."""
             # dense columns: drop the omitted group's columns (or keep all)
             if drop_dense_group is None:
                 col_mask = np.ones(dense_full.shape[1], dtype=bool)
@@ -405,6 +412,11 @@ def fn():
                           subj_emb_dim=int(HP["subj_emb_dim"]))
             state = fit_mlp_member(**kw)
 
+            # persist the trained model (reloadable) BEFORE prediction, if requested
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                state.save(save_dir)
+
             # predict OOF rows (chunked apply)
             ap = dict()
             if use_subject:
@@ -417,10 +429,31 @@ def fn():
             return np.asarray(p, dtype=np.float64).reshape(-1), \
                 float(state.train_loss), float(state.val_loss)
 
+        # ---- (6b) persist SHARED reload state (subject vocab + dense layout) -------
+        # These are common to all 11 MLPs (same train rows) and are required to apply a
+        # reloaded MlpMemberState to new rows: subject_key->id, and the dense column layout.
+        models_dir = Path(SAVE_ROOT) / "models"
+        if SAVE_MODELS:
+            shared_dir = Path(SAVE_ROOT) / "shared"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            (shared_dir / "subj_vocab.json").write_text(
+                json.dumps({str(k): int(v) for k, v in subj_vocab.items()}), encoding="utf-8")
+            (shared_dir / "dense_layout.json").write_text(json.dumps({
+                "dense_names_full": list(dense_names_full),
+                "dense_group_of_col": [str(g) for g in dense_group_of_col.tolist()],
+                "categories": SPECIAL_CATS + DENSE_GROUPS,
+                "category_ncols": cat_ncols,
+                "d_emb": int(D_EMB), "subj_emb_dim": int(HP["subj_emb_dim"]),
+                "embedding_slug": slug,
+                "items_parquet": f"{emb_dir}/items.parquet",
+            }, indent=2), encoding="utf-8")
+            step("shared_state_saved", save_root=str(SAVE_ROOT))
+
         # ---- (7) full MLP (baseline) ----------------------------------------------
         step("fit_full")
         p_full, tl_full, vl_full = fit_and_predict_oof(
-            use_item=True, use_subject=True, drop_dense_group=None, tag="FULL", seed_off=900)
+            use_item=True, use_subject=True, drop_dense_group=None, tag="FULL", seed_off=900,
+            save_dir=(models_dir / "full") if SAVE_MODELS else None)
         ll_full = soft_logloss(oof_y, p_full)
         step("full_done", soft_logloss_full=round(ll_full, 6), val_loss=round(vl_full, 5))
 
@@ -431,18 +464,19 @@ def fn():
         loo_meta = {}
         for ci, c in enumerate(categories):
             step(f"fit_loo_{c}", category=c, idx=ci + 1, of=len(categories))
+            sdir = (models_dir / f"loo__{c}") if SAVE_MODELS else None
             if c == "item_embedding":
                 p, tl, vl = fit_and_predict_oof(
                     use_item=False, use_subject=True, drop_dense_group=None,
-                    tag=c, seed_off=100 + ci)
+                    tag=c, seed_off=100 + ci, save_dir=sdir)
             elif c == "subject_embedding":
                 p, tl, vl = fit_and_predict_oof(
                     use_item=True, use_subject=False, drop_dense_group=None,
-                    tag=c, seed_off=100 + ci)
+                    tag=c, seed_off=100 + ci, save_dir=sdir)
             else:  # a dense AIDE group
                 p, tl, vl = fit_and_predict_oof(
                     use_item=True, use_subject=True, drop_dense_group=c,
-                    tag=c, seed_off=100 + ci)
+                    tag=c, seed_off=100 + ci, save_dir=sdir)
             p_loo[c] = p
             loo_ll[c] = soft_logloss(oof_y, p)
             loo_meta[c] = {"train_loss": round(tl, 6), "val_loss": round(vl, 6),
@@ -477,6 +511,26 @@ def fn():
         if not np.isfinite(stacked).all():
             raise ValueError("LGB stacked OOF has non-finite entries (GroupKFold coverage gap)")
         ll_stack = soft_logloss(oof_y, np.clip(stacked, _EPS, 1 - _EPS))
+
+        # ---- (9b) DEPLOYABLE final stacker: fit on ALL held-out rows, persist --------
+        # The inner-CV `stacked` above is the HONEST score (each row predicted by a booster
+        # that never saw it). The final booster below is the reloadable ensemble model: it
+        # consumes the K LOO columns (in `cat_list` order) and emits the stacked probability.
+        if SAVE_MODELS:
+            stk_dir = Path(SAVE_ROOT) / "stacker"
+            stk_dir.mkdir(parents=True, exist_ok=True)
+            final_booster = lgb.train(
+                lgb_params, lgb.Dataset(P, label=oof_y.astype(np.float64)),
+                num_boost_round=n_rounds)
+            final_booster.save_model(str(stk_dir / "lgb_stack_final.txt"))
+            (stk_dir / "stacker_meta.json").write_text(json.dumps({
+                "input_columns": list(cat_list),     # column order the booster expects
+                "input_kind": "leave-one-category-out MLP OOF probability",
+                "objective": "cross_entropy", "num_boost_round": n_rounds,
+                "lgb_params": {k: v for k, v in lgb_params.items()},
+                "honest_inner_cv_soft_logloss": round(ll_stack, 6),
+            }, indent=2), encoding="utf-8")
+            step("final_stacker_saved", path=str(stk_dir / "lgb_stack_final.txt"))
 
         # secondary combiner: logit-mean blend of the LOO preds
         logit_mean = _sigmoid(np.mean(np.column_stack([_logit(p_loo[c]) for c in cat_list]), axis=1))
@@ -543,8 +597,81 @@ def fn():
         print("VERDICT:", verdict, flush=True)
         print("=" * 72 + "\n", flush=True)
 
+        # ---- (13) persist preds + result + manifest to DRIVE, and VERIFY reload ----
+        if SAVE_MODELS:
+            preds_dir = Path(SAVE_ROOT) / "preds"
+            preds_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                preds_dir / "oof_preds.npz",
+                oof_items=np.asarray(oof_items),
+                oof_subj=np.asarray([tr_subj[r] for r in oof_idx]),
+                oof_y=oof_y.astype(np.float32),
+                p_full=p_full.astype(np.float32),
+                stacked_oof=stacked.astype(np.float32),
+                logit_mean=logit_mean.astype(np.float32),
+                cat_list=np.asarray(cat_list),
+                P=P.astype(np.float32),
+                **{f"p_loo__{c}": p_loo[c].astype(np.float32) for c in cat_list},
+            )
+            (Path(SAVE_ROOT) / "result.json").write_text(
+                json.dumps(result, indent=2, default=str), encoding="utf-8")
+
+            # reload-verify: load `full` + first LOO model from disk and re-predict OOF.
+            from src.mlp_member import MlpMemberState as _MMS
+            reload_report = {}
+            try:
+                first_loo = cat_list[-1]  # a dense-group LOO (uses item+subject+dense)
+                for tag, sd, p_ref, use_it, use_sub, dropg in [
+                    ("full", models_dir / "full", p_full, True, True, None),
+                    (f"loo__{first_loo}", models_dir / f"loo__{first_loo}",
+                     p_loo[first_loo], first_loo != "item_embedding",
+                     first_loo != "subject_embedding",
+                     first_loo if first_loo in DENSE_GROUPS else None),
+                ]:
+                    st = _MMS.load(sd)
+                    ap = {}
+                    if use_sub: ap["subject_ids"] = sid[oof_idx]
+                    if use_it: ap["item_emb"] = oof_item_emb
+                    if dropg is None and st.dense_dim > 0:
+                        ap["dense_X"] = dense_full[oof_idx]
+                    elif st.dense_dim > 0:
+                        cm = dense_group_of_col != dropg
+                        ap["dense_X"] = dense_full[oof_idx][:, cm]
+                    p2 = np.asarray(mlp_apply_batch(st, **ap), dtype=np.float64).reshape(-1)
+                    reload_report[tag] = round(float(np.max(np.abs(p2 - p_ref))), 8)
+                result["reload_verify_max_abs_diff"] = reload_report
+                ok_reload = all(v < 1e-5 for v in reload_report.values())
+                result["reload_verify_ok"] = bool(ok_reload)
+                step("reload_verified", **reload_report, ok=ok_reload)
+            except Exception as _re:
+                result["reload_verify_error"] = repr(_re)
+                step("reload_verify_failed", err=repr(_re))
+
+            # manifest = single entry point for future reload
+            (Path(SAVE_ROOT) / "manifest.json").write_text(json.dumps({
+                "experiment": "loo_category_mlp", "family": FAMILY,
+                "save_root": str(SAVE_ROOT), "oof_fold": OOF_FOLD,
+                "models": ["full"] + [f"loo__{c}" for c in cat_list],
+                "model_format": "MlpMemberState.save -> {weights.npz, meta.json}; "
+                                "load via src.mlp_member.MlpMemberState.load(dir)",
+                "shared": {"subj_vocab": "shared/subj_vocab.json",
+                           "dense_layout": "shared/dense_layout.json"},
+                "stacker": "stacker/lgb_stack_final.txt (lgb.Booster; "
+                           "input cols = stacker/stacker_meta.json:input_columns)",
+                "preds": "preds/oof_preds.npz", "result": "result.json",
+                "reload_verify_ok": result.get("reload_verify_ok"),
+            }, indent=2), encoding="utf-8")
+            step("drive_persisted", save_root=str(SAVE_ROOT))
+
         prog.update(stage="done", **result)
         _write_status(dict(prog))
+        # mirror the final status to Drive too (survives runtime recycle)
+        if SAVE_MODELS:
+            try:
+                (Path(SAVE_ROOT) / "status_final.json").write_text(
+                    json.dumps(dict(prog), indent=2, default=str), encoding="utf-8")
+            except Exception:
+                pass
         return result
 
     except Exception as exc:
