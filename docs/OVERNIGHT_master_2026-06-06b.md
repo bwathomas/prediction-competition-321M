@@ -100,6 +100,9 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 16:37 — lgai ET COMPLETE (et 0.4485/0.4464/0.4475), now on fm_f0 (9/24). nemotron/qwen
+  still on et_f2 (8/24, 7/24). fm next (fast GPU), then mlp -> T1 15/15. lgai will finish T1 first
+  => launch its greedy-ablation LIBRARY when it hits 15/15. RAM 81-87GB free, healthy.
 - TICK 16:27 — all 3 on FINAL ET fold (et_f2, capped). et_f1 done: qwen 0.45044/24min,
   nemo 0.44388/26min, lgai 0.44638/23min. Counts qwen7/nemo8/lgai8. RAM 81-82GB free, healthy.
   After et_f2 -> fm (fast) -> mlp finishes T1(15/15) -> T2 drivers fire. THEN (cron must launch):
