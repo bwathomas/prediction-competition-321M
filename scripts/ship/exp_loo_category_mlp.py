@@ -195,6 +195,11 @@ LIB_BUDGET_S = float(os.environ.get("SHIP_LIB_BUDGET_S", "0")) # per-cell wall b
 _rho = os.environ.get("SHIP_LIB_RHO", "0.3,0.9").split(",")
 RHO_LO, RHO_HI = float(_rho[0]), float(_rho[1])
 LIB_SEED = int(os.environ.get("SHIP_LIB_SEED", "777"))
+# Library tractability: at ~24min/fold on full 4.5M rows, training MANY members is infeasible.
+# Subsample each fold's TRAIN rows once (seeded) for ALL library members — members differ by
+# feature subspace (the intended diversity); OOF prediction still covers ALL held-out rows.
+# Set SHIP_LIB_MAX_ROWS=0 to disable (train members on full rows).
+LIB_MAX_ROWS = int(os.environ.get("SHIP_LIB_MAX_ROWS", "1000000"))
 _TAG = (f"{ROW_SOURCE}_fold{OOF_FOLD}" if MODEL == "mlp"
         else f"{TREE_TAG}_{ROW_SOURCE}_fold{OOF_FOLD}")
 if SWEEP:
@@ -752,6 +757,13 @@ def fn():
         # its per-fold OOF preds concatenate into one coherent full-OOF vector for that member.
         if LIBRARY:
             ncol = int(dense_full.shape[1])
+            # Row subsample for tractability: reassign train_idx (the fit primitives read it as a
+            # closure, so all member fits below train on the subsample). OOF rows (oof_idx) are
+            # untouched -> full OOF coverage preserved. Same subsample for all members this fold.
+            if LIB_MAX_ROWS and train_idx.shape[0] > LIB_MAX_ROWS:
+                _rng_rows = np.random.default_rng((LIB_SEED, 777777))
+                train_idx = np.sort(_rng_rows.choice(train_idx, size=LIB_MAX_ROWS, replace=False))
+                step("library_row_subsample", n_train_sub=int(train_idx.shape[0]), cap=LIB_MAX_ROWS)
             oof_subj = np.asarray([tr_subj[r] for r in oof_idx])
             mem_dir = Path(SAVE_ROOT) / "members"
             if SAVE_MODELS:
