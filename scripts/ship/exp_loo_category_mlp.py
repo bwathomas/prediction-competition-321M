@@ -150,8 +150,18 @@ XGB_HP = dict(objective="reg:logistic", eval_metric="logloss", tree_method="hist
               device="cuda", max_depth=8, eta=0.05, subsample=0.8, colsample_bytree=0.8,
               min_child_weight=100.0, reg_lambda=2.0, reg_alpha=1.0, seed=SEED)
 XGB_ROUNDS = int(os.environ.get("SHIP_XGB_ROUNDS", "2000"))  # max; early-stopped on item-grouped val
+# SHIP_MODE: 'loo' (default leave-one-kind-out) or 'sweep' (random-subspace fractional leave-out:
+# for each keep-fraction rho, train M members on random rho-fractions of the feature COLUMNS,
+# stack, and record stack MLL + member accuracy + mean pairwise correlation — to map the
+# accuracy/diversity frontier and find the optimal leave-out fraction). Trees (xgb) only for now.
+SHIP_MODE = os.environ.get("SHIP_MODE", "loo").strip().lower()
+SWEEP = SHIP_MODE == "sweep"
+SWEEP_M = int(os.environ.get("SHIP_SWEEP_M", "12"))   # members per keep-fraction
+SWEEP_FRACS = [float(x) for x in os.environ.get("SHIP_SWEEP_FRACS", "0.9,0.7,0.5,0.3").split(",")]
 _TAG = (f"{ROW_SOURCE}_fold{OOF_FOLD}" if MODEL == "mlp"
         else f"{TREE_TAG}_{ROW_SOURCE}_fold{OOF_FOLD}")
+if SWEEP:
+    _TAG = "sweep_" + _TAG
 STATUS_PATH = f"/content/exp_loo_{FAMILY}_{_TAG}.json"
 # Persist every trained model + result to Drive (survives runtime recycle), reloadable.
 # model+source+fold-specific subdir so runs never clobber each other.
@@ -430,14 +440,14 @@ def fn():
                  explained_var=round(float(pca_obj.explained_variance_ratio_.sum()), 4))
 
         # ---- (6-tree) XGBoost-GPU fit/predict primitive ---------------------------
-        def fit_and_predict_oof_xgb(*, drop_dense_group, save_dir=None):
-            """Train one XGBoost (GPU) on TRAIN rows over the dense groups except the omitted
-            one (8 AIDE groups + item_emb_pca); predict OOF rows. reg:logistic on the soft
-            target, early-stopped on an item-grouped internal val. Saves the booster (JSON)."""
-            if drop_dense_group is None:
-                col_mask = np.ones(dense_full.shape[1], dtype=bool)
-            else:
-                col_mask = dense_group_of_col != drop_dense_group
+        def fit_and_predict_oof_xgb(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            """Train one XGBoost (GPU) on TRAIN rows over a column subset; predict OOF rows.
+            reg:logistic on the soft target, early-stopped on an item-grouped internal val.
+            Column subset = explicit ``col_mask`` if given, else all-but-``drop_dense_group``'s
+            columns, else all columns. Saves the booster (JSON) if ``save_dir`` given."""
+            if col_mask is None:
+                col_mask = (np.ones(dense_full.shape[1], dtype=bool) if drop_dense_group is None
+                            else dense_group_of_col != drop_dense_group)
             dnames = [n for n, k in zip(dense_names_full, col_mask) if k]
             ytr = y[train_idx]
             vmask = (row_to_uniq[train_idx] % 10 == 0)                    # item-grouped val
@@ -510,6 +520,89 @@ def fn():
             p = mlp_apply_batch(state, **ap)
             return np.asarray(p, dtype=np.float64).reshape(-1), \
                 float(state.train_loss), float(state.val_loss)
+
+        # ---- (SWEEP) random-subspace fractional-leave-out sweep (trees) -----------
+        # For each keep-fraction rho in SWEEP_FRACS: train SWEEP_M XGBoost members, each on a
+        # random rho-fraction of the dense feature COLUMNS; stack them (honest inner GroupKFold)
+        # and record stack MLL, member accuracy, and mean pairwise correlation. Maps the
+        # accuracy/diversity frontier vs leave-out fraction (LOO sits near rho~0.9). Returns
+        # early — the leave-one-kind-out machinery below is skipped in sweep mode.
+        if SWEEP:
+            if not TREE:
+                raise ValueError("SHIP_MODE=sweep currently supports SHIP_MODEL=xgb only")
+            ncol = int(dense_full.shape[1])
+            step("sweep_start", n_cols=ncol, fracs=SWEEP_FRACS, M=SWEEP_M)
+
+            def _inner_stack(P):
+                gkf = GroupKFold(n_splits=INNER_FOLDS)
+                out = np.full(P.shape[0], np.nan, dtype=np.float64)
+                sp = dict(objective="cross_entropy", learning_rate=0.05, num_leaves=31,
+                          min_child_samples=200, feature_fraction=0.9, bagging_fraction=0.9,
+                          bagging_freq=1, max_depth=-1, verbosity=-1, seed=SEED)
+                for itr, iva in gkf.split(P, oof_y, groups=oof_group):
+                    b = lgb.train(sp, lgb.Dataset(P[itr], label=oof_y[itr].astype(np.float64)),
+                                  num_boost_round=300)
+                    out[iva] = b.predict(P[iva])
+                return np.clip(out, _EPS, 1 - _EPS)
+
+            def _mean_pair_corr(P):
+                if P.shape[1] < 2:
+                    return float("nan")
+                C = np.corrcoef(P, rowvar=False); k = C.shape[0]
+                return float((C.sum() - k) / (k * (k - 1)))
+
+            p_full, _, _ = fit_and_predict_oof_xgb(col_mask=np.ones(ncol, dtype=bool))
+            ll_full = soft_logloss(oof_y, p_full)
+            step("sweep_full_done", full_mll=round(ll_full, 6))
+            sweep = {"full_mll": round(ll_full, 6), "n_cols": ncol, "M": SWEEP_M, "by_frac": {}}
+            for rho in SWEEP_FRACS:
+                keep_n = max(1, int(round(rho * ncol)))
+                preds, mlls = [], []
+                for mi in range(SWEEP_M):
+                    rgen = np.random.default_rng(10_000 * int(round(rho * 1000)) + mi)
+                    cols = rgen.choice(ncol, size=keep_n, replace=False)
+                    cm = np.zeros(ncol, dtype=bool); cm[cols] = True
+                    p, _, _ = fit_and_predict_oof_xgb(col_mask=cm)
+                    preds.append(p); mlls.append(soft_logloss(oof_y, p))
+                P = np.column_stack(preds)
+                ll_stack = soft_logloss(oof_y, _inner_stack(P))
+                rho_corr = _mean_pair_corr(P)
+                sweep["by_frac"][f"{rho:.2f}"] = {
+                    "keep_frac": rho, "keep_n": keep_n,
+                    "member_mll_mean": round(float(np.mean(mlls)), 6),
+                    "member_mll_min": round(float(np.min(mlls)), 6),
+                    "stack_mll": round(ll_stack, 6),
+                    "delta_stack_vs_full": round(ll_full - ll_stack, 6),
+                    "mean_pairwise_corr": round(rho_corr, 4),
+                }
+                step(f"sweep_rho{rho:.2f}_done", keep_n=keep_n, stack_mll=round(ll_stack, 6),
+                     delta=round(ll_full - ll_stack, 6), corr=round(rho_corr, 4))
+            result = {"ok": True, "experiment": "subspace_sweep_xgb", "model": TREE_TAG,
+                      "family": FAMILY, "oof_fold": OOF_FOLD, "row_source": ROW_SOURCE,
+                      "n_rows_total": N, "n_train": n_train, "n_oof": n_oof,
+                      "fracs": SWEEP_FRACS, "M": SWEEP_M, "sweep": sweep,
+                      "xgb_hp": XGB_HP, "t_total_s": round(time.time() - t0, 1)}
+            if SAVE_MODELS:
+                Path(SAVE_ROOT).mkdir(parents=True, exist_ok=True)
+                (Path(SAVE_ROOT) / "result.json").write_text(
+                    json.dumps(result, indent=2, default=str), encoding="utf-8")
+            print("\n" + "=" * 72, flush=True)
+            print(f"SUBSPACE SWEEP (xgb) family={FAMILY} fold={OOF_FOLD}  full={ll_full:.6f}", flush=True)
+            print(f"  {'keep':>6}{'keep_n':>9}{'memMLL':>11}{'stackMLL':>11}{'Δvs full':>11}{'meanρ':>9}", flush=True)
+            for rho in SWEEP_FRACS:
+                b = sweep["by_frac"][f"{rho:.2f}"]
+                print(f"  {rho:>6.2f}{b['keep_n']:>9}{b['member_mll_mean']:>11.6f}"
+                      f"{b['stack_mll']:>11.6f}{b['delta_stack_vs_full']:>+11.6f}{b['mean_pairwise_corr']:>9.3f}",
+                      flush=True)
+            print("=" * 72, flush=True)
+            prog.update(stage="done", **result); _write_status(dict(prog))
+            if SAVE_MODELS:
+                try:
+                    (Path(SAVE_ROOT) / "status_final.json").write_text(
+                        json.dumps(dict(prog), indent=2, default=str), encoding="utf-8")
+                except Exception:
+                    pass
+            return result
 
         # ---- (6b) persist SHARED reload state (subject vocab + dense layout) -------
         # These are common to all 11 MLPs (same train rows) and are required to apply a
