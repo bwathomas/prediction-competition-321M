@@ -142,8 +142,15 @@ ROW_SOURCE = os.environ.get("SHIP_ROW_SOURCE", "full").strip().lower()
 # feature groups + a PCA item-embedding kind — design (b), to test whether the item embedding
 # helps trees, which AIDE never tested. (The layer-2 meta-stacker stays LightGBM.)
 MODEL = os.environ.get("SHIP_MODEL", "mlp").strip().lower()
-TREE = MODEL in ("lgbm", "xgb")
-TREE_TAG = "xgb"
+IS_XGB = MODEL in ("lgbm", "xgb")
+# All non-mlp learners use the dense+PCA feature space with explicit column masks ("tree-style").
+TREE = MODEL in ("lgbm", "xgb", "et", "fm", "logreg")
+MODEL_TAG = "xgb" if IS_XGB else MODEL      # Drive dir / result tag (mlp handled separately)
+TREE_TAG = MODEL_TAG                          # back-compat alias (was hard-coded "xgb")
+# tree-style member hyperparams (per-model; env-overridable)
+ET_TREES = int(os.environ.get("SHIP_ET_TREES", "150"))
+FM_EPOCHS = int(os.environ.get("SHIP_FM_EPOCHS", "40"))
+LR_EPOCHS = int(os.environ.get("SHIP_LR_EPOCHS", "200"))
 PCA_DIM = int(os.environ.get("SHIP_PCA_DIM", "64"))   # PCA dim of item embedding for trees
 # XGBoost hyperparameters (fixed across all members; only the omitted kind varies). GPU.
 XGB_HP = dict(objective="reg:logistic", eval_metric="logloss", tree_method="hist",
@@ -158,10 +165,23 @@ SHIP_MODE = os.environ.get("SHIP_MODE", "loo").strip().lower()
 SWEEP = SHIP_MODE == "sweep"
 SWEEP_M = int(os.environ.get("SHIP_SWEEP_M", "12"))   # members per keep-fraction
 SWEEP_FRACS = [float(x) for x in os.environ.get("SHIP_SWEEP_FRACS", "0.9,0.7,0.5,0.3").split(",")]
+# SHIP_MODE='library': the CANONICAL member-generation method. Train a rich library of
+# random-subspace members, each keeping a fraction rho of the feature COLUMNS where rho is
+# drawn PER-MEMBER from U[RHO_LO, RHO_HI] (Random Subspace Method; the library is inherently
+# multi-rho). Save every member's OOF prediction vector (+ rho, seed, cols) so greedy ensemble
+# selection (Caruana) can pick/weight on cached vectors. Members are reproducible from (LIB_SEED, i).
+LIBRARY = SHIP_MODE == "library"
+LIB_M = int(os.environ.get("SHIP_LIB_M", "0"))                 # member count (0 => use wall budget)
+LIB_BUDGET_S = float(os.environ.get("SHIP_LIB_BUDGET_S", "0")) # per-cell wall budget for members (0 => use LIB_M)
+_rho = os.environ.get("SHIP_LIB_RHO", "0.3,0.9").split(",")
+RHO_LO, RHO_HI = float(_rho[0]), float(_rho[1])
+LIB_SEED = int(os.environ.get("SHIP_LIB_SEED", "777"))
 _TAG = (f"{ROW_SOURCE}_fold{OOF_FOLD}" if MODEL == "mlp"
         else f"{TREE_TAG}_{ROW_SOURCE}_fold{OOF_FOLD}")
 if SWEEP:
     _TAG = "sweep_" + _TAG
+if LIBRARY:
+    _TAG = f"lib_{MODEL_TAG}_fold{OOF_FOLD}" if MODEL != "mlp" else f"lib_mlp_fold{OOF_FOLD}"
 STATUS_PATH = f"/content/exp_loo_{FAMILY}_{_TAG}.json"
 # Persist every trained model + result to Drive (survives runtime recycle), reloadable.
 # model+source+fold-specific subdir so runs never clobber each other.
@@ -465,6 +485,70 @@ def fn():
             vl = float(bst.best_score) if bst.best_score is not None else float("nan")
             return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), vl
 
+        # ---- (6-tree) ExtraTrees / FM / LogReg fit/predict primitives -------------
+        # Same dense_full + col_mask interface as the xgb primitive (drop a kind, or an
+        # explicit mask). Each trains on TRAIN rows, predicts OOF rows, optionally saves a
+        # reloadable *MemberState. Soft (continuous-[0,1]) targets throughout = the metric.
+        def _tree_cols(drop_dense_group, col_mask):
+            if col_mask is None:
+                col_mask = (np.ones(dense_full.shape[1], dtype=bool) if drop_dense_group is None
+                            else dense_group_of_col != drop_dense_group)
+            dnames = [n for n, k in zip(dense_names_full, col_mask) if k]
+            return col_mask, dnames
+
+        def fit_and_predict_oof_et(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            """sklearn ExtraTrees REGRESSOR on soft labels over a column subset (CPU, n_jobs=-1)."""
+            from src.forest_member import fit_forest_member, apply_batch as _forest_apply
+            col_mask, dnames = _tree_cols(drop_dense_group, col_mask)
+            Xtr = dense_full[train_idx][:, col_mask]
+            state = fit_forest_member(
+                X=Xtr, y=y[train_idx], feature_names=dnames, classifier=False,
+                n_estimators=ET_TREES, max_features=0.3, min_samples_leaf=20,
+                seed=SEED, num_threads=-1)
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True); state.save(save_dir)
+            p = _forest_apply(state, dense_full[oof_idx][:, col_mask])
+            return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), float("nan")
+
+        def fit_and_predict_oof_fm(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            """Factorization machine (FwFM, torch GPU) on soft labels over a column subset."""
+            from src.fwfm_member import fit_fwfm_member, apply_state_batch as _fwfm_apply
+            col_mask, dnames = _tree_cols(drop_dense_group, col_mask)
+            Xtr = dense_full[train_idx][:, col_mask].astype(np.float32)
+            state = fit_fwfm_member(
+                X=Xtr, y=y[train_idx].astype(np.float32), feature_names=dnames,
+                k=16, epochs=FM_EPOCHS, batch_size=16384, standardize=True,
+                device="cuda", seed=SEED, holdout_group_id=row_to_uniq[train_idx])
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True); state.save(save_dir)
+            p = _fwfm_apply(state, dense_full[oof_idx][:, col_mask].astype(np.float32))
+            vl = float(getattr(state, "val_loss", float("nan")) or float("nan"))
+            return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), vl
+
+        def fit_and_predict_oof_logreg(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            """Torch logistic regression (BCE) on soft labels over a column subset (GPU)."""
+            from src.logreg_member import fit_logreg_member, apply_state_batch as _lr_apply
+            col_mask, dnames = _tree_cols(drop_dense_group, col_mask)
+            Xtr = dense_full[train_idx][:, col_mask].astype(np.float32)
+            state = fit_logreg_member(
+                X=Xtr, y=y[train_idx].astype(np.float32), feature_names=dnames,
+                epochs=LR_EPOCHS, batch_size=16384, standardize=True,
+                device="cuda", seed=SEED, holdout_group_id=row_to_uniq[train_idx])
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True); state.save(save_dir)
+            p = _lr_apply(state, dense_full[oof_idx][:, col_mask].astype(np.float32))
+            vl = float(getattr(state, "val_loss", float("nan")) or float("nan"))
+            return np.asarray(p, dtype=np.float64).reshape(-1), float("nan"), vl
+
+        _TREE_FIT = {"xgb": fit_and_predict_oof_xgb, "lgbm": fit_and_predict_oof_xgb,
+                     "et": fit_and_predict_oof_et, "fm": fit_and_predict_oof_fm,
+                     "logreg": fit_and_predict_oof_logreg}
+
+        def fit_and_predict_oof_tree(*, drop_dense_group=None, col_mask=None, save_dir=None):
+            """Dispatch the tree-style primitive on MODEL (xgb/lgbm/et/fm/logreg)."""
+            return _TREE_FIT[MODEL](drop_dense_group=drop_dense_group,
+                                    col_mask=col_mask, save_dir=save_dir)
+
         # ---- (6) the MLP fit/predict primitive ------------------------------------
         def fit_and_predict_oof(*, use_item, use_subject, drop_dense_group, tag, seed_off,
                                 save_dir=None):
@@ -637,7 +721,7 @@ def fn():
         # ---- (7) full model (baseline) --------------------------------------------
         step("fit_full")
         if TREE:
-            p_full, tl_full, vl_full = fit_and_predict_oof_xgb(
+            p_full, tl_full, vl_full = fit_and_predict_oof_tree(
                 drop_dense_group=None, save_dir=(models_dir / "full") if SAVE_MODELS else None)
         else:
             p_full, tl_full, vl_full = fit_and_predict_oof(
@@ -655,7 +739,7 @@ def fn():
             step(f"fit_loo_{c}", category=c, idx=ci + 1, of=len(categories))
             sdir = (models_dir / f"loo__{c}") if SAVE_MODELS else None
             if TREE:
-                p, tl, vl = fit_and_predict_oof_xgb(drop_dense_group=c, save_dir=sdir)
+                p, tl, vl = fit_and_predict_oof_tree(drop_dense_group=c, save_dir=sdir)
             elif c == "item_embedding":
                 p, tl, vl = fit_and_predict_oof(
                     use_item=False, use_subject=True, drop_dense_group=None,
