@@ -100,6 +100,13 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 15:27 — et_f0 still grinding (qwen 39min/nemo 45min/lgai 48min), 203% CPU, RSS 105GB
+  (computing, not deadlocked). Will finish; folds 1/2 follow heavy => ~2.5h/tab uncapped ET.
+  Considered kernel-restart->capped-ET relaunch (would cut ET to ~13min/fold) but REJECTED as too
+  risky autonomously: restart drops Drive, and if drive.mount needs an interactive popup post-
+  restart it bricks the tab till user wakes — loses more than the ~2h saved. HOLDING safe course:
+  let heavy ET fulls finish (valid full-data ET baselines); library uses capped ET. Light-touch
+  monitoring until ET completes (no safe action to take). Counts unchanged qwen5/nemo6/lgai6.
 - TICK 15:17 — et_f0 PATHOLOGICALLY SLOW: 29-38min at fit_full (qwen1768/nemo2142/lgai2277s),
   still going, RSS~105GB (bounded). CANNOT abort safely: ET runs IN-KERNEL via joblib THREADING
   (single python3 proc, no killable workers) -> only a kernel restart would stop it, which loses
