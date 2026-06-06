@@ -100,6 +100,14 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
 ## RESULTS LOG (append)
+- TICK 19:17 — ✅ PYC FIX CONFIRMED: lgai lib_xgb_fold0 = 7 members growing (past member 0, no
+  crash) — libraries now generate correctly. ⚠️ thread-heavy from repeated double-launches (I
+  re-ran launch cells AGAIN): nemotron 4 lib threads, qwen 2 lib2+T2. Bounded+self-converging
+  (idempotent skip on result.json; deterministic members + atomic oof => no corruption; single-
+  pass drivers self-terminate). Cells NOW POLL-ONLY (no launch code) => no more accidental
+  re-launch. qwen logreg_f2 backfilled (15/15). qwen T2 on dae_f1. NEXT: let libraries complete
+  (~18min/run, redundancy converges), then greedy_select over members + restack vs 0.42519.
+  LESSON (repeated!): immediately overwrite launch cells with poll content.
 - TICK 19:08 — relaunched CLEAN library drivers `lib2`=[xgb,logreg,fm,mlp] (NO et) on all 3 tabs
   (git pull + pyc delete + idempotent skip). xgb_f0 assembling (emb_index_ready, no crash) —
   confirms pyc fix path; member-count validation (expect 30) next tick. Old et-stuck lib_drivers
