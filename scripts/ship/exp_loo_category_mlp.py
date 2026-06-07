@@ -493,6 +493,7 @@ def fn():
             # OOF prediction/scoring code runs harmlessly — the SAVED model (fit on all
             # rows) is the deliverable; the dummy OOF number is meaningless and ignored.
             oof_idx = train_idx[:1]
+            n_oof = int(oof_idx.shape[0])   # keep n_oof consistent (oof_item_emb is sized by it)
         oof_items = [tr_item[r] for r in oof_idx]
         oof_y = y[oof_idx]
         oof_group = np.asarray(oof_items)  # GroupKFold groups = item_key (cold-start honest)
