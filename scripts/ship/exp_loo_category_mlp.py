@@ -109,6 +109,10 @@ OOF_FOLD = int(os.environ.get("SHIP_OOF_FOLD", "2"))   # which nf3 fold is held 
 # OOF scoring. Produces the final SHIPPING model (all-data fit) for a canon member. Label-derived
 # features stay leakage-free (each row still uses its own fold's cross-fitted shard).
 TRAIN_ALL = OOF_FOLD < 0
+# SHIP_HOLDOUT_BENCH=<benchmark>: true benchmark-COLD member probe — train on all rows whose benchmark
+# != this, predict (OOF) the held-out benchmark's rows. Measures member-level domain cold-start
+# (vs the item-fold OOF which still trains on the same benchmark's other items).
+HOLDOUT_BENCH = os.environ.get("SHIP_HOLDOUT_BENCH", "").strip()
 N_TRAIN_EXPECTED = 264350
 
 FAM_ALIAS = {"qwen": "qwen", "nemotron": "llama", "llama": "llama",
@@ -385,7 +389,13 @@ def fn():
         # ---- (3) nf3 fold per row (item_fold -> matches the shards) ---------------
         row_fold = np.fromiter((item_fold(i, N_FOLDS, SPLIT_SEED) for i in tr_item),
                                dtype=np.int64, count=N)
-        if TRAIN_ALL:
+        if HOLDOUT_BENCH:
+            _brow = np.array([item_bench.get(str(k), "<unk>") for k in tr_item])
+            oof_mask = _brow == HOLDOUT_BENCH
+            train_mask = ~oof_mask
+            if int(oof_mask.sum()) == 0:
+                raise ValueError(f"holdout benchmark {HOLDOUT_BENCH!r} has 0 rows")
+        elif TRAIN_ALL:
             train_mask = np.ones(N, dtype=bool); oof_mask = np.zeros(N, dtype=bool)
         else:
             oof_mask = row_fold == OOF_FOLD
