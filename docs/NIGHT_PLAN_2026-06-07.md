@@ -8,6 +8,11 @@ only the INDEX is quantized. Bake-off (qwen, 300 q, recall@64 of true top-64 + n
 - PQ-512: 164MB, recall 0.825 | PQ-256: 84MB, recall 0.740  <- only viable SMALL option
 - PCA: DISQUALIFIED — even PCA-2048 (98.6% var kept) recall only 0.589; neighbors live in low-variance dirs.
 DECISION: int8-full if ~1.3GB OK (quantized AND near-lossless); else PQ-512 (164MB). PQ >> PCA at all sizes.
+**3-FAMILY MULTIPLIER (decisive):** submission needs all 3 families' indices -> int8-full×3=3.8GB (infeasible),
+PQ-512×3=492MB, PQ-256×3=252MB. -> PQ MANDATORY. COMMITTED: **PQ-512** (~492MB total, recall 0.82). BUILDING
+the ship artifacts now: pqidx_<fam>.npz {codebook[512,256,8], codes[N,512] uint8, item_keys} -> nemotron
+(qwen+nemo) pid 157915, lgai pid 165695. ADC decode: query full-precision, score=sum_m LUT[m,code]. Wire into
+geom_runtime nn-path (replace bruteforce_knn index with PQ-ADC). Downstream-OOF confirm still TODO (expect fine).
 TIEBREAK TODO: measure DOWNSTREAM final-OOF impact of PQ-512 vs full index (nn feats are ~16/543, trees robust,
 irt_bag unaffected -> expect negligible) -> if negligible, ship PQ-512 small; else int8-full. Bake-off JSONs:
 /content/quant_bakeoff.json, pq2.json, pcahi.json (on lgai tab).
