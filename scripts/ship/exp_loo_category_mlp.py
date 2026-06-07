@@ -769,6 +769,38 @@ def fn():
                             "mu": _mu.cpu(), "sd": _sd.cpu(), "K": K}, str(Path(save_dir) / "irt_state.pt"))
             return np.clip(out, _EPS, 1 - _EPS), float("nan"), float("nan")
 
+        # ---- (6-knn) kNN over item embedding (cuML GPU). Item-cold-start: predict a
+        # cold item's pass-rate from its embedding-nearest TRAIN items' mean label
+        # (distance-weighted). Transferable: embedding similarity holds for unseen items.
+        def fit_and_predict_oof_knn(*, save_dir=None):
+            from sklearn.decomposition import PCA
+            from cuml.neighbors import NearestNeighbors
+            import cupy as cp
+            Kn = int(os.environ.get("SHIP_KNN_K", "100"))
+            pdim = int(os.environ.get("SHIP_KNN_PCA", "64"))
+            tr_items = np.unique(row_to_uniq[train_idx])
+            pdim = int(min(pdim, item_emb_unique.shape[1], len(tr_items)))
+            pca = PCA(n_components=pdim, random_state=SEED).fit(item_emb_unique[tr_items])
+            Xall = pca.transform(item_emb_unique).astype(np.float32)
+            sums = np.zeros(item_emb_unique.shape[0], dtype=np.float64)
+            cnts = np.zeros(item_emb_unique.shape[0], dtype=np.float64)
+            np.add.at(sums, row_to_uniq[train_idx], y[train_idx].astype(np.float64))
+            np.add.at(cnts, row_to_uniq[train_idx], 1.0)
+            item_mean = sums / np.maximum(cnts, 1e-9)
+            nbr = NearestNeighbors(n_neighbors=int(min(Kn, len(tr_items))), metric="euclidean")
+            nbr.fit(cp.asarray(Xall[tr_items]))
+            oof_uniq = np.unique(row_to_uniq[oof_idx])
+            dist, ind = nbr.kneighbors(cp.asarray(Xall[oof_uniq]))
+            dist = cp.asnumpy(dist); ind = cp.asnumpy(ind)
+            w = 1.0 / (dist + 1e-6); w /= w.sum(1, keepdims=True)
+            pred_uniq = (w * item_mean[tr_items[ind]]).sum(1)
+            u2p = {int(u): float(pv) for u, pv in zip(oof_uniq, pred_uniq)}
+            p = np.array([u2p[int(u)] for u in row_to_uniq[oof_idx]], dtype=np.float64)
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(Path(save_dir) / "knn_meta.npz", K=int(Kn), pdim=int(pdim))
+            return np.clip(p, _EPS, 1 - _EPS), float("nan"), float("nan")
+
         # ---- (SWEEP) random-subspace fractional-leave-out sweep (trees) -----------
         # For each keep-fraction rho in SWEEP_FRACS: train SWEEP_M XGBoost members, each on a
         # random rho-fraction of the dense feature COLUMNS; stack them (honest inner GroupKFold)
@@ -974,6 +1006,9 @@ def fn():
                 drop_dense_group=None, save_dir=(models_dir / "full") if SAVE_MODELS else None)
         elif MODEL == "irt":
             p_full, tl_full, vl_full = fit_and_predict_oof_irt(
+                save_dir=(models_dir / "full") if SAVE_MODELS else None)
+        elif MODEL == "knn":
+            p_full, tl_full, vl_full = fit_and_predict_oof_knn(
                 save_dir=(models_dir / "full") if SAVE_MODELS else None)
         else:
             p_full, tl_full, vl_full = fit_and_predict_oof(
