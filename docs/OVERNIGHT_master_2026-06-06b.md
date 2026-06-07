@@ -122,6 +122,18 @@ RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
 ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
 
 ## RESULTS LOG (append)
+- TICK (2026-06-07, autonomous) — **BENCHMARK-COLD MEMBER PROBE** (SHIP_HOLDOUT_BENCH: train irt_bag on all
+  benchmarks EXCEPT X, predict X cold; nemotron, M=6). **Member signal is benchmark-SPECIFIC and ANTI-TRANSFERS:**
+  | bench | warm item-OOF | COLD (domain held out) | own-mean | degradation |
+  | afrimedqa | 0.610 | **1.027** | 0.652 | +0.42 |
+  | mmlupro | 0.633 | **0.858** | 0.693 | +0.22 |
+  | swebench | 0.711 | **0.801** | 0.693 | +0.09 |
+  Cold > own-mean for ALL 3 ⇒ a domain-cold member is WORSE THAN A CONSTANT. Warm < own-mean ⇒ in-distribution
+  it adds real signal. **This explains the ~0.42 item-OOF vs ~0.57 real-test gap: the gap is DOMAIN COLD-START.**
+  The stack-level LOBO (+0.0008) missed it because its members were warm. Result: DR/ship/stack/coldprobe_warmvscold.json.
+  ⇒ HIGHEST-VALUE next work: **OOD-aware shrinkage** — detect cold/sparse-domain items (embedding distance to
+  train, or benchmark frequency) and shrink their prediction toward base-rate (cold 1.03 vs mean 0.65 ⇒ huge
+  recoverable loss). Global shrinkage was λ=0 on warm-LOBO but should be large in the genuinely-cold regime.
 - TICK (2026-06-07, autonomous) — **LOBO CV + CALIBRATION** on the 9-member canon stack (leave-one-
   benchmark-out: fit non-neg stack on 15 benchmarks, predict the held-out one; 16 benchmarks).
   **item-OOF 0.42182 → LOBO 0.42266 (+0.00084 only)** ⇒ the STACK COMBINER generalizes across benchmarks,
