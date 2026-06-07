@@ -328,6 +328,18 @@ def fn():
             labels_df["subject_key"].to_numpy(), labels_df["item_key"].to_numpy(),
             labels_df["label"].to_numpy())}
 
+        # item-level benchmark / condition attributes (for the richer IRT variants).
+        # benchmark -> latent ability factor; benchmark_condition_key -> additive difficulty.
+        # These are item attributes; dedup by item_key (a small frame vs the full label table).
+        _bc_df = pd.read_parquet(
+            db, columns=["item_key", "benchmark", "benchmark_condition_key"]
+        ).drop_duplicates("item_key")
+        item_bench = dict(zip(_bc_df["item_key"].astype(str),
+                              _bc_df["benchmark"].astype(str)))
+        item_cond = dict(zip(_bc_df["item_key"].astype(str),
+                             _bc_df["benchmark_condition_key"].astype(str)))
+        del _bc_df
+
         # ROW SOURCE (module-level ROW_SOURCE): 'full' = every labeled (subject,item) row ->
         # all 3 nf3 folds populated (unredacted 3-fold CV: hold out fold f, train on other two).
         # 'ship' = the curated redacted 264350-row sample (folds 1&2 only) AIDE trained on.
@@ -471,6 +483,29 @@ def fn():
         oof_items = [tr_item[r] for r in oof_idx]
         oof_y = y[oof_idx]
         oof_group = np.asarray(oof_items)  # GroupKFold groups = item_key (cold-start honest)
+
+        # ---- (5b) benchmark / condition categorical ids (TRAIN vocab; 0 = unseen) ----
+        # Vocab is built from TRAIN rows only so an OOF row whose benchmark/condition was
+        # never trained routes to id 0 (its factor stays at init / its difficulty is ~0).
+        # Under item-GroupKFold every benchmark still appears in train, so id-0 is rare.
+        def _build_cat_ids(values_per_row):
+            vocab = {"<unk>": 0}
+            for r in train_idx:
+                v = values_per_row[r]
+                if v not in vocab:
+                    vocab[v] = len(vocab)
+            ids = np.fromiter((vocab.get(values_per_row[r], 0) for r in range(N)),
+                              dtype=np.int64, count=N)
+            return ids, len(vocab)
+        _bench_vals = [item_bench.get(k, "<unk>") for k in tr_item]
+        _cond_vals = [item_cond.get(k, "<unk>") for k in tr_item]
+        bench_id, n_bench = _build_cat_ids(_bench_vals)
+        cond_id, n_cond = _build_cat_ids(_cond_vals)
+        step("bc_ids_ready", n_bench=n_bench, n_cond=n_cond)
+
+        # extra OOF columns a fit-fn may emit (e.g. irt_lib's sub-model preds); written
+        # alongside p_full in the FULL-ONLY save block.
+        extra_oof = {}
 
         # per-row item embedding gather for apply (OOF rows only)
         oof_item_emb = np.empty((n_oof, D_EMB), dtype=np.float32)
@@ -769,6 +804,226 @@ def fn():
                             "mu": _mu.cpu(), "sd": _sd.cpu(), "K": K}, str(Path(save_dir) / "irt_state.pt"))
             return np.clip(out, _EPS, 1 - _EPS), float("nan"), float("nan")
 
+        # ---- (6-irtX) richer IRT variants -----------------------------------------
+        # Shared building blocks for the three-variant IRT study (design: A richer MIRT,
+        # B diverse latent-factor library, C bagged). All reuse the K-dim item-amortized
+        # core of `fit_and_predict_oof_irt`: item discrimination a(x)=A.emb in R^K and
+        # difficulty b(x)=w.emb+b0 are LINEAR maps of the (standardized) item embedding,
+        # so COLD items get real params and the model transfers item-cold-start.
+        def _irt_std_emb(dev):
+            import torch
+            E = torch.as_tensor(item_emb_unique, dtype=torch.float32, device=dev)
+            mu = E.mean(0, keepdim=True); sd = E.std(0, keepdim=True).clamp_min(1e-6)
+            return (E - mu) / sd, mu, sd
+
+        def _subject_profiles(dev, E_std):
+            # Transferable subject profile = mean standardized item-embedding over the
+            # subject's TRAIN items (a content prior; replaces the absent precomputed
+            # subj_emb). Subjects are seen in OOF (item-cold-start), so this is leak-free.
+            import torch
+            prof = torch.zeros(int(n_subjects), int(D_EMB), device=dev)
+            cnt = torch.zeros(int(n_subjects), 1, device=dev)
+            s_tr = torch.as_tensor(sid[train_idx], device=dev)
+            r_tr = torch.as_tensor(row_to_uniq[train_idx], device=dev)
+            prof.index_add_(0, s_tr, E_std.index_select(0, r_tr))
+            cnt.index_add_(0, s_tr, torch.ones(s_tr.shape[0], 1, device=dev))
+            return prof / cnt.clamp_min(1.0)
+
+        # ---- (6-irt2) Variant A: richer MIRT ---------------------------------------
+        # logit = <theta_s + beta_bench, A.e> + b(e) + d_cond + mu, with
+        #   theta_s = Wsub.profile_s (amortized, transferable) + theta_resid_s (free, shrunk)
+        #   beta_bench: free K-vector per benchmark (benchmark-level ability shift)
+        #   d_cond: free additive difficulty per benchmark-condition cell.
+        def fit_and_predict_oof_irt2(*, save_dir=None):
+            import torch
+            import torch.nn as nn
+            K = int(os.environ.get("SHIP_IRT_K", "32"))
+            EPOCHS = int(os.environ.get("SHIP_IRT_EPOCHS", "30"))
+            BS = int(os.environ.get("SHIP_IRT_BATCH", "65536"))
+            LR = float(os.environ.get("SHIP_IRT_LR", "1e-3"))
+            WD = float(os.environ.get("SHIP_IRT_WD", "1e-5"))
+            RESID_WD = float(os.environ.get("SHIP_IRT_RESID_WD", "1e-3"))  # shrink free resid
+            dev = "cuda"
+            E, _mu, _sd = _irt_std_emb(dev)
+            prof = _subject_profiles(dev, E)
+            r2u = torch.as_tensor(row_to_uniq[train_idx], device=dev)
+            sid_tr = torch.as_tensor(sid[train_idx], device=dev)
+            bench_tr = torch.as_tensor(bench_id[train_idx], device=dev)
+            cond_tr = torch.as_tensor(cond_id[train_idx], device=dev)
+            ytr = torch.as_tensor(y[train_idx].astype(np.float32), device=dev)
+            Wsub = nn.Linear(int(D_EMB), K, bias=False).to(dev)
+            theta_resid = nn.Embedding(int(n_subjects), K).to(dev)
+            nn.init.normal_(theta_resid.weight, std=0.01)
+            beta_bench = nn.Embedding(int(n_bench), K).to(dev); nn.init.zeros_(beta_bench.weight)
+            A = nn.Linear(int(D_EMB), K, bias=False).to(dev)
+            bw = nn.Linear(int(D_EMB), 1).to(dev)
+            d_cond = nn.Embedding(int(n_cond), 1).to(dev); nn.init.zeros_(d_cond.weight)
+            with torch.no_grad():
+                _p0 = float(np.clip(y[train_idx].mean(), 1e-6, 1 - 1e-6))
+                bw.bias.fill_(float(np.log(_p0 / (1 - _p0))))
+            decayed = (list(Wsub.parameters()) + list(A.parameters()) + list(bw.parameters())
+                       + list(beta_bench.parameters()) + list(d_cond.parameters()))
+            opt = torch.optim.Adam(
+                [{"params": decayed, "weight_decay": WD},
+                 {"params": list(theta_resid.parameters()), "weight_decay": RESID_WD}], lr=LR)
+            bce = nn.BCEWithLogitsLoss()
+
+            def _logits(emb, s_b, bench_b, cond_b):
+                ability = Wsub(prof.index_select(0, s_b)) + theta_resid(s_b) + beta_bench(bench_b)
+                return (ability * A(emb)).sum(1) + bw(emb).squeeze(-1) + d_cond(cond_b).squeeze(-1)
+
+            ntr = int(train_idx.shape[0])
+            for ep in range(EPOCHS):
+                perm = torch.randperm(ntr, device=dev)
+                for s in range(0, ntr, BS):
+                    b = perm[s:s + BS]
+                    logit = _logits(E.index_select(0, r2u[b]), sid_tr[b], bench_tr[b], cond_tr[b])
+                    opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward(); opt.step()
+                step("irt2_epoch", epoch=ep + 1, n_epochs=EPOCHS, train_loss=round(float(loss.item()), 5))
+            sid_o = torch.as_tensor(sid[oof_idx], device=dev)
+            bench_o = torch.as_tensor(bench_id[oof_idx], device=dev)
+            cond_o = torch.as_tensor(cond_id[oof_idx], device=dev)
+            out = np.empty(int(oof_idx.shape[0]), dtype=np.float64)
+            with torch.no_grad():
+                for s in range(0, oof_item_emb.shape[0], 200000):
+                    e = min(s + 200000, oof_item_emb.shape[0])
+                    emb = (torch.as_tensor(oof_item_emb[s:e], dtype=torch.float32, device=dev) - _mu) / _sd
+                    out[s:e] = torch.sigmoid(_logits(emb, sid_o[s:e], bench_o[s:e], cond_o[s:e])).double().cpu().numpy()
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                torch.save({"Wsub": Wsub.weight.detach().cpu(),
+                            "theta_resid": theta_resid.weight.detach().cpu(),
+                            "beta_bench": beta_bench.weight.detach().cpu(),
+                            "A": A.weight.detach().cpu(), "bw_w": bw.weight.detach().cpu(),
+                            "bw_b": bw.bias.detach().cpu(), "d_cond": d_cond.weight.detach().cpu(),
+                            "mu": _mu.cpu(), "sd": _sd.cpu(), "K": K, "n_bench": int(n_bench),
+                            "n_cond": int(n_cond)}, str(Path(save_dir) / "irt2_state.pt"))
+            return np.clip(out, _EPS, 1 - _EPS), float("nan"), float("nan")
+
+        # ---- (6-irtlib) Variant B: diverse latent-factor library -------------------
+        # Five STRUCTURALLY-distinct factor models (not reseeds): subject K16, subject
+        # K48, benchmark-factor, subject-profile-amortized (fully transferable), and
+        # condition-factor. Each emits an OOF column; the returned p_full is their
+        # logit-mean and all 5 sub-columns are saved (extra_oof) for the family stacker.
+        def _basic_factor_irt(*, factor_id, n_factor, K, amortized=False, seed=0, tag=""):
+            import torch
+            import torch.nn as nn
+            EPOCHS = int(os.environ.get("SHIP_IRT_EPOCHS", "30"))
+            BS = int(os.environ.get("SHIP_IRT_BATCH", "65536"))
+            LR = float(os.environ.get("SHIP_IRT_LR", "1e-3"))
+            WD = float(os.environ.get("SHIP_IRT_WD", "1e-5"))
+            dev = "cuda"
+            E, _mu, _sd = _irt_std_emb(dev)
+            r2u = torch.as_tensor(row_to_uniq[train_idx], device=dev)
+            fac_tr = torch.as_tensor(factor_id[train_idx], device=dev)
+            sid_tr = torch.as_tensor(sid[train_idx], device=dev)
+            ytr = torch.as_tensor(y[train_idx].astype(np.float32), device=dev)
+            A = nn.Linear(int(D_EMB), K, bias=False).to(dev)
+            bw = nn.Linear(int(D_EMB), 1).to(dev)
+            with torch.no_grad():
+                _p0 = float(np.clip(y[train_idx].mean(), 1e-6, 1 - 1e-6))
+                bw.bias.fill_(float(np.log(_p0 / (1 - _p0))))
+            params = list(A.parameters()) + list(bw.parameters())
+            if amortized:
+                prof = _subject_profiles(dev, E)
+                Wsub = nn.Linear(int(D_EMB), K, bias=False).to(dev)
+                params += list(Wsub.parameters())
+                ability = lambda s_b, f_b: Wsub(prof.index_select(0, s_b))
+            else:
+                torch.manual_seed(int(seed))
+                emb = nn.Embedding(int(n_factor), K).to(dev); nn.init.normal_(emb.weight, std=0.1)
+                params += list(emb.parameters())
+                ability = lambda s_b, f_b: emb(f_b)
+            opt = torch.optim.Adam(params, lr=LR, weight_decay=WD)
+            bce = nn.BCEWithLogitsLoss()
+            ntr = int(train_idx.shape[0])
+            for ep in range(EPOCHS):
+                perm = torch.randperm(ntr, device=dev)
+                for s in range(0, ntr, BS):
+                    b = perm[s:s + BS]
+                    embx = E.index_select(0, r2u[b])
+                    logit = (ability(sid_tr[b], fac_tr[b]) * A(embx)).sum(1) + bw(embx).squeeze(-1)
+                    opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward(); opt.step()
+            step("irtlib_sub_trained", sub=tag, last_train_loss=round(float(loss.item()), 5))
+            sid_o = torch.as_tensor(sid[oof_idx], device=dev)
+            fac_o = torch.as_tensor(factor_id[oof_idx], device=dev)
+            out = np.empty(int(oof_idx.shape[0]), dtype=np.float64)
+            with torch.no_grad():
+                for s in range(0, oof_item_emb.shape[0], 200000):
+                    e = min(s + 200000, oof_item_emb.shape[0])
+                    embx = (torch.as_tensor(oof_item_emb[s:e], dtype=torch.float32, device=dev) - _mu) / _sd
+                    logit = (ability(sid_o[s:e], fac_o[s:e]) * A(embx)).sum(1) + bw(embx).squeeze(-1)
+                    out[s:e] = torch.sigmoid(logit).double().cpu().numpy()
+            return np.clip(out, _EPS, 1 - _EPS)
+
+        def fit_and_predict_oof_irt_lib(*, save_dir=None):
+            subs = [
+                ("subj_k16", dict(factor_id=sid, n_factor=n_subjects, K=16, seed=11)),
+                ("subj_k48", dict(factor_id=sid, n_factor=n_subjects, K=48, seed=12)),
+                ("bench", dict(factor_id=bench_id, n_factor=n_bench, K=16, seed=13)),
+                ("subj_amort", dict(factor_id=sid, n_factor=n_subjects, K=32, amortized=True, seed=14)),
+                ("cond", dict(factor_id=cond_id, n_factor=n_cond, K=16, seed=15)),
+            ]
+            cols = []
+            for name, kw in subs:
+                c = _basic_factor_irt(tag=name, **kw)
+                cols.append(c)
+                extra_oof[f"p_irtlib__{name}"] = c.astype(np.float32)
+                step("irtlib_sub_done", sub=name, soft_logloss=round(soft_logloss(oof_y, c), 6))
+            combo = _sigmoid(np.mean([_logit(c) for c in cols], axis=0))
+            return np.clip(combo, _EPS, 1 - _EPS), float("nan"), float("nan")
+
+        # ---- (6-irtbag) Variant C: bagged IRT --------------------------------------
+        # M bootstrap fits of the plain K-dim item-amortized IRT (subject factor),
+        # each on a with-replacement resample of train rows + own seed; average OOF probs.
+        def fit_and_predict_oof_irt_bag(*, save_dir=None):
+            import torch
+            import torch.nn as nn
+            K = int(os.environ.get("SHIP_IRT_K", "16"))
+            M = int(os.environ.get("SHIP_IRT_BAG_M", "16"))
+            EPOCHS = int(os.environ.get("SHIP_IRT_EPOCHS", "30"))
+            BS = int(os.environ.get("SHIP_IRT_BATCH", "65536"))
+            LR = float(os.environ.get("SHIP_IRT_LR", "1e-3"))
+            WD = float(os.environ.get("SHIP_IRT_WD", "1e-5"))
+            dev = "cuda"
+            E, _mu, _sd = _irt_std_emb(dev)
+            r2u = torch.as_tensor(row_to_uniq[train_idx], device=dev)
+            sid_tr = torch.as_tensor(sid[train_idx], device=dev)
+            ytr = torch.as_tensor(y[train_idx].astype(np.float32), device=dev)
+            sid_o = torch.as_tensor(sid[oof_idx], device=dev)
+            ntr = int(train_idx.shape[0])
+            _p0 = float(np.clip(y[train_idx].mean(), 1e-6, 1 - 1e-6))
+            acc = np.zeros(int(oof_idx.shape[0]), dtype=np.float64)
+            gen = torch.Generator(device=dev)
+            for m in range(M):
+                gen.manual_seed(1000 + m)
+                boot = torch.randint(0, ntr, (ntr,), generator=gen, device=dev)
+                torch.manual_seed(2000 + m)
+                theta = nn.Embedding(int(n_subjects), K).to(dev); nn.init.normal_(theta.weight, std=0.1)
+                A = nn.Linear(int(D_EMB), K, bias=False).to(dev)
+                bw = nn.Linear(int(D_EMB), 1).to(dev)
+                with torch.no_grad():
+                    bw.bias.fill_(float(np.log(_p0 / (1 - _p0))))
+                opt = torch.optim.Adam(list(theta.parameters()) + list(A.parameters())
+                                       + list(bw.parameters()), lr=LR, weight_decay=WD)
+                bce = nn.BCEWithLogitsLoss()
+                for ep in range(EPOCHS):
+                    perm = boot[torch.randperm(ntr, device=dev)]
+                    for s in range(0, ntr, BS):
+                        b = perm[s:s + BS]
+                        emb = E.index_select(0, r2u[b])
+                        logit = (theta(sid_tr[b]) * A(emb)).sum(1) + bw(emb).squeeze(-1)
+                        opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward(); opt.step()
+                with torch.no_grad():
+                    for s in range(0, oof_item_emb.shape[0], 200000):
+                        e = min(s + 200000, oof_item_emb.shape[0])
+                        emb = (torch.as_tensor(oof_item_emb[s:e], dtype=torch.float32, device=dev) - _mu) / _sd
+                        logit = (theta(sid_o[s:e]) * A(emb)).sum(1) + bw(emb).squeeze(-1)
+                        acc[s:e] += torch.sigmoid(logit).double().cpu().numpy()
+                step("irt_bag_member", member=m + 1, n_members=M,
+                     run_soft_logloss=round(soft_logloss(oof_y, np.clip(acc / (m + 1), _EPS, 1 - _EPS)), 6))
+            return np.clip(acc / float(M), _EPS, 1 - _EPS), float("nan"), float("nan")
+
         # ---- (6-knn) kNN over item embedding (cuML GPU). Item-cold-start: predict a
         # cold item's pass-rate from its embedding-nearest TRAIN items' mean label
         # (distance-weighted). Transferable: embedding similarity holds for unseen items.
@@ -1007,6 +1262,15 @@ def fn():
         elif MODEL == "irt":
             p_full, tl_full, vl_full = fit_and_predict_oof_irt(
                 save_dir=(models_dir / "full") if SAVE_MODELS else None)
+        elif MODEL == "irt2":
+            p_full, tl_full, vl_full = fit_and_predict_oof_irt2(
+                save_dir=(models_dir / "full") if SAVE_MODELS else None)
+        elif MODEL == "irt_lib":
+            p_full, tl_full, vl_full = fit_and_predict_oof_irt_lib(
+                save_dir=(models_dir / "full") if SAVE_MODELS else None)
+        elif MODEL == "irt_bag":
+            p_full, tl_full, vl_full = fit_and_predict_oof_irt_bag(
+                save_dir=(models_dir / "full") if SAVE_MODELS else None)
         elif MODEL == "knn":
             p_full, tl_full, vl_full = fit_and_predict_oof_knn(
                 save_dir=(models_dir / "full") if SAVE_MODELS else None)
@@ -1031,7 +1295,8 @@ def fn():
                 np.savez_compressed(preds_dir / "oof_preds.npz",
                                     oof_items=np.asarray(oof_items),
                                     oof_subj=np.asarray([tr_subj[r] for r in oof_idx]),
-                                    oof_y=oof_y.astype(np.float32), p_full=p_full.astype(np.float32))
+                                    oof_y=oof_y.astype(np.float32), p_full=p_full.astype(np.float32),
+                                    **{k: np.asarray(v, dtype=np.float32) for k, v in extra_oof.items()})
                 (Path(SAVE_ROOT) / "result.json").write_text(
                     json.dumps(result, indent=2, default=str), encoding="utf-8")
             print(f"FULL-ONLY {MODEL} fam={FAMILY} fold={OOF_FOLD}: "
