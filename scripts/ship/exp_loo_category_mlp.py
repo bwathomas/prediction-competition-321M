@@ -820,13 +820,20 @@ def fn():
             # Transferable subject profile = mean standardized item-embedding over the
             # subject's TRAIN items (a content prior; replaces the absent precomputed
             # subj_emb). Subjects are seen in OOF (item-cold-start), so this is leak-free.
+            # Chunked: a one-shot E_std.index_select over ~3M train rows materializes a
+            # [n_train, D_EMB] tensor (~49 GB at D=4096) and OOMs; accumulate in chunks
+            # (peak ~CH*D*4 bytes) instead.
             import torch
             prof = torch.zeros(int(n_subjects), int(D_EMB), device=dev)
             cnt = torch.zeros(int(n_subjects), 1, device=dev)
-            s_tr = torch.as_tensor(sid[train_idx], device=dev)
-            r_tr = torch.as_tensor(row_to_uniq[train_idx], device=dev)
-            prof.index_add_(0, s_tr, E_std.index_select(0, r_tr))
-            cnt.index_add_(0, s_tr, torch.ones(s_tr.shape[0], 1, device=dev))
+            s_all = sid[train_idx]; r_all = row_to_uniq[train_idx]
+            ntr = int(s_all.shape[0]); CH = 262144
+            for s in range(0, ntr, CH):
+                e = min(s + CH, ntr)
+                s_b = torch.as_tensor(s_all[s:e], device=dev)
+                r_b = torch.as_tensor(r_all[s:e], device=dev)
+                prof.index_add_(0, s_b, E_std.index_select(0, r_b))
+                cnt.index_add_(0, s_b, torch.ones(int(e - s), 1, device=dev))
             return prof / cnt.clamp_min(1.0)
 
         # ---- (6-irt2) Variant A: richer MIRT ---------------------------------------
@@ -878,7 +885,9 @@ def fn():
                 for s in range(0, ntr, BS):
                     b = perm[s:s + BS]
                     logit = _logits(E.index_select(0, r2u[b]), sid_tr[b], bench_tr[b], cond_tr[b])
-                    opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward(); opt.step()
+                    opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward()
+                    torch.nn.utils.clip_grad_norm_([p for gg in opt.param_groups for p in gg["params"]], 5.0)
+                    opt.step()
                 step("irt2_epoch", epoch=ep + 1, n_epochs=EPOCHS, train_loss=round(float(loss.item()), 5))
             sid_o = torch.as_tensor(sid[oof_idx], device=dev)
             bench_o = torch.as_tensor(bench_id[oof_idx], device=dev)
@@ -943,7 +952,9 @@ def fn():
                     b = perm[s:s + BS]
                     embx = E.index_select(0, r2u[b])
                     logit = (ability(sid_tr[b], fac_tr[b]) * A(embx)).sum(1) + bw(embx).squeeze(-1)
-                    opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward(); opt.step()
+                    opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward()
+                    torch.nn.utils.clip_grad_norm_([p for gg in opt.param_groups for p in gg["params"]], 5.0)
+                    opt.step()
             step("irtlib_sub_trained", sub=tag, last_train_loss=round(float(loss.item()), 5))
             sid_o = torch.as_tensor(sid[oof_idx], device=dev)
             fac_o = torch.as_tensor(factor_id[oof_idx], device=dev)
@@ -1013,7 +1024,9 @@ def fn():
                         b = perm[s:s + BS]
                         emb = E.index_select(0, r2u[b])
                         logit = (theta(sid_tr[b]) * A(emb)).sum(1) + bw(emb).squeeze(-1)
-                        opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward(); opt.step()
+                        opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward()
+                        torch.nn.utils.clip_grad_norm_([p for gg in opt.param_groups for p in gg["params"]], 5.0)
+                        opt.step()
                 with torch.no_grad():
                     for s in range(0, oof_item_emb.shape[0], 200000):
                         e = min(s + 200000, oof_item_emb.shape[0])
