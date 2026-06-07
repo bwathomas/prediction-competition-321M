@@ -122,6 +122,16 @@ RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
 ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
 
 ## RESULTS LOG (append)
+- TICK (2026-06-07, autonomous) — **LOBO CV + CALIBRATION** on the 9-member canon stack (leave-one-
+  benchmark-out: fit non-neg stack on 15 benchmarks, predict the held-out one; 16 benchmarks).
+  **item-OOF 0.42182 → LOBO 0.42266 (+0.00084 only)** ⇒ the STACK COMBINER generalizes across benchmarks,
+  does NOT overfit benchmark composition; local OOF is trustworthy. **Calibration NULL**: opt temperature
+  1.002, shrink-to-global-mean λ=0.0 → no change (stack already well-calibrated globally). Stack beats
+  predict-own-benchmark-mean on ALL 16 (hardest swebench 0.599/0.693, hle 0.595/0.623, mmlupro 0.560/0.693;
+  easiest agentdojo 0.267, mmbench_v11 0.269). Result: DR/ship/stack/lobo_calib.json.
+  ⚠️ CAVEAT: this holds out only the STACK; base members still trained on each benchmark's items (item-fold
+  OOF). So it does NOT measure member-level benchmark cold-start — the prime remaining suspect for the
+  ~0.42→0.57 real-test gap. NEXT: true benchmark-cold MEMBER probe (retrain a member holding out a benchmark).
 - TICK (2026-06-07, Stage E) — **FINAL CANON STACK** (9 members: mlp-LOO `stacked_oof` + etbig `p_full`
   + irt_bag `p_full`, per family; non-neg logistic on logit-space cols, GroupKFold(5) honest item OOF).
   **canon non-neg OOF = 0.42182** — IDENTICAL to the full 24-col base+irt_bag pool (0.42182) ⇒ the 15
