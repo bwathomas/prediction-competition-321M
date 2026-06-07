@@ -25,8 +25,15 @@ f0/1/2 there — SHIP_FAMILY=qwen reads qwen embeddings from the shared Drive, s
 Stage D qwen-family canon training: run on a freed tab. Do NOT block the whole pipeline on the dead tab.
 
 ## STAGE B — stacking eval (after A)
-On colab2, `master_stack.py` (already on /content) fits the linear + non-neg master stack over each family's
-base member pool. Append the new IRT columns (irt2 `p_full`, irt_lib `p_full` + 5 `p_irtlib__*`, irt_bag
+⚠️ The original `master_stack.py` was LOST with the qwen recycle — RECOVERED + extended as repo
+`scripts/ship/master_stack_eval.py` (commit d4d70d8). Run it on ANY live tab (git pull first):
+`cd /content/pc321 && git fetch origin feat/principled-export-pipeline -q && git checkout -B
+feat/principled-export-pipeline FETCH_HEAD`, then `python scripts/ship/master_stack_eval.py` (detached).
+It reports base vs base+{irt,irt2,irt_lib,irt_bag,knn} (linear + non-neg), full-data non-neg weights for
+base+best-irt (-> the CANON = positive-weight members), and per-member drop-importance. Writes
+`/content/master_stack_eval_result.json` + mirrors to `DR/ship/stack/`. Needs all 3 families to have each
+model (gated by have()); qwen irt_bag must finish first. It fits the linear + non-neg master stack over each
+family's base member pool. Append the new IRT columns (irt2 `p_full`, irt_lib `p_full` + 5 `p_irtlib__*`, irt_bag
 `p_full`) to the pool; re-run non-neg + linear + leave-one-out drop-importance vs the current irt baseline.
 Report each variant's stack-lift + drop-Δ. **Append to `docs/OVERNIGHT_master_2026-06-06b.md` RESULTS LOG.**
 Prior 4-way: base 0.42153; +IRT 0.42041 (+0.0011, earns a seat); +kNN +0.0002 (does not). Non-neg base
