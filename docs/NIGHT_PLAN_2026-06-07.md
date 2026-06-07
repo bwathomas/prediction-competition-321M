@@ -1,5 +1,18 @@
 # NIGHT PLAN 2026-06-07 — autonomous IRT→canon→final-stack pipeline
 
+## 🚢 SUBMISSION-READINESS (user-directed, 2026-06-07) — numpy-only inference
+GOAL: run the canon members with python+numpy only (Codabench has no cuML/GPU). Build+verify per member.
+- **etbig (tree): numpy inference BUILT + VERIFIED** — `src/tree_numpy.py` (extract_forest from cuML
+  `.as_treelite().dump_as_json()` -> flat node arrays; forest_predict = numpy traversal, mean of per-tree
+  leaves, left if x<=thr). Verified numpy==cuML predict to **8.6e-8** (commit 59e3346).
+- ⚠️ foldALL etbig is HUGE (~33M nodes/family, depth18/300trees) -> impractical to ship. FIX: ship-sized
+  etbig **depth12/128trees**. IN FLIGHT: nemotron ship-etbig TRAIN_ALL (pid 129830) ->
+  `DR/ship/ship_models/etbig_nemotron/models/full/cuml_rf.pkl`. NEXT: extract->npz, verify numpy==cuML, report
+  node-count/size/speed; then do qwen+lgai; then check ship-etbig OOF ≈ big etbig (so stack weight holds);
+  re-fit stack if needed. THEN numpy inference for mlp (torch->numpy fwd) + irt_bag (already numpy-friendly:
+  theta/A/bw matmuls) + the GBM stacker (lightgbm->numpy or pure-python tree eval).
+- mlp cold sweep (nemotron pid, bonus) may still be running; deprioritized vs submission.
+
 ## 🔬 POST-PIPELINE: generalization investigation (autonomous, 2026-06-07)
 Done: LOBO (stack generalizes +0.0008), cold-probe (members anti-transfer; gap=domain cold-start),
 OOD-detector embedding-distance FAILED. IN FLIGHT: **16-benchmark cold sweep on ETBIG** (the tree — the high-weight member; user: "use the tree,
