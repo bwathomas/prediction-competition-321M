@@ -1,5 +1,17 @@
 # NIGHT PLAN 2026-06-07 — autonomous IRT→canon→final-stack pipeline
 
+## ✅✅ PIPELINE COMPLETE (Stages A–E done) — 2026-06-07
+- A: 3-variant IRT done (irt_bag won). B: stack eval logged. C: canon = mlp-LOO + etbig + irt_bag.
+- D: all 9 canon members trained on ALL data (foldALL) in all 3 families, saved to `*_full_foldALL/models/`.
+- E: final 9-member non-neg stack OOF = **0.42182** (= full 24-col pool; -0.01471 vs old ship 0.43653).
+  Manifest `DR/ship/stack/FINAL_CANON_2026-06-07.json` (members+paths+weights). Old FINAL untouched.
+- REMAINING (not started, needs user/explicit go): (1) export submission CSV = run foldALL models on TEST,
+  logit-blend with manifest weights+bias (touches the shipped deliverable → back up _winners_snapshot/FINAL_* first).
+  (2) Tier-1 ideas: LOBO CV + calibration (see docs/IDEAS_2026-06-07.md). DO NOT auto-launch new experiments
+  without user direction — cron ticks should just keep tabs alive + report idle until then.
+
+
+
 User asleep, **full authority granted** to decide the canon and train final models. Map: **colab2=qwen,
 colab=nemotron, colab3=lgai**. DR=`/content/drive/MyDrive/prediction-competition-321M`. Branch
 `feat/principled-export-pipeline`. Metric = mean soft BCE, honest **GroupKFold(item)** OOF (item cold-start).
