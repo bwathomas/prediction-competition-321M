@@ -1,5 +1,18 @@
 # NIGHT PLAN 2026-06-07 — autonomous IRT→canon→final-stack pipeline
 
+## 🚢 EMBEDDING-INDEX QUANTIZATION BAKE-OFF (user: "quantized, reasonably sized, least lossy") 2026-06-07
+Only nn-index features (nn_geometry 3 cols + nn_label ~13) need the train-emb index; cluster blocks need only
+the full-precision centroids + full-precision query; irt_bag uses NO index. Query is full-precision at runtime;
+only the INDEX is quantized. Bake-off (qwen, 300 q, recall@64 of true top-64 + nn_geom err):
+- int8 per-row full-dim: 1.28GB, **recall 0.991**, nngeo 0.014  <- LEAST LOSSY
+- PQ-512: 164MB, recall 0.825 | PQ-256: 84MB, recall 0.740  <- only viable SMALL option
+- PCA: DISQUALIFIED — even PCA-2048 (98.6% var kept) recall only 0.589; neighbors live in low-variance dirs.
+DECISION: int8-full if ~1.3GB OK (quantized AND near-lossless); else PQ-512 (164MB). PQ >> PCA at all sizes.
+TIEBREAK TODO: measure DOWNSTREAM final-OOF impact of PQ-512 vs full index (nn feats are ~16/543, trees robust,
+irt_bag unaffected -> expect negligible) -> if negligible, ship PQ-512 small; else int8-full. Bake-off JSONs:
+/content/quant_bakeoff.json, pq2.json, pcahi.json (on lgai tab).
+ALSO: all 3 families' ship-etbig now numpy-verified (qwen/nemotron/lgai forest.npz ~4MB each, MAXDIFF ~9e-8).
+
 ## 🚢 RUNTIME GEOMETRY — DONE + FULL-BLOCK VERIFIED (2026-06-07)
 `src/geom_runtime.py` (commit b613239, LOCAL — see push-blocked note) recomputes the full 525-col geometry
 block for new embeddings, EXACT column order vs stored (cols_match_order TRUE), max_abs 0.0021 (only LID col),
