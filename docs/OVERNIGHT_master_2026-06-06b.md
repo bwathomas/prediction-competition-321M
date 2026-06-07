@@ -122,6 +122,15 @@ RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
 ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
 
 ## RESULTS LOG (append)
+- TICK (2026-06-07, Stage E) — **FINAL CANON STACK** (9 members: mlp-LOO `stacked_oof` + etbig `p_full`
+  + irt_bag `p_full`, per family; non-neg logistic on logit-space cols, GroupKFold(5) honest item OOF).
+  **canon non-neg OOF = 0.42182** — IDENTICAL to the full 24-col base+irt_bag pool (0.42182) ⇒ the 15
+  zero-weight members (dae/cnn1d/logreg/fm/xgb/knn/irt2/irt_lib) add nothing; the lean canon is complete
+  and more robust. Weights (full-data fit): nemotron.mlp.L1 0.450 (dom) · lgai.etbig 0.207 · qwen.mlp.L1
+  0.098 · nemotron.irt_bag 0.078 · qwen.irt_bag 0.075 · qwen.etbig 0.065 · nemotron.etbig 0.052 · lgai.mlp.L1
+  0.035 · lgai.irt_bag 0.008 · bias -0.073. vs old shipped 0.43653 = -0.0147. Result: DR/ship/stack/canon_stack.json.
+  ⚠️ This is the OOF stack metric/weights; SHIPPING (test preds) needs the all-data TRAIN_ALL models (Stage D)
+  + export. CAVEAT (STRATEGIC): 0.42182 is item-OOF (optimistic vs ~0.57 real); validate under LOBO next.
 - TICK (2026-06-07, user req) — **3-VARIANT IRT STACK EVAL** (`master_stack_eval.py`, full 4.5M-row OOF,
   GroupKFold(5) on item, vs the 21-col base pool: per family dae/mlp/cnn1d LOO stacked_oof + xgb/etbig/logreg/fm
   p_full). Each IRT variant = its `p_full` col/family appended to the pool.
