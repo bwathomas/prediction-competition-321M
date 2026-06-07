@@ -11,8 +11,14 @@ DECISION: int8-full if ~1.3GB OK (quantized AND near-lossless); else PQ-512 (164
 **3-FAMILY MULTIPLIER (decisive):** submission needs all 3 families' indices -> int8-full×3=3.8GB (infeasible),
 PQ-512×3=492MB, PQ-256×3=252MB. -> PQ MANDATORY. COMMITTED: **PQ-512** (~492MB total, recall 0.82). BUILDING
 the ship artifacts now: pqidx_<fam>.npz {codebook[512,256,8], codes[N,512] uint8, item_keys} -> nemotron
-(qwen+nemo) pid 157915, lgai pid 165695. ADC decode: query full-precision, score=sum_m LUT[m,code]. Wire into
-geom_runtime nn-path (replace bruteforce_knn index with PQ-ADC). Downstream-OOF confirm still TODO (expect fine).
+(qwen+nemo) pid 157915, lgai pid 165695. ADC decode: query full-precision, score=sum_m LUT[m,code].
+BUILT + VERIFIED: pqidx_{qwen 174.8MB / nemotron 177.9MB / lgai 148.4MB}.npz (~501MB total). `src/pq_index.py`
+(load_pq_index/pq_knn ADC). Verify (qwen, saved artifact): keys_aligned TRUE, recall@64 0.826 (==bakeoff).
+⚠️ nn_geometry from PQ-APPROX sims is NOISY (local_density max-abs err ~0.98 outlier; LID large) — PQ dot is
+approximate & we can't recompute exact sims without full emb. So the 3 nn_geometry cols are approximate under PQ.
+⇒ DOWNSTREAM-OOF VALIDATION NOW NECESSARY: recompute etbig/mlp OOF with PQ-index nn feats vs full-index, check
+final stack OOF moves negligibly (irt_bag unaffected; nn feats ~16/543; trees robust). If it DOES move, options:
+bump M / ship int8-full for nn_geometry only / drop nn_geometry. Wire PQ into geom_runtime nn-path after.
 TIEBREAK TODO: measure DOWNSTREAM final-OOF impact of PQ-512 vs full index (nn feats are ~16/543, trees robust,
 irt_bag unaffected -> expect negligible) -> if negligible, ship PQ-512 small; else int8-full. Bake-off JSONs:
 /content/quant_bakeoff.json, pq2.json, pcahi.json (on lgai tab).
