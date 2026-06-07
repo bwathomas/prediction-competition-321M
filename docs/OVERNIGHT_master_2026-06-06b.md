@@ -122,6 +122,14 @@ RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
 ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
 
 ## RESULTS LOG (append)
+- TICK (2026-06-07, autonomous) — **OOD-DETECTOR check (NEGATIVE)**: tested embedding-distance as a cold-start
+  detector (per-benchmark mean dist to nearest OTHER-benchmark item, nemotron emb, PCA-128). Does NOT predict
+  cold degradation: afrimedqa (degr +0.42) OOD-dist 0.585 (LOW, 12/16) < swebench (degr +0.09) 0.641. Inverted/
+  uncorrelated. ⇒ cold-start failure = LABEL/difficulty-mapping transfer, not embedding novelty; a distance gate
+  won't work (also confounded: ultrafeedback = 254k/300k items dominates distances). Result: DR/ship/stack/
+  ood_detector.json. Detector triage: embedding-distance OUT. Remaining untested: member-disagreement/variance,
+  benchmark-frequency (only helps truly-absent domains). RIGOROUS detector validation needs the full 16-benchmark
+  cold sweep (16 member retrains) — bigger compute commitment; flag for user decision.
 - TICK (2026-06-07, autonomous) — **BENCHMARK-COLD MEMBER PROBE** (SHIP_HOLDOUT_BENCH: train irt_bag on all
   benchmarks EXCEPT X, predict X cold; nemotron, M=6). **Member signal is benchmark-SPECIFIC and ANTI-TRANSFERS:**
   | bench | warm item-OOF | COLD (domain held out) | own-mean | degradation |
