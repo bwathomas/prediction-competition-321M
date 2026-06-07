@@ -99,7 +99,13 @@ isolation for the library phase (full reclaim per run; an OOM kills only the sub
 - NEXT: monitor fulls completing (record t_total_s + full_baseline mll per archetype×fold×family);
   then SHIP_MODE=library dropout fleet; then greedy-ES + stacking. T2 (cnn/dae/ft) after smoke.
 
-## 🔴 MORNING ACTION NEEDED (2026-06-06 ~19:37) — LIBRARY PHASE STUCK
+## ✅ MORNING ACTION DONE — L2 LIBRARY PHASE CLEANLY RELAUNCHED (see top RESULTS LOG tick)
+The stuck/OOM library phase below was resolved: dup drivers self-terminated, tabs went clean, and
+ONE clean driver/tab is now running (lgai pid200554/qwen pid97328/nemotron pid197710, status files
+/content/lib_status_<fam>.json). Future ticks: MONITOR + double-launch-guard, do NOT relaunch.
+Original stuck-phase notes kept below for history:
+
+## 🔴 (HISTORICAL) MORNING ACTION NEEDED (2026-06-06 ~19:37) — LIBRARY PHASE STUCK
 The dropout-library phase is stuck: my repeated accidental double-launches left MULTIPLE library
 drivers per tab (nemotron 4, qwen 2, lgai 2), so multiple concurrent ~37GB assemblies OOM each
 other. After ~30min: ZERO completed libraries on any family; nemotron actively OOM-thrashing
@@ -116,6 +122,217 @@ RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
 ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
 
 ## RESULTS LOG (append)
+- TICK (2026-06-07, user req) — **3-VARIANT IRT STACK EVAL** (`master_stack_eval.py`, full 4.5M-row OOF,
+  GroupKFold(5) on item, vs the 21-col base pool: per family dae/mlp/cnn1d LOO stacked_oof + xgb/etbig/logreg/fm
+  p_full). Each IRT variant = its `p_full` col/family appended to the pool.
+  **LINEAR stack soft-logloss** (Δ vs base 0.42153): base+**irt_bag 0.42038 (+0.00115, BEST)** > base+irt(orig)
+  0.42041 (+0.00112) > base+irt_lib 0.42072 (+0.00081) > base+irt2 0.42120 (+0.00033) > base+knn 0.42137 (+0.00016).
+  **NON-NEG stack** (Δ vs base 0.42278): base+**irt_bag 0.42182 (+0.00096, BEST)** > irt 0.42198 (+0.0008) >
+  irt_lib 0.42206 (+0.00072) > irt2 0.42263 (+0.00015) > knn 0.42278 (**+0.0, zero help**).
+  ⇒ **WINNER = irt_bag** (M=16 bagged K-dim item-amortized IRT). It is the only IRT model that earns a seat;
+  it gets POSITIVE non-neg weight in ALL 3 families: qwen.irt_bag 0.0714, nemotron.irt_bag 0.0788, lgai.irt_bag
+  0.0148. Drop-importance (Δ if removed): nemotron.irt_bag +0.00038, qwen.irt_bag +0.00022, lgai.irt_bag ~0.
+  **irt2 (richer MIRT) FAILS** (+0.00015 nonneg; lgai diverged to 0.67-1.06 standalone) — documented negative.
+  knn confirmed redundant (+0.0). irt_lib helps but < irt_bag.
+  **CANON (nonzero non-neg weight, base+irt_bag):** mlp.L1 (all 3: nemo 0.422 dominant, qwen 0.122, lgai 0.064)
+  + etbig (lgai 0.142, nemo 0.095, qwen 0.055) + irt_bag (all 3) + trivial nemotron.xgb 0.005. **dae/cnn1d/logreg/
+  fm = 0 everywhere.** Result JSON: DR/ship/stack/master_stack_eval_result.json. ⇒ canon = mlp-LOO + etbig + irt_bag.
+- TICK (2026-06-07, user req) — GREEDY WITHIN-FAMILY HIERARCHICAL STACK, honest **3-fold** leave-one-base-fold-out
+  CV (each base model only predicts its held-out fold; meta folds = base folds — user correction to my initial
+  5-fold). Arch: per family, bagged Caruana greedy ES over 9 members (3 neural-LOO L1 stacked_oof + xgb/etbig/
+  logreg/fm full + IRT + kNN) -> 1 honest OOF/family -> top combiner over the 3. Results on colab2; persisted to
+  DR/ship/results_greedy_hier_3fold/{greedy_hier,flat_3fold}_result.json.
+  - Within-family greedy beats each family's best single modestly: qwen 0.43542 (vs mlp.L1 0.43855, +0.0031) /
+    nemotron 0.42636 (vs 0.42728, +0.0009) / lgai 0.43618 (vs 0.43802, +0.0018). IRT earns real greedy weight
+    (qwen .15 / nemo .07 / lgai .06); kNN marginal (qwen .09 / lgai .05 / nemo ~0, kNN single 0.521 useless) —
+    same IRT>kNN verdict as master stack. mlp.L1 dominates every family; logreg/cnn1d/fm ~0.
+  - Top combiner over 3 family OOF: tree 0.42351 | linear 0.42407 | greedy 0.42592 | logit-mean 0.42627.
+  - ⚖️ APPLES-TO-APPLES (recomputed FLAT baselines under SAME 3-fold): flat_tree 0.41983 | flat_linear 0.42043 |
+    flat_nonneg 0.42201 | best_single 0.42728. (5-fold flat_tree was 0.41934 -> 3-fold costs ~0.0005.)
+  - VERDICT: hierarchical-greedy LOSES to flat by ~0.0037 (0.42351 vs 0.41983). Collapsing each family to one
+    greedy-averaged number discards cross-family member-level interactions the flat meta exploits; greedy's prob-
+    averaging collapse is even coarser than a linear/tree collapse. Confirms "flat > hierarchical"; best honest
+    3-fold = flat_tree 0.41983. (colab/nemotron + colab3/lgai still RECYCLED — Drive unmounted, need user remount.)
+- TICK — 4-WAY MASTER LINEAR STACKER RESULT (base 21 cols, no et): base 0.42153 | +IRT 0.42041 (+0.00112) |
+  +kNN 0.42137 (+0.00016) | +IRT+kNN 0.42035 (+0.00118). VERDICT: IRT MOVES the needle (~+0.0011, the bilinear
+  subject-ability x item signal mlp/etbig lack); kNN basically does NOT (~+0.0002, redundant with embedding
+  models). Reverses AIDE-era knn>irt expectation. Resume doc: docs/WARM_START_2026-06-07b.md.
+- TICK — MASTER LINEAR STACKER (user): over 21 cols (9 neural-LOO stacked_oof dae/mlp/cnn1d x3 +
+  xgb/etbig/logreg/fm full x3; OMIT cpu et). BASE = linear 0.42153 / nonneg 0.42278 (vs flat-tree 0.4193).
+  Added SHIP_MODEL=irt (3a2e63f, K-dim item-params-linear-from-embedding, no MLP) + SHIP_MODEL=knn
+  (7d0cb3a, cuML GPU item-embedding kNN). Training irt+knn for all 3 fams (extras_driver.py). qwen.irt
+  standalone ~0.476 (weak, generalizes cold). master_stack.py auto-runs +irt/+knn/+both deltas when ready.
+  Sub-task: non-neg linear stacker over logreg-LOO members (greedy_lgai_logreg.json). Cron ed5648ee drives.
+  - logreg-LOO verdict: full 0.4642 -> tree-meta-LOO 0.4559 (+0.0083, but that's tree NONLINEARITY on linear
+    members) / non-neg LINEAR-meta-LOO 0.4625 (+0.0017, the fair linear-combiner test = small, fits variance story).
+  - irt+knn done for qwen+nemotron; lgai in progress (knn 1/3 then irt). Full 4-way master_stack auto-runs when lgai done.
+  - Non-neg master stacker WEIGHTS (base 21 cols): only mlp (0.81) + etbig (0.26) nonzero; xgb/dae/cnn1d/logreg/fm = 0
+    (collinear-redundant given mlp/etbig selected). By emb: nemo 0.58 > lgai 0.28 > qwen 0.21. nemotron.mlp 0.567 dominates.
+- TICK — DROPOUT-by-model-type verdicts: mlp +0.029, dae +0.010 (neural, strong) >> xgb +0.0027,
+  etbig +0.0014 (trees, tree-meta ONLY; greedy/logit-mean WORSE than full for etbig). Confirms:
+  random-subspace dropout helps HIGH-VARIANCE learners, negligible for already-bagged trees.
+  CURVE (monotonic in learner variance): mlp +0.029 > dae +0.010 > fm +0.0066 > xgb +0.0027 > etbig +0.0014 > logreg(pending).
+  fm-LOO: full 0.4494 -> loo_stack 0.4427 (+0.0066). [pure free-param IRT (no embedding) = 0.754, useless cold.]
+  NEW: K-IRT (SHIP_MODEL=irt, commit 3a2e63f) = K-dim, item params LINEARLY amortized from item embedding
+  (no MLP); running on qwen -> irt_full_fold<f>. Geometry-augmented LLTM/explanatory variant queued next.
+  etbig: best_single 0.4481/logit_mean 0.4478/greedy 0.4471/linear 0.4457/tree 0.4445 vs full 0.4459.
+- ⭐ USER STRATEGIC PIVOT (pending my action): local OOF 0.419 vs leaderboard-best 0.57 vs predict-mean
+  0.629 => CV is optimistic (item-CV not benchmark-cold-start); cold test dominated by base-rate calibration
+  + thin transferable (embedding) signal. PLAN proposed: (1) leave-one-BENCHMARK-out CV to re-rank all
+  stacks honestly, (2) calibration layer (temperature + base-rate shrinkage tuned on LOBO), (3) switch
+  submission combiner to most-LOBO-robust (non-neg blend / bagged greedy, NOT tree stack), (4) re-select
+  members favoring embedding-driven over identity-feature ones. Awaiting user go-ahead.
+- TICK — DROPOUT+GREEDY EXPERIMENT RESULTS (in progress):
+  (A) lgai.xgb LIBRARY+greedy = 0.44016 vs full xgb 0.4420 -> BEATS by +0.0018 (greedy 0.4402 <
+      logit_mean 0.4409 < full 0.4420 < best_single 0.4427). 30 members. /content/greedy_lgai_xgb.json.
+      => random-subspace dropout + Caruana greedy helps a strong tree, modestly.
+      FULL 3-COMBINER (user asked to verify greedy wasn't the weak link): best_single 0.4427 |
+      logit_mean 0.4409 | greedy 0.4402 | linear 0.4401 | TREE_STACK 0.4393 (vs full 0.4420).
+      => greedy/linear ~nothing (+0.0018), but TREE meta extracts +0.0027 (member interactions).
+      NOT a clean falsification: dropout WEAKLY useful for GBDT (tree-meta only), STRONGLY useful for
+      high-variance learners (mlp-LOO +0.029). Consistent w/ theory (xgb already colsamples internally).
+  (B) qwen.etbig (GPU cuML RF) LIBRARY: fold0 done (M=20, ~56s/member); greedy pending all 3 folds.
+  (C) nemotron.fm LOO: converted to GPU-RESIDENT FwFM (commit 829df1a) -> ~115s/member @40ep vs old
+      ~300s/member @15ep streaming (~7x/epoch speedup); ~1h for full 3-fold sweep. verdict pending.
+- TICK — 🏆 LAYERED RESTACK = NEW BEST 0.41989. layered_tree (L1=9 LOO stacked_oof ensembles + 15
+  non-neural fulls -> LGB L2, GroupKFold5 item) = **0.41989** | layered_linear 0.42132 | flat_all_tree
+  (=~90 raw members+15 fulls) = **0.41934** (the BEST, marginally beats layered by 0.0005). BEATS prior
+  best mlp-LOO 0.42302 (-0.0034) and flat-tree 0.42355 and flat full-model 0.42519 and old shipped 0.43653.
+  VERDICT: flat-all ~= layered (both ~0.419); layering did NOT beat flat (collapsing each LOO model to 1
+  discards member-level interactions the flat GBM exploits). The WIN is the LOO members themselves.
+  Then user: also test library+greedy on et -> qwen et library launched (pid218075, M=20, ET caps
+  trees=80/depth=14/rows=400k for tractability) vs qwen full et 0.4520.
+  Result /content/layered_stack_result.json (qwen). Bridges DROPPED then RECONNECTED — all 3 runtimes
+  survived (same hosts, jobs ran through the disconnect as detached subprocs).
+- TICK — LIBRARY+GREEDY EXPERIMENT (user): test random-subspace dropout (rho~U[0.3,0.9]) + Caruana
+  greedy-w-replacement on other model types. nemotron.fm (colab, pid313595) + lgai.xgb (colab3, pid320851),
+  SHIP_MODE=library M=30 RHO=0.3,0.9 MAX_ROWS=1M, folds 0-2, lib_<model>_fold<f>/members/m####/oof.npz.
+  xgb fast (~35s/member, 17 done fold0); fm SLOW (~9min/member -> will get ~16/fold via 9000s timeout, enough
+  for greedy). Greedy step: reuse greedy_select.py greedy_es() w/ custom loader over members/*/oof.npz, vs
+  full fm 0.4496 / full xgb(lgai) 0.4420. status /content/libx_status_<fam>_<model>.json.
+- TICK — NEURAL-LOO COMPLETE (all 3 fams x dae/mlp/cnn1d x 3 folds, every run ok). Per-fold LOO-stack
+  beats full: dae ~+0.010, mlp ~+0.020-0.030, cnn1d ~+0.020 (cnn1d biggest relative but still weakest abs ~0.46).
+  LAYERED restack LAUNCHED (pid 211884, /content/layered_stack.py -> /content/layered_stack_result.json):
+  layered_tree (L1=9 stacked_oof ensembles + 15 non-neural fulls -> LGB L2), layered_linear, flat_all_tree
+  (~90 raw members + 15 fulls). ~15-20 min. Compare vs 0.42355 (flat full-model) / 0.42302 (old mlp-LOO).
+- TICK — ft STOPPED (user) + NEURAL-LOO LAUNCHED. ft was ~12 min/EPOCH (epoch1 vals: qwen 0.4517 /
+  nemotron 0.4524 / lgai 0.4444 — ~0.45 neural band, marginal, worse than trees ~0.44) => 8 epochs
+  ~96 min/fold > timeout => guaranteed waste. Killed ft on all 3 (batch is MEMORY not speed lever;
+  per-epoch cost = rows x 607-token attention, irreducible by batch). User: "run LOO for each neural
+  model". Launched SHIP_MODE=loo for dae,mlp,cnn1d (ft EXCLUDED — 11x too slow) per family x 3 folds:
+  SHIP_ROW_SOURCE=full, SHIP_NEURAL_EPOCHS=15 (LOO=11 fits/fold), distinct dirs <model>_loo_fold<f>
+  (no clobber of _full_fold), SAVE_MODELS=1. Produces p_full + 10 p_loo__<group> per (fam,model) =
+  the feature-group-dropout members (the lever that got mlp-LOO to 0.42302). Drivers nloo_driver.py
+  qwen142727/nemo242812/lgai248734, status /content/nloo_status_<fam>.json, logs nloo_<fam>_<m>_f<f>.log.
+  ⚠️ neural-LOO is UNTESTED (was code-complete but never run) — watch dae fold0 produces p_loo__* cols.
+  GOAL: stack these neural-LOO members (+ full models) -> test if it beats/closes gap to 0.42302.
+  - UPDATE: neural-LOO path VALIDATED (dae_loo_fold0 saved p_full + 9 p_loo__<group> cols on all 3 fams,
+    ~20 min/fold @ epochs=15). dae f0 done qwen/nemo/lgai; now on dae f1. mlp + cnn1d LOO queued after.
+    Monitor cron 72a6bb2b (every 10 min) replaced f1d71779. dropping nn_label_derivatives hurts dae most.
+  - UPDATE2: dae-LOO DONE qwen/lgai 3/3, nemotron 2/3 (f2 finishing) -> on to mlp-LOO. ENCOURAGING:
+    the LOO exp's own internal LGB-stack-of-LOO-members BEATS the full model: nemotron dae f2
+    stack 0.43706 vs full 0.44590 (+0.0088). Supports that neural-LOO members add real signal.
+  - UPDATE3: dae-LOO 9/9 done. mlp-LOO f0 done all 3 (10 p_loo + p_full cols), on mlp f1. STRONG:
+    nemotron mlp f0 internal LGB-stack-of-LOO = 0.42867 vs full mlp 0.45820 (+0.0295!) — near the
+    GLOBAL best 0.42355 from ONE family's mlp alone. mlp-LOO members are the biggest lever so far.
+    Folds ~30 min (mlp). cnn1d-LOO still queued after mlp.
+  - RESTACK DESIGN (user, LAYERED — supersedes flat): LAYER 1 = per (family x neural archetype) GBM-stack
+    of that LOO model's members = the saved 'stacked_oof' col in <model>_loo_fold<f>/preds/oof_preds.npz
+    (9 ensembles: dae/mlp/cnn1d x 3 fams). LAYER 2 = LightGBM GroupKFold(5,item) over the 9 layer-1
+    ensembles + 15 non-neural full models (logreg/xgb/et/etbig/fm x 3). Each LOO-model ensemble = own
+    input. Compare vs 0.42355 / 0.42302 + a flat-all baseline. Monitor cron now 948c3417 (was 72a6bb2b).
+    dae LOO-stack vs full dae (per fam, mean/3folds): qwen 0.4458 vs 0.4566 (+0.0108) / nemo 0.4373 vs
+    0.4475 (+0.0102) / lgai 0.4408 vs 0.4512 (+0.0103). mlp LOO-stack lift bigger (~+0.0295 nemo).
+- TICK — STACKING EXPERIMENTS DONE (24 cols = 8 models x 3 fams, ft EXCLUDED; honest GroupKFold(5)
+  on item, full 4.5M OOF). Results (soft-logloss): best_single 0.43789 · logit_mean 0.43433 ·
+  **C_tree (flat LightGBM) 0.42355 (BEST)** · C_linear 0.42520 · A_tree (hier) 0.42473 · A_linear 0.42605.
+  Per-family tree ensembles: nemotron 0.4287 (strongest emb) · lgai 0.4356 · qwen 0.4394.
+  CONCLUSIONS: FLAT > HIERARCHICAL (collapsing each emb to 1 number loses cross-emb model interactions);
+  TREE > LINEAR at both levels. Best 0.42355 BEATS old flat 0.42519 (-0.0016, upgraded set w/ etbig+mlp-full
+  pays off) but still +0.0005 vs mlp-LOO 0.42302 (its feature-group-dropout members carry extra signal).
+  Script /content/stack_exp.py, result /content/stack_exp_result.json. NEXT: add ft when ready; revisit
+  whether feature-dropout LIBRARY members (the mlp-LOO lever) close the gap to/below 0.42302.
+- TICK — ft KILLED + SPED UP (user): ft was ~48 min/fold (default batch=2048, epochs=25). Added code
+  (commit ea160f8): SHIP_NEURAL_EPOCHS / SHIP_NEURAL_BATCH knobs in _fit_neural + per-epoch step_fn ->
+  status JSON (stage=fit_epoch epoch/n_epochs/val_loss) AND stdout; ft wrapper now forwards step_fn.
+  Relaunched ft-only driver per tab (ft_driver.py, status /content/ft_status_<fam>.json) with
+  SHIP_NEURAL_EPOCHS=8 SHIP_NEURAL_BATCH=4096, live per-fold log /content/run_<fam>_ft_fold<f>.log,
+  40-min/fold timeout. ⚠️ batch=16384 OOM'd (FT attention ~batch x 607_tokens^2 => tried 132GB > 80GB GPU);
+  ft is batch-MEMORY-bound, NOT throughput-bound. SAFE batch <= ~4096 (~33GB). Speedup comes from
+  epochs (25->8), not batch. Drivers qwen133625/nemo233785/lgai239285 @ea160f8. (batch 16384 sized to avoid
+  FT-attention GPU OOM; can push higher once confirmed.) ⚠️ GUARD: poll ft_status_<fam>.json; pid alive
+  or finished unset => do not relaunch.
+- TICK — RESULTS: etbig (cuML GPU RF, real/full) is a BIG win over capped et, now best/tied-best
+  TREE member per family (full NLL, mean/folds):
+    qwen     etbig 0.4459 (0.4477/0.4440/0.4458)  vs et 0.4519  vs xgb 0.4472  -> BEATS xgb
+    nemotron etbig 0.4381 (0.4401/0.4362, 2/3)     vs et 0.4455  vs xgb 0.4379  -> ties xgb
+    lgai     etbig 0.4405 (0.4417/0.4392, 2/3)     vs et 0.4475  vs xgb 0.4420  -> BEATS xgb
+  ~13 min/fold on full rows (vs capped et 24-70 min on 1M subsample). cuML integration clean.
+  dae full DONE 9/9: qwen 0.4566 / nemotron 0.4475 / lgai 0.4512 (fm-competitive, decorrelated).
+  cnn1d DONE 9/9 (~0.47-0.49, weakest but most-decorrelated). Queue now: qwen on mlp-full f0
+  (115GB RSS, 2h timeout); nemotron/lgai on etbig f2. NEXT: etbig 3/3 all fams -> mlp-full sweep -> ft.
+- TICK — MASTER QUEUE + etbig + MLP-FULL + STACKING PLAN (user 4-part request). Replaced the T2
+  drivers with ONE master queue driver per tab (/content/q_driver.py, status /content/q_status_<fam>.json,
+  log /content/q_driver_<fam>.log). QUEUE per family (idempotent skip on <model>_full_fold<f>/result.json
+  ok + preds/oof_preds.npz; SHIP_EXP_SAVE_ROOT set per item so paths are uniform <model>_full_fold<f>):
+    cnn1d -> dae -> etbig -> mlp -> ft   (ft LAST so it can't starve the wanted models)
+  Drivers: qwen pid104496 / nemotron pid204834 / lgai pid208325, all @c3fb355.
+  STATE at launch: qwen cnn1d3/3+dae3/3 done -> on etbig f0; nemotron/lgai cnn1d3/3 done -> on dae f0.
+  (1) MLP FULL UNIVERSE: SHIP_MODEL=mlp SHIP_MODE=full SHIP_ROW_SOURCE=full -> mlp_full_fold<f>
+      (overrode the mlp special _TAG via SHIP_EXP_SAVE_ROOT). Fixes the universe mismatch: the old
+      mlp lived on the disjoint 264k LOO universe (exp_loo/<fam>/preds, zero item-overlap w/ the 4.5M
+      full models) -> could NOT be co-correlated/co-stacked. New mlp_full_fold puts it on the 4.5M universe.
+  (2) REAL ET = 'etbig' (commit c3fb355): cuML 26.02 GPU RandomForest on A100-80GB, ALL train rows,
+      n_est=300 depth=18 max_features=0.3 n_bins=128 (env SHIP_ETB_*). sklearn ET couldn't scale
+      (depth-12 + 1M-row cap was a hack). cuML has no literal ExtraTrees -> GPU RF w/ col-subsampling
+      = same decorrelated-bagged-tree role. NEW tag 'etbig' (does NOT clobber old capped 'et').
+      ⚠️ etbig model = cuml_rf.pkl (needs cuml/GPU to reload; fine for OOF/stack, revisit for final submit).
+  (3) STACKING EXPERIMENTS (QUEUED — run after ALL of T2+mlp+etbig land; ft optional). Build per
+      (fam,model) full OOF by concat folds 0/1/2 (position-aligned per fold), GroupKFold(item) meta.
+      Compare, each with a LINEAR meta (logreg on logits) AND a TREE meta (LightGBM):
+        (A) HIERARCHICAL: stack models WITHIN each embedding -> 3 embedding ensembles -> stack those 3.
+        (C) FLAT: all (embedding x model) in one meta.
+      Report OOF soft-logloss for {A-linear, A-tree, C-linear, C-tree} + logit-mean baseline; vs
+      0.42519 (flat full stack) / 0.42302 (mlp-LOO). (Script to be written when OOF complete + smoke-tested.)
+  CORR MATRICES (fold0, 4.5M universe) computed: cnn1d most-decorrelated everywhere (weak solo, diverse);
+  xgb-et ~0.97 redundant; dae fm-competitive. mlp excluded (was 264k universe) -> fixed by (1).
+  ⚠️ LESSON: pkill -9 -f run_one.py REPEATEDLY MISSES a heavy run_one (uninterruptible D-state mid-fit);
+  twice left a ~100GB orphan after switching drivers. ALWAYS verify `ps run_one` after a driver swap and
+  `kill -9 <pid>` any orphan (else 2x ~100GB assemblies OOM). ⚠️ GUARD (future ticks): poll q_status_<fam>.json;
+  pid alive or finished unset => DO NOT relaunch.
+- TICK — T2 REDIRECT (user correction: "L2 models" meant TIER-2 = cnn1d/dae/ft, NOT layer-2
+  dropout libraries). KILLED the tier-1 library drivers; LAUNCHED Tier-2 FULL-model completion per
+  tab via run_one subprocess: SHIP_MODE=full, SHIP_ROW_SOURCE=full, SAVE_MODELS=1, order
+  cnn1d->dae->ft (slowest/riskiest last), ft has a 3600s/fold timeout. Idempotent skip on valid
+  result.json(ok)+preds/oof_preds.npz. Picks up per family from left-off:
+    qwen     needs dae f1,f2 + ft f0,f1,f2     (cnn1d 3/3 + dae f0 already done)
+    nemotron needs cnn1d f1,f2 + dae x3 + ft x3 (only cnn1d f0 done)
+    lgai     needs cnn1d f1,f2 + dae x3 + ft x3 (only cnn1d f0 done)
+  Drivers: qwen pid98653 / nemotron pid199026 / lgai pid202139. Status /content/t2_status_<fam>.json;
+  log /content/t2_driver_<fam>.log. (Had to kill one orphan nemotron lib run_one pid197711 @78GB
+  that pkill missed -> tabs now 1 assembly each, ~100GB+ free.) ⚠️ GUARD (future ticks): poll
+  t2_status_<fam>.json; if "pid" alive (ps -p) or "finished" unset => DO NOT relaunch, just poll.
+  ⚠️ ft (FT-Transformer) NEVER completed before (OOM/slowness risk) — watch its runs; if it times
+  out, cut batch_size in src/neural_members.py or skip ft. KNOWN T2 scores (full): cnn1d ~0.47-0.49
+  (weakest archetype), qwen.dae 0.4580 (fm-competitive, promising). NEXT: when T2 fulls land, fold
+  cnn1d/dae/ft OOF into the Layer-3 stack; compare vs 0.42519 (flat) / 0.42302 (mlp-LOO).
+- TICK — L2 LAUNCH (live session, user present). ✅ CLEAN L2 DROPOUT-LIBRARY PHASE LAUNCHED on
+  all 3 tabs after a full state audit. AUDIT: (a) all full-model OOF intact => 0.42519 flat stack
+  reproducible; (b) MLP was the original LOO experiment, stored at exp_loo/<fam>/preds/oof_preds.npz
+  (keys: p_full + 10 p_loo__<group>) NOT in <model>_full_fold dirs — its nested LightGBM stack =
+  **0.42302** (greedy_mlp_report.json) = BEST on disk, beats 0.42519; (c) the prior OOM dup-drivers
+  all self-terminated overnight; tabs clean/idle (3x A100/167GB, Drive mounted) before launch.
+  TIER-1 full NLLs (mean/3 folds): xgb 0.4472/0.4379/0.4420 · et 0.4520/0.4455/0.4475 · fm
+  0.4576/0.4496/0.4513 · mlp 0.4605/0.4519/0.4467 · logreg 0.4691/0.4621/0.4642 (qwen/nemo/lgai).
+  LAUNCH: ONE driver/tab = /content/lib_driver.py (detached Popen), MODELS=[logreg,xgb,fm,mlp,et]
+  x folds[0,1,2], SHIP_MODE=library, SHIP_LIB_M=30 (et=8), RHO=0.3,0.9, MAX_ROWS=1M, BUDGET_S=2400,
+  SAVE_MODELS=1, each run via run_one.py subprocess (ONE ~24GB assembly/tab => no OOM). Idempotent
+  skip on result.json experiment==subspace_library. Drivers: lgai pid200554 / qwen pid97328 /
+  nemotron pid197710, all @167f28b, all on logreg_f0, run_one assembling (~24GB RSS), lgai 1 member.
+  ⚠️ DOUBLE-LAUNCH GUARD (future ticks): read /content/lib_status_<fam>.json — if "pid" is alive
+  (ps -p) or "finished" not set, DO NOT relaunch; just poll. Per-tab driver log /content/lib_driver_<fam>.log.
+  NEXT: when libraries fill (~4-7h/tab), greedy_select.py per archetype over members/*/oof.npz =>
+  per-archetype L2 OOF => Layer-3 stack (within-family A->B and flat C); compare vs 0.42519 / 0.42302.
 - TICK 19:48 — ✅ nemotron SELF-HEALED (4 dup threads finished their passes -> 0 lib threads,
   164GB free). Launched ONE clean single lib driver (libclean: xgb,logreg,fm,mlp; xgb_f0 running,
   151GB free) — clean no-contention progress. Cell now POLL-ONLY (no more re-launch). lgai still
