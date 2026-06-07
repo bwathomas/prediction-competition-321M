@@ -105,6 +105,10 @@ CODE_VERSION = os.environ.get("SHIP_CODE_VERSION", "v2")             # A-FOLD: s
 N_FOLDS = 3
 SPLIT_SEED = 0
 OOF_FOLD = int(os.environ.get("SHIP_OOF_FOLD", "2"))   # which nf3 fold is held out (0/1/2)
+# SHIP_OOF_FOLD=-1 => TRAIN_ALL: train on ALL rows (no fold held out), save the model, skip
+# OOF scoring. Produces the final SHIPPING model (all-data fit) for a canon member. Label-derived
+# features stay leakage-free (each row still uses its own fold's cross-fitted shard).
+TRAIN_ALL = OOF_FOLD < 0
 N_TRAIN_EXPECTED = 264350
 
 FAM_ALIAS = {"qwen": "qwen", "nemotron": "llama", "llama": "llama",
@@ -214,8 +218,9 @@ LIB_SEED = int(os.environ.get("SHIP_LIB_SEED", "777"))
 # feature subspace (the intended diversity); OOF prediction still covers ALL held-out rows.
 # Set SHIP_LIB_MAX_ROWS=0 to disable (train members on full rows).
 LIB_MAX_ROWS = int(os.environ.get("SHIP_LIB_MAX_ROWS", "1000000"))
-_TAG = (f"{ROW_SOURCE}_fold{OOF_FOLD}" if MODEL == "mlp"
-        else f"{TREE_TAG}_{ROW_SOURCE}_fold{OOF_FOLD}")
+_FOLDLBL = "ALL" if TRAIN_ALL else str(OOF_FOLD)
+_TAG = (f"{ROW_SOURCE}_fold{_FOLDLBL}" if MODEL == "mlp"
+        else f"{TREE_TAG}_{ROW_SOURCE}_fold{_FOLDLBL}")
 if SWEEP:
     _TAG = "sweep_" + _TAG
 if LIBRARY:
@@ -380,10 +385,13 @@ def fn():
         # ---- (3) nf3 fold per row (item_fold -> matches the shards) ---------------
         row_fold = np.fromiter((item_fold(i, N_FOLDS, SPLIT_SEED) for i in tr_item),
                                dtype=np.int64, count=N)
-        oof_mask = row_fold == OOF_FOLD
-        train_mask = ~oof_mask
+        if TRAIN_ALL:
+            train_mask = np.ones(N, dtype=bool); oof_mask = np.zeros(N, dtype=bool)
+        else:
+            oof_mask = row_fold == OOF_FOLD
+            train_mask = ~oof_mask
         n_oof, n_train = int(oof_mask.sum()), int(train_mask.sum())
-        if n_oof == 0 or n_train == 0:
+        if n_train == 0 or (not TRAIN_ALL and n_oof == 0):
             raise ValueError(f"degenerate split: train={n_train}, oof={n_oof}")
         step("nf3_split", n_train=n_train, n_oof=n_oof, oof_frac=round(n_oof / N, 4))
 
@@ -416,7 +424,7 @@ def fn():
         # which is guaranteed present (the OOF derivation always writes it).
         lab_group_of_col = []
         for g in LABEL_GROUPS:
-            _, lc = store.assemble([g], fold=OOF_FOLD, check_coverage=False)
+            _, lc = store.assemble([g], fold=(0 if TRAIN_ALL else OOF_FOLD), check_coverage=False)
             lab_group_of_col += [g] * len(lc)
         n_lab_cols = len(lab_group_of_col)
         Xlab = np.full((N, n_lab_cols), np.nan, dtype=np.float32)
@@ -480,6 +488,11 @@ def fn():
 
         train_idx = np.where(train_mask)[0]
         oof_idx = np.where(oof_mask)[0]
+        if TRAIN_ALL:
+            # No held-out rows: train on ALL of train_idx. Use a 1-row dummy oof so the
+            # OOF prediction/scoring code runs harmlessly — the SAVED model (fit on all
+            # rows) is the deliverable; the dummy OOF number is meaningless and ignored.
+            oof_idx = train_idx[:1]
         oof_items = [tr_item[r] for r in oof_idx]
         oof_y = y[oof_idx]
         oof_group = np.asarray(oof_items)  # GroupKFold groups = item_key (cold-start honest)
@@ -1033,6 +1046,14 @@ def fn():
                         emb = (torch.as_tensor(oof_item_emb[s:e], dtype=torch.float32, device=dev) - _mu) / _sd
                         logit = (theta(sid_o[s:e]) * A(emb)).sum(1) + bw(emb).squeeze(-1)
                         acc[s:e] += torch.sigmoid(logit).double().cpu().numpy()
+                # TRAIN_ALL ship: persist each bag member so the all-data ensemble can be
+                # reloaded to score the test set (averaging the M members' sigmoids).
+                if TRAIN_ALL and save_dir is not None and SAVE_MODELS:
+                    md = Path(save_dir) / "members"; md.mkdir(parents=True, exist_ok=True)
+                    torch.save({"theta": theta.weight.detach().cpu(), "A": A.weight.detach().cpu(),
+                                "bw_w": bw.weight.detach().cpu(), "bw_b": bw.bias.detach().cpu(),
+                                "mu": _mu.cpu(), "sd": _sd.cpu(), "K": K, "member": m},
+                               str(md / f"m{m:02d}.pt"))
                 step("irt_bag_member", member=m + 1, n_members=M,
                      run_soft_logloss=round(soft_logloss(oof_y, np.clip(acc / (m + 1), _EPS, 1 - _EPS)), 6))
             return np.clip(acc / float(M), _EPS, 1 - _EPS), float("nan"), float("nan")
@@ -1347,6 +1368,22 @@ def fn():
 
         cat_list = list(categories)
         P = np.column_stack([p_loo[c] for c in cat_list])        # [n_oof, K]
+
+        # TRAIN_ALL ship: the full model + all LOO members are now trained on ALL rows and
+        # saved (models_dir/full + models_dir/loo__*). The GBM stacker is fit on honest OOF,
+        # which does not exist here (1-row dummy) — skip it; the stacker weights come from the
+        # fold-OOF loo run. Return the saved-member manifest as the deliverable.
+        if TRAIN_ALL:
+            result = {"ok": True, "experiment": f"train_all_{MODEL}", "model": MODEL,
+                      "family": FAMILY, "row_source": ROW_SOURCE, "train_all": True,
+                      "n_train": int(train_idx.shape[0]), "members_saved": ["full"] + [f"loo__{c}" for c in cat_list],
+                      "save_root": str(SAVE_ROOT), "models_dir": str(models_dir),
+                      "t_total_s": round(time.time() - t0, 1)}
+            (Path(SAVE_ROOT) / "result.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+            print(f"TRAIN_ALL {MODEL} fam={FAMILY}: trained+saved full + {len(cat_list)} LOO members "
+                  f"on ALL {train_idx.shape[0]} rows ~{result['t_total_s']}s", flush=True)
+            prog.update(stage="done", **result); _write_status(dict(prog))
+            return result
 
         # ---- (9) LightGBM stack over the K LOO columns, honest inner GroupKFold ----
         step("lgb_stack_inner_cv")
