@@ -1,5 +1,19 @@
 # NIGHT PLAN 2026-06-07 — autonomous IRT→canon→final-stack pipeline
 
+## 🚢 RUNTIME GEOMETRY — DONE + FULL-BLOCK VERIFIED (2026-06-07)
+`src/geom_runtime.py` (commit b613239, LOCAL — see push-blocked note) recomputes the full 525-col geometry
+block for new embeddings, EXACT column order vs stored (cols_match_order TRUE), max_abs 0.0021 (only LID col),
+mean 3.3e-7. Per-group also verified (centroid_distance/item_cluster exact). Centroids exported to
+`DR/ship/ship_models/geom_<fam>_centroids.npz` (qwen done; TODO nemotron+lgai). Artifacts: centroids (~4.7MB)
++ unit-normalized train emb index (for nn-kNN; ship fp16 ~2.5GB or quantized cache.py). query emb must be
+unit_rows-normalized; self/alias exclusion is key-based (no-op for genuinely-new items).
+⚠️ PUSH BLOCKED: local->github connectivity DOWN (port 443 timeouts). 4 commits UNPUSHED locally incl
+geom_runtime.py + irt_numpy.py (origin stuck 94c6261). Commits safe locally; geom_runtime.py was WRITTEN
+DIRECTLY onto the lgai tab to run the verify. `git push` when connectivity returns. (Earlier "pushed" reports
+were FALSE — `git push|tail` masked the exit code; fixed to check $?.)
+TODO: export centroids nemo+lgai; embedding-index shipping decision (fp16 vs quantized); then full numpy
+predict() = geom_runtime -> [etbig forest_predict + mlp + irt_bag] -> stacker.
+
 ## 🚢 RUNTIME GEOMETRY (user priority, 2026-06-07) — VERIFIED reproducible on new embeddings
 The tree/mlp consume geometry feats (centroid_distance/item_cluster/cluster_geometry/nn_geometry) that were
 precomputed from TRAIN item-embedding distribution. At runtime a cold item gives only its raw embedding ->
