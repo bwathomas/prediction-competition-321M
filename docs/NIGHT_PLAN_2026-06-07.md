@@ -2,9 +2,13 @@
 
 ## 🔬 POST-PIPELINE: generalization investigation (autonomous, 2026-06-07)
 Done: LOBO (stack generalizes +0.0008), cold-probe (members anti-transfer; gap=domain cold-start),
-OOD-detector embedding-distance FAILED. IN FLIGHT: **16-benchmark cold sweep** (irt_bag, nemotron, M=6,
-SHIP_HOLDOUT_BENCH per bench) — nemotron pid (sweep A, 8 benches) + lgai (sweep B, 8) → cold preds to
-`DR/ship/coldsweep/nemotron/irt_bag_<bench>/preds/oof_preds.npz`, BCE in coldsweep_{a,b}.json.
+OOD-detector embedding-distance FAILED. IN FLIGHT: **16-benchmark cold sweep on ETBIG** (the tree — the high-weight member; user: "use the tree,
+irt is weak"). nemotron pid 112474 (sweep A, 8) + lgai 114659 (sweep B, 8), capped 100 trees/800k rows,
+SHIP_HOLDOUT_BENCH per bench → cold preds to `DR/ship/coldsweep/nemotron/etbig_<bench>/preds/oof_preds.npz`,
+BCE in coldsweep_{a,b}.json. ⚠️ CAVEAT: etbig's dense label-derived feats (cluster passrate/counts) are
+cross-fitted per ITEM-fold, so a held-out benchmark's rows still see that benchmark's other-item label stats
+=> cold number is OPTIMISTIC (floor on true degradation). irt_bag probe (afrimedqa+0.42/mmlupro+0.22/swebench
++0.09) was leak-free embedding-only; the two bracket the truth.
 **ON COMPLETION run the analysis:** for all 16 benches compute cold BCE vs warm item-OOF BCE (degradation);
 correlate degradation with candidate detectors — (1) benchmark frequency (n rows), (2) member-disagreement =
 variance across the 3 families' WARM irt_bag preds per item, (3) embedding-distance (have it, failed). Pick best
