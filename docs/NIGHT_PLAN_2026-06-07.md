@@ -1,5 +1,20 @@
 # NIGHT PLAN 2026-06-07 — autonomous IRT→canon→final-stack pipeline
 
+## 🚢 RUNTIME GEOMETRY (user priority, 2026-06-07) — VERIFIED reproducible on new embeddings
+The tree/mlp consume geometry feats (centroid_distance/item_cluster/cluster_geometry/nn_geometry) that were
+precomputed from TRAIN item-embedding distribution. At runtime a cold item gives only its raw embedding ->
+must recompute. ⚠️ centroids NOT persisted (fit fresh each derivation, seed=0). VERIFIED (qwen, lgai tab):
+re-fit `fit_multi_kmeans(unit_rows(emb),{coarse:32,fine:256},seed=0)` (42s) REPRODUCES stored shards:
+centroid_distance 0.0 (exact), item_cluster 0.0 (exact), cluster_geometry 9e-4, nn_geometry 1e-3 (LID float).
+-> runtime geometry works. Recipe: `cluster_geometry_fast`(centroids+all_emb sizes) + nn-geo from
+`bruteforce_knn` over train emb. Artifacts to EXPORT: centroids fine[256,D]+coarse[32,D] (~4.7MB);
+cluster-size vector [256]; train item-embedding index (311k×4096 -- BIG -> quantize via cache_export.py for
+nn-kNN, accept small nn_geometry drift, OR ship fp16 ~2.5GB). NEXT: write geom_runtime.py (assemble all 4
+groups in EXACT training column order: GEOM_GROUPS=[centroid_distance,cluster_geometry,nn_geometry,item_cluster]
+matching dense_full layout) + verify the full assembled block matches stored dense; decide emb-index shipping.
+⚠️ qwen colab2 tab OOM-crashed (small CPU runtime, can't load 5GB emb) — kernel dead, cells return empty; not
+needed (geometry runs on lgai/nemotron high-RAM tabs via shared Drive). Flag for user: restart that tab if wanted.
+
 ## 🚢 SUBMISSION-READINESS (user-directed, 2026-06-07) — numpy-only inference
 GOAL: run the canon members with python+numpy only (Codabench has no cuML/GPU). Build+verify per member.
 - **etbig (tree): numpy inference BUILT + VERIFIED** — `src/tree_numpy.py` (extract_forest from cuML
