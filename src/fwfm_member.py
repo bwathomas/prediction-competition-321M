@@ -749,6 +749,37 @@ def fit_fwfm_member(
         )
         return xb, yb, wb
 
+    # ---- Optional GPU-RESIDENT fast path (auto on CUDA when it fits VRAM) ----
+    # Classic-FM forward is cheap, so the per-batch CPU gather+standardize+upload
+    # in the streaming path above dominates wall-time. When the standardized
+    # matrix comfortably fits VRAM, upload it ONCE and gather on-device. The name
+    # _gather_batch_to_device is rebound so the train/eval loops below are
+    # unchanged. Falls back to streaming on any CUDA OOM.
+    if str(device).startswith("cuda"):
+        try:
+            _need = int(N) * int(F) * 4
+            _free_b, _total_b = torch.cuda.mem_get_info()
+            if _need < 0.45 * float(_total_b):
+                _Xg = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32)).to(device)
+                if standardize:
+                    _Xg.sub_(torch.from_numpy(mu_f32).to(device)).div_(torch.from_numpy(sigma_f32).to(device))
+                _yg = torch.from_numpy(y_np).to(device)
+                _swg = None if sw_np is None else torch.from_numpy(sw_np).to(device)
+
+                def _gather_batch_to_device(global_idx, _Xg=_Xg, _yg=_yg, _swg=_swg):
+                    _it = torch.as_tensor(np.asarray(global_idx), dtype=torch.long, device=device)
+                    return (_Xg.index_select(0, _it), _yg.index_select(0, _it),
+                            None if _swg is None else _swg.index_select(0, _it))
+
+                LOG.info("fwfm_member: GPU-resident data path (X=%dx%d, %.1f GB on device)",
+                         N, F, _need / 1e9)
+        except (RuntimeError, MemoryError) as _e:
+            LOG.warning("fwfm_member: resident path unavailable (%s); using streaming", _e)
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     # ---- Torch model ----
     init_scale = float(1.0 / math.sqrt(max(int(k), 1)))
     if init_V_scale is not None:
