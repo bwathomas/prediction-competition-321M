@@ -715,6 +715,60 @@ def fn():
             return np.asarray(p, dtype=np.float64).reshape(-1), \
                 float(state.train_loss), float(state.val_loss)
 
+        # ---- (6-irt) K-dim IRT, item params LINEARLY amortized from the item
+        # embedding (NO MLP / no hidden layers). theta_s in R^K is a free per-subject
+        # nn.Embedding; item discrimination a(x)=A.emb in R^K and difficulty b(x)=w.emb+b0
+        # are LINEAR maps of the item embedding ("learn to represent the embedding as
+        # K difficulty dimensions"). score = <theta_s, a(x_i)> + b(x_i). Because item
+        # params come from the embedding, COLD items get real params => generalizes.
+        def fit_and_predict_oof_irt(*, save_dir=None):
+            import torch
+            import torch.nn as nn
+            K = int(os.environ.get("SHIP_IRT_K", "16"))
+            EPOCHS = int(os.environ.get("SHIP_IRT_EPOCHS", "30"))
+            BS = int(os.environ.get("SHIP_IRT_BATCH", "65536"))
+            LR = float(os.environ.get("SHIP_IRT_LR", "1e-3"))
+            WD = float(os.environ.get("SHIP_IRT_WD", "1e-5"))
+            dev = "cuda"
+            Euniq = torch.as_tensor(item_emb_unique, dtype=torch.float32, device=dev)
+            _mu = Euniq.mean(0, keepdim=True); _sd = Euniq.std(0, keepdim=True).clamp_min(1e-6)
+            Euniq = (Euniq - _mu) / _sd
+            r2u = torch.as_tensor(row_to_uniq[train_idx], device=dev)
+            sid_tr = torch.as_tensor(sid[train_idx], device=dev)
+            ytr = torch.as_tensor(y[train_idx].astype(np.float32), device=dev)
+            theta = nn.Embedding(int(n_subjects), K).to(dev); nn.init.normal_(theta.weight, std=0.1)
+            A = nn.Linear(int(D_EMB), K, bias=False).to(dev)
+            bw = nn.Linear(int(D_EMB), 1).to(dev)
+            with torch.no_grad():
+                _p0 = float(np.clip(y[train_idx].mean(), 1e-6, 1 - 1e-6))
+                bw.bias.fill_(float(np.log(_p0 / (1 - _p0))))
+            opt = torch.optim.Adam(list(theta.parameters()) + list(A.parameters())
+                                   + list(bw.parameters()), lr=LR, weight_decay=WD)
+            bce = nn.BCEWithLogitsLoss()
+            ntr = int(train_idx.shape[0])
+            for ep in range(EPOCHS):
+                perm = torch.randperm(ntr, device=dev)
+                for s in range(0, ntr, BS):
+                    b = perm[s:s + BS]
+                    emb = Euniq.index_select(0, r2u[b])
+                    logit = (theta(sid_tr[b]) * A(emb)).sum(1) + bw(emb).squeeze(-1)
+                    opt.zero_grad(); loss = bce(logit, ytr[b]); loss.backward(); opt.step()
+                step("irt_epoch", epoch=ep + 1, n_epochs=EPOCHS, train_loss=round(float(loss.item()), 5))
+            sid_oof_t = torch.as_tensor(sid[oof_idx], device=dev)
+            out = np.empty(int(oof_idx.shape[0]), dtype=np.float64)
+            with torch.no_grad():
+                for s in range(0, oof_item_emb.shape[0], 200000):
+                    e = min(s + 200000, oof_item_emb.shape[0])
+                    emb = (torch.as_tensor(oof_item_emb[s:e], dtype=torch.float32, device=dev) - _mu) / _sd
+                    logit = (theta(sid_oof_t[s:e]) * A(emb)).sum(1) + bw(emb).squeeze(-1)
+                    out[s:e] = torch.sigmoid(logit).double().cpu().numpy()
+            if save_dir is not None and SAVE_MODELS:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                torch.save({"theta": theta.weight.detach().cpu(), "A": A.weight.detach().cpu(),
+                            "bw_w": bw.weight.detach().cpu(), "bw_b": bw.bias.detach().cpu(),
+                            "mu": _mu.cpu(), "sd": _sd.cpu(), "K": K}, str(Path(save_dir) / "irt_state.pt"))
+            return np.clip(out, _EPS, 1 - _EPS), float("nan"), float("nan")
+
         # ---- (SWEEP) random-subspace fractional-leave-out sweep (trees) -----------
         # For each keep-fraction rho in SWEEP_FRACS: train SWEEP_M XGBoost members, each on a
         # random rho-fraction of the dense feature COLUMNS; stack them (honest inner GroupKFold)
@@ -918,6 +972,9 @@ def fn():
         if TREE:
             p_full, tl_full, vl_full = fit_and_predict_oof_tree(
                 drop_dense_group=None, save_dir=(models_dir / "full") if SAVE_MODELS else None)
+        elif MODEL == "irt":
+            p_full, tl_full, vl_full = fit_and_predict_oof_irt(
+                save_dir=(models_dir / "full") if SAVE_MODELS else None)
         else:
             p_full, tl_full, vl_full = fit_and_predict_oof(
                 use_item=True, use_subject=True, drop_dense_group=None, tag="FULL", seed_off=900,
