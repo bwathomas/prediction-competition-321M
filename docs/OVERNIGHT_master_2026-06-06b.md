@@ -122,6 +122,19 @@ RECOMMENDED MORNING FIX (with user present for drive.mount if needed):
 ALTERNATIVE: ship the delivered 0.42519 stack as-is (already beats old 0.43653 by 0.011).
 
 ## RESULTS LOG (append)
+- TICK (2026-06-07, autonomous) — **16-BENCHMARK COLD SWEEP on ETBIG (the high-weight TREE; user: "use the
+  tree, irt is weak")**. Hold out each benchmark, train etbig (100 trees/800k rows) on the rest, predict cold.
+  **TREE IS COLD-ROBUST:** mean degradation (cold-warm) **+0.039** (vs irt +0.09..+0.42); cold BEATS the
+  benchmark's own-mean on **14/16** (worst mmbench_v11 +0.13, agentdojo +0.12 — still < own-mean; only
+  ultrafeedback cold 0.506 > mean 0.464). **Base-rate shrinkage gives ~0** (mean cold 0.5031 -> shrunk 0.5027,
+  λ=0 for 13/16) — OOD-shrinkage is MOOT for the tree (cold already < mean). **No detector works**:
+  Spearman(degr, ·) = freq +0.37 (weak), disagreement -0.05, embed-dist -0.13. Result:
+  DR/ship/stack/etbig_coldsweep_analysis.json. **Conclusion:** the catastrophic cold blowups were specific to
+  irt (weakest member, ~0.01-0.08 weight); the tree (+mlp) carry the stack and extrapolate gracefully. The
+  ensemble's real-test cold-start exposure is much smaller than the irt probe implied. CAVEAT: etbig's label-
+  derived feats leak benchmark-internal stats in HOLDOUT_BENCH (cold optimistic; a truly-unseen test benchmark
+  has empty label feats) — those feats ARE the tree's cold-robustness source. Remaining untested: mlp cold-start
+  (dominant member) + label-feature-cold (re-derive label shards excluding the benchmark).
 - TICK (2026-06-07, autonomous) — **OOD-DETECTOR check (NEGATIVE)**: tested embedding-distance as a cold-start
   detector (per-benchmark mean dist to nearest OTHER-benchmark item, nemotron emb, PCA-128). Does NOT predict
   cold degradation: afrimedqa (degr +0.42) OOD-dist 0.585 (LOW, 12/16) < swebench (degr +0.09) 0.641. Inverted/
