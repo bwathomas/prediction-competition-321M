@@ -45,7 +45,20 @@ Canon = members with POSITIVE weight in the final non-neg linear stack. Baseline
 non-neg weight shows it contributes; drop redundant ones (kNN, logreg, fm, cnn1d, dae likely out). Pick the
 single best IRT variant (by stack-lift). Document the choice + rationale in the RESULTS LOG.
 
-## STAGE D — train the CANON on full data, ALL 3 families
+## STAGE D — train the CANON on full data, ALL 3 families  [IN PROGRESS]
+**Canon decided (Stage C):** mlp-LOO + etbig + **irt_bag** (the IRT winner). knn/irt2/irt_lib/dae/cnn1d/
+logreg/fm dropped (zero non-neg weight). User directive: train each on ALL data, NO oof, once per model;
+mlp stays LOO.
+**Mechanism:** new `TRAIN_ALL` mode (`SHIP_OOF_FOLD=-1`, commit c8e608f) — fits on all 4.5M rows, no holdout,
+saves the model, skips OOF scoring. Driver `/content/trainall_driver.py` (per-model SHIP_MODE via
+`TRAINALL_SPECS=mlp:loo,etbig:full,irt_bag:full`), detached, status `/content/trainall_<fam>.json`. Models →
+`DR/ship/exp_loo/<fam>/<model>_full_foldALL/models/` (etbig: cuml_rf.pkl; irt_bag: members/m00..15.pt; mlp:
+full + loo__*). Smoke-validated all 3 paths on nemotron.
+**Launched:** nemotron (colab) + lgai (colab3) real runs. **qwen-family STILL PENDING** — qwen tab is GPU-less
+(recycle dropped it to CPU), so run qwen-family TRAIN_ALL on whichever GPU tab frees first (SHIP_FAMILY=qwen
+reads qwen embeddings from shared Drive): write trainall_driver if absent, launch with TRAINALL_SPECS, detached.
+~70 min/family (mlp ~40 / etbig ~20 / irt_bag ~8).
+(orig:)
 `SHIP_ROW_SOURCE=full` (all 4.5M rows, honest 3-fold OOF). Per canon member:
 - **mlp**: `SHIP_MODEL=mlp SHIP_MODE=loo` → p_full + p_loo__* + `stacked_oof` (the honest GBM stack of its LOO members).
 - **etbig**: `SHIP_MODEL=etbig SHIP_MODE=full`.
