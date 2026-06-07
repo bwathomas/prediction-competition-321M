@@ -5,12 +5,17 @@ GOAL: run the canon members with python+numpy only (Codabench has no cuML/GPU). 
 - **etbig (tree): numpy inference BUILT + VERIFIED** — `src/tree_numpy.py` (extract_forest from cuML
   `.as_treelite().dump_as_json()` -> flat node arrays; forest_predict = numpy traversal, mean of per-tree
   leaves, left if x<=thr). Verified numpy==cuML predict to **8.6e-8** (commit 59e3346).
-- ⚠️ foldALL etbig is HUGE (~33M nodes/family, depth18/300trees) -> impractical to ship. FIX: ship-sized
-  etbig **depth12/128trees**. IN FLIGHT: nemotron ship-etbig TRAIN_ALL (pid 129830) ->
-  `DR/ship/ship_models/etbig_nemotron/models/full/cuml_rf.pkl`. NEXT: extract->npz, verify numpy==cuML, report
-  node-count/size/speed; then do qwen+lgai; then check ship-etbig OOF ≈ big etbig (so stack weight holds);
-  re-fit stack if needed. THEN numpy inference for mlp (torch->numpy fwd) + irt_bag (already numpy-friendly:
-  theta/A/bw matmuls) + the GBM stacker (lightgbm->numpy or pure-python tree eval).
+- ⚠️ foldALL etbig HUGE (~33M nodes) -> impractical. FIX: **ship-sized etbig depth12/128trees**.
+  **nemotron DONE + extracted + VERIFIED**: 895868 nodes, **forest.npz 4.0 MB**, numpy 0.078 ms/row,
+  numpy==cuML **9.6e-8** (exact). -> tree-ship is SOLVED at 4MB/family. lgai ship-etbig pid 132514 (running);
+  qwen pending (nemotron tab busy w/ mlp sweep, qwen tab GPU-less) -> launch when free. Forests saved to
+  `DR/ship/ship_models/etbig_<fam>/forest.npz` (+ cuml_rf.pkl).
+- **xgb-vs-etbig (user Q):** etbig already ships at 4MB exact, so NO need to switch. xgb only marginally
+  cleaner build (native JSON, no treelite roundtrip) but predictively ~= etbig (0.98 corr; got 0 canon weight
+  by collinearity) and switching costs a stack re-fit. DECISION: keep etbig.
+- TODO check: ship-etbig (depth12/128) OOF ≈ big etbig (depth18/300) so the stack weight still holds — re-run
+  its 3-fold OOF + compare; if drift, re-fit stack. THEN numpy for mlp (torch->numpy fwd) + irt_bag (theta/A/bw
+  matmuls, avg 16 members) + GBM stacker (lightgbm->numpy/pure-python).
 - mlp cold sweep (nemotron pid, bonus) may still be running; deprioritized vs submission.
 
 ## 🔬 POST-PIPELINE: generalization investigation (autonomous, 2026-06-07)
