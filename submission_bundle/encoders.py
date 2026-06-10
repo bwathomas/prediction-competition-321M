@@ -152,6 +152,16 @@ class Encoder:
         dtype = (torch.bfloat16 if self.device == "cuda"
                  and torch.cuda.is_bf16_supported() else torch.float32)
 
+        # Register the llama_bidirec config/model classes BEFORE any from_pretrained
+        # touches the repo (trc5 order): AutoTokenizer also instantiates the repo
+        # config, and an unregistered model_type falls back to the generic
+        # PreTrainedConfig, which AttributeErrors on nemotron's rope-scaling fields
+        # under transformers >= 5.10.
+        if enc_meta.get("bidirectional_llama"):
+            if self.model_id != "nvidia/llama-embed-nemotron-8b":
+                raise RuntimeError("bidirectional_llama is nemotron-only")
+            _install_llama_bidirectional()
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_id, cache_dir=cache_dir, local_files_only=True)
         if enc_meta.get("padding_side"):
@@ -160,9 +170,6 @@ class Encoder:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         if enc_meta.get("bidirectional_llama"):
-            if self.model_id != "nvidia/llama-embed-nemotron-8b":
-                raise RuntimeError("bidirectional_llama is nemotron-only")
-            _install_llama_bidirectional()
             self.model = AutoModel.from_pretrained(
                 self.model_id, cache_dir=cache_dir, torch_dtype=dtype,
                 attn_implementation="sdpa", local_files_only=True)
