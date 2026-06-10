@@ -173,3 +173,19 @@ STRATEGIC note favors over the flexible tree-meta). Save artifacts **NON-DESTRUC
 - run_bg / detached subprocess for ALL heavy cells; never synchronous heavy work.
 - A recycled tab (Drive unmounted / pc321 gone) CANNOT be remounted headless → flag for morning, keep other 2 going.
 - Commit+push every code change here; redeploy to tabs via git fetch/checkout.
+
+## 🔬 PQ-512 DOWNSTREAM-OOF VALIDATION — RESULT (2026-06-09, nemotron fold0, 1.52M rows)
+`scripts/ship/pq_downstream_validation.py` (51fce57). Models FIXED (full-feat-trained fold0); OOF rows'
+17 nn cols recomputed from the PQ-decoded index (== runtime ADC exactly). Rebuild check: rebuilt baseline
+== stored etbig p_full to BCE 7 decimals (max|Δp| 0.006). Result JSON: DR/ship/stack/pqval_nemotron_fold0.json.
+- FEATURES: nn_geometry badly distorted (mean|Δ| 1.77); nn_label mean|Δ| 0.025; counts ±1.1 neighbors.
+  PQ sims SATURATE the alias threshold (1-1e-6) across near-duplicate groups → runtime nn-path needs
+  deep retrieval buffers (GEO 2048 / LAB 1024 used here; default search_buffer=2 CRASHES under-retrieved).
+- etbig:       0.44008 → 0.44244  (Δ +0.00236, pred corr 0.990)
+- mlp stacked: 0.42113 → 0.42326  (Δ +0.00213; mlp p_full only +0.00025 — LOO members amplify)
+- CANON STACK (only nemotron's 2 cols swapped): 0.41939 → 0.42023  (Δ +0.00085)
+VERDICT: not "highly damaging" but NOT negligible: extrapolated all-3-family cost ≈ +0.002 BCE ≈ ~15% of
+the canon's gain over old ship (-0.0147). lgai+qwen fold0 validations IN FLIGHT (sequential, A100, pid 17340).
+MITIGATIONS if confirmed: (a) retrain members on PQ-derived features (train/serve consistency — likely
+recovers most), (b) drop the 3 nn_geometry cols, (c) PQ-1024/OPQ (~1GB), (d) re-check real Codabench size
+cap — int8-full (recall 0.99) ends the issue if ~4GB allowed.
