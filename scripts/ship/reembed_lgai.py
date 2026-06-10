@@ -24,7 +24,7 @@ DR = os.environ.get("SHIP_DRIVE_ROOT", "/content/drive/MyDrive/prediction-compet
 REPO = os.environ.get("SHIP_REPO_ROOT", "/content/pc321")
 BUNDLE_SRC = os.environ.get("BUNDLE_SRC", f"{REPO}/submission_bundle")
 STATUS = "/content/reembed_lgai.json"
-EMB_DIR = f"{DR}/embeddings/mistral"            # legacy slug holding the lgai family
+EMB_DIR = f"{DR}/embeddings/embedding_cache_lgai_preview_fa2/annamodels__LGAI-Embedding-Preview"  # FAMILY_SLUG["mistral"]
 BATCH = int(os.environ.get("LGAI_BATCH", "16"))
 _t0 = time.time()
 sys.path.insert(0, REPO)
