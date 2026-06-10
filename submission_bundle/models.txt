@@ -1,0 +1,3 @@
+Qwen/Qwen3-Embedding-8B
+nvidia/llama-embed-nemotron-8b
+annamodels/LGAI-Embedding-Preview
