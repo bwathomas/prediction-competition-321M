@@ -468,6 +468,12 @@ def main():
     res["t_total_s"] = round(time.time() - _t0, 1)
     _status["result"] = res
     step("done")
+    # persist per-row member preds so the ALL-3-families-swapped stack delta can be
+    # computed once every family's run exists (each run swaps only its own columns)
+    np.savez_compressed(f"{DRIVE_ROOT}/ship/stack/pqval_preds_{FAMILY}_fold{FOLD}.npz",
+                        et_base=et_base.astype(np.float32), et_pq=et_pq.astype(np.float32),
+                        mlp_base=mlp_out["base"]["stacked"].astype(np.float32),
+                        mlp_pq=mlp_out["pq"]["stacked"].astype(np.float32))
     out = Path(f"{DRIVE_ROOT}/ship/stack/pqval_{FAMILY}_fold{FOLD}.json")
     out.write_text(json.dumps(res, indent=2, default=str))
     print("PQVAL DONE", json.dumps(res["stack"]), flush=True)
