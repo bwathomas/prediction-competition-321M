@@ -1,95 +1,87 @@
-# WARM START — resume the AIDE overnight run
+# WARM START — resume the AIDE 3-family ensemble run (post-context-clear)
 
-**Snapshot:** 2026-06-05 ~04:15. Read this first, then `docs/AIDE_OVERNIGHT_WORKFLOW.md`
-(the full runbook + §6 babysitting protocol). This file = the 60-second resume.
-
-> ⚠️ You were launched in the STUB repo `/home/akhaemenid/projects/321M/head` (its CLAUDE.md
-> is an unrelated seeding-proof template — ignore it). **All real work is in the work repo
-> `/home/akhaemenid/projects/prediction-competition-321M`**, branch `clean/aide-stacked-ensemble`,
-> HEAD `133b56b` (pushed to origin `bwathomas/prediction-competition-321M`).
+**Snapshot: 2026-06-05 ~18:35.** Read this FIRST, then `docs/OVERNIGHT_WORKING_MEMORY.md` (detailed log).
+Work repo: `/home/akhaemenid/projects/prediction-competition-321M`, branch `clean/aide-stacked-ensemble`.
+(The stub `/home/akhaemenid/projects/321M/head` CLAUDE.md is an unrelated seeding-proof template — ignore.)
 
 ---
 
-## What's happening
-Three families (**qwen / mistral / llama**), each: derive leakage-safe OOF features → export
-an item-cold-start task → an **AIDE-ml** agent (LLM that writes+runs code) searches for the
-best model minimizing **GroupKFold(item_key) log loss**. Each runs on its own Colab A100 via a
-separate MCP bridge. Goal: three honest per-family winners → stack into the final ensemble.
+## THE DELIVERABLE (safe on Drive, snapshot-protected)
+**Final 2-layer stack: secret-holdout soft-logloss = 0.43722** (LightGBM cross_entropy meta over 17 base
+learners from 3 families). Beats best single family (llama 0.44324) and baseline (predict-mean 0.629).
+Saved on Drive: `…/aide/_winners_snapshot/` (per-family `{qwen,mistral,llama}/` winners + `FINAL_stack_submission.csv`
++ `FINAL_results.json`). **This is the protected result — never overwrite snapshots with anything worse-on-OOF.**
 
-## Live state at snapshot
-| Family | Bridge (MCP) | Notebook | State / job |
-|---|---|---|---|
-| **qwen** | `colab2` | original | **AIDE running** `qwen_aide` — was 12/30 steps, best val NLL **0.477**, healthy |
-| **mistral** | `colab3` | `drive/1Hki5…` | **deriving** `mistral_feat` — ~fold0 660k/1.82M; when done → export → `mistral_aide` |
-| **llama** | `colab` (mcp1) | `drive/1d7ALtX…` | **pending user's A100 alloc** (was L4). Drive mounted, embeddings confirmed. When A100: launch `derive_family(family="llama")` |
+Metric = mean binary cross-entropy on a CONTINUOUS pass-rate label ∈[0,1] (NOT binary), item-cold-start,
+GroupKFold(item_key). Score by POSITION (submission/holdout_features/holdout_labels are row-aligned) — NEVER
+merge on item_key (it's non-unique → cartesian explosion).
 
-A **≤20-min monitoring wakeup is scheduled** (ScheduleWakeup, self-contained prompt) — it may
-fire and drive the loop even before you read this. If you're resuming manually, run §6 of the
-runbook yourself.
+## WHAT'S RUNNING NOW
+3 AIDE-ml agents (LLM coding agents, model claude-opus-4-8), one per embedding family, each on its own
+Colab A100 via a separate MCP bridge. Each builds a diverse ensemble; the 3 winners stack.
+- **qwen** → bridge `colab2` (notebook empty.ipynb)
+- **mistral** → bridge `colab3` (drive/1Hki5…) → host 1b1fce795001
+- **llama** → bridge `colab` (mcp1, drive/1d7ALtX…) → host 87e3dc14ce39
+All relaunched ~18:35 on Opus, `exec.timeout=2100` (35-min/node cap), gpt-4o fallback armed. 2 aideprocs each.
 
----
+**Current TARGET (in each task.md):** reproduce the FULL ENRICHED ROSTER first — lgb(+DART/GOSS) · xgb
+`reg:logistic` · cat `CrossEntropy`(classifier) · ExtraTrees · KNN · MLP(bagged) · Factorization Machine ·
+amortized K-dim IRT (θ_s∈R^K from subject_key⊕subj_emb · item discrim+difficulty from features · benchmark
+effect · subject dropout) — using metadata cols (subject_key/benchmark/condition/subj_emb_*), logit-blended —
+THEN add the **featroute** member (a NESTED ensemble of per-feature-GROUP sub-models: nn/geo/clu-soft/
+clu-onehot/centroid/cnt+clusubj/subj_emb/meta-cat → logit-mean → one decorrelated input covering all features).
+Last bests (val): qwen ~0.444 / mistral ~0.440 / llama ~0.435 (building fresh trees post-relaunch).
 
-## First actions on resume
-1. **Load the Colab MCP tools** (they're deferred): `ToolSearch` for
-   `mcp__colab2__run_code_cell,mcp__colab2__add_code_cell`, and the same for `colab3` and `colab`.
-   The bridges should still be connected; if a `run_code_cell` errors, call that bridge's
-   `mcp__<bridge>__open_colab_browser_connection` to reattach.
-2. **Bridge map (do NOT mix up):** `colab2`=qwen, `colab3`=mistral, `colab`(mcp1)=llama.
-   `colab`(mcp1) was repointed to the llama notebook by editing
-   `/home/akhaemenid/projects/349D/.claude/colab_url_capture.sh` (rewrites the notebook path to
-   `drive/1d7ALtX…`, keeps the `#mcpProxyToken/Port` fragment). To repoint any bridge, edit that
-   `NOTEBOOK="drive/<id>"` line + reconnect. Verify with a `hostname`/`nvidia-smi` cell.
-3. **Poll each job** (status files under `/content/<job>.json`; helper `poll(name)` in
-   `aide/features/colab_runtime`). Job names: `qwen_aide`, `mistral_feat`, `mistral_aide`,
-   `llama_feat`, `llama_aide`. Apply runbook §6.
+## ⚠️ FREEZE RULES (caused two 20-30min freezes — DO NOT REPEAT)
+1. **ALL heavy compute (multi-second) via `run_bg`+poll or a `threading.Thread`** — NEVER synchronous
+   `run_code_cell`. `run_code_cell` is UNBOUNDED: a heavy cell or busy/dead kernel blocks it forever → freeze.
+2. `open_colab_browser_connection` is BOUNDED (60s) → SAFE to call. `run_code_cell` only on a freshly-
+   connected bridge with a FREE kernel.
+3. `drive.mount`/`userdata.get` via MCP worked via cached browser auth but can hang on first-auth — prefer user runs them.
 
-## How to drive each stage (templates already in the notebooks)
-- **Derive features:** on the family's bridge, `derive_family(drive_root=DRIVE, family=…,
-  code_version="v2", include_cluster=True)` via `run_bg` (~40 min A100). DRIVE =
-  `/content/drive/MyDrive/prediction-competition-321M`. Repo at `/content/pc321`.
-- **Export for AIDE:** `assemble_training_matrix` (geometry + nn/cluster label groups) →
-  subsample 400k → `export_for_aide(ds, manifest, out_dir=DRIVE/aide/<fam>_task,
-  secret_dir=DRIVE/aide/<fam>_secret)`. (qwen template = colab2 cell `pVitfQ_5uOz4`.)
-- **Launch AIDE:** subprocess `aide data_dir=<task> desc_file=<task>/task.md
-  exp_name=<fam>_overnight agent.steps=80 agent.code.model=claude-opus-4-8
-  agent.feedback.model=… report.model=…` via `run_bg`, with `env={**os.environ,"PYTHONPATH":""}`
-  (so it imports installed aideml, not our `aide/`), `cwd=DRIVE/aide/<fam>_run`. **Use Opus**
-  (`claude-opus-4-8`), high step budgets, and **extend freely while improving — the run is
-  expected to take FAR more than 30 steps.** Template with the OpenAI fallback wrapper = colab2
-  cell `RQb54mX_fQJ6` (kills any running aide, relaunches Opus, falls back to `gpt-4o` on a
-  Claude funding/credit/quota/429/overloaded error if `OPENAI_API_KEY` is set).
+## BRIDGE RECONNECT (after a disconnect)
+Bridges drop on freeze/idle. Reconnect: ToolSearch `select:mcp__<bridge>__open_colab_browser_connection,
+mcp__<bridge>__run_code_cell,mcp__<bridge>__add_code_cell` then call `open_colab_browser_connection` (bounded).
+It re-binds a runtime for the notebook — may land on the SAME live runtime (if alive) OR a FRESH blank one (if
+the original was recycled). Check host/Drive/aideprocs with a trivial cell first. colab2(qwen)=empty.ipynb (no
+redirect → tends to land fresh); colab/colab3 redirect to drive/<id>. Capture scripts:
+`/home/akhaemenid/projects/349D/.claude/colab_url_capture{,2,3}.sh`. colab-mcp = `uvx git+github.com/googlecolab/colab-mcp`.
 
-## Gotchas (will bite you)
-- **API keys:** `ANTHROPIC_API_KEY` AND `OPENAI_API_KEY` must be in the kernel env. `userdata.get()`
-  only works from the **Colab UI** (not via MCP) — have the user run a loader cell per runtime
-  (colab2 cell `eDMEymzzXe6Z` loads both). The OpenAI key is the **funding fallback**.
-- **Models:** use **`claude-opus-4-8`** for AIDE (per user). Key has the 4.x family
-  (`claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` for cheap smokes; 3.5 → 404).
-  **Fallback:** `gpt-4o` (OpenAI) — aideml supports it natively; the launch wrapper switches to it
-  automatically if a Claude run dies on funding/credit/quota/429/overloaded.
-- **Steps:** expected to run ≫30 steps. Start ~80, extend by +50 whenever the best metric is
-  still improving; only stop when flat for ~8–10 nodes.
-- **aide namespace collision:** the installed `aideml` and our package both import as `aide`;
-  always run AIDE as a subprocess with `PYTHONPATH=""` and `cwd` NOT in `/content/pc321`.
-- **Secret holdout:** `holdout_labels.parquet` lives in `…/<fam>_secret/` (OUTSIDE the AIDE
-  data_dir) — AIDE must never see it. Use it to independently re-score each winner (runbook §6e).
-- **FoldFeatureStore args are keyword-only:** `FoldFeatureStore(cache, embedding_family=…,
-  seed=0, n_folds=3)`.
-- **Colab `run_code_cell` is synchronous** → all long work goes through `run_bg`/`poll`.
-- **GPU contention:** don't run two FAISS/GPU jobs in one runtime — it crashed both threads
-  earlier. One derivation per runtime.
-- **Drive parquet reads are slow** (~5 min for the 10 GB items file); `embed_io` has a one-time
-  float16 `.npy` converter to speed repeat loads (not yet applied per family).
+## STATUS / POLL CELLS (current notebook cell IDs)
+- qwen colab2: status `60CtWaT8fbgE` · clean-relaunch `LuFJvPHtfw0c` · mount+keys `RZMmeeQRe54a`
+- mistral colab3: status `Sycd1pxUh_39` · relaunch `dUezV3QBgD6c` · mount `SBRM9eXkdbEi` · keys `ntTCAWAsdpPn` · backend-patch `iGUt40L7f_zl`
+- llama colab: status `ZpfiVv1bfV7f` · relaunch `kNfs1iebf29j` · mount+keys `OERJAmmFfQEe`
+- colab2 stack/analysis cells: featroute build `mdeNLjxYPXrD` (RE-RUN VIA run_bg!), best-code-recover `Y2m0W512idjI`, task.md TARGET-fix `7-5HiPyaj3ak`.
+(If a cell ID is "not found" after a runtime reset, just re-add the cell — Drive data persists.)
 
-## What's DONE (committed, tested — don't redo)
-- Full feature pipeline: `aide/features/` (cache, derive_nn/cluster/tabular, store, driver,
-  nn_fast, cluster_fast, passrate, embed_io, colab_runtime, metadata). 175 tests pass.
-- qwen features fully derived + validated (Drive `features/qwen/`, 17 shards).
-- AIDE wiring: `aide/ensemble/{assemble,optimize,overnight,aide_export}.py` + tests.
-- Runbook `docs/AIDE_OVERNIGHT_WORKFLOW.md`.
+## BABYSIT PROTOCOL (20-min cadence; a ScheduleWakeup is active — fires & re-enters this loop)
+Each cycle: reconnect dropped bridges → poll the 3 status cells → verify 2 aideprocs + bests descending toward
+~0.444/0.440/0.435 + the full roster (lgb/xgb/cat/et/knn/mlp/fm/irt) then `featroute` appearing in
+working/oof_predictions.csv. **RE-STACK** when a family beats its snapshot val (qwen<0.44442/mistral<0.44032/
+llama<0.43715), JUDGED BY OOF: load that family's working oof+holdout_base CSVs + others' best + train label +
+secret holdout → GroupKFold(5) LightGBM cross_entropy meta → SAVE to _winners_snapshot+FINAL ONLY IF
+OOF<0.42993 AND secret<0.43722. Runtime reset → re-setup (mount+keys cells → clone pc321 → `pip install
+git+https://github.com/WecoAI/aideml.git` via threading.Thread [NOT pypi `aideml` stub] → backend patch
+{drop temperature for opus-4, V2 prompt-cache, max_tokens=16000} → relaunch on persisted task.md).
 
-## What's PENDING
-- mistral: derivation finishing → export → `mistral_aide`.
-- llama: A100 alloc → `llama_feat` → export → `llama_aide`.
-- Babysit all three (runbook §6); extend steps while improving; secret-score each winner.
-- Then: stack the three winners into the final 2-layer ensemble.
+## KEY FACTS / ANALYSES (don't redo)
+- **Bake-off (9 combiners): LightGBM meta WINS** (OOF 0.42993/secret 0.43722) > logistic 0.43784 > nonneg-wt >
+  Caruana > family-mean > prob-mean > best-single 0.44595. all-17 > 3-family-means; logit>prob; OOF&secret rank consistently.
+- **Meta-lean:** meta leans ~60% on `llama.mlp` (item-only, decorrelated); specialists `mistral.knn`(+110 perm),
+  `mistral.ridge`(+62), `qwen.irt`(+38) punch above their gain; `mistral.cat`/`qwen.fm`/`llama.cat` are ballast.
+- **Data enrichment (done):** added subject_key(906)+benchmark(16)+condition(215)+subj_emb_0..47 to all 3
+  families' train/holdout parquets, ROW-ALIGNED (deterministic re-assemble; secret holdout_labels untouched).
+- **AIDE does NOT resume** across launches (fresh tree; old journals persist but workspaces rmtree'd). Seed a run
+  by injecting a target solution/roster into task.md ("TARGET ENSEMBLE" section).
+- **Bug history (fixed):** label-is-continuous→cross-entropy regression; CatBoost CrossEntropy needs Classifier;
+  Opus rejects temperature; max_tokens 4096→16000 (truncation); 1hr exec timeout vs slow KNN/ExtraTrees →
+  exec.timeout=2100 + speed caps; duplicate-parent stall; aideml pypi stub vs real GitHub install.
+- **Plateaued** ~1.5h before the freeze; featroute (orthogonal feature-routed member) is the current shot to break it.
+- **API:** keys load from Colab userdata (UI). Anthropic funds were topped up; if a run shows credit/fallback,
+  test `c.messages.create(model=claude-opus-4-8,...)` then relaunch on Opus.
+
+## NEXT ACTIONS ON RESUME
+1. Reconnect any dropped bridge (bounded call). 2. Poll the 3 status cells; confirm healthy + building full
+roster→featroute. 3. Continue the 20-min babysit; re-stack on OOF improvement. 4. The user's idea (featroute
+two-layer nested ensemble) is now mandated — watch for it to help the stack. 5. On user say-so: final re-stack
+best-by-OOF + present FINAL (per-family table + best stack + did-featroute-help + bake-off + meta-lean + diversity).

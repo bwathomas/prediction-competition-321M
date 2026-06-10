@@ -33,6 +33,11 @@ import numpy as np
 
 FAMILY = os.environ.get("VAL_FAMILY", "nemotron").strip().lower()
 FOLD = int(os.environ.get("VAL_FOLD", "0"))
+# PQ sims saturate >= the alias threshold (1 - 1e-6) for whole near-duplicate groups
+# (quantization collapses them onto the same codes), so far more retrieved neighbours get
+# alias-dropped than with exact sims — retrieve much deeper than derive_nn's default 2.
+GEO_BUFFER = int(os.environ.get("VAL_GEO_BUFFER", "2048"))
+LAB_BUFFER = int(os.environ.get("VAL_LAB_BUFFER", "1024"))
 REPO_ROOT = os.environ.get("SHIP_REPO_ROOT", "/content/pc321")
 DRIVE_ROOT = os.environ.get("SHIP_DRIVE_ROOT", "/content/drive/MyDrive/prediction-competition-321M")
 CODE_VERSION = os.environ.get("SHIP_CODE_VERSION", "v2")
@@ -289,7 +294,7 @@ def main():
                         row_ids=[str(k) for k in uniq_items[s:e]],
                         index_emb=x_hat, index_item_keys=[str(k) for k in item_keys],
                         passrate=empty_pr, Ks=(4, 8, 32, 64), knn_fn=knn_all,
-                        search_buffer=16)
+                        search_buffer=GEO_BUFFER)
         geo_blocks.append(blk["nn_geometry"].X)
         step("pq_nn_geometry", done=e, of=int(uniq_items.size))
     geo_pq = np.concatenate(geo_blocks, axis=0)[uniq_inv].astype(np.float32)
@@ -308,7 +313,7 @@ def main():
                                    [str(k) for k in item_keys])
     knn_tr, idx_t2 = gpu_knn_factory(x_hat[tk_rows], device)
     nn_blocks, cnt_blocks = [], []
-    CH = 60000
+    CH = 30000
     for s in range(0, oof_idx.size, CH):
         e = min(s + CH, oof_idx.size)
         blk = derive_nn_labels_fast(
@@ -317,7 +322,8 @@ def main():
             query_subjects=[str(k) for k in oof_subj[s:e]],
             row_ids=list(rid_oof[s:e]),
             index_emb=x_hat[tk_rows], index_item_keys=[str(k) for k in train_keys],
-            passrate=passrate, Ks=(4, 8, 32, 64), knn_fn=knn_tr, search_buffer=16)
+            passrate=passrate, Ks=(4, 8, 32, 64), knn_fn=knn_tr,
+            search_buffer=LAB_BUFFER)
         nn_blocks.append(blk["nn_label_derivatives"].X)
         cnt_blocks.append(blk["counts_subject"].X)
         step("pq_nn_labels", done=e, of=int(oof_idx.size))
