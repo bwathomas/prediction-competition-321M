@@ -108,21 +108,37 @@ def _install_llama_bidirectional():
                                 past_key_values=None, output_attentions=False):
             return _nemo_bidir_mask_4d(attention_mask, input_tensor.dtype)
 
-    def _nemo_bidir_create_causal_mask(config=None, input_embeds=None,
-                                       attention_mask=None, *args, **kwargs):
-        if input_embeds is None:
-            input_embeds = kwargs.get("inputs_embeds")
-        if input_embeds is None:
-            return attention_mask
-        return _nemo_bidir_mask_4d(attention_mask, input_embeds.dtype)
+    # SCOPED patch: dispatch on the calling model's config. trc5's blunt global
+    # replacement was safe single-family; with three encoders in one process the
+    # non-causal mask must apply ONLY to llama_bidirec — on transformers >= 5.10
+    # the factories are resolved late, so a blunt patch silently makes qwen/lgai
+    # bidirectional too (measured: cache cos drops to ~0.3-0.5).
+    def _make_scoped(orig):
+        def scoped(*args, **kwargs):
+            cfg = kwargs.get("config", args[0] if args else None)
+            if getattr(cfg, "model_type", "") != "llama_bidirec":
+                return orig(*args, **kwargs)
+            input_embeds = kwargs.get("input_embeds", kwargs.get("inputs_embeds"))
+            if input_embeds is None and len(args) > 1:
+                input_embeds = args[1]
+            attention_mask = kwargs.get("attention_mask")
+            if attention_mask is None and len(args) > 2:
+                attention_mask = args[2]
+            if input_embeds is None:
+                return attention_mask
+            return _nemo_bidir_mask_4d(attention_mask, input_embeds.dtype)
+        scoped._nemo_scoped = True
+        return scoped
 
     try:
         import transformers.masking_utils as _mu
         for name in ("create_causal_mask", "create_sliding_window_causal_mask",
                      "create_chunked_causal_mask"):
-            if hasattr(_mu, name):
-                setattr(_mu, name, _nemo_bidir_create_causal_mask)
-        LOG.info("nemotron: masking_utils factories patched (v5 path)")
+            orig = getattr(_mu, name, None)
+            if orig is None or getattr(orig, "_nemo_scoped", False):
+                continue
+            setattr(_mu, name, _make_scoped(orig))
+        LOG.info("nemotron: masking_utils factories patched (v5 path, scoped)")
     except ImportError:
         LOG.info("nemotron: no masking_utils (v4) — _update_causal_mask override active")
 
