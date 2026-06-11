@@ -101,7 +101,9 @@ def main():
     import pandas as pd
 
     step("load_dump")
-    d = np.load(DUMP, allow_pickle=False)
+    # allow_pickle: the dump stores pandas string keys as object arrays; it is our
+    # own artifact written by notebooks/m1_oof_only.py on our Drive (trusted).
+    d = np.load(DUMP, allow_pickle=True)
     rid_m1 = np.char.add(np.char.add(d["subject_key"].astype(str), "|"),
                          d["item_key"].astype(str))
     p_m1 = d["p_m1_oof"].astype(np.float64)
