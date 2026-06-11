@@ -48,8 +48,11 @@ DR = os.environ.get("SHIP_DRIVE_ROOT", "/content/drive/MyDrive/prediction-compet
 FAMS = ["qwen", "nemotron", "lgai"]
 FOLDS = [0, 1, 2]
 EPS = 1e-7
-REVEAL_FRACS = [0.005, 0.01, 0.02, 0.05, 0.10]
+# NOTE: the platform reveals only ~75 labels per round (top-5 x 15 hash categories,
+# labeling.py docstring) => realistic per-benchmark budgets are at the SMALL end.
+REVEAL_FRACS = [0.001, 0.005, 0.01, 0.02, 0.05, 0.10]
 KNN_K = 16
+KNN_MAX_REF = 16384   # cap on revealed reference ITEMS for the kNN corrector
 SEED = 0
 STATUS = "/content/lobo_alpha_probe.json"
 OUT = f"{DR}/ship/exp_cold/lobo_alpha_probe.json"
@@ -286,34 +289,74 @@ def main():
                                              ridge=5.0 / rows.sum())
             off_t = np.array([soff.get(s, 0.0) for s in subj_b[te]])
             p4 = sg(z3t + off_t)
-            # v5 + kNN residual on revealed items (same bench, qwen emb cosine)
+            # v5 + kNN residual, ITEM-level (same bench, qwen emb cosine). Residuals
+            # are aggregated per revealed ITEM and deltas computed per unique
+            # unrevealed item then broadcast to rows — items carry the signal, and
+            # this is ~30x cheaper than row-level matmuls. GPU matmul when available.
             p5 = None
-            if have_emb[rev].sum() >= KNN_K and have_emb[te].sum() > 0:
-                rev_emb_pos = eb_pos[rev]
-                te_emb_pos = eb_pos[te]
-                vr = np.asarray(iv[rev_emb_pos[have_emb[rev]]], np.float32)
-                vr /= np.clip(np.linalg.norm(vr, axis=1, keepdims=True), 1e-9, None)
-                resid_r = (yr[have_emb[rev]]
-                           - sg(z3r[have_emb[rev]] + np.array(
-                               [soff.get(s, 0.0) for s in subj_b[rev][have_emb[rev]]])))
-                z5t = z3t + off_t
-                p5 = sg(z5t).copy()
-                te_ok = np.where(have_emb[te])[0]
-                CH = 4096
-                for s0 in range(0, len(te_ok), CH):
-                    sel = te_ok[s0:s0 + CH]
-                    vt = np.asarray(iv[te_emb_pos[sel]], np.float32)
-                    vt /= np.clip(np.linalg.norm(vt, axis=1, keepdims=True), 1e-9, None)
-                    sims = vt @ vr.T
-                    k_eff = min(KNN_K, sims.shape[1])
-                    nn = np.argpartition(-sims, k_eff - 1, axis=1)[:, :k_eff]
-                    sw = np.take_along_axis(sims, nn, axis=1)
-                    sw = np.clip(sw, 0, None)
-                    rs = resid_r[nn]
-                    wsum = sw.sum(1) + 1e-9
-                    delta = (sw * rs).sum(1) / wsum
-                    shrink = wsum / (wsum + 4.0)  # count/sim shrinkage
-                    p5[sel] = np.clip(sg(z5t[sel]) + shrink * delta, EPS, 1 - EPS)
+            z3_all = t_b * (z_t + c)
+            off_all = np.array([soff.get(s, 0.0) for s in subj_b])
+            rev_have = rev & (eb_pos >= 0)
+            te_have = te & (eb_pos >= 0)
+            if rev_have.sum() >= KNN_K and te_have.sum() > 0:
+                resid_rows = y_b - sg(z3_all + off_all)
+                uit, uinv = np.unique(item_b[rev_have], return_inverse=True)
+                sums = np.zeros(len(uit))
+                cnts = np.zeros(len(uit))
+                np.add.at(sums, uinv, resid_rows[rev_have])
+                np.add.at(cnts, uinv, 1)
+                r_item = sums / np.maximum(cnts, 1)
+                if len(uit) > KNN_MAX_REF:
+                    pick = rng.choice(len(uit), KNN_MAX_REF, replace=False)
+                    uit, r_item = uit[pick], r_item[pick]
+                ref_pos = np.array([ipos[k] for k in uit])
+                VR = np.asarray(iv[ref_pos], np.float32)
+                VR /= np.clip(np.linalg.norm(VR, axis=1, keepdims=True), 1e-9, None)
+                tit = np.unique(item_b[te_have])
+                tpos = np.array([ipos[k] for k in tit])
+                k_eff = min(KNN_K, len(uit))
+                deltas = np.zeros(len(tit))
+                shrinks = np.zeros(len(tit))
+                use_gpu = False
+                try:
+                    import torch
+                    use_gpu = torch.cuda.is_available()
+                except Exception:
+                    torch = None
+                if use_gpu:
+                    VRt = torch.tensor(VR, device="cuda")
+                    RIt = torch.tensor(r_item, device="cuda", dtype=torch.float32)
+                    CH = 16384
+                    for s0 in range(0, len(tit), CH):
+                        vt = np.asarray(iv[tpos[s0:s0 + CH]], np.float32)
+                        vt /= np.clip(np.linalg.norm(vt, axis=1, keepdims=True),
+                                      1e-9, None)
+                        VTt = torch.tensor(vt, device="cuda")
+                        sims = VTt @ VRt.T
+                        sw, nn = torch.topk(sims, k_eff, dim=1)
+                        sw = torch.clamp(sw, min=0)
+                        rs = RIt[nn]
+                        wsum = sw.sum(1) + 1e-9
+                        deltas[s0:s0 + CH] = ((sw * rs).sum(1) / wsum).cpu().numpy()
+                        shrinks[s0:s0 + CH] = (wsum / (wsum + 4.0)).cpu().numpy()
+                    del VRt, RIt
+                    torch.cuda.empty_cache()
+                else:
+                    CH = 4096
+                    for s0 in range(0, len(tit), CH):
+                        vt = np.asarray(iv[tpos[s0:s0 + CH]], np.float32)
+                        vt /= np.clip(np.linalg.norm(vt, axis=1, keepdims=True),
+                                      1e-9, None)
+                        sims = vt @ VR.T
+                        nn = np.argpartition(-sims, k_eff - 1, axis=1)[:, :k_eff]
+                        sw = np.clip(np.take_along_axis(sims, nn, axis=1), 0, None)
+                        rs = r_item[nn]
+                        wsum = sw.sum(1) + 1e-9
+                        deltas[s0:s0 + CH] = (sw * rs).sum(1) / wsum
+                        shrinks[s0:s0 + CH] = wsum / (wsum + 4.0)
+                d_by_item = dict(zip(tit.tolist(), (shrinks * deltas).tolist()))
+                row_delta = np.array([d_by_item.get(k, 0.0) for k in item_b[te]])
+                p5 = np.clip(sg(z3_all[te] + off_all[te]) + row_delta, EPS, 1 - EPS)
             row = {"v2_intercept": {"bce": round(bce(yt, p2), 5)},
                    "v3_slope": {"bce": round(bce(yt, p3), 5)},
                    "v4_subject_offsets": {"bce": round(bce(yt, p4), 5)}}
