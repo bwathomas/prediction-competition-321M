@@ -74,8 +74,9 @@ def main():
     # ---- 2. derive fresh shards -----------------------------------------------------
     from aide.features.driver import derive_family
 
-    def prog(msg, frac=None):
-        step("derive", msg=str(msg), frac=frac)
+    def prog(*a, **kw):
+        step("derive", msg=str(a[0]) if a else "",
+             **{k: str(v) for k, v in kw.items()})
 
     derive_family(drive_root=DR, family="mistral", code_version="v2",
                   include_cluster=True, progress=prog)

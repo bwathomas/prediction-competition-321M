@@ -1404,7 +1404,7 @@ if _M1_LOO_ON:
         _bk = []
         _rids_f = None
         for _g in _LABG:
-            _sh = _enr_store.cache.read_shard(_enr_store._key(_g, f"fold{_f}"))
+            _sh = _enr_store.cache.read_shard(_enr_store._key(_g, _f))
             if _rids_f is None:
                 _rids_f = [str(r) for r in _sh.row_ids]
             _X = np.asarray(_sh.X, np.float32)

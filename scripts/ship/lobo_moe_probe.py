@@ -171,7 +171,7 @@ def main():
         blocks = []
         rids = None
         for g in LABEL_GROUPS:
-            sh = store.cache.read_shard(store._key(g, f"fold{f}"))
+            sh = store.cache.read_shard(store._key(g, f))
             if rids is None:
                 rids = [str(r) for r in sh.row_ids]
             blocks.append(np.asarray(sh.X, np.float32))
