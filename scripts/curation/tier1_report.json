@@ -1,0 +1,120 @@
+{
+  "sources": {
+    "eval_arena": {
+      "n_rows": 117556,
+      "n_models_source": 335,
+      "n_matched_subjects": 157,
+      "match_tier_counts": {
+        "exact": 116556,
+        "fallback": 1000
+      },
+      "n_unmatched_models": 169,
+      "top_unmatched_models": {
+        "gpt-3.5-turbo-0613": 4200,
+        "phi-2": 3742,
+        "mistral-7b": 3578,
+        "codellama-34b+cot": 3200,
+        "codellama-34b": 3200,
+        "codellama-python-13b": 3200,
+        "codellama-python-34b": 3200,
+        "codellama-python-7b": 3200,
+        "codetulu-2-34b": 3200,
+        "deepseek-base-1.3b": 3200,
+        "deepseek-base-33b": 3200,
+        "deepseek-base-6.7b": 3200,
+        "deepseek-instruct-1.3b": 3200,
+        "deepseek-instruct-33b": 3200,
+        "deepseek-instruct-6.7b": 3200,
+        "gpt-3.5-turbo-0613+cot": 3200,
+        "magicoder-ds-7b": 3200,
+        "mixtral-8x7b": 3200,
+        "phi-1.5": 3200,
+        "phi-1": 3200
+      },
+      "failures": []
+    },
+    "swebench_experiments": {
+      "n_rows": 42985,
+      "n_models_source": 125,
+      "n_matched_subjects": 124,
+      "match_tier_counts": {
+        "exact": 38985,
+        "fallback": 2500,
+        "fuzzy": 1500
+      },
+      "n_unmatched_models": 21,
+      "top_unmatched_models": {
+        "gpt-5-mini-2025-08-07": 1000,
+        "gpt-5.2-2025-12-11": 1000,
+        "o3-20250416": 500,
+        "o4-mini-20250416": 500,
+        "llama-4-maverick-instruct": 500,
+        "Qwen2.5-Coder-32B-Instruct": 500,
+        "Qwen3-Coder-480B-A35B-Instruct": 500,
+        "gpt-5-nano-2025-08-07": 500,
+        "gpt-5-2025-08-07": 500,
+        "gpt-oss-120b": 500,
+        "Kimi-K2-Instruct": 500,
+        "gpt-5.1-codex": 500,
+        "deepseek-v3.2-reasoner": 500,
+        "devstral-2512": 500,
+        "devstral-small-2512": 500,
+        "claude-haiku-4-5-20251001": 500,
+        "claude-opus-4-6": 500,
+        "deepseek-v3.2": 500,
+        "gpt-5-2": 500,
+        "minimax-m2.5": 500
+      },
+      "failures": [
+        "bash-only/20250720_mini-v0.0.0-Llama-4-Scout-17B-Instruct: HTTPError: 404 Client Error: Not Found for url: https://raw.githubusercontent.com/SWE-bench/experiments/main/evaluation/bash-only/20250720_mini-v0.0.0-Llama-4-Scout-17B-Instruct/per_instance_details.json",
+        "bash-only/20250726_mini-v1.0.0_gpt-4.1-2025-04-14: HTTPError: 404 Client Error: Not Found for url: https://raw.githubusercontent.com/SWE-bench/experiments/main/evaluation/bash-only/20250726_mini-v1.0.0_gpt-4.1-2025-04-14/per_instance_details.json",
+        "bash-only/20250726_mini-v1.0.0_gemini-2.5-flash: HTTPError: 404 Client Error: Not Found for url: https://raw.githubusercontent.com/SWE-bench/experiments/main/evaluation/bash-only/20250726_mini-v1.0.0_gemini-2.5-flash/per_instance_details.json",
+        "bash-only/20250726_mini-v1.0.0_gemini-2.0-flash: HTTPError: 404 Client Error: Not Found for url: https://raw.githubusercontent.com/SWE-bench/experiments/main/evaluation/bash-only/20250726_mini-v1.0.0_gemini-2.0-flash/per_instance_details.json",
+        "bash-only/20250720_mini-v0.0.0-gpt-4o-2024-11-20: HTTPError: 404 Client Error: Not Found for url: https://raw.githubusercontent.com/SWE-bench/experiments/main/evaluation/bash-only/20250720_mini-v0.0.0-gpt-4o-2024-11-20/per_instance_details.json",
+        "bash-only/20250720_mini-v0.0.0_gpt-4.1-mini-2025-04-14: HTTPError: 404 Client Error: Not Found for url: https://raw.githubusercontent.com/SWE-bench/experiments/main/evaluation/bash-only/20250720_mini-v0.0.0_gpt-4.1-mini-2025-04-14/per_instance_details.json",
+        "bash-only/20260219_mini-v2.0.0_gpt-5-2-codex: HTTPError: 404 Client Error: Not Found for url: https://raw.githubusercontent.com/SWE-bench/experiments/main/evaluation/bash-only/20260219_mini-v2.0.0_gpt-5-2-codex/per_instance_details.json"
+      ]
+    },
+    "helm": {
+      "n_rows": 520065,
+      "n_models_source": 56,
+      "n_matched_subjects": 28,
+      "match_tier_counts": {
+        "exact": 520065
+      },
+      "n_unmatched_models": 28,
+      "top_unmatched_models": {
+        "google_gemma-2b-it": 33880,
+        "meta_llama-3-8b-instruct-turbo": 33880,
+        "qwen_qwen2.5-7b-instruct-turbo": 33880,
+        "openai_gpt2": 33880,
+        "meta_llama-3.3-70b-instruct-turbo": 33880,
+        "google_gemini-2.0-flash-lite-001": 33880,
+        "qwen_qwen2.5-72b-instruct-turbo": 33880,
+        "damo_seallm-7b-v2.5": 565,
+        "aisingapore_sea-lion-7b-instruct": 565,
+        "meta_llama-3-8b-chat": 565,
+        "mistralai_mixtral-8x22b-instruct-v0.1": 565,
+        "openthaigpt_openthaigpt-1.0.0-13b-chat": 565,
+        "qwen_qwen2-72b-instruct": 565,
+        "damo_seallm-7b-v2": 565,
+        "sail_sailor-7b-chat": 565,
+        "sail_sailor-14b-chat": 565,
+        "openthaigpt_openthaigpt-1.0.0-7b-chat": 565,
+        "scb10x_llama-3-typhoon-v1.5x-70b-instruct": 565,
+        "sambanova_sambalingo-thai-chat": 565,
+        "scb10x_typhoon-v1.5-8b-instruct": 565
+      },
+      "failures": []
+    }
+  },
+  "overall": {
+    "total_rows": 680606,
+    "total_matched_subjects": 195,
+    "parquet_files": [
+      "eval_arena.parquet",
+      "helm.parquet",
+      "swebench_experiments.parquet"
+    ]
+  }
+}
